@@ -1,15 +1,18 @@
-# KashFlow API foundation
+# KashFlow API
 
-This is a minimal secure-by-default API host for future provider adapters. It currently exposes `GET /healthz` and `GET /v1/integrations/readiness` only. It does not connect to providers or handle customer, payroll, tax, invoice, or payment data.
+The API provides first-admin workspace setup, password sign-in, signed HttpOnly sessions, database-backed manual transactions and invoices, dashboard aggregates, and health/readiness endpoints. It automatically applies the idempotent SQL schema in `migrations/001_core.sql` at startup when `DATABASE_URL` is set.
 
-## Local development
+## Required environment
 
-Run `npm ci`, copy `.env.example` to `.env`, then run `npm run dev`. Do not commit `.env` or provider credentials. In production, configure values in the hosting provider's secret/environment settings.
+- `NODE_ENV`: set `production` when deployed.
+- `PORT`: supplied by Render; defaults to `3001` locally.
+- `FRONTEND_ORIGIN`: exact frontend URL; CORS and write requests are restricted to this origin.
+- `DATABASE_URL`: PostgreSQL connection string.
+- `SESSION_SECRET`: at least 32 characters; signs HttpOnly session cookies.
+- `BOOTSTRAP_ADMIN_EMAIL`: email allowed to create the first administrator/workspace. Bootstrap closes as soon as that account is created.
+- `FRONTEND_ORIGIN`: exact browser site origin allowed by CORS and write-origin checks.
+- `DATABASE_URL`: PostgreSQL connection string; required. The schema applies at startup.
 
-## Before enabling real integrations
+Copy `.env.example` to `.env` and configure a local PostgreSQL database. Run `npm ci` and `npm run dev`. Do not commit `.env` or credentials.
 
-- Select approved providers and obtain sandbox credentials and written API access.
-- Implement each provider adapter against its current API specification, including authentication, token rotation, signed callbacks, idempotency, retries, audit logging, and reconciliation.
-- Add authenticated tenant/user authorization and a reviewed data model before persisting financial or employee data.
-- Validate current statutory rules and filing flows with qualified Kenyan payroll/tax professionals.
-- Complete sandbox/UAT, security review, and production approval before enabling production credentials.
+The API does not yet connect to KRA/eTIMS, Safaricom Daraja, bank feeds, or statutory filing services. Do not accept/store payroll or regulated data before appropriate security, privacy, backup, and professional reviews. Manual invoice records are internal only and are not eTIMS tax invoices or sent to customers.

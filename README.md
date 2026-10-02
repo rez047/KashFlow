@@ -1,67 +1,48 @@
 # KashFlow
 
-KashFlow is a Kenyan-first accounting workspace prototype built with React, TypeScript, and Vite. The current experience demonstrates a finance dashboard, cash-flow chart, transaction search, invoice and transaction entry dialogs, module navigation, and a Kenya compliance overview for KRA eTIMS, PAYE, SHIF, NSSF, and Affordable Housing Levy.
+KashFlow is a Kenyan-first finance workspace. The app no longer seeds fictional companies, balances, transactions, invoices, or compliance statuses. After deployment and first-time setup, users sign in and save transaction and invoice records to the configured PostgreSQL database. The dashboard totals, chart, and lists are calculated from those saved records.
+
+## Current working functionality
+
+- First-admin workspace setup, password sign-in, signed HttpOnly sessions, and sign-out.
+- Database-backed manual income/expense transaction entry and invoice entry.
+- Workspace dashboard totals, recent transactions, and a daily chart sourced from saved records.
+- Empty states when the workspace has no records.
+
+Bank sync, card/mobile payment processing, customer emailing, payroll, statutory calculations, document storage, and filing are not implemented. KRA/eTIMS, Safaricom Daraja/M-Pesa, banks, SHIF, NSSF, and Affordable Housing Levy are explicitly shown as inactive. Entering an internal invoice does not make it a KRA eTIMS invoice or send it to a customer. Have qualified Kenyan payroll/tax professionals review any future statutory calculations and filing workflows.
 
 ## Run locally
 
-Install dependencies with `npm install`, then start the development server with `npm run dev`. Run `npm run build` to type-check and create a production build.
+1. Install frontend dependencies in the project root: `npm ci`.
+2. Install API dependencies: from `api/`, run `npm ci`.
+3. Create an empty PostgreSQL database; the API applies `api/migrations/001_core.sql` automatically on startup.
+4. Copy `api/.env.example` to `api/.env`; set the database URL, a random session secret of at least 32 characters, and your admin email.
+5. Start the API from `api/` using `npm run dev`.
+6. In the project root, copy `.env.example` to `.env.local` (it defaults to `http://localhost:3001`), then run `npm run dev` in another terminal.
+7. Open the Vite URL and create the first workspace with the email configured in `BOOTSTRAP_ADMIN_EMAIL` and a password of at least 12 characters. First-account setup closes automatically once that account is created.
 
-## Prototype scope and compliance note
+Do not commit `.env`, `.env.local`, database URLs, passwords, or provider secrets.
 
-This workspace currently uses illustrative, in-memory sample data. It does not connect to QuickBooks, KRA, eTIMS, SHIF, NSSF, banks, or M-Pesa; it does not submit filings or provide payroll/tax calculations. Government and payment integrations require approved providers, credentials, security controls, tested statutory rules, and legal/accounting review before production use. Navigation for accounting, payroll, sales, inventory, projects, reports, documents, and other areas currently represents product structure rather than complete working features.
+## Deploy on Render
 
-## Next implementation stages
+The repository includes `render.yaml` for a static frontend, Node API, and managed PostgreSQL database. In Render, create a Blueprint from this repository and review the generated resources before applying it. During setup, provide `BOOTSTRAP_ADMIN_EMAIL`; Render generates `SESSION_SECRET` and links `DATABASE_URL` from the database. Confirm `FRONTEND_ORIGIN` exactly matches the resulting KashFlow static-site URL and `VITE_API_BASE_URL` exactly matches the API URL. If Render assigns different service URLs, update these two values and redeploy the API and frontend respectively. The first visit presents workspace setup; create the initial admin account with the configured email and a strong password.
 
-1. Define tenant/user roles, audit logs, and a secure backend.
-2. Implement double-entry ledger, chart of accounts, taxes, invoices, receivables, payables, reconciliation, and financial reports.
-3. Implement payroll and maintain versioned statutory rules for PAYE, SHIF, NSSF, and Affordable Housing Levy.
-4. Build provider-based integrations for KRA/eTIMS, Kenyan banks, and M-Pesa; validate against sandbox accounts and current provider requirements.
-5. Add persistence, automated tests, backups, access controls, and deployment monitoring.
+### Environment variable reference
 
-## Backend and live integrations
+| Variable | Service | Required | Purpose |
+|---|---|---:|---|
+| `NODE_ENV` | API | Yes | Set to `production` on Render. |
+| `PORT` | API | Render supplies it | HTTP listen port; local default is `3001`. |
+| `FRONTEND_ORIGIN` | API | Yes | Exact frontend origin allowed by CORS and write-origin checks. |
+| `DATABASE_URL` | API | Yes | Render PostgreSQL connection string; provisioned by the Blueprint. |
+| `SESSION_SECRET` | API | Yes | Random secret of at least 32 characters used to sign sessions; generate in Render, never expose to the browser. |
+| `BOOTSTRAP_ADMIN_EMAIL` | API | Yes, for first setup | The one email allowed to create the first admin workspace account. It is not a password. Once the first account exists, bootstrap is disabled. |
+| `VITE_API_BASE_URL` | Static site build | Yes | Public base URL for the API, e.g. `https://kashflow-api.onrender.com`. This is intentionally public, not a secret. |
 
-A small Express API foundation is in `api/`; the Render Blueprint is in `render.yaml`. The API currently exposes health and integration-readiness endpoints only. It is not a live connection to KRA/eTIMS, Safaricom Daraja, banks, SHIF, NSSF, or Affordable Housing Levy. The UI marks sample values and compliance statuses as demo/setup-required.
+`api/.env.example` contains the local API variables. For Render, use the service Environment settings or the Blueprint. Provider credential variable names from a provider's documentation should only be added after its adapter is implemented; arbitrary credentials do not activate an integration. Never use `VITE_*` for secrets because browser bundles are public.
 
-The Render Blueprint provisions the static frontend, API web service, and PostgreSQL database. Before real provider calls or employee/financial data storage, implement tenant authentication, authorization, audit history, migrations, provider-specific adapters, webhook verification, idempotency, and reviewed data-retention/security controls. Live activation also requires provider approval, sandbox credentials, current API specifications, and qualified Kenyan payroll/tax review. Configure secrets in Render environment settings only; never commit them.
+## Data and security notes
 
-## Environment variables
+This MVP creates a private workspace and a single first-admin account; it does not yet have multi-user invitations, role-based access, ledger double-entry accounting, invoice payment/status management, backups, or audited integration credential storage. Protect the Render account and database, use a unique strong first-admin password, enable appropriate backups, and do not enter regulated/payroll data until the application receives a security and privacy review. The database schema is in `api/migrations/001_core.sql`.
 
-Use this section as the setup checklist. **Only the API variables in the first table are read by the current code.** The provider variable names below are proposed names for the future integration adapters; adding them to Render alone will not connect any services. Provider APIs, approval, and authentication flows must be implemented and tested first.
-
-### Current API variables
-
-| Name | Required | Example / source | Used for |
-|---|---|---|---|
-| `NODE_ENV` | Yes in production | `production` | Runtime mode; validated by the API. |
-| `PORT` | Supplied by Render; local default is `3001` | `3001` | API listen port. |
-| `FRONTEND_ORIGIN` | Yes | Local: `http://localhost:5173`; production: exact KashFlow static-site origin, e.g. `https://kashflow.onrender.com` | CORS allow-list for browser requests. Must match the deployed frontend origin exactly. |
-| `DATABASE_URL` | Required when enabling persistence | Render PostgreSQL connection string | PostgreSQL connection. Render Blueprint can populate this automatically. Current API only checks database health; application data persistence is not implemented. |
-
-Local API setup: copy `api/.env.example` to `api/.env` and adjust local values. Keep `.env` files out of Git. For Render, set API variables under the **kashflow-api service → Environment**; use Render's linked database variable for `DATABASE_URL`.
-
-### Provider variables to add when adapters are implemented
-
-These are suggested KashFlow names, **not official provider-defined environment variable names**. Confirm the exact credentials, scopes, endpoints, and callback URLs with each approved provider before creating the Render variables. Never put secrets in frontend variables such as `VITE_*`; those values are embedded in browser JavaScript and are public.
-
-| Integration | Suggested variable names | Setup notes |
-|---|---|---|
-| KashFlow frontend → API | `VITE_API_BASE_URL` | Public API base URL, e.g. `https://kashflow-api.onrender.com`. Frontend code must be updated to read and use this variable. |
-| App authentication / sessions | `SESSION_SECRET`, `DATA_ENCRYPTION_KEY` | Generate high-entropy secrets and store only in API service environment. Authentication, session handling, and encryption are not implemented yet. |
-| KRA eTIMS (through an approved integration provider) | `ETIMS_PROVIDER`, `ETIMS_API_BASE_URL`, `ETIMS_CLIENT_ID`, `ETIMS_CLIENT_SECRET`, `ETIMS_CALLBACK_URL`, `ETIMS_WEBHOOK_SECRET` | The approved eTIMS route and any required KRA/provider identifiers must be confirmed. Do not assume direct API access is available. |
-| Safaricom Daraja / M-Pesa | `MPESA_ENV`, `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, `MPESA_SHORTCODE`, `MPESA_PASSKEY`, `MPESA_CALLBACK_BASE_URL`, `MPESA_WEBHOOK_SECRET` | Start with Daraja sandbox credentials; configure public HTTPS callback URLs and verify callbacks. No Daraja adapter is implemented yet. |
-| Bank feeds | `BANK_FEED_PROVIDER`, `BANK_FEED_API_BASE_URL`, `BANK_FEED_CLIENT_ID`, `BANK_FEED_CLIENT_SECRET`, `BANK_FEED_WEBHOOK_SECRET` | Choose a provider that supports the target Kenyan banks; confirm bank/customer consent and data-access requirements. |
-| Statutory filing provider (only if approved API access exists) | `STATUTORY_PROVIDER`, `STATUTORY_API_BASE_URL`, `STATUTORY_CLIENT_ID`, `STATUTORY_CLIENT_SECRET`, `STATUTORY_WEBHOOK_SECRET` | Confirm separately which, if any, approved provider supports PAYE, SHIF, NSSF, and Affordable Housing Levy submissions. Filing integration is not implemented. |
-
-### Per-business credentials and identifiers
-
-Do **not** set customer-specific or employee-specific credentials as shared Render environment variables. Items such as KRA PINs, M-Pesa till/paybill identifiers, bank authorizations, employee records, and provider account tokens belong to the relevant business tenant and should be stored in access-controlled, encrypted application storage after tenant security and consent flows exist. The current product does not yet implement that storage.
-
-### Safe configuration checklist
-
-1. Deploy frontend and API; copy the exact frontend origin into API `FRONTEND_ORIGIN`.
-2. Add Render PostgreSQL and connect `DATABASE_URL` to the API.
-3. Obtain provider approval and sandbox credentials; identify exact APIs and callback requirements.
-4. Implement provider adapters, secure tenant authentication, encrypted credential storage, webhook signature checks, idempotency, audit logging, retry/reconciliation handling, and tests.
-5. Validate payroll/tax rules and filing flows with qualified Kenyan professionals; test in sandbox/UAT.
-6. Add provider secrets to the API's encrypted Render environment settings—not to the frontend, README, source code, or Git repository.
-7. Enable production credentials only after provider approval, security review, and end-to-end sign-off.
+The API exposes `GET /healthz` and `GET /v1/integrations/readiness` for operational/status checks. No external provider credentials are currently consumed by the code. Live KRA, M-Pesa, banking, and statutory integrations still require approved providers, credentials, provider-specific adapters, verified callbacks/webhooks, sandbox tests, and production approval.

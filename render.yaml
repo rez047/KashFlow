@@ -9,18 +9,25 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: BOOTSTRAP_ADMIN_EMAIL
+        sync: false
       - key: FRONTEND_ORIGIN
-        value: https://kashflow.onrender.com
+        value: https://kashflow-frontend.onrender.com
       - key: DATABASE_URL
         fromDatabase:
           name: kashflow-db
           property: connectionString
 
   - type: web
-    name: kashflow
+    name: kashflow-frontend
     runtime: static
     buildCommand: npm ci && npm run build
     staticPublishPath: ./dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        value: https://kashflow-api.onrender.com
 
 databases:
   - name: kashflow-db
