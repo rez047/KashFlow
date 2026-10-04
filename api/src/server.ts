@@ -26,7 +26,40 @@ if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET |
   console.error('Production requires DATABASE_URL, SESSION_SECRET (32+ characters), and BOOTSTRAP_ADMIN_EMAIL.')
   process.exit(1)
 }
-const pool = env.DATABASE_URL ? new Pool({ connectionString: env.DATABASE_URL, max: 5, ssl: env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined }) : undefined
+async function createPool() {
+  if (env.DATABASE_URL) return new Pool({ connectionString: env.DATABASE_URL, max: 5, ssl: env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined })
+  if (env.NODE_ENV === 'production') return undefined
+
+  try {
+    const { randomUUID } = await import('node:crypto')
+    const { DataType, newDb } = await import('pg-mem')
+    const db = newDb()
+    db.public.registerFunction({
+      name: 'gen_random_uuid',
+      args: [],
+      returns: DataType.uuid,
+      implementation: () => randomUUID(),
+    })
+    db.public.registerFunction({
+      name: 'length',
+      args: [DataType.text],
+      returns: DataType.integer,
+      implementation: (value: string | null | undefined) => String(value ?? '').length,
+    })
+    db.public.registerFunction({
+      name: 'pg_advisory_xact_lock',
+      args: [DataType.bigint],
+      returns: DataType.integer,
+      implementation: () => 1,
+    })
+    const { Pool: PgMemPool } = db.adapters.createPg()
+    return new PgMemPool()
+  } catch (error) {
+    console.warn('No DATABASE_URL configured; pg-mem fallback unavailable. Set DATABASE_URL for this environment.')
+    return undefined
+  }
+}
+const pool = await createPool()
 const app = express()
 const cookieName = 'kashflow_session'
 const sessionTtlSeconds = 60 * 60 * 12
