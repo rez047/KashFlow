@@ -46,8 +46,8 @@ type Dashboard = {
   cashflow: Array<{ date: string; income: string; expense: string }>
   invoices: { count: number; unpaid_amount: string }
 }
-type Account = { user: { email: string }; workspace: { id: string; name: string } }
-type Modal = 'invoice' | 'transaction' | null
+type Account = { user: { email: string }; workspace: { id: string; name: string }; workspaces?: Array<{ id: string; name: string; role: string }> }
+type Modal = 'invoice' | 'transaction' | 'business' | 'invite' | null
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -86,6 +86,10 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
   const [bootstrapAvailable, setBootstrapAvailable] = useState(false)
   const [showSetupFlow, setShowSetupFlow] = useState(false)
+  const [businessName, setBusinessName] = useState('')
+  const [invite, setInvite] = useState({ email: '', role: 'viewer' })
+  const [customRole, setCustomRole] = useState('')
+  const [inviteScope, setInviteScope] = useState<'single' | 'all_owned'>('single')
   const [starting, setStarting] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -144,6 +148,32 @@ function App() {
   async function logout() {
     try { await request('/v1/auth/logout', { method: 'POST' }) } catch { /* Discard an expired local session. */ }
     setAccount(null); setDashboard(null); setPage('Overview')
+  }
+
+  async function createBusiness(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      const created = await request<{ workspace: { id: string; name: string; role: string } }>('/v1/workspaces', { method: 'POST', body: JSON.stringify({ name: businessName }) })
+      const nextAccount = account ? { ...account, workspace: { id: created.workspace.id, name: created.workspace.name }, workspaces: [...(account.workspaces ?? []), { id: created.workspace.id, name: created.workspace.name, role: created.workspace.role }] } : null
+      setAccount(nextAccount)
+      setDashboard((current) => current ? { ...current, workspaceName: created.workspace.name } : current)
+      setBusinessName(''); setModal(null); notify(`Business “${created.workspace.name}” added.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not create business.')
+    } finally { setBusy(false) }
+  }
+
+  async function inviteUser(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      const role = invite.role === 'custom' ? customRole.trim() : invite.role
+      const result = await request<{ delivery: string }>(`/v1/workspaces/${account?.workspace.id}/invitations`, { method: 'POST', body: JSON.stringify({ email: invite.email, role, scope: inviteScope }) })
+      setInvite({ email: '', role: 'viewer' }); setModal(null)
+      setCustomRole(''); setInviteScope('single')
+      notify(result.delivery === 'not_configured' ? 'Invitation recorded. Email delivery is not configured.' : 'Invitation created.')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not create invitation.')
+    } finally { setBusy(false) }
   }
 
   async function saveTransaction(event: FormEvent<HTMLFormElement>) {
@@ -224,8 +254,9 @@ function App() {
         <button className="icon-button sidebar-close" onClick={() => setSidebarOpen(false)} aria-label="Close menu"><X size={18} /></button>
       </div>
       <div className="company-switcher"><span className="company-avatar">{dashboard?.workspaceName.slice(0, 1).toUpperCase()}</span>
-        <span className="company-copy"><strong>{dashboard?.workspaceName}</strong><small>Private workspace</small></span>
+        <span className="company-copy"><strong>{dashboard?.workspaceName}</strong><small>{account?.workspaces?.length ? `${account.workspaces.length} businesses` : 'Private workspace'}</small></span>
       </div>
+      <button className="nav-link bottom-link" onClick={() => { setModal('business'); setSidebarOpen(false) }}><Plus size={18} /> Add business</button>
       <nav className="side-nav" aria-label="Main navigation">
         {groups.map((group) => <div className="nav-group" key={group.title}><p className="nav-heading">{group.title}</p>
           {group.items.map(([name, Icon]) => <button key={name} className={`nav-link ${page === name ? 'active' : ''}`} onClick={() => { setPage(name); setSidebarOpen(false) }}>
@@ -238,7 +269,7 @@ function App() {
         <button className="nav-link bottom-link" onClick={() => notify('Workspace settings are not implemented yet')}><Settings2 size={18} /> Settings</button>
         <button className="nav-link bottom-link" onClick={() => notify('Help centre is not configured yet')}><LifeBuoy size={18} /> Help & support</button>
         <div className="profile-row"><div className="profile-avatar">{account.user.email.slice(0, 1).toUpperCase()}</div>
-          <div className="profile-copy"><strong>{account.user.email}</strong><small>Workspace admin</small></div>
+          <div className="profile-copy"><strong>{account.user.email}</strong><small>{account.workspaces?.length ? `Business admin • ${account.workspaces.length} businesses` : 'Workspace admin'}</small></div>
           <button className="icon-button" onClick={() => void logout()} aria-label="Sign out"><LogOut size={16} /></button>
         </div>
       </div>
@@ -263,6 +294,7 @@ function App() {
           </div><div className="welcome-actions">
             <button className="button button-secondary" onClick={() => { setError(''); setModal('transaction') }}><Plus size={16} /> Add transaction</button>
             <button className="button button-primary" onClick={() => { setError(''); setModal('invoice') }}><Plus size={17} /> Create invoice</button>
+            <button className="button button-secondary" onClick={() => { setError(''); setModal('invite') }}><Users size={16} /> Invite member</button>
           </div></section>
 
           <section className="metric-grid" aria-label="Saved business totals">
@@ -349,9 +381,35 @@ function App() {
 
     {modal && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget && !busy) setModal(null) }}>
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
-        <div className="dialog-head"><div><div className="eyebrow">{dashboard?.workspaceName}</div><h2 id="dialog-title">{modal === 'invoice' ? 'Create an invoice' : 'Add a transaction'}</h2></div>
+        <div className="dialog-head"><div><div className="eyebrow">{dashboard?.workspaceName}</div><h2 id="dialog-title">{modal === 'invoice' ? 'Create an invoice' : modal === 'business' ? 'Add a business' : modal === 'invite' ? 'Invite team member' : 'Add a transaction'}</h2></div>
           <button className="icon-button" aria-label="Close dialog" onClick={() => setModal(null)}><X size={19} /></button>
         </div>
+        {modal === 'business' ? <form onSubmit={createBusiness}>
+          <label className="field-label">Business name<input required maxLength={120} value={businessName} onChange={(event) => setBusinessName(event.target.value)} /></label>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? 'Creating…' : 'Create business'}</button></div>
+        </form> : null}
+        {modal === 'invite' ? <form onSubmit={inviteUser}>
+          <label className="field-label">Email<input type="email" required value={invite.email} onChange={(event) => setInvite({ ...invite, email: event.target.value })} /></label>
+          <label className="field-label">Role<select value={invite.role} onChange={(event) => setInvite({ ...invite, role: event.target.value })}>
+            <option value="admin">Admin</option>
+            <option value="accountant">Accountant</option>
+            <option value="viewer">Viewer</option>
+            <option value="custom">Custom role…</option>
+          </select></label>
+          {invite.role === 'custom' && <label className="field-label">Custom role name
+            <input required maxLength={50} pattern="[A-Za-z0-9 _\\-]+" placeholder="e.g. Sales manager" value={customRole} onChange={(event) => setCustomRole(event.target.value)} />
+          </label>}
+          <fieldset className="field-label" style={{ border: 0, padding: 0, margin: '0 0 16px' }}>
+            <legend>Business access</legend>
+            <label><input type="radio" name="invite-scope" checked={inviteScope === 'single'} onChange={() => setInviteScope('single')} /> This business only ({dashboard?.workspaceName})</label>
+            <label><input type="radio" name="invite-scope" checked={inviteScope === 'all_owned'} onChange={() => setInviteScope('all_owned')} /> All businesses I administer</label>
+            <small>All-business access applies only to businesses where you are an admin.</small>
+          </fieldset>
+          <p className="dialog-note"><ShieldCheck size={15} /> The invitation will be recorded, but email delivery is not configured. The selected role is saved as a label; fine-grained role permissions are not implemented yet.</p>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? 'Sending…' : 'Send invite'}</button></div>
+        </form> : null}
         {modal === 'invoice' ? <form onSubmit={saveInvoice}>
           <label className="field-label">Customer<input required maxLength={160} value={invoice.customer} onChange={(event) => setInvoice({ ...invoice, customer: event.target.value })} /></label>
           <label className="field-label">Description<input required maxLength={240} value={invoice.description} onChange={(event) => setInvoice({ ...invoice, description: event.target.value })} /></label>
@@ -361,17 +419,18 @@ function App() {
           <p className="dialog-note"><ShieldCheck size={15} /> Internal record only. Not sent to the customer and not a KRA/eTIMS tax invoice.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save invoice'}</button></div>
-        </form> : <form onSubmit={saveTransaction}>
+        </form> : null}
+        {modal === 'transaction' ? <form onSubmit={saveTransaction}>
           <label className="field-label">Description<input required maxLength={240} value={transaction.description} onChange={(event) => setTransaction({ ...transaction, description: event.target.value })} /></label>
           <div className="field-row"><label className="field-label">Amount (KSh)<input required min="0.01" step="0.01" type="number" value={transaction.amount} onChange={(event) => setTransaction({ ...transaction, amount: event.target.value })} /></label>
-            <label className="field-label">Type<select value={transaction.direction} onChange={(event) => setTransaction({ ...transaction, direction: event.target.value })}><option value="expense">Expense</option><option value="income">Income</option></select></label>
+            <label className="field-label">Type<select value={transaction.direction} onChange={(event) => setTransaction({ ...transaction, direction: event.target.value as 'expense' | 'income' })}><option value="expense">Expense</option><option value="income">Income</option></select></label>
           </div>
           <div className="field-row"><label className="field-label">Account<input required maxLength={80} value={transaction.account} onChange={(event) => setTransaction({ ...transaction, account: event.target.value })} /></label>
             <label className="field-label">Date<input required type="date" value={transaction.date} onChange={(event) => setTransaction({ ...transaction, date: event.target.value })} /></label>
           </div>
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save transaction'}</button></div>
-        </form>}
+        </form> : null}
       </div>
     </div>}
     {toast && <div className="toast"><span><Check size={15} /></span>{toast}<button aria-label="Dismiss notification" onClick={() => setToast('')}><X size={14} /></button></div>}

@@ -11,8 +11,6 @@ services:
         value: production
       - key: SESSION_SECRET
         generateValue: true
-      - key: BOOTSTRAP_ADMIN_EMAIL
-        sync: false
       - key: FRONTEND_ORIGIN
         value: https://kashflow-frontend.onrender.com
       - key: DATABASE_URL

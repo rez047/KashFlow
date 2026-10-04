@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
 import { promisify } from 'node:util'
 import cors from 'cors'
 import express from 'express'
@@ -14,7 +14,6 @@ const envSchema = z.object({
   FRONTEND_ORIGIN: z.string().url().default('http://localhost:5173'),
   DATABASE_URL: z.string().url().optional(),
   SESSION_SECRET: z.string().min(32).optional(),
-  BOOTSTRAP_ADMIN_EMAIL: z.string().email().optional(),
 })
 const parsed = envSchema.safeParse(process.env)
 if (!parsed.success) {
@@ -22,8 +21,8 @@ if (!parsed.success) {
   process.exit(1)
 }
 const env = parsed.data
-if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET || !env.BOOTSTRAP_ADMIN_EMAIL)) {
-  console.error('Production requires DATABASE_URL, SESSION_SECRET (32+ characters), and BOOTSTRAP_ADMIN_EMAIL.')
+if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET)) {
+  console.error('Production requires DATABASE_URL and SESSION_SECRET (32+ characters).')
   process.exit(1)
 }
 async function createPool() {
@@ -115,7 +114,14 @@ function setSessionCookie(response: express.Response, session: Session) {
 }
 function isAllowedOrigin(origin: string | undefined) {
   if (origin === env.FRONTEND_ORIGIN) return true
-  return env.NODE_ENV !== 'production' && (origin === 'http://localhost:5173' || origin === 'http://127.0.0.1:5173')
+  if (env.NODE_ENV === 'production') return false
+  if (!origin) return false
+  try {
+    const parsed = new URL(origin)
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
+  } catch {
+    return false
+  }
 }
 async function hashPassword(password: string) {
   const salt = randomBytes(16)
@@ -144,7 +150,7 @@ function verifyOrigin(request: express.Request, response: express.Response, next
 }
 app.disable('x-powered-by')
 app.use(helmet())
-app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }))
+app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH'], allowedHeaders: ['Content-Type'] }))
 app.use(express.json({ limit: '32kb', type: 'application/json' }))
 app.use(rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-8', legacyHeaders: false }))
 
@@ -157,7 +163,7 @@ app.get('/healthz', async (_request, response) => {
 app.get('/v1/auth/status', requirePool, async (_request, response, next) => {
   try {
     const result = await pool!.query('SELECT count(*)::int AS count FROM users')
-    response.json({ bootstrapAvailable: result.rows[0].count === 0, configured: Boolean(env.BOOTSTRAP_ADMIN_EMAIL) })
+    response.json({ bootstrapAvailable: result.rows[0].count === 0 })
   } catch (error) { next(error) }
 })
 
@@ -180,12 +186,14 @@ app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 
     await client.query('SELECT pg_advisory_xact_lock(748201)')
     const existing = await client.query('SELECT id FROM users WHERE ($1::text IS NOT NULL AND email = $1) OR ($2::text IS NOT NULL AND phone = $2) LIMIT 1', [email, phone])
     if (existing.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'That email or phone number is already in use.' }); return }
+
     const workspace = await client.query('INSERT INTO workspaces (name) VALUES ($1) RETURNING id', [input.data.businessName])
     const user = await client.query('INSERT INTO users (workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, workspace_id, email, phone', [workspace.rows[0].id, email, phone, await hashPassword(input.data.password)])
+    await client.query('INSERT INTO workspace_members (user_id, workspace_id, role) VALUES ($1, $2, $3)', [user.rows[0].id, workspace.rows[0].id, 'admin'])
     await client.query('COMMIT')
     const row = user.rows[0]
     setSessionCookie(response, { userId: row.id, workspaceId: row.workspace_id, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
-    response.status(201).json({ user: { email: row.email ?? row.phone }, workspace: { id: row.workspace_id, name: input.data.businessName } })
+    response.status(201).json({ user: { email: row.email ?? row.phone }, workspace: { id: row.workspace_id, name: input.data.businessName }, workspaces: [{ id: row.workspace_id, name: input.data.businessName, role: 'admin' }] })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
@@ -207,31 +215,103 @@ app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 *
     const result = await pool!.query('SELECT u.id, u.workspace_id, u.email, u.phone, u.password_hash, w.name AS workspace_name FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE (u.email = $1 OR u.phone = $2) LIMIT 1', [normalized.email, normalized.phone])
     const user = result.rows[0]
     if (!user || !(await verifyPassword(input.data.password, user.password_hash))) { response.status(401).json({ error: 'Email/phone or password is incorrect.' }); return }
+
+    const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1', [user.id])
+    const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
+    const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: user.workspace_id, name: user.workspace_name, role: 'admin' }]
     setSessionCookie(response, { userId: user.id, workspaceId: user.workspace_id, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
-    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name } })
+    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces })
   } catch (error) { next(error) }
 })
 
 app.post('/v1/auth/logout', verifyOrigin, (_request, response) => { response.clearCookie(cookieName, { httpOnly: true, secure: env.NODE_ENV === 'production', sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax', path: '/' }); response.status(204).end() })
 app.get('/v1/auth/me', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT u.email, w.id AS workspace_id, w.name FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE u.id = $1 AND w.id = $2', [request.session!.userId, request.session!.workspaceId])
+    const result = await pool!.query('SELECT u.email, u.phone, wm.workspace_id, w.name AS workspace_name FROM users u JOIN workspace_members wm ON wm.user_id = u.id AND wm.workspace_id = $2 JOIN workspaces w ON w.id = wm.workspace_id WHERE u.id = $1', [request.session!.userId, request.session!.workspaceId])
     if (!result.rowCount) { response.status(401).json({ error: 'Session is no longer valid.' }); return }
-    response.json({ user: { email: result.rows[0].email }, workspace: { id: result.rows[0].workspace_id, name: result.rows[0].name } })
+    const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1 ORDER BY w.name ASC', [request.session!.userId])
+    const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
+    const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: result.rows[0].workspace_id, name: result.rows[0].workspace_name, role: 'admin' }]
+    response.json({ user: { email: result.rows[0].email ?? result.rows[0].phone }, workspace: { id: result.rows[0].workspace_id, name: result.rows[0].workspace_name }, workspaces })
   } catch (error) { next(error) }
 })
 
 app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
     const workspaceId = request.session!.workspaceId
+    const dateParts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit' }).formatToParts(new Date())
+    const dateValues = Object.fromEntries(dateParts.map(({ type, value }) => [type, value]))
+    const monthStart = `${dateValues.year}-${dateValues.month}-01`
     const [workspace, totals, transactions, cashflow, invoices] = await Promise.all([
       pool!.query('SELECT name FROM workspaces WHERE id = $1', [workspaceId]),
-         pool!.query(`SELECT COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Africa/Nairobi')::date), 0)::text AS month_income, COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Africa/Nairobi')::date), 0)::text AS month_expenses, COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS all_income, COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS all_expenses FROM ledger_transactions WHERE workspace_id = $1`, [workspaceId]),
-      pool!.query('SELECT id, description, amount::text, direction, account, transaction_date::text, created_at FROM ledger_transactions WHERE workspace_id = $1 ORDER BY transaction_date DESC, created_at DESC LIMIT 20', [workspaceId]),
-      pool!.query(`SELECT transaction_date::text AS date, COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS income, COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS expense FROM ledger_transactions WHERE workspace_id = $1 AND transaction_date >= date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Africa/Nairobi')::date GROUP BY transaction_date ORDER BY transaction_date`, [workspaceId]),
+      pool!.query(`SELECT COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= $2), 0)::text AS month_income, COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $2), 0)::text AS month_expenses, COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS all_income, COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS all_expenses FROM ledger_transactions WHERE workspace_id = $1`, [workspaceId, monthStart]),
+      pool!.query('SELECT id, description, amount::text, direction, account, transaction_date, created_at FROM ledger_transactions WHERE workspace_id = $1 ORDER BY transaction_date DESC, created_at DESC LIMIT 20', [workspaceId]),
+      pool!.query(`SELECT transaction_date AS date, COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS income, COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS expense FROM ledger_transactions WHERE workspace_id = $1 AND transaction_date >= $2 GROUP BY transaction_date ORDER BY transaction_date`, [workspaceId, monthStart]),
       pool!.query("SELECT count(*)::int AS count, COALESCE(SUM(amount) FILTER (WHERE status = 'unpaid'), 0)::text AS unpaid_amount FROM invoices WHERE workspace_id = $1", [workspaceId]),
     ])
-    response.json({ workspaceName: workspace.rows[0]?.name ?? '', totals: { monthIncome: totals.rows[0].month_income, monthExpenses: totals.rows[0].month_expenses, monthNet: (Number(totals.rows[0].month_income) - Number(totals.rows[0].month_expenses)).toFixed(2) }, transactions: transactions.rows, cashflow: cashflow.rows, invoices: invoices.rows[0] })
+    const asDateString = (value: unknown) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
+    response.json({ workspaceName: workspace.rows[0]?.name ?? '', totals: { monthIncome: totals.rows[0].month_income, monthExpenses: totals.rows[0].month_expenses, monthNet: (Number(totals.rows[0].month_income) - Number(totals.rows[0].month_expenses)).toFixed(2) }, transactions: transactions.rows.map((row: Record<string, unknown>) => ({ ...row, transaction_date: asDateString(row.transaction_date) })), cashflow: cashflow.rows.map((row: Record<string, unknown>) => ({ ...row, date: asDateString(row.date) })), invoices: invoices.rows[0] })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/workspaces', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ name: z.string().trim().min(1).max(120) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a business name.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const workspaceId = randomUUID()
+    const workspace = await client.query('INSERT INTO workspaces (id, name) VALUES ($1, $2) RETURNING id, name', [workspaceId, input.data.name])
+    const membership = await client.query('INSERT INTO workspace_members (id, user_id, workspace_id, role) VALUES ($1, $2, $3, $4) RETURNING role', [randomUUID(), request.session!.userId, workspaceId, 'admin'])
+    await client.query('COMMIT')
+    setSessionCookie(response, { ...request.session!, workspaceId })
+    response.status(201).json({ workspace: { id: workspace.rows[0].id, name: workspace.rows[0].name, role: membership.rows[0].role } })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    email: z.string().trim().email().max(254).transform((value) => value.toLowerCase()),
+    role: z.string().trim().min(1).max(50).regex(/^[\p{L}\p{N} _-]+$/u),
+    scope: z.enum(['single', 'all_owned']).default('single'),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a valid email address and a role name (up to 50 letters, numbers, spaces, hyphens, or underscores).' }); return }
+  if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Invitations can only be created for the active business.' }); return }
+
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const currentAdmin = await client.query('SELECT 1 FROM workspace_members WHERE user_id = $1 AND workspace_id = $2 AND role = $3', [request.session!.userId, request.session!.workspaceId, 'admin'])
+    if (!currentAdmin.rowCount) { await client.query('ROLLBACK'); response.status(403).json({ error: 'Only a business admin can invite team members.' }); return }
+
+    let targets: Array<{ workspace_id: string; name: string }> = []
+    if (input.data.scope === 'all_owned') {
+      const result = await client.query('SELECT wm.workspace_id, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1 AND wm.role = $2 ORDER BY w.name', [request.session!.userId, 'admin'])
+      targets = result.rows as Array<{ workspace_id: string; name: string }>
+    } else {
+      const result = await client.query('SELECT id AS workspace_id, name FROM workspaces WHERE id = $1', [request.session!.workspaceId])
+      targets = result.rows as Array<{ workspace_id: string; name: string }>
+    }
+    if (!targets.length) { await client.query('ROLLBACK'); response.status(403).json({ error: 'No businesses are available for this invitation.' }); return }
+
+    const invite = await client.query('INSERT INTO workspace_invitations (workspace_id, email, role, scope, invited_by) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, role, scope, status', [request.session!.workspaceId, input.data.email, input.data.role, input.data.scope, request.session!.userId])
+    for (const target of targets) {
+      await client.query('INSERT INTO invitation_workspaces (id, invitation_id, workspace_id) VALUES ($1, $2, $3)', [randomUUID(), invite.rows[0].id, target.workspace_id])
+    }
+    await client.query('COMMIT')
+    response.status(201).json({ invitation: { ...invite.rows[0], businesses: targets.map((target) => target.name) }, delivery: 'not_configured' })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+app.patch('/v1/invoices/:invoiceId/status', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ status: z.enum(['unpaid', 'paid', 'void']) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Status must be unpaid, paid, or void.' }); return }
+  try {
+    const result = await pool!.query('UPDATE invoices SET status = $1 WHERE id = $2 AND workspace_id = $3 RETURNING id, status', [input.data.status, request.params.invoiceId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Invoice not found in this workspace.' }); return }
+    response.json({ invoice: result.rows[0] })
   } catch (error) { next(error) }
 })
 
@@ -239,7 +319,7 @@ app.post('/v1/transactions', requirePool, verifyOrigin, requireSession, async (r
   const input = z.object({ description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), direction: z.enum(['income', 'expense']), account: z.string().trim().min(1).max(80), date: z.string().date() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a description, positive amount, transaction type, account, and valid date.' }); return }
   try {
-    const result = await pool!.query('INSERT INTO ledger_transactions (workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, description, amount::text, direction, account, transaction_date::text, created_at', [request.session!.workspaceId, input.data.description, input.data.amount.toFixed(2), input.data.direction, input.data.account, input.data.date])
+    const result = await pool!.query('INSERT INTO ledger_transactions (workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, description, amount::text, direction, account, transaction_date, created_at', [request.session!.workspaceId, input.data.description, input.data.amount.toFixed(2), input.data.direction, input.data.account, input.data.date])
     response.status(201).json({ transaction: result.rows[0] })
   } catch (error) { next(error) }
 })
@@ -248,7 +328,7 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, async (reque
   const input = z.object({ customer: z.string().trim().min(1).max(160), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), dueDate: z.string().date() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a customer, description, positive amount, and valid due date.' }); return }
   try {
-    const result = await pool!.query('INSERT INTO invoices (workspace_id, customer, description, amount, due_date) VALUES ($1, $2, $3, $4, $5) RETURNING id, customer, description, amount::text, due_date::text, status, created_at', [request.session!.workspaceId, input.data.customer, input.data.description, input.data.amount.toFixed(2), input.data.dueDate])
+    const result = await pool!.query('INSERT INTO invoices (workspace_id, customer, description, amount, due_date) VALUES ($1, $2, $3, $4, $5) RETURNING id, customer, description, amount::text, due_date, status, created_at', [request.session!.workspaceId, input.data.customer, input.data.description, input.data.amount.toFixed(2), input.data.dueDate])
     response.status(201).json({ invoice: result.rows[0] })
   } catch (error) { next(error) }
 })
@@ -258,7 +338,7 @@ app.use((_request, response) => response.status(404).json({ error: 'Not found' }
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   if (error instanceof SyntaxError) { response.status(400).json({ error: 'Invalid JSON request body' }); return }
   console.error('Unhandled API error:', error)
-  response.status(500).json({ error: 'Internal server error' })
+  response.status(500).json({ error: 'Internal server error', ...(env.NODE_ENV === 'production' ? {} : { detail: error instanceof Error ? error.message : String(error) }) })
 })
 
 async function start() {
