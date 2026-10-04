@@ -32,9 +32,20 @@ const cookieName = 'kashflow_session'
 const sessionTtlSeconds = 60 * 60 * 12
 const passwordSchema = z.string().min(12).max(200)
 const emailSchema = z.string().email().max(254).transform((value) => value.toLowerCase())
+const phoneSchema = z.string().trim().min(7).max(30).transform((value) => value.replace(/[\s().-]/g, ''))
 
 type Session = { userId: string; workspaceId: string; expiresAt: number }
 type AuthedRequest = express.Request & { session?: Session }
+
+function normalizeIdentifier(value: string): { email: string | null; phone: string | null } {
+  const trimmed = value.trim()
+  if (!trimmed) return { email: null, phone: null }
+  if (trimmed.includes('@')) {
+    return { email: trimmed.toLowerCase(), phone: null }
+  }
+  const phone = trimmed.replace(/[^\d+]/g, '')
+  return { email: null, phone: phone || null }
+}
 
 function signSession(session: Session) {
   const payload = Buffer.from(JSON.stringify(session)).toString('base64url')
@@ -118,34 +129,53 @@ app.get('/v1/auth/status', requirePool, async (_request, response, next) => {
 })
 
 app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request, response, next) => {
-  const input = z.object({ email: emailSchema, password: passwordSchema, businessName: z.string().trim().min(1).max(120) }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Enter the configured admin email, a business name, and a password of at least 12 characters.' }); return }
-  if (!env.BOOTSTRAP_ADMIN_EMAIL || input.data.email !== env.BOOTSTRAP_ADMIN_EMAIL.toLowerCase()) { response.status(403).json({ error: 'Email does not match BOOTSTRAP_ADMIN_EMAIL configured by the developer.' }); return }
+  const input = z.object({
+    identifier: z.string().trim().min(1).max(254),
+    password: passwordSchema,
+    businessName: z.string().trim().min(1).max(120),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a business name, a valid email or phone number, and a password of at least 12 characters.' }); return }
+
+  const normalized = normalizeIdentifier(input.data.identifier)
+  if (!normalized.email && !normalized.phone) { response.status(400).json({ error: 'Enter a valid email or phone number.' }); return }
+  const email = normalized.email ?? null
+  const phone = normalized.phone ?? null
+
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
     await client.query('SELECT pg_advisory_xact_lock(748201)')
-    const existing = await client.query('SELECT id FROM users LIMIT 1')
-    if (existing.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Workspace setup is already complete.' }); return }
+    const existing = await client.query('SELECT id FROM users WHERE ($1::text IS NOT NULL AND email = $1) OR ($2::text IS NOT NULL AND phone = $2) LIMIT 1', [email, phone])
+    if (existing.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'That email or phone number is already in use.' }); return }
     const workspace = await client.query('INSERT INTO workspaces (name) VALUES ($1) RETURNING id', [input.data.businessName])
-    const user = await client.query('INSERT INTO users (workspace_id, email, password_hash) VALUES ($1, $2, $3) RETURNING id, workspace_id, email', [workspace.rows[0].id, input.data.email, await hashPassword(input.data.password)])
+    const user = await client.query('INSERT INTO users (workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, workspace_id, email, phone', [workspace.rows[0].id, email, phone, await hashPassword(input.data.password)])
     await client.query('COMMIT')
     const row = user.rows[0]
     setSessionCookie(response, { userId: row.id, workspaceId: row.workspace_id, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
-    response.status(201).json({ user: { email: row.email }, workspace: { id: row.workspace_id, name: input.data.businessName } })
+    response.status(201).json({ user: { email: row.email ?? row.phone }, workspace: { id: row.workspace_id, name: input.data.businessName } })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
 
 app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 10 }), async (request, response, next) => {
-  const input = z.object({ email: emailSchema, password: z.string().min(1).max(200) }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Enter a valid email and password.' }); return }
+  const input = z.object({
+    identifier: z.string().trim().min(1).max(254).optional(),
+    email: emailSchema.optional(),
+    phone: phoneSchema.optional(),
+    password: z.string().min(1).max(200),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a valid email or phone number and password.' }); return }
+
+  const rawIdentifier = input.data.identifier ?? input.data.email ?? input.data.phone
+  const normalized = rawIdentifier ? normalizeIdentifier(String(rawIdentifier)) : { email: null, phone: null }
+  if (!normalized.email && !normalized.phone) { response.status(400).json({ error: 'Enter a valid email or phone number and password.' }); return }
+
   try {
-    const result = await pool!.query('SELECT u.id, u.workspace_id, u.email, u.password_hash, w.name AS workspace_name FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE u.email = $1', [input.data.email])
+    const result = await pool!.query('SELECT u.id, u.workspace_id, u.email, u.phone, u.password_hash, w.name AS workspace_name FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE (u.email = $1 OR u.phone = $2) LIMIT 1', [normalized.email, normalized.phone])
     const user = result.rows[0]
-    if (!user || !(await verifyPassword(input.data.password, user.password_hash))) { response.status(401).json({ error: 'Email or password is incorrect.' }); return }
+    if (!user || !(await verifyPassword(input.data.password, user.password_hash))) { response.status(401).json({ error: 'Email/phone or password is incorrect.' }); return }
     setSessionCookie(response, { userId: user.id, workspaceId: user.workspace_id, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
-    response.json({ user: { email: user.email }, workspace: { id: user.workspace_id, name: user.workspace_name } })
+    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name } })
   } catch (error) { next(error) }
 })
 
@@ -200,10 +230,14 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
 
 async function start() {
   if (pool) {
-    const { readFile } = await import('node:fs/promises')
+    const { readdir, readFile } = await import('node:fs/promises')
     const { fileURLToPath } = await import('node:url')
-    const migration = await readFile(fileURLToPath(new URL('../migrations/001_core.sql', import.meta.url)), 'utf8')
-    await pool.query(migration)
+    const migrationDir = fileURLToPath(new URL('../migrations', import.meta.url))
+    const files = (await readdir(migrationDir)).filter((file) => file.endsWith('.sql')).sort()
+    for (const file of files) {
+      const migration = await readFile(fileURLToPath(new URL(`../migrations/${file}`, import.meta.url)), 'utf8')
+      await pool.query(migration)
+    }
   }
   return app.listen(env.PORT, () => console.info(`KashFlow API listening on port ${env.PORT}`))
 }

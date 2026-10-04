@@ -89,7 +89,7 @@ function App() {
   const [starting, setStarting] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [credentials, setCredentials] = useState({ email: '', password: '', businessName: '' })
+  const [credentials, setCredentials] = useState({ identifier: '', password: '', businessName: '' })
   const [transaction, setTransaction] = useState({ description: '', amount: '', direction: 'expense', account: '', date: today })
   const [invoice, setInvoice] = useState({ customer: '', description: '', amount: '', dueDate: '' })
 
@@ -131,7 +131,9 @@ function App() {
     event.preventDefault(); setBusy(true); setError('')
     try {
       const route = showSetupFlow ? '/v1/auth/bootstrap' : '/v1/auth/login'
-      const body = showSetupFlow ? credentials : { email: credentials.email, password: credentials.password }
+      const body = showSetupFlow
+        ? { identifier: credentials.identifier, password: credentials.password, businessName: credentials.businessName }
+        : { identifier: credentials.identifier, password: credentials.password }
       const signedIn = await request<Account>(route, { method: 'POST', body: JSON.stringify(body) })
       setAccount(signedIn); setBootstrapAvailable(false); setShowSetupFlow(false); await refresh()
     } catch (reason) {
@@ -178,12 +180,12 @@ function App() {
   if (!account) return <div className="auth-screen">
     <form className="auth-card" onSubmit={submitAuth}>
       <Brand />
-      <p className="auth-intro">{showSetupFlow ? 'Create the first workspace account.' : 'Sign in to your business workspace.'}</p>
+      <p className="auth-intro">{showSetupFlow ? 'Create your first workspace admin account.' : 'Sign in to your business workspace.'}</p>
       {showSetupFlow && <label className="field-label">Business name
         <input required maxLength={120} value={credentials.businessName} onChange={(event) => setCredentials({ ...credentials, businessName: event.target.value })} />
       </label>}
-      <label className="field-label">Admin email
-        <input type="email" required autoComplete="username" value={credentials.email} onChange={(event) => setCredentials({ ...credentials, email: event.target.value })} />
+      <label className="field-label">Email or phone number
+        <input type="text" required autoComplete={showSetupFlow ? 'username' : 'username'} value={credentials.identifier} onChange={(event) => setCredentials({ ...credentials, identifier: event.target.value })} />
       </label>
       <label className="field-label">Password
         <input type="password" required minLength={showSetupFlow ? 12 : 1} autoComplete={showSetupFlow ? 'new-password' : 'current-password'} value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
@@ -194,7 +196,7 @@ function App() {
       {!showSetupFlow && bootstrapAvailable && (
         <p style={{ marginTop: '12px', textAlign: 'center' }}>
           <button type="button" style={{ background: 'transparent', border: 'none', color: '#5f46ca', fontWeight: 600, cursor: 'pointer', padding: 0 }} onClick={() => setShowSetupFlow(true)}>
-            Create admin email and password
+            Create admin account
           </button>
         </p>
       )}
