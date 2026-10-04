@@ -1,12 +1,12 @@
-import { createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
 import { promisify } from 'node:util'
 import cors from 'cors'
 import express from 'express'
 import rateLimit from 'express-rate-limit'
 import helmet from 'helmet'
-import { Pool } from 'pg'
+import { Pool, type PoolClient } from 'pg'
 import { z } from 'zod'
-import { estimateKenyaPayroll } from './domain/kenyaPayroll.js'
+import { estimateKenyaPayroll, type KenyaPayrollEstimate } from './domain/kenyaPayroll.js'
 
 const scrypt = promisify(scryptCallback)
 const envSchema = z.object({
@@ -15,6 +15,7 @@ const envSchema = z.object({
   FRONTEND_ORIGIN: z.string().url().default('http://localhost:5173'),
   DATABASE_URL: z.string().url().optional(),
   SESSION_SECRET: z.string().min(32).optional(),
+  PAYROLL_DATA_ENCRYPTION_KEY: z.string().min(32).optional(),
   MPESA_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
   MPESA_CONSUMER_KEY: z.string().trim().optional(),
   MPESA_CONSUMER_SECRET: z.string().trim().optional(),
@@ -41,8 +42,8 @@ const mpesaConfig = {
 const mpesaConfigured = Object.values(mpesaConfig).every((value) => Boolean(value))
 const mpesaApiBase = env.MPESA_ENV === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke'
 let cachedDarajaToken: { value: string; expiresAt: number } | undefined
-if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET)) {
-  console.error('Production requires DATABASE_URL and SESSION_SECRET (32+ characters).')
+if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET || !env.PAYROLL_DATA_ENCRYPTION_KEY)) {
+  console.error('Production requires DATABASE_URL, SESSION_SECRET, and PAYROLL_DATA_ENCRYPTION_KEY (each secret 32+ characters).')
   process.exit(1)
 }
 async function createPool() {
@@ -82,6 +83,11 @@ const pool = await createPool()
 const app = express()
 const cookieName = 'kashflow_session'
 const sessionTtlSeconds = 60 * 60 * 12
+function nairobiToday() {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date())
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]))
+  return `${values.year}-${values.month}-${values.day}`
+}
 const passwordSchema = z.string().min(12).max(200)
 const emailSchema = z.string().email().max(254).transform((value) => value.toLowerCase())
 const phoneSchema = z.string().trim().min(7).max(30).transform((value) => value.replace(/[\s().-]/g, ''))
@@ -155,6 +161,68 @@ async function verifyPassword(password: string, encoded: string) {
   const actual = await scrypt(password, Buffer.from(saltHex, 'hex'), expected.length) as Buffer
   return actual.length === expected.length && timingSafeEqual(actual, expected)
 }
+function payrollEncryptionKey() {
+  if (!env.PAYROLL_DATA_ENCRYPTION_KEY) throw new Error('Set PAYROLL_DATA_ENCRYPTION_KEY before storing employee or payslip records.')
+  return createHash('sha256').update(env.PAYROLL_DATA_ENCRYPTION_KEY).digest()
+}
+function encryptPayrollData(value: unknown) {
+  const nonce = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', payrollEncryptionKey(), nonce)
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value), 'utf8'), cipher.final()])
+  return `${nonce.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ciphertext.toString('base64')}`
+}
+function decryptPayrollData<T>(encoded: string): T {
+  const [nonceText, tagText, dataText] = encoded.split(':')
+  if (!nonceText || !tagText || !dataText) throw new Error('Encrypted payroll record has an invalid format.')
+  const decipher = createDecipheriv('aes-256-gcm', payrollEncryptionKey(), Buffer.from(nonceText, 'base64'))
+  decipher.setAuthTag(Buffer.from(tagText, 'base64'))
+  const plaintext = Buffer.concat([decipher.update(Buffer.from(dataText, 'base64')), decipher.final()]).toString('utf8')
+  return JSON.parse(plaintext) as T
+}
+const defaultChartOfAccounts = [
+  { code: '1000', name: 'Cash and bank', type: 'asset' },
+  { code: '1100', name: 'Accounts receivable', type: 'asset' },
+  { code: '2000', name: 'Net salaries payable', type: 'liability' },
+  { code: '2100', name: 'PAYE payable', type: 'liability' },
+  { code: '2110', name: 'SHIF payable', type: 'liability' },
+  { code: '2120', name: 'NSSF payable', type: 'liability' },
+  { code: '2130', name: 'Affordable Housing Levy payable', type: 'liability' },
+  { code: '3000', name: 'Retained earnings', type: 'equity' },
+  { code: '4000', name: 'Sales income', type: 'income' },
+  { code: '5000', name: 'Salaries expense', type: 'expense' },
+  { code: '5010', name: 'Employer NSSF expense', type: 'expense' },
+  { code: '5020', name: 'Employer Housing Levy expense', type: 'expense' },
+  { code: '6000', name: 'Operating expenses', type: 'expense' },
+] as const
+async function ensureDefaultAccounts(workspaceId: string) {
+  for (const account of defaultChartOfAccounts) {
+    await pool!.query('INSERT INTO workspace_accounts (id, workspace_id, code, name, account_type) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (workspace_id, code) DO NOTHING', [randomUUID(), workspaceId, account.code, account.name, account.type])
+  }
+}
+type JournalLineInput = { accountCode: string; description?: string; debit: number; credit: number }
+async function recordAudit(client: PoolClient, input: { workspaceId: string; actorUserId: string | null; eventType: string; entityType: string; entityId?: string; eventData?: Record<string, unknown> }) {
+  await client.query('INSERT INTO audit_events (id, workspace_id, actor_user_id, event_type, entity_type, entity_id, event_data) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)', [randomUUID(), input.workspaceId, input.actorUserId, input.eventType, input.entityType, input.entityId ?? null, JSON.stringify(input.eventData ?? {})])
+}
+async function insertJournal(client: PoolClient, input: { workspaceId: string; userId: string | null; date: string; description: string; sourceType: string; sourceId?: string; lines: JournalLineInput[] }) {
+  const debitCents = input.lines.reduce((sum, line) => sum + Math.round(line.debit * 100), 0)
+  const creditCents = input.lines.reduce((sum, line) => sum + Math.round(line.credit * 100), 0)
+  if (input.lines.length < 2 || debitCents <= 0 || debitCents !== creditCents) throw new Error('Journal entry must contain at least two lines with equal positive debits and credits.')
+  const period = input.date.slice(0, 7)
+  await client.query('INSERT INTO accounting_periods (id, workspace_id, period) VALUES ($1, $2, $3) ON CONFLICT (workspace_id, period) DO NOTHING', [randomUUID(), input.workspaceId, period])
+  const accountingPeriod = await client.query('SELECT status FROM accounting_periods WHERE workspace_id = $1 AND period = $2 FOR UPDATE', [input.workspaceId, period])
+  if (accountingPeriod.rows[0]?.status === 'closed') throw new Error(`Accounting period ${period} is closed.`)
+  const accounts = await client.query('SELECT id, code FROM workspace_accounts WHERE workspace_id = $1 AND active = true', [input.workspaceId])
+  const ids = new Map(accounts.rows.map((account) => [String(account.code), String(account.id)]))
+  const entryId = randomUUID()
+  await client.query('INSERT INTO journal_entries (id, workspace_id, entry_date, description, source_type, source_id, posted_by) VALUES ($1, $2, $3, $4, $5, $6, $7)', [entryId, input.workspaceId, input.date, input.description, input.sourceType, input.sourceId ?? null, input.userId])
+  for (const line of input.lines) {
+    const accountId = ids.get(line.accountCode)
+    if (!accountId) throw new Error(`Account ${line.accountCode} is not in this business chart of accounts.`)
+    await client.query('INSERT INTO journal_lines (id, journal_entry_id, account_id, description, debit, credit) VALUES ($1, $2, $3, $4, $5, $6)', [randomUUID(), entryId, accountId, line.description ?? null, line.debit.toFixed(2), line.credit.toFixed(2)])
+  }
+  await recordAudit(client, { workspaceId: input.workspaceId, actorUserId: input.userId, eventType: 'journal.posted', entityType: 'journal_entry', entityId: entryId, eventData: { sourceType: input.sourceType, sourceId: input.sourceId ?? null, date: input.date, lineCount: input.lines.length, totalDebit: (debitCents / 100).toFixed(2) } })
+  return entryId
+}
 function requirePool(_request: express.Request, response: express.Response, next: express.NextFunction) {
   if (!pool) { response.status(503).json({ error: 'Database is not configured. Set DATABASE_URL.' }); return }
   next()
@@ -162,6 +230,17 @@ function requirePool(_request: express.Request, response: express.Response, next
 function requireSession(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
   request.session = readSession(cookies(request.headers.cookie)[cookieName]) ?? undefined
   if (!request.session) { response.status(401).json({ error: 'Sign in to access this workspace.' }); return }
+  next()
+}
+async function requireWorkspaceAdmin(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
+  try {
+    const result = await pool!.query('SELECT 1 FROM workspace_members WHERE user_id = $1 AND workspace_id = $2 AND role = $3', [request.session!.userId, request.session!.workspaceId, 'admin'])
+    if (!result.rowCount) { response.status(403).json({ error: 'Workspace administrator access is required for this operation.' }); return }
+    next()
+  } catch (error) { next(error) }
+}
+function requirePayrollEncryption(_request: express.Request, response: express.Response, next: express.NextFunction) {
+  if (!env.PAYROLL_DATA_ENCRYPTION_KEY) { response.status(503).json({ error: 'Encrypted payroll storage is unavailable until PAYROLL_DATA_ENCRYPTION_KEY is configured.' }); return }
   next()
 }
 function verifyOrigin(request: express.Request, response: express.Response, next: express.NextFunction) {
@@ -259,6 +338,9 @@ app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 
     const workspace = await client.query('INSERT INTO workspaces (name) VALUES ($1) RETURNING id', [input.data.businessName])
     const user = await client.query('INSERT INTO users (workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, workspace_id, email, phone', [workspace.rows[0].id, email, phone, await hashPassword(input.data.password)])
     await client.query('INSERT INTO workspace_members (user_id, workspace_id, role) VALUES ($1, $2, $3)', [user.rows[0].id, workspace.rows[0].id, 'admin'])
+    for (const account of defaultChartOfAccounts) {
+      await client.query('INSERT INTO workspace_accounts (id, workspace_id, code, name, account_type) VALUES ($1, $2, $3, $4, $5)', [randomUUID(), workspace.rows[0].id, account.code, account.name, account.type])
+    }
     await client.query('COMMIT')
     const row = user.rows[0]
     setSessionCookie(response, { userId: row.id, workspaceId: row.workspace_id, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
@@ -332,6 +414,9 @@ app.post('/v1/workspaces', requirePool, verifyOrigin, requireSession, async (req
     const workspaceId = randomUUID()
     const workspace = await client.query('INSERT INTO workspaces (id, name) VALUES ($1, $2) RETURNING id, name', [workspaceId, input.data.name])
     const membership = await client.query('INSERT INTO workspace_members (id, user_id, workspace_id, role) VALUES ($1, $2, $3, $4) RETURNING role', [randomUUID(), request.session!.userId, workspaceId, 'admin'])
+    for (const account of defaultChartOfAccounts) {
+      await client.query('INSERT INTO workspace_accounts (id, workspace_id, code, name, account_type) VALUES ($1, $2, $3, $4, $5)', [randomUUID(), workspaceId, account.code, account.name, account.type])
+    }
     await client.query('COMMIT')
     setSessionCookie(response, { ...request.session!, workspaceId })
     response.status(201).json({ workspace: { id: workspace.rows[0].id, name: workspace.rows[0].name, role: membership.rows[0].role } })
@@ -374,9 +459,17 @@ app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, r
   finally { client.release() }
 })
 
+app.get('/v1/invoices', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, customer, description, amount::text, due_date, status, created_at FROM invoices WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
+    response.json({ invoices: result.rows })
+  } catch (error) { next(error) }
+})
+
 app.patch('/v1/invoices/:invoiceId/status', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
   const input = z.object({ status: z.enum(['unpaid', 'paid', 'void']) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Status must be unpaid, paid, or void.' }); return }
+  if (input.data.status === 'paid') { response.status(409).json({ error: 'Invoices can only be marked paid after a recorded payment or verified M-Pesa callback.' }); return }
   try {
     const result = await pool!.query('UPDATE invoices SET status = $1 WHERE id = $2 AND workspace_id = $3 RETURNING id, status', [input.data.status, request.params.invoiceId, request.session!.workspaceId])
     if (!result.rowCount) { response.status(404).json({ error: 'Invoice not found in this workspace.' }); return }
@@ -387,22 +480,289 @@ app.patch('/v1/invoices/:invoiceId/status', requirePool, verifyOrigin, requireSe
 app.post('/v1/transactions', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
   const input = z.object({ description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), direction: z.enum(['income', 'expense']), account: z.string().trim().min(1).max(80), date: z.string().date() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a description, positive amount, transaction type, account, and valid date.' }); return }
+  const client = await pool!.connect()
   try {
-    const result = await pool!.query('INSERT INTO ledger_transactions (workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, description, amount::text, direction, account, transaction_date, created_at', [request.session!.workspaceId, input.data.description, input.data.amount.toFixed(2), input.data.direction, input.data.account, input.data.date])
+    await client.query('BEGIN')
+    const id = randomUUID()
+    const result = await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, description, amount::text, direction, account, transaction_date, created_at', [id, request.session!.workspaceId, input.data.description, input.data.amount.toFixed(2), input.data.direction, input.data.account, input.data.date])
+    const amount = input.data.amount
+    const lines: JournalLineInput[] = input.data.direction === 'income'
+      ? [{ accountCode: '1000', debit: amount, credit: 0 }, { accountCode: '4000', debit: 0, credit: amount }]
+      : [{ accountCode: '6000', debit: amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: amount }]
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: input.data.description, sourceType: 'transaction', sourceId: id, lines })
+    await client.query('COMMIT')
     response.status(201).json({ transaction: result.rows[0] })
-  } catch (error) { next(error) }
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  }
+  finally { client.release() }
 })
 
 app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
   const input = z.object({ customer: z.string().trim().min(1).max(160), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), dueDate: z.string().date() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a customer, description, positive amount, and valid due date.' }); return }
+  const client = await pool!.connect()
   try {
-    const result = await pool!.query('INSERT INTO invoices (workspace_id, customer, description, amount, due_date) VALUES ($1, $2, $3, $4, $5) RETURNING id, customer, description, amount::text, due_date, status, created_at', [request.session!.workspaceId, input.data.customer, input.data.description, input.data.amount.toFixed(2), input.data.dueDate])
+    await client.query('BEGIN')
+    const id = randomUUID()
+    const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, customer, description, amount::text, due_date, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.description, input.data.amount.toFixed(2), input.data.dueDate])
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${input.data.customer} — ${input.data.description}`, sourceType: 'invoice', sourceId: id, lines: [{ accountCode: '1100', debit: input.data.amount, credit: 0 }, { accountCode: '4000', debit: 0, credit: input.data.amount }] })
+    await client.query('COMMIT')
     response.status(201).json({ invoice: result.rows[0] })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+app.get('/v1/accounting/chart', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    await ensureDefaultAccounts(request.session!.workspaceId)
+    const result = await pool!.query('SELECT id, code, name, account_type AS type, active FROM workspace_accounts WHERE workspace_id = $1 ORDER BY code', [request.session!.workspaceId])
+    response.json({ accounts: result.rows })
   } catch (error) { next(error) }
 })
 
-app.post('/v1/payroll/kenya/estimate', requirePool, verifyOrigin, requireSession, (request, response) => {
+app.get('/v1/accounting/trial-balance', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ from: z.string().date().optional(), to: z.string().date().optional() }).safeParse(request.query)
+  if (!input.success) { response.status(400).json({ error: 'Use valid YYYY-MM-DD from/to dates.' }); return }
+  try {
+    await ensureDefaultAccounts(request.session!.workspaceId)
+    const result = await pool!.query(`SELECT a.id, a.code, a.name, a.account_type AS type, COALESCE(SUM(CASE WHEN e.id IS NOT NULL THEN l.debit ELSE 0 END), 0)::text AS debit, COALESCE(SUM(CASE WHEN e.id IS NOT NULL THEN l.credit ELSE 0 END), 0)::text AS credit FROM workspace_accounts a LEFT JOIN journal_lines l ON l.account_id = a.id LEFT JOIN journal_entries e ON e.id = l.journal_entry_id AND e.workspace_id = a.workspace_id AND ($2::date IS NULL OR e.entry_date >= $2) AND ($3::date IS NULL OR e.entry_date <= $3) WHERE a.workspace_id = $1 GROUP BY a.id, a.code, a.name, a.account_type ORDER BY a.code`, [request.session!.workspaceId, input.data.from ?? null, input.data.to ?? null])
+    const accounts = result.rows.map((row: Record<string, unknown>) => ({ ...row, debit: String(row.debit), credit: String(row.credit), balance: (Number(row.debit) - Number(row.credit)).toFixed(2) }))
+    response.json({ accounts, totals: { debit: accounts.reduce((total: number, row: { debit: string }) => total + Number(row.debit), 0).toFixed(2), credit: accounts.reduce((total: number, row: { credit: string }) => total + Number(row.credit), 0).toFixed(2) } })
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/accounting/journals', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const entries = await pool!.query('SELECT id, entry_date, description, source_type, source_id, created_at FROM journal_entries WHERE workspace_id = $1 ORDER BY entry_date DESC, created_at DESC LIMIT 100', [request.session!.workspaceId])
+    const result = []
+    for (const entry of entries.rows) {
+      const lines = await pool!.query('SELECT a.code, a.name, l.description, l.debit::text, l.credit::text FROM journal_lines l JOIN workspace_accounts a ON a.id = l.account_id WHERE l.journal_entry_id = $1 ORDER BY a.code', [entry.id])
+      result.push({ ...entry, lines: lines.rows })
+    }
+    response.json({ entries: result })
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/accounting/periods', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, period, status, closed_at FROM accounting_periods WHERE workspace_id = $1 ORDER BY period DESC', [request.session!.workspaceId])
+    response.json({ periods: result.rows })
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/accounting/audit-events', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, actor_user_id, event_type, entity_type, entity_id, event_data, created_at FROM audit_events WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 200', [request.session!.workspaceId])
+    response.json({ events: result.rows })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/accounting/periods/:period/close', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const period = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/).safeParse(request.params.period)
+  if (!period.success) { response.status(400).json({ error: 'Period must use YYYY-MM format.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('INSERT INTO accounting_periods (id, workspace_id, period) VALUES ($1, $2, $3) ON CONFLICT (workspace_id, period) DO NOTHING', [randomUUID(), request.session!.workspaceId, period.data])
+    const periodRow = await client.query('SELECT status FROM accounting_periods WHERE workspace_id = $1 AND period = $2 FOR UPDATE', [request.session!.workspaceId, period.data])
+    if (periodRow.rows[0]?.status === 'closed') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Accounting period is already closed.' }); return }
+    const [year = 2026, month = 1] = period.data.split('-').map(Number)
+    const startDate = `${year}-${String(month).padStart(2, '0')}-01`
+    const nextMonth = month === 12 ? `${year + 1}-01-01` : `${year}-${String(month + 1).padStart(2, '0')}-01`
+    const totals = await client.query('SELECT COALESCE(SUM(l.debit), 0)::text AS debit, COALESCE(SUM(l.credit), 0)::text AS credit FROM journal_lines l JOIN journal_entries e ON e.id = l.journal_entry_id WHERE e.workspace_id = $1 AND e.entry_date >= $2 AND e.entry_date < $3', [request.session!.workspaceId, startDate, nextMonth])
+    if (Math.round(Number(totals.rows[0].debit) * 100) !== Math.round(Number(totals.rows[0].credit) * 100)) { await client.query('ROLLBACK'); response.status(409).json({ error: 'The period trial balance is out of balance and cannot be closed.' }); return }
+    await client.query('UPDATE accounting_periods SET status = $1, closed_by = $2, closed_at = now() WHERE workspace_id = $3 AND period = $4', ['closed', request.session!.userId, request.session!.workspaceId, period.data])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'accounting_period.closed', entityType: 'accounting_period', eventData: { period: period.data, debit: totals.rows[0].debit, credit: totals.rows[0].credit } })
+    await client.query('COMMIT')
+    response.json({ period: period.data, status: 'closed', totals: totals.rows[0] })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+app.post('/v1/accounting/periods/:period/reopen', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const period = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/).safeParse(request.params.period)
+  if (!period.success) { response.status(400).json({ error: 'Period must use YYYY-MM format.' }); return }
+  try {
+    const client = await pool!.connect()
+    try {
+      await client.query('BEGIN')
+      const result = await client.query("UPDATE accounting_periods SET status = 'open', closed_by = NULL, closed_at = NULL WHERE workspace_id = $1 AND period = $2 AND status = 'closed' RETURNING period, status", [request.session!.workspaceId, period.data])
+      if (!result.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Closed accounting period not found.' }); return }
+      await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'accounting_period.reopened', entityType: 'accounting_period', eventData: { period: period.data } })
+      await client.query('COMMIT')
+      response.json({ period: result.rows[0] })
+    } catch (error) { await client.query('ROLLBACK'); throw error }
+    finally { client.release() }
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/accounting/journals', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, _next) => {
+  const input = z.object({ date: z.string().date(), description: z.string().trim().min(1).max(240), lines: z.array(z.object({ accountCode: z.string().trim().min(1).max(20), description: z.string().trim().max(160).optional(), debit: z.coerce.number().finite().min(0), credit: z.coerce.number().finite().min(0) })).min(2).max(30) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a journal date, description and at least two debit/credit lines.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const id = await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: input.data.description, sourceType: 'manual', lines: input.data.lines })
+    await client.query('COMMIT')
+    response.status(201).json({ journalEntryId: id, status: 'posted' })
+    } catch (error) {
+      await client.query('ROLLBACK')
+      const message = error instanceof Error ? error.message : 'Could not post journal.'
+      response.status(message.startsWith('Accounting period ') ? 409 : 400).json({ error: message })
+    }
+  finally { client.release() }
+})
+
+app.get('/v1/payroll/employees', requirePool, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, employee_data_encrypted, active, created_at FROM employees WHERE workspace_id = $1 ORDER BY created_at DESC', [request.session!.workspaceId])
+    response.json({ employees: result.rows.map((row: Record<string, unknown>) => ({ id: row.id, ...decryptPayrollData<Record<string, unknown>>(String(row.employee_data_encrypted)), active: row.active, created_at: row.created_at })) })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/payroll/employees', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ employeeNumber: z.string().trim().min(1).max(40), fullName: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).optional().or(z.literal('')), phone: z.string().trim().max(30).optional(), grossMonthlyPay: z.coerce.number().finite().positive().max(100_000_000), otherTaxableDeductions: z.coerce.number().finite().min(0).default(0), otherTaxReliefs: z.coerce.number().finite().min(0).default(0) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter an employee number, name, and positive gross monthly pay.' }); return }
+  try {
+    const id = randomUUID()
+    const employee = { ...input.data, email: input.data.email?.toLowerCase() || '' }
+    await pool!.query('INSERT INTO employees (id, workspace_id, employee_data_encrypted) VALUES ($1, $2, $3)', [id, request.session!.workspaceId, encryptPayrollData(employee)])
+    const client = await pool!.connect()
+    try {
+      await client.query('BEGIN')
+      await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'employee.created', entityType: 'employee', entityId: id, eventData: { employeeNumber: employee.employeeNumber } })
+      await client.query('COMMIT')
+    } catch (error) { await client.query('ROLLBACK'); throw error }
+    finally { client.release() }
+    response.status(201).json({ employee: { id, ...employee, active: true } })
+  } catch (error) { next(error) }
+})
+
+app.patch('/v1/payroll/employees/:employeeId/status', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ active: z.boolean() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide active as true or false.' }); return }
+  try {
+    const result = await pool!.query('UPDATE employees SET active = $1, updated_at = now() WHERE id = $2 AND workspace_id = $3 RETURNING id, active', [input.data.active, request.params.employeeId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Employee not found.' }); return }
+    response.json({ employee: result.rows[0] })
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/payroll/runs', requirePool, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, period, status, rule_set, employee_count, gross_total::text, net_total::text, paye_total::text, shif_total::text, nssf_employee_total::text, nssf_employer_total::text, housing_employee_total::text, housing_employer_total::text, created_at FROM payroll_runs WHERE workspace_id = $1 ORDER BY period DESC', [request.session!.workspaceId])
+    response.json({ runs: result.rows })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/payroll/runs', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ period: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a payroll period in YYYY-MM format.' }); return }
+  try {
+    const rows = await pool!.query('SELECT id, employee_data_encrypted FROM employees WHERE workspace_id = $1 AND active = true', [request.session!.workspaceId])
+    if (!rows.rowCount) { response.status(409).json({ error: 'Add at least one active employee before preparing a payroll run.' }); return }
+    const items = rows.rows.map((row: Record<string, unknown>) => {
+      const employee = decryptPayrollData<Record<string, unknown>>(String(row.employee_data_encrypted))
+      const estimate = estimateKenyaPayroll({ grossMonthlyPay: Number(employee.grossMonthlyPay), otherTaxableDeductions: Number(employee.otherTaxableDeductions ?? 0), otherTaxReliefs: Number(employee.otherTaxReliefs ?? 0) })
+      return { employeeId: String(row.id), employee, estimate }
+    })
+    const sum = (field: keyof KenyaPayrollEstimate) => items.reduce((total: number, item: { estimate: KenyaPayrollEstimate }) => total + Number(item.estimate[field]), 0)
+    const id = randomUUID()
+    const totals = { gross: sum('grossMonthlyPay'), net: sum('netPayEstimate'), paye: sum('payeEstimate'), shif: sum('shifEmployee'), nssfEmployee: sum('nssfEmployee'), nssfEmployer: sum('nssfEmployer'), housingEmployee: sum('housingLevyEmployee'), housingEmployer: sum('housingLevyEmployer') }
+    const client = await pool!.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('INSERT INTO payroll_runs (id, workspace_id, period, rule_set, employee_count, gross_total, net_total, paye_total, shif_total, nssf_employee_total, nssf_employer_total, housing_employee_total, housing_employer_total, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)', [id, request.session!.workspaceId, input.data.period, 'KE-2026-01', items.length, totals.gross.toFixed(2), totals.net.toFixed(2), totals.paye.toFixed(2), totals.shif.toFixed(2), totals.nssfEmployee.toFixed(2), totals.nssfEmployer.toFixed(2), totals.housingEmployee.toFixed(2), totals.housingEmployer.toFixed(2), request.session!.userId])
+      for (const item of items) await client.query('INSERT INTO payroll_run_items (id, payroll_run_id, employee_id, payslip_encrypted) VALUES ($1, $2, $3, $4)', [randomUUID(), id, item.employeeId, encryptPayrollData({ period: input.data.period, employee: item.employee, estimate: item.estimate })])
+        await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'payroll_run.draft_created', entityType: 'payroll_run', entityId: id, eventData: { period: input.data.period, employeeCount: items.length, ruleSet: 'KE-2026-01', gross: totals.gross.toFixed(2) } })
+      await client.query('COMMIT')
+      response.status(201).json({ run: { id, period: input.data.period, status: 'draft', ruleSet: 'KE-2026-01', employeeCount: items.length, ...totals }, reviewRequired: true })
+    } catch (error) { await client.query('ROLLBACK'); next(error) }
+    finally { client.release() }
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/payroll/runs/:runId/payslips', requirePool, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  try {
+    const run = await pool!.query('SELECT id FROM payroll_runs WHERE id = $1 AND workspace_id = $2', [request.params.runId, request.session!.workspaceId])
+    if (!run.rowCount) { response.status(404).json({ error: 'Payroll run not found.' }); return }
+    const result = await pool!.query('SELECT id, payslip_encrypted FROM payroll_run_items WHERE payroll_run_id = $1 ORDER BY created_at', [request.params.runId])
+    response.json({ payslips: result.rows.map((row: Record<string, unknown>) => ({ id: row.id, ...decryptPayrollData<Record<string, unknown>>(String(row.payslip_encrypted)) })) })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/payroll/runs/:runId/post', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query('SELECT * FROM payroll_runs WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.runId, request.session!.workspaceId])
+    const run = result.rows[0]
+    if (!run) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Payroll run not found.' }); return }
+    if (run.status !== 'draft') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only a draft payroll run can be posted.' }); return }
+    const nssfTotal = Number(run.nssf_employee_total) + Number(run.nssf_employer_total)
+    const housingTotal = Number(run.housing_employee_total) + Number(run.housing_employer_total)
+    const lines: JournalLineInput[] = [
+      { accountCode: '5000', debit: Number(run.gross_total), credit: 0 },
+      { accountCode: '5010', debit: Number(run.nssf_employer_total), credit: 0 },
+      { accountCode: '5020', debit: Number(run.housing_employer_total), credit: 0 },
+      { accountCode: '2000', debit: 0, credit: Number(run.net_total) },
+      { accountCode: '2100', debit: 0, credit: Number(run.paye_total) },
+      { accountCode: '2110', debit: 0, credit: Number(run.shif_total) },
+      { accountCode: '2120', debit: 0, credit: nssfTotal },
+      { accountCode: '2130', debit: 0, credit: housingTotal },
+    ].filter((line) => line.debit > 0 || line.credit > 0)
+    const [year = 2026, month = 1] = String(run.period).split('-').map(Number)
+    const entryDate = `${year}-${String(month).padStart(2, '0')}-${String(new Date(year, month, 0).getDate()).padStart(2, '0')}`
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: entryDate, description: `Payroll ${run.period}`, sourceType: 'payroll', sourceId: String(run.id), lines })
+    for (const remittance of [['paye', Number(run.paye_total)], ['shif', Number(run.shif_total)], ['nssf', nssfTotal], ['housing_levy', housingTotal]] as const) {
+      await client.query('INSERT INTO payroll_remittances (id, payroll_run_id, workspace_id, remittance_type, amount) VALUES ($1, $2, $3, $4, $5)', [randomUUID(), run.id, request.session!.workspaceId, remittance[0], remittance[1].toFixed(2)])
+    }
+    await client.query('UPDATE payroll_runs SET status = $1 WHERE id = $2', ['posted', run.id])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'payroll_run.posted', entityType: 'payroll_run', entityId: String(run.id), eventData: { period: run.period, ruleSet: run.rule_set } })
+    await client.query('COMMIT')
+    response.json({ runId: run.id, status: 'posted', remittancesCreated: 4, reviewRequired: true })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+app.post('/v1/payroll/runs/:runId/pay', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query('SELECT id, period, status, net_total::text FROM payroll_runs WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.runId, request.session!.workspaceId])
+    const run = result.rows[0]
+    if (!run) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Payroll run not found.' }); return }
+    if (run.status !== 'posted') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only a posted run can be recorded as paid.' }); return }
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Net payroll paid ${run.period}`, sourceType: 'payroll_payment', sourceId: String(run.id), lines: [{ accountCode: '2000', debit: Number(run.net_total), credit: 0 }, { accountCode: '1000', debit: 0, credit: Number(run.net_total) }] })
+    await client.query('UPDATE payroll_runs SET status = $1 WHERE id = $2', ['paid', run.id])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'payroll_run.payment_recorded', entityType: 'payroll_run', entityId: String(run.id), eventData: { period: run.period, amount: String(run.net_total) } })
+    await client.query('COMMIT')
+    response.json({ runId: run.id, status: 'paid' })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+app.get('/v1/payroll/remittances', requirePool, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, payroll_run_id, remittance_type, amount::text, status, payment_reference, created_at, recorded_at FROM payroll_remittances WHERE workspace_id = $1 ORDER BY created_at DESC', [request.session!.workspaceId])
+    response.json({ remittances: result.rows })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/payroll/remittances/:remittanceId/record-payment', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ paymentReference: z.string().trim().min(1).max(120) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter the external statutory payment reference.' }); return }
+  try {
+    const result = await pool!.query("UPDATE payroll_remittances SET status = $1, payment_reference = $2, recorded_by = $3, recorded_at = now() WHERE id = $4 AND workspace_id = $5 AND status = 'due' RETURNING id, status, remittance_type, amount::text, payment_reference", ['recorded_paid', input.data.paymentReference, request.session!.userId, request.params.remittanceId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Due remittance not found.' }); return }
+    response.json({ remittance: result.rows[0], note: 'Payment is marked from your recorded reference only; it was not sent to a statutory authority.' })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/payroll/kenya/estimate', requirePool, verifyOrigin, requireSession, (request, response, _next) => {
   const input = z.object({
     grossMonthlyPay: z.coerce.number().finite().min(0).max(1_000_000_000),
     otherTaxableDeductions: z.coerce.number().finite().min(0).max(1_000_000_000).default(0),
@@ -447,7 +807,14 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
       })
       const checkoutRequestId = String(result.CheckoutRequestID ?? '')
       if (String(result.ResponseCode ?? '') !== '0' || !checkoutRequestId) throw new Error(String(result.ResponseDescription ?? 'Daraja did not accept the STK Push request.'))
-      await pool!.query('UPDATE mpesa_payment_requests SET status = $1, merchant_request_id = $2, checkout_request_id = $3 WHERE id = $4', ['pending', String(result.MerchantRequestID ?? ''), checkoutRequestId, paymentId])
+      const client = await pool!.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query('UPDATE mpesa_payment_requests SET status = $1, merchant_request_id = $2, checkout_request_id = $3 WHERE id = $4', ['pending', String(result.MerchantRequestID ?? ''), checkoutRequestId, paymentId])
+        await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'mpesa.stk_push_requested', entityType: 'mpesa_payment', entityId: paymentId, eventData: { invoiceId: request.params.invoiceId, amount: invoiceAmount, environment: env.MPESA_ENV } })
+        await client.query('COMMIT')
+      } catch (error) { await client.query('ROLLBACK'); throw error }
+      finally { client.release() }
       response.status(202).json({ payment: { id: paymentId, status: 'pending' }, customerMessage: String(result.CustomerMessage ?? 'Check the customer’s phone and complete the M-Pesa prompt.') })
     } catch (error) {
       await pool!.query('UPDATE mpesa_payment_requests SET status = $1, result_description = $2 WHERE id = $3', ['failed', error instanceof Error ? error.message.slice(0, 500) : 'Daraja request failed.', paymentId])
@@ -499,7 +866,10 @@ app.post('/v1/integrations/mpesa/callback', requirePool, rateLimit({ windowMs: 6
     try {
       await client.query('BEGIN')
       await client.query('UPDATE mpesa_payment_requests SET status = $1, result_code = $2, result_description = $3, mpesa_receipt_number = $4, callback_received_at = now() WHERE id = $5', ['paid', '0', resultDescription, String(metadata.MpesaReceiptNumber), payment.id])
-      await client.query('UPDATE invoices SET status = $1 WHERE id = $2 AND workspace_id = $3 AND status = $4', ['paid', payment.invoice_id, payment.workspace_id, 'unpaid'])
+      const invoice = await client.query('UPDATE invoices SET status = $1 WHERE id = $2 AND workspace_id = $3 AND status = $4 RETURNING customer, description', ['paid', payment.invoice_id, payment.workspace_id, 'unpaid'])
+      if (!invoice.rowCount) throw new Error('Invoice was already paid or changed before this payment callback; review this payment against the bank statement.')
+      await insertJournal(client, { workspaceId: String(payment.workspace_id), userId: null, date: nairobiToday(), description: `M-Pesa receipt ${String(metadata.MpesaReceiptNumber)}`, sourceType: 'mpesa_payment', sourceId: String(payment.invoice_id), lines: [{ accountCode: '1000', debit: Number(payment.amount), credit: 0 }, { accountCode: '1100', debit: 0, credit: Number(payment.amount) }] })
+      await recordAudit(client, { workspaceId: String(payment.workspace_id), actorUserId: null, eventType: 'mpesa.payment_verified', entityType: 'mpesa_payment', entityId: String(payment.id), eventData: { invoiceId: String(payment.invoice_id), receiptNumber: String(metadata.MpesaReceiptNumber), amount: String(payment.amount) } })
       await client.query('COMMIT')
       response.status(200).json({ ResultCode: 0, ResultDesc: 'Payment verified.' })
     } catch (error) { await client.query('ROLLBACK'); next(error) }
@@ -514,7 +884,7 @@ app.get('/v1/integrations/readiness', (_request, response) => {
     { id: 'kra_etims', status: 'provider_and_kra_approval_required' },
     { id: 'mpesa', status: mpesaReady ? `configured_${env.MPESA_ENV}` : 'daraja_credentials_and_callback_required' },
     { id: 'bank_feeds', status: 'licensed_open_banking_provider_required' },
-    { id: 'payroll_estimates', status: 'versioned_estimator_available_professional_review_required' },
+    { id: 'payroll', status: `encrypted_internal_runs_${env.PAYROLL_DATA_ENCRYPTION_KEY ? 'configured' : 'encryption_key_required'}_statutory_filing_unavailable` },
     { id: 'paye_shif_nssf_ahl_filing', status: 'statutory_filing_not_implemented' },
   ], note: 'M-Pesa STK Push is enabled only when server-side Daraja credentials and a callback URL are configured. Kenya payroll estimates are not certified payroll outputs; KRA eTIMS, bank feeds, and statutory filing are unavailable.' })
 })
@@ -535,6 +905,8 @@ async function start() {
       const migration = await readFile(fileURLToPath(new URL(`../migrations/${file}`, import.meta.url)), 'utf8')
       await pool.query(migration)
     }
+    const workspaces = await pool.query('SELECT id FROM workspaces')
+    for (const workspace of workspaces.rows) await ensureDefaultAccounts(String(workspace.id))
   }
   return app.listen(env.PORT, () => console.info(`KashFlow API listening on port ${env.PORT}`))
 }

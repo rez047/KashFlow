@@ -9,6 +9,7 @@ export const kenyaPayrollRuleSet = {
     'https://www.sha.go.ke/',
   ],
   nssf: { rate: 0.06, lowerEarningsLimit: 9_000, upperEarningsLimit: 108_000 },
+  nssfEmployerRate: 0.06,
   shif: { rate: 0.0275, minimum: 300 },
   housingLevy: { employeeRate: 0.015, employerRate: 0.015 },
   personalRelief: 2_400,
@@ -68,10 +69,11 @@ export function estimateKenyaPayroll(input: KenyaPayrollEstimateInput): KenyaPay
   const otherDeductions = roundMoney(input.otherTaxableDeductions ?? 0)
   const otherReliefs = roundMoney(input.otherTaxReliefs ?? 0)
   const { nssf, shif, housingLevy, personalRelief } = kenyaPayrollRuleSet
-  const nssfEmployee = roundMoney(Math.min(Math.max(gross, 0), nssf.upperEarningsLimit) * nssf.rate)
+  const pensionablePay = Math.max(0, Math.min(gross, nssf.upperEarningsLimit))
+  const nssfEmployee = roundMoney(pensionablePay * nssf.rate)
   const shifEmployee = gross > 0 ? roundMoney(Math.max(shif.minimum, gross * shif.rate)) : 0
   const housingLevyEmployee = roundMoney(gross * housingLevy.employeeRate)
-  const nssfEmployer = nssfEmployee
+  const nssfEmployer = roundMoney(pensionablePay * kenyaPayrollRuleSet.nssfEmployerRate)
   const housingLevyEmployer = roundMoney(gross * housingLevy.employerRate)
   const taxablePayEstimate = roundMoney(Math.max(0, gross - nssfEmployee - shifEmployee - housingLevyEmployee - otherDeductions))
   const payeBeforeRelief = calculatePaye(taxablePayEstimate)

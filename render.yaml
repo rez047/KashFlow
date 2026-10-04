@@ -11,11 +11,10 @@ services:
         value: production
       - key: SESSION_SECRET
         generateValue: true
+      - key: PAYROLL_DATA_ENCRYPTION_KEY
+        generateValue: true
       - key: FRONTEND_ORIGIN
-        fromService:
-          type: web
-          name: kashflow-frontend
-          property: url
+        value: https://kashflow-frontend.onrender.com
       - key: DATABASE_URL
         fromDatabase:
           name: kashflow-db
@@ -42,10 +41,7 @@ services:
     staticPublishPath: ./dist
     envVars:
       - key: VITE_API_BASE_URL
-        fromService:
-          type: web
-          name: kashflow-api
-          property: url
+        value: https://kashflow-api.onrender.com
 
 databases:
   - name: kashflow-db
