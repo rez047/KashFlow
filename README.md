@@ -1,48 +1,97 @@
 # KashFlow
 
-KashFlow is a Kenyan-first finance workspace. The app no longer seeds fictional companies, balances, transactions, invoices, or compliance statuses. After deployment and first-time setup, users sign in and save transaction and invoice records to the configured PostgreSQL database. The dashboard totals, chart, and lists are calculated from those saved records.
+KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with React, TypeScript, Vite, Express, and PostgreSQL. It is intended to help small businesses keep basic financial records in one place. It is an early MVP, **not a feature-complete QuickBooks Advanced replacement** and not yet production-ready for regulated accounting, payroll, or statutory filing.
 
-## Current working functionality
+## What it currently does
 
-- First-admin workspace setup, password sign-in, signed HttpOnly sessions, and sign-out.
-- Add multiple businesses, record team invitations with custom role labels, and scope each invitation to the active business or all businesses the inviter administers.
-- Database-backed manual income/expense transaction entry and invoice entry.
-- Workspace dashboard totals, recent transactions, and a daily chart sourced from saved records.
-- Empty states when the workspace has no records.
+- Lets a business owner create the first administrator account from the homepage using a business name, email or phone number, and their own password.
+- Provides password sign-in, signed HttpOnly session cookies, and sign-out.
+- Lets a signed-in user create additional businesses/workspaces and switch to the newly created business.
+- Saves manual income/expense records and internal invoice records to PostgreSQL.
+- Shows saved transactions, monthly totals, a daily cash-flow chart, and unpaid invoice totals.
+- Lets an administrator record an invitation with an email, built-in or custom role label, and target scope of the active business or all businesses they administer.
+- Uses Kenyan Shillings (KSh) in the finance UI and describes the intended local compliance integrations transparently.
 
-Bank sync, card/mobile payment processing, customer emailing, payroll, statutory calculations, document storage, and filing are not implemented. KRA/eTIMS, Safaricom Daraja/M-Pesa, banks, SHIF, NSSF, and Affordable Housing Levy are explicitly shown as inactive. Entering an internal invoice does not make it a KRA eTIMS invoice or send it to a customer. Have qualified Kenyan payroll/tax professionals review any future statutory calculations and filing workflows.
+## Important implementation and readiness limits
+
+Do not treat UI labels, environment variables, or saved invitation records as working third-party integrations. The current repository does **not** include:
+
+- A KRA/eTIMS adapter, certification, live invoice submission, fiscal-device integration, or production credentials.
+- Safaricom Daraja/M-Pesa STK Push, callbacks, reconciliation, refunds, or live payment processing.
+- Bank-feed providers, OAuth connections, transaction imports, or reconciliation.
+- Payroll processing or verified PAYE, SHIF, NSSF, or Affordable Housing Levy calculations/filing.
+- Double-entry journal posting, chart of accounts, trial balance, financial statements, or period close.
+- Invoice email/delivery, customer payment collection, or complete payment/status management.
+- Invitation email delivery, invitation acceptance, membership provisioning, or fine-grained permission enforcement. Custom role values are labels only; invitation scope is recorded but does not grant the invitee access.
+- Automated backup/restore tools, audited integration-credential vault, document storage, inventory, projects, or a full audit trail.
+
+The product interface currently indicates that external integrations are inactive. Production use requires qualified Kenyan accounting/payroll review, security/privacy review, tested provider integrations, operational monitoring, and tested backup and recovery. Do not enter sensitive payroll, tax, banking, or personal data until those controls are in place.
+
+## Deploy to Render (Blueprint)
+
+The repository includes [render.yaml](render.yaml), which describes a static frontend, Node API, and managed PostgreSQL database. Render may change service URLs or Blueprint defaults; inspect the plan before applying it.
+
+1. Push this repository to GitHub and sign in to [Render](https://render.com/).
+2. In Render, choose **New → Blueprint**, connect the GitHub repository `rez047/KashFlow`, and select the `main` branch.
+3. Review the Blueprint resources before applying: `kashflow-api` (Node web service), `kashflow-frontend` (static site), and `kashflow-db` (PostgreSQL). Confirm the database plan, region, cost, and retention meet your needs; the configured database plan may incur charges.
+4. Apply the Blueprint and wait for the database and services to provision. The API runs `npm ci && npm run build`, starts with `npm start`, and checks `/healthz`. The static site builds with `npm ci && npm run build` and publishes `dist`.
+5. In the API service's **Environment** settings, confirm these values:
+   - `NODE_ENV=production`
+   - `DATABASE_URL` is linked to the Render PostgreSQL connection string.
+   - `SESSION_SECRET` is a Render-generated secret with at least 32 characters. Keep it private; rotating it signs out existing sessions.
+   - `FRONTEND_ORIGIN` is the exact HTTPS origin of the deployed frontend, with no path or trailing slash (for example, `https://kashflow-frontend.onrender.com`).
+6. In the frontend static site's **Environment** settings, confirm `VITE_API_BASE_URL` is the exact HTTPS base URL of the API (for example, `https://kashflow-api.onrender.com`), with no path. Because `VITE_*` values are included in the public browser bundle, never put secrets there.
+7. Save environment changes and redeploy both services. If Render generated URLs different from the example, update both sides: set API `FRONTEND_ORIGIN` to the frontend's actual origin and frontend `VITE_API_BASE_URL` to the API's actual URL, then redeploy.
+8. Check `https://<your-api-host>/healthz` returns `{"status":"ok","database":"available"}`. Check the frontend URL loads, create the first admin account, and verify sign-in, sign-out, business creation, and manual record entry.
+9. Before production data: configure and test database backups/restore, access and security policies, monitoring/alerts, privacy notices, domain/TLS settings, and incident recovery. The app does not currently provide backup tooling or invitation email delivery.
+
+### Render deployment troubleshooting
+
+- **CORS/request-origin errors:** `FRONTEND_ORIGIN` must match the browser origin exactly, including `https://`, and the API must be redeployed after changing it.
+- **API unreachable:** verify `VITE_API_BASE_URL` points to the API service, not the static frontend; redeploy the static site after changing it.
+- **Database unavailable:** verify the `DATABASE_URL` reference points to the provisioned database and that database/service regions and access are correct.
+- **No first-account setup:** setup is enabled only when the database has no users. Do not delete production users just to re-enable bootstrap.
+- **Render free instances:** may sleep or have other limits depending on current Render plans; review Render's current pricing, persistence, and database backup terms before selecting a plan.
+
+## Required environment variables
+
+These are the variables used by the **current code**. The Blueprint sets or links them. Do not create provider credentials expecting them to activate integrations; no external provider adapters currently read provider credentials.
+
+| Name | Where | Required | Value / purpose |
+|---|---|---:|---|
+| `NODE_ENV` | API | Yes in production | Set to `production`; selects secure cookie and production configuration behavior. |
+| `PORT` | API | Render supplies it | HTTP listening port. Local default is `3001`; normally do not set manually on Render. |
+| `FRONTEND_ORIGIN` | API | Yes | Exact frontend HTTPS origin allowed by CORS and write-origin checks. |
+| `DATABASE_URL` | API | Yes in production | PostgreSQL connection URL; linked from the Render database resource. |
+| `SESSION_SECRET` | API | Yes in production | Random secret, minimum 32 characters, used to sign sessions. Generate in Render; never commit or expose to the frontend. |
+| `VITE_API_BASE_URL` | Static site build | Yes | Public base URL for the API; not a secret. Vite embeds it in the browser build. |
+
+No first-admin email/password is provided or required: the first user chooses these from the homepage. The API also uses local defaults for `NODE_ENV`, `PORT`, and `FRONTEND_ORIGIN` during development; production must have the required values above. For local development, copy [api/.env.example](api/.env.example) to `api/.env`, set `DATABASE_URL` and a random `SESSION_SECRET`, then copy [.env.example](.env.example) to `.env.local` and set `VITE_API_BASE_URL=http://localhost:3001`. The development-only in-memory `pg-mem` fallback loses data when the API restarts; do not use it for deployment.
+
+### Provider-specific variables (future work only)
+
+The current code does not read any KRA/eTIMS, Daraja/M-Pesa, bank, email, payroll, SHIF, NSSF, or Affordable Housing Levy credentials. Therefore there are **no provider environment-variable names that can make these services live today**. When a provider adapter is implemented and approved, use that provider's current official documentation to define the exact credential names, callback URLs, encryption/storage requirements, sandbox-to-production process, and rotation plan. Store secrets only in server-side Render environment settings or a purpose-built encrypted credential vault—not in `VITE_*`, source control, or README values. Never claim a statutory or payment integration is live until end-to-end provider tests and production approval have succeeded.
 
 ## Run locally
 
-1. Install frontend dependencies in the project root: `npm ci`.
-2. Install API dependencies: from `api/`, run `npm ci`.
-3. Create an empty PostgreSQL database; the API applies all SQL files in `api/migrations/` on startup.
-4. Copy `api/.env.example` to `api/.env`; set the database URL and a random session secret of at least 32 characters. No fixed admin email is required.
-5. Start the API from `api/` using `npm run dev`.
-6. In the project root, copy `.env.example` to `.env.local` (it defaults to `http://localhost:3001`), then run `npm run dev` in another terminal.
-7. Open the Vite URL, create your workspace by entering a business name, email or phone number, and a password of at least 12 characters, then sign in.
+1. Install Node.js compatible with the package engines and Git.
+2. From the repository root, run `npm ci`.
+3. From `api/`, run `npm ci`.
+4. Provision PostgreSQL for persistent local development. Copy `api/.env.example` to `api/.env`; set `DATABASE_URL` and `SESSION_SECRET` to local values. Without `DATABASE_URL`, the API uses a development-only in-memory database.
+5. Start the API from `api/` with `npm run dev`.
+6. In a second terminal at the repository root, copy `.env.example` to `.env.local`, set `VITE_API_BASE_URL=http://localhost:3001`, and run `npm run dev`.
+7. Open the Vite URL printed in the terminal. If the default port is busy, use the URL Vite prints; local API CORS permits localhost origins in development.
+8. Create the first business/admin account from the homepage.
 
-Do not commit `.env`, `.env.local`, database URLs, passwords, or provider secrets.
+Never commit `.env`, `.env.local`, database URLs, session secrets, passwords, private keys, or provider credentials.
 
-## Deploy on Render
+## Project structure
 
-The repository includes `render.yaml` for a static frontend, Node API, and managed PostgreSQL database. In Render, create a Blueprint from this repository and review the generated resources before applying it. Render generates `SESSION_SECRET` and links `DATABASE_URL` from the database. Confirm `FRONTEND_ORIGIN` exactly matches the resulting KashFlow static-site URL and `VITE_API_BASE_URL` exactly matches the API URL. If Render assigns different service URLs, update these two values and redeploy the API and frontend respectively. The homepage lets users create their own first workspace admin account with a business name, email or phone number, and a strong password.
+- `src/` — React and TypeScript frontend.
+- `api/src/server.ts` — Express API, authentication, database access, and current endpoints.
+- `api/migrations/` — SQL schema migrations, automatically applied on API startup.
+- `render.yaml` — Render Blueprint for the frontend, API, and PostgreSQL resources.
 
-### Environment variable reference
+## Security and accounting notice
 
-| Variable | Service | Required | Purpose |
-|---|---|---:|---|
-| `NODE_ENV` | API | Yes | Set to `production` on Render. |
-| `PORT` | API | Render supplies it | HTTP listen port; local default is `3001`. |
-| `FRONTEND_ORIGIN` | API | Yes | Exact frontend origin allowed by CORS and write-origin checks. |
-| `DATABASE_URL` | API | Yes | Render PostgreSQL connection string; provisioned by the Blueprint. |
-| `SESSION_SECRET` | API | Yes | Random secret of at least 32 characters used to sign sessions; generate in Render, never expose to the browser. |
-| `VITE_API_BASE_URL` | Static site build | Yes | Public base URL for the API, e.g. `https://kashflow-api.onrender.com`. This is intentionally public, not a secret. |
-
-`api/.env.example` contains the local API variables. For Render, use the service Environment settings or the Blueprint. Provider credential variable names from a provider's documentation should only be added after its adapter is implemented; arbitrary credentials do not activate an integration. Never use `VITE_*` for secrets because browser bundles are public.
-
-## Data and security notes
-
-Team invitations are recorded in the database but are not emailed or redeemable yet. Custom roles are stored as labels and do not grant configurable fine-grained permissions; business-scope selection records its target businesses but does not yet provision invited users. This MVP also lacks double-entry accounting, invoice payment/status management, backup tooling, and audited integration credential storage. Protect the Render account and database, use a unique strong first-admin password, enable appropriate backups, and do not enter regulated/payroll data until the application receives a security and privacy review. The database schema is in `api/migrations/`.
-
-The API exposes `GET /healthz` and `GET /v1/integrations/readiness` for operational/status checks. No external provider credentials are currently consumed by the code. Live KRA, M-Pesa, banking, and statutory integrations still require approved providers, credentials, provider-specific adapters, verified callbacks/webhooks, sandbox tests, and production approval.
+This is an early-stage MVP and is not a substitute for professional accounting, tax, payroll, legal, or security advice. Validate financial data and statutory calculations with qualified Kenyan professionals. Use least-privilege access, unique credentials, private server-side secrets, encrypted transport, database backups, restore tests, security monitoring, and a privacy review before storing real business or personal data.
