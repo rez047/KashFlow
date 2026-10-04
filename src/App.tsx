@@ -47,6 +47,7 @@ type Dashboard = {
   invoices: { count: number; unpaid_amount: string }
 }
 type Account = { user: { email: string }; workspace: { id: string; name: string }; workspaces?: Array<{ id: string; name: string; role: string }> }
+type IntegrationReadiness = { integrations: Array<{ id: string; status: string }> }
 type Modal = 'invoice' | 'transaction' | 'business' | 'invite' | null
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -84,6 +85,7 @@ function App() {
   const [statusOpen, setStatusOpen] = useState(false)
   const [account, setAccount] = useState<Account | null>(null)
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
+  const [integrationReadiness, setIntegrationReadiness] = useState<IntegrationReadiness | null>(null)
   const [bootstrapAvailable, setBootstrapAvailable] = useState(false)
   const [showSetupFlow, setShowSetupFlow] = useState(false)
   const [businessName, setBusinessName] = useState('')
@@ -96,12 +98,16 @@ function App() {
   const [credentials, setCredentials] = useState({ identifier: '', password: '', businessName: '' })
   const [transaction, setTransaction] = useState({ description: '', amount: '', direction: 'expense', account: '', date: today })
   const [invoice, setInvoice] = useState({ customer: '', description: '', amount: '', dueDate: '' })
+  const [paymentPhone, setPaymentPhone] = useState('')
 
   const refresh = useCallback(async () => setDashboard(await request<Dashboard>('/v1/dashboard')), [])
 
   useEffect(() => {
     let active = true
     async function initialize() {
+      void request<IntegrationReadiness>('/v1/integrations/readiness').then((readiness) => {
+        if (active) setIntegrationReadiness(readiness)
+      }).catch(() => undefined)
       try {
         const status = await request<{ bootstrapAvailable: boolean }>('/v1/auth/status')
         if (!active) return
@@ -190,9 +196,19 @@ function App() {
   async function saveInvoice(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
-      await request('/v1/invoices', { method: 'POST', body: JSON.stringify({ ...invoice, amount: Number(invoice.amount) }) })
+      const created = await request<{ invoice: { id: string } }>('/v1/invoices', { method: 'POST', body: JSON.stringify({ ...invoice, amount: Number(invoice.amount) }) })
       setModal(null); setInvoice({ customer: '', description: '', amount: '', dueDate: '' })
-      await refresh(); notify('Invoice saved to this workspace')
+      const mobileNumber = paymentPhone.trim()
+      setPaymentPhone('')
+      await refresh()
+      if (mobileNumber) {
+        try {
+          const result = await request<{ customerMessage: string }>(`/v1/invoices/${created.invoice.id}/payments/mpesa`, { method: 'POST', body: JSON.stringify({ phone: mobileNumber }) })
+          notify(`Invoice saved. ${result.customerMessage}`)
+        } catch (reason) {
+          notify(`Invoice saved; M-Pesa request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
+        }
+      } else notify('Invoice saved to this workspace')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not save invoice.')
     } finally { setBusy(false) }
@@ -204,6 +220,8 @@ function App() {
     date: new Date(`${row.date}T00:00:00`).toLocaleDateString('en-KE', { day: 'numeric', month: 'short' }),
     income: Number(row.income), expense: Number(row.expense),
   })), [dashboard])
+  const mpesaStatus = integrationReadiness?.integrations.find((item) => item.id === 'mpesa')?.status ?? 'daraja_credentials_and_callback_required'
+  const mpesaConfigured = mpesaStatus.startsWith('configured_')
 
   if (starting) return <div className="auth-screen"><div className="auth-card"><Brand /><p>Connecting securely to your workspace…</p></div></div>
 
@@ -284,7 +302,7 @@ function App() {
           <button className="icon-button notification-button" aria-label="Workspace status" onClick={() => setStatusOpen((open) => !open)}><Bell size={18} /></button>
           <button className="top-help" onClick={() => notify('Help centre is not configured yet')}><CircleHelp size={17} /><span>Help</span></button>
         </div>
-        {statusOpen && <div className="notification-popover"><strong>No external services connected</strong><p>Saved records are available in this workspace. Bank, payment, and government integrations still require approved providers.</p><button onClick={() => setStatusOpen(false)}>Close</button></div>}
+        {statusOpen && <div className="notification-popover"><strong>{mpesaConfigured ? 'Daraja STK Push configured' : 'No external services connected'}</strong><p>Saved records are available in this workspace. KRA/eTIMS, bank feeds, and statutory filing remain inactive; verify any M-Pesa payment with Daraja and your merchant statement.</p><button onClick={() => setStatusOpen(false)}>Close</button></div>}
       </header>
 
       <div className="content-wrap">
@@ -293,7 +311,7 @@ function App() {
             <h1>{dashboard?.workspaceName}</h1><p className="welcome-subtitle">Your saved records for this month.</p>
           </div><div className="welcome-actions">
             <button className="button button-secondary" onClick={() => { setError(''); setModal('transaction') }}><Plus size={16} /> Add transaction</button>
-            <button className="button button-primary" onClick={() => { setError(''); setModal('invoice') }}><Plus size={17} /> Create invoice</button>
+            <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}><Plus size={17} /> Create invoice</button>
             <button className="button button-secondary" onClick={() => { setError(''); setModal('invite') }}><Users size={16} /> Invite member</button>
           </div></section>
 
@@ -327,18 +345,18 @@ function App() {
             </article>
 
             <article className="panel compliance-panel">
-              <div className="panel-header"><div><h2>Integrations</h2><p>External services are not connected</p></div>
+              <div className="panel-header"><div><h2>Integrations</h2><p>{mpesaConfigured ? 'Daraja M-Pesa is configured; other integrations remain inactive' : 'External services are not connected'}</p></div>
                 <button className="icon-button more-button" aria-label="Integration status" onClick={() => setStatusOpen(true)}><MoreHorizontal size={19} /></button>
               </div>
-              <div className="integration-notice"><ShieldCheck size={19} /><div><strong>Setup required</strong><p>KRA/eTIMS, M-Pesa, bank feeds, and statutory filing are inactive. Connect approved providers before relying on sync or submissions.</p></div></div>
+              <div className="integration-notice"><ShieldCheck size={19} /><div><strong>{mpesaConfigured ? 'M-Pesa STK Push configured' : 'Setup required'}</strong><p>KRA/eTIMS, bank feeds, and statutory filing still require approved providers. M-Pesa status reflects server configuration only; confirm live transactions against Daraja and your merchant statement.</p></div></div>
               <div className="compliance-list">
                 {[
-                  ['KRA eTIMS', 'Provider adapter not configured'],
-                  ['Safaricom Daraja / M-Pesa', 'Credentials and callbacks not configured'],
-                  ['Bank feeds', 'Provider not selected'],
-                  ['PAYE · SHIF · NSSF · AHL', 'Calculations and filing routes not implemented'],
-                ].map(([name, detail]) => <div className="integration-row" key={name}>
-                  <span className="compliance-icon blue"><Building2 size={16} /></span><span className="compliance-copy"><strong>{name}</strong><small>{detail}</small></span><span className="status-pill amber">Inactive</span>
+                  { name: 'KRA eTIMS', detail: 'Adapter, certification, and credentials not configured', status: 'Inactive', configured: false },
+                  { name: 'Safaricom Daraja / M-Pesa', detail: mpesaConfigured ? `STK Push configured (${mpesaStatus.replace('configured_', '')})` : 'Credentials and public callback not configured', status: mpesaConfigured ? mpesaStatus.replace('configured_', '') : 'Inactive', configured: mpesaConfigured },
+                  { name: 'Bank feeds', detail: 'Open banking provider not selected', status: 'Inactive', configured: false },
+                  { name: 'PAYE · SHIF · NSSF · AHL', detail: 'Verified calculations and filing route not implemented', status: 'Inactive', configured: false },
+                ].map(({ name, detail, status, configured }) => <div className="integration-row" key={name}>
+                  <span className="compliance-icon blue"><Building2 size={16} /></span><span className="compliance-copy"><strong>{name}</strong><small>{detail}</small></span><span className={`status-pill ${configured ? 'green' : 'amber'}`}>{status}</span>
                 </div>)}
               </div>
             </article>
@@ -363,7 +381,7 @@ function App() {
             </article>
             <article className="panel tasks-panel"><div className="panel-header"><div><h2>Invoices</h2><p>Totals from saved records</p></div><span className="task-count">{dashboard?.invoices.count ?? 0}</span></div>
               <div className="invoice-summary"><span>Unpaid invoice value</span><strong>{money(dashboard?.invoices.unpaid_amount ?? '0')}</strong><p>{dashboard?.invoices.count ?? 0} total invoices recorded</p></div>
-              <button className="task-footer" onClick={() => { setError(''); setModal('invoice') }}>Create invoice <ArrowRight size={14} /></button>
+              <button className="task-footer" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice <ArrowRight size={14} /></button>
             </article>
           </section>
           <footer className="page-footer"><span>© 2026 KashFlow Technologies</span><span><i className="secure-dot" /> Private workspace</span><button onClick={() => void logout()}>Sign out</button></footer>
@@ -416,7 +434,11 @@ function App() {
           <div className="field-row"><label className="field-label">Amount (KSh)<input required min="0.01" step="0.01" type="number" value={invoice.amount} onChange={(event) => setInvoice({ ...invoice, amount: event.target.value })} /></label>
             <label className="field-label">Due date<input required type="date" value={invoice.dueDate} onChange={(event) => setInvoice({ ...invoice, dueDate: event.target.value })} /></label>
           </div>
-          <p className="dialog-note"><ShieldCheck size={15} /> Internal record only. Not sent to the customer and not a KRA/eTIMS tax invoice.</p>
+          <label className="field-label">M-Pesa phone (optional)
+            <input type="tel" autoComplete="tel" placeholder="0712345678" value={paymentPhone} onChange={(event) => setPaymentPhone(event.target.value)} />
+            <small>If Daraja is configured, saving sends an STK Push request for the full, whole-KSh amount.</small>
+          </label>
+          <p className="dialog-note"><ShieldCheck size={15} /> The invoice itself is not emailed and is not a KRA/eTIMS tax invoice. An optional phone number sends a separate M-Pesa payment prompt.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save invoice'}</button></div>
         </form> : null}

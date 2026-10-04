@@ -9,6 +9,7 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 - Lets a signed-in user create additional businesses/workspaces and switch to the newly created business.
 - Saves manual income/expense records and internal invoice records to PostgreSQL.
 - Shows saved transactions, monthly totals, a daily cash-flow chart, and unpaid invoice totals.
+- Can initiate a Safaricom Daraja M-Pesa STK Push for a whole-KSh unpaid invoice when merchant credentials and a public callback URL are configured; it verifies the callback with Daraja's STK Query API before marking the invoice paid.
 - Lets an administrator record an invitation with an email, built-in or custom role label, and target scope of the active business or all businesses they administer.
 - Uses Kenyan Shillings (KSh) in the finance UI and describes the intended local compliance integrations transparently.
 
@@ -17,7 +18,8 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 Do not treat UI labels, environment variables, or saved invitation records as working third-party integrations. The current repository does **not** include:
 
 - A KRA/eTIMS adapter, certification, live invoice submission, fiscal-device integration, or production credentials.
-- Safaricom Daraja/M-Pesa STK Push, callbacks, reconciliation, refunds, or live payment processing.
+- KRA/eTIMS integration, certification, live invoice submission, fiscal-device integration, or production credentials.
+- M-Pesa settlement/reconciliation, refunds, disbursements, or production verification of merchant account setup. Daraja STK Push works only with the optional server-side variables below and is not active until configured and tested.
 - Bank-feed providers, OAuth connections, transaction imports, or reconciliation.
 - Payroll processing or verified PAYE, SHIF, NSSF, or Affordable Housing Levy calculations/filing.
 - Double-entry journal posting, chart of accounts, trial balance, financial statements, or period close.
@@ -25,7 +27,7 @@ Do not treat UI labels, environment variables, or saved invitation records as wo
 - Invitation email delivery, invitation acceptance, membership provisioning, or fine-grained permission enforcement. Custom role values are labels only; invitation scope is recorded but does not grant the invitee access.
 - Automated backup/restore tools, audited integration-credential vault, document storage, inventory, projects, or a full audit trail.
 
-The product interface currently indicates that external integrations are inactive. Production use requires qualified Kenyan accounting/payroll review, security/privacy review, tested provider integrations, operational monitoring, and tested backup and recovery. Do not enter sensitive payroll, tax, banking, or personal data until those controls are in place.
+Only the M-Pesa STK Push status can become configured when its server-side Daraja settings are present; this does not certify live payments. KRA/eTIMS, bank feeds, and statutory filing remain unavailable. Production use requires qualified Kenyan accounting/payroll review, security/privacy review, provider onboarding, operational monitoring, and tested backup and recovery. Do not enter sensitive payroll, tax, banking, or personal data until those controls are in place.
 
 ## Deploy to Render (Blueprint)
 
@@ -44,6 +46,7 @@ The repository includes [render.yaml](render.yaml), which describes a static fro
 7. Save environment changes and redeploy both services. If Render generated URLs different from the example, update both sides: set API `FRONTEND_ORIGIN` to the frontend's actual origin and frontend `VITE_API_BASE_URL` to the API's actual URL, then redeploy.
 8. Check `https://<your-api-host>/healthz` returns `{"status":"ok","database":"available"}`. Check the frontend URL loads, create the first admin account, and verify sign-in, sign-out, business creation, and manual record entry.
 9. Before production data: configure and test database backups/restore, access and security policies, monitoring/alerts, privacy notices, domain/TLS settings, and incident recovery. The app does not currently provide backup tooling or invitation email delivery.
+10. Optional M-Pesa setup: complete Daraja merchant/app onboarding, add every `MPESA_*` value in the API service environment, set the callback to `https://<your-api-host>/v1/integrations/mpesa/callback`, redeploy the API, then test with sandbox credentials and a Safaricom-reachable HTTPS callback before considering production mode.
 
 ### Render deployment troubleshooting
 
@@ -55,7 +58,7 @@ The repository includes [render.yaml](render.yaml), which describes a static fro
 
 ## Required environment variables
 
-These are the variables used by the **current code**. The Blueprint sets or links them. Do not create provider credentials expecting them to activate integrations; no external provider adapters currently read provider credentials.
+These are the variables used by the **current code**. The Blueprint sets or links the core deployment variables. M-Pesa variables are optional for the application, but all listed Daraja credentials and a callback URL are required to initiate STK Push.
 
 | Name | Where | Required | Value / purpose |
 |---|---|---:|---|
@@ -65,12 +68,21 @@ These are the variables used by the **current code**. The Blueprint sets or link
 | `DATABASE_URL` | API | Yes in production | PostgreSQL connection URL; linked from the Render database resource. |
 | `SESSION_SECRET` | API | Yes in production | Random secret, minimum 32 characters, used to sign sessions. Generate in Render; never commit or expose to the frontend. |
 | `VITE_API_BASE_URL` | Static site build | Yes | Public base URL for the API; not a secret. Vite embeds it in the browser build. |
+| `MPESA_ENV` | API | Optional | `sandbox` (default) or `production`. Do not select production until Safaricom has approved and provided live merchant details. |
+| `MPESA_CONSUMER_KEY` | API | Required for STK Push | Daraja app consumer key. Server-side secret/config only. |
+| `MPESA_CONSUMER_SECRET` | API | Required for STK Push | Daraja app consumer secret. Keep private. |
+| `MPESA_SHORTCODE` | API | Required for STK Push | PayBill/Till shortcode enabled for the selected STK transaction type. |
+| `MPESA_PASSKEY` | API | Required for STK Push | Daraja STK Push passkey for that shortcode. Keep private. |
+| `MPESA_CALLBACK_URL` | API | Required for STK Push | Public callback URL ending `/v1/integrations/mpesa/callback`; production must use HTTPS and be reachable by Safaricom. |
+| `MPESA_TRANSACTION_TYPE` | API | Optional | `CustomerPayBillOnline` (default) or `CustomerBuyGoodsOnline`, according to merchant configuration. |
 
 No first-admin email/password is provided or required: the first user chooses these from the homepage. The API also uses local defaults for `NODE_ENV`, `PORT`, and `FRONTEND_ORIGIN` during development; production must have the required values above. For local development, copy [api/.env.example](api/.env.example) to `api/.env`, set `DATABASE_URL` and a random `SESSION_SECRET`, then copy [.env.example](.env.example) to `.env.local` and set `VITE_API_BASE_URL=http://localhost:3001`. The development-only in-memory `pg-mem` fallback loses data when the API restarts; do not use it for deployment.
 
-### Provider-specific variables (future work only)
+### Other provider-specific variables (not implemented)
 
-The current code does not read any KRA/eTIMS, Daraja/M-Pesa, bank, email, payroll, SHIF, NSSF, or Affordable Housing Levy credentials. Therefore there are **no provider environment-variable names that can make these services live today**. When a provider adapter is implemented and approved, use that provider's current official documentation to define the exact credential names, callback URLs, encryption/storage requirements, sandbox-to-production process, and rotation plan. Store secrets only in server-side Render environment settings or a purpose-built encrypted credential vault—not in `VITE_*`, source control, or README values. Never claim a statutory or payment integration is live until end-to-end provider tests and production approval have succeeded.
+There are no current KRA/eTIMS, bank-feed/open-banking, email-delivery, payroll, SHIF, NSSF, or Affordable Housing Levy adapters, so this repository does not define variables that can activate those services. KRA/eTIMS requires the appropriate KRA onboarding, device/API specification, certificates or credentials, and certification; payroll/statutory processing needs versioned calculations reviewed by qualified Kenyan professionals and authorized filing routes; bank feeds require selecting and onboarding a licensed provider. Do not invent environment variable names or store unrelated credentials hoping to enable these systems. Store all secrets only in server-side Render environment settings or an approved encrypted vault—not in `VITE_*`, source control, or README values.
+
+The implemented M-Pesa setup flow covers invoice STK Push and callback/query verification only. It does not offer full merchant reconciliation, refunds, settlement reporting, or guarantee provider approval. A manual invoice is still not an eTIMS invoice.
 
 ## Run locally
 

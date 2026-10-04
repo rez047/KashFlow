@@ -14,6 +14,13 @@ const envSchema = z.object({
   FRONTEND_ORIGIN: z.string().url().default('http://localhost:5173'),
   DATABASE_URL: z.string().url().optional(),
   SESSION_SECRET: z.string().min(32).optional(),
+  MPESA_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
+  MPESA_CONSUMER_KEY: z.string().trim().optional(),
+  MPESA_CONSUMER_SECRET: z.string().trim().optional(),
+  MPESA_SHORTCODE: z.string().trim().optional(),
+  MPESA_PASSKEY: z.string().trim().optional(),
+  MPESA_CALLBACK_URL: z.string().url().optional(),
+  MPESA_TRANSACTION_TYPE: z.enum(['CustomerPayBillOnline', 'CustomerBuyGoodsOnline']).default('CustomerPayBillOnline'),
 })
 const parsed = envSchema.safeParse(process.env)
 if (!parsed.success) {
@@ -21,6 +28,18 @@ if (!parsed.success) {
   process.exit(1)
 }
 const env = parsed.data
+const mpesaConfig = {
+  environment: env.MPESA_ENV,
+  consumerKey: env.MPESA_CONSUMER_KEY,
+  consumerSecret: env.MPESA_CONSUMER_SECRET,
+  shortcode: env.MPESA_SHORTCODE,
+  passkey: env.MPESA_PASSKEY,
+  callbackUrl: env.MPESA_CALLBACK_URL,
+  transactionType: env.MPESA_TRANSACTION_TYPE,
+}
+const mpesaConfigured = Object.values(mpesaConfig).every((value) => Boolean(value))
+const mpesaApiBase = env.MPESA_ENV === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke'
+let cachedDarajaToken: { value: string; expiresAt: number } | undefined
 if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET)) {
   console.error('Production requires DATABASE_URL and SESSION_SECRET (32+ characters).')
   process.exit(1)
@@ -53,7 +72,7 @@ async function createPool() {
     })
     const { Pool: PgMemPool } = db.adapters.createPg()
     return new PgMemPool()
-  } catch (error) {
+  } catch {
     console.warn('No DATABASE_URL configured; pg-mem fallback unavailable. Set DATABASE_URL for this environment.')
     return undefined
   }
@@ -147,6 +166,55 @@ function requireSession(request: AuthedRequest, response: express.Response, next
 function verifyOrigin(request: express.Request, response: express.Response, next: express.NextFunction) {
   if (!isAllowedOrigin(request.get('origin'))) { response.status(403).json({ error: 'Request origin is not allowed.' }); return }
   next()
+}
+function darajaTimestamp() {
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(new Date())
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]))
+  return `${values.year}${values.month}${values.day}${values.hour}${values.minute}${values.second}`
+}
+function normalizeKenyanPhone(value: string) {
+  const digits = value.replace(/\D/g, '')
+  const normalized = digits.startsWith('254') ? digits : digits.startsWith('0') ? `254${digits.slice(1)}` : `254${digits}`
+  return /^254[17]\d{8}$/.test(normalized) ? normalized : null
+}
+async function darajaToken() {
+  if (!mpesaConfigured) throw new Error('Daraja is not configured. Add all required MPESA_* environment variables.')
+  if (cachedDarajaToken && cachedDarajaToken.expiresAt > Date.now() + 30_000) return cachedDarajaToken.value
+
+  const credentials = Buffer.from(`${mpesaConfig.consumerKey}:${mpesaConfig.consumerSecret}`).toString('base64')
+  const response = await fetch(`${mpesaApiBase}/oauth/v1/generate?grant_type=client_credentials`, {
+    headers: { Authorization: `Basic ${credentials}` },
+    signal: AbortSignal.timeout(15_000),
+  })
+  const result = await response.json().catch(() => ({})) as { access_token?: string; expires_in?: string | number; errorMessage?: string }
+  if (!response.ok || !result.access_token) throw new Error(result.errorMessage ?? `Daraja authentication failed (${response.status}).`)
+  const expiresIn = Number(result.expires_in ?? 3600)
+  cachedDarajaToken = { value: result.access_token, expiresAt: Date.now() + expiresIn * 1000 }
+  return result.access_token
+}
+async function darajaPost(path: string, payload: Record<string, unknown>) {
+  const token = await darajaToken()
+  const response = await fetch(`${mpesaApiBase}${path}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(20_000),
+  })
+  const result = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) throw new Error(String(result.errorMessage ?? result.ResponseDescription ?? `Daraja request failed (${response.status}).`))
+  return result
+}
+function mpesaPassword(timestamp: string) {
+  return Buffer.from(`${mpesaConfig.shortcode}${mpesaConfig.passkey}${timestamp}`).toString('base64')
+}
+async function queryDarajaPayment(checkoutRequestId: string) {
+  const timestamp = darajaTimestamp()
+  return darajaPost('/mpesa/stkpushquery/v1/query', {
+    BusinessShortCode: mpesaConfig.shortcode,
+    Password: mpesaPassword(timestamp),
+    Timestamp: timestamp,
+    CheckoutRequestID: checkoutRequestId,
+  })
 }
 app.disable('x-powered-by')
 app.use(helmet())
@@ -333,7 +401,111 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, async (reque
   } catch (error) { next(error) }
 })
 
-app.get('/v1/integrations/readiness', (_request, response) => response.json({ mode: 'setup_required', integrations: [{ id: 'kra_etims', status: 'provider_required' }, { id: 'mpesa', status: 'daraja_credentials_required' }, { id: 'bank_feeds', status: 'provider_required' }, { id: 'paye_shif_nssf_ahl', status: 'filing_route_required' }], note: 'No external provider is connected.' }))
+app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, requireSession, rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request: AuthedRequest, response, next) => {
+  if (!mpesaConfigured) { response.status(503).json({ error: 'M-Pesa is not configured. Set all required MPESA_* API environment variables and a public callback URL.' }); return }
+  if (env.MPESA_ENV === 'production' && !env.MPESA_CALLBACK_URL!.startsWith('https://')) { response.status(503).json({ error: 'Production Daraja requires a public HTTPS MPESA_CALLBACK_URL.' }); return }
+
+  const input = z.object({ phone: z.string().trim().min(7).max(24) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter the customer’s Safaricom-compatible Kenyan phone number.' }); return }
+  const phone = normalizeKenyanPhone(input.data.phone)
+  if (!phone) { response.status(400).json({ error: 'Use a valid Kenyan mobile number, such as 0712345678 or 254712345678.' }); return }
+
+  try {
+    const invoiceResult = await pool!.query('SELECT id, amount, status FROM invoices WHERE id = $1 AND workspace_id = $2', [request.params.invoiceId, request.session!.workspaceId])
+    if (!invoiceResult.rowCount) { response.status(404).json({ error: 'Invoice not found in this business.' }); return }
+    const invoiceAmount = Number(invoiceResult.rows[0].amount)
+    if (invoiceResult.rows[0].status !== 'unpaid') { response.status(409).json({ error: 'Only unpaid invoices can be sent for M-Pesa payment.' }); return }
+    if (!Number.isSafeInteger(invoiceAmount) || invoiceAmount < 1) { response.status(400).json({ error: 'M-Pesa STK Push requires a whole-number KSh invoice amount.' }); return }
+
+    const paymentId = randomUUID()
+    await pool!.query('INSERT INTO mpesa_payment_requests (id, workspace_id, invoice_id, customer_phone, amount, status) VALUES ($1, $2, $3, $4, $5, $6)', [paymentId, request.session!.workspaceId, request.params.invoiceId, phone, invoiceAmount.toFixed(2), 'initiating'])
+    const timestamp = darajaTimestamp()
+    try {
+      const result = await darajaPost('/mpesa/stkpush/v1/processrequest', {
+        BusinessShortCode: mpesaConfig.shortcode,
+        Password: mpesaPassword(timestamp),
+        Timestamp: timestamp,
+        TransactionType: mpesaConfig.transactionType,
+        Amount: invoiceAmount,
+        PartyA: phone,
+        PartyB: mpesaConfig.shortcode,
+        PhoneNumber: phone,
+        CallBackURL: mpesaConfig.callbackUrl,
+        AccountReference: `KF-${String(request.params.invoiceId).replace(/-/g, '').slice(0, 10)}`,
+        TransactionDesc: 'Invoice payment',
+      })
+      const checkoutRequestId = String(result.CheckoutRequestID ?? '')
+      if (String(result.ResponseCode ?? '') !== '0' || !checkoutRequestId) throw new Error(String(result.ResponseDescription ?? 'Daraja did not accept the STK Push request.'))
+      await pool!.query('UPDATE mpesa_payment_requests SET status = $1, merchant_request_id = $2, checkout_request_id = $3 WHERE id = $4', ['pending', String(result.MerchantRequestID ?? ''), checkoutRequestId, paymentId])
+      response.status(202).json({ payment: { id: paymentId, status: 'pending' }, customerMessage: String(result.CustomerMessage ?? 'Check the customer’s phone and complete the M-Pesa prompt.') })
+    } catch (error) {
+      await pool!.query('UPDATE mpesa_payment_requests SET status = $1, result_description = $2 WHERE id = $3', ['failed', error instanceof Error ? error.message.slice(0, 500) : 'Daraja request failed.', paymentId])
+      response.status(502).json({ error: error instanceof Error ? error.message : 'Daraja could not start the payment request.' })
+    }
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/invoices/:invoiceId/payments/mpesa', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, status, amount::text, result_description, mpesa_receipt_number, created_at FROM mpesa_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 ORDER BY created_at DESC LIMIT 10', [request.params.invoiceId, request.session!.workspaceId])
+    response.json({ payments: result.rows })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/integrations/mpesa/callback', requirePool, rateLimit({ windowMs: 60_000, limit: 60 }), async (request, response, next) => {
+  const input = z.object({ Body: z.object({ stkCallback: z.object({ CheckoutRequestID: z.string().min(1), ResultCode: z.union([z.number(), z.string()]), ResultDesc: z.string().optional(), CallbackMetadata: z.object({ Item: z.array(z.object({ Name: z.string(), Value: z.union([z.string(), z.number()]).optional() })) }).optional() }).passthrough() }).passthrough() }).passthrough().safeParse(request.body)
+  if (!input.success) { response.status(400).json({ ResultCode: 1, ResultDesc: 'Invalid callback payload.' }); return }
+  const callback = input.data.Body.stkCallback
+  try {
+    const paymentResult = await pool!.query('SELECT id, invoice_id, workspace_id, amount::text, status FROM mpesa_payment_requests WHERE checkout_request_id = $1', [callback.CheckoutRequestID])
+    const payment = paymentResult.rows[0]
+    if (!payment) { response.status(200).json({ ResultCode: 0, ResultDesc: 'Callback received.' }); return }
+    if (payment.status === 'paid' || payment.status === 'failed') { response.status(200).json({ ResultCode: 0, ResultDesc: 'Callback already processed.' }); return }
+
+    const resultCode = String(callback.ResultCode)
+    const resultDescription = (callback.ResultDesc ?? '').slice(0, 500)
+    if (resultCode !== '0') {
+      await pool!.query('UPDATE mpesa_payment_requests SET status = $1, result_code = $2, result_description = $3, callback_received_at = now() WHERE id = $4', ['failed', resultCode, resultDescription, payment.id])
+      response.status(200).json({ ResultCode: 0, ResultDesc: 'Callback received.' })
+      return
+    }
+
+    const metadata = Object.fromEntries((callback.CallbackMetadata?.Item ?? []).map(({ Name, Value }) => [Name, Value]))
+    if (Number(metadata.Amount) !== Number(payment.amount) || !metadata.MpesaReceiptNumber) {
+      await pool!.query('UPDATE mpesa_payment_requests SET result_code = $1, result_description = $2, callback_received_at = now() WHERE id = $3', ['verification_required', 'Successful callback did not contain the expected amount and receipt number.', payment.id])
+      response.status(503).json({ ResultCode: 1, ResultDesc: 'Payment is awaiting verification.' })
+      return
+    }
+
+    const verification = await queryDarajaPayment(callback.CheckoutRequestID)
+    if (String(verification.ResultCode ?? '') !== '0') {
+      await pool!.query('UPDATE mpesa_payment_requests SET result_code = $1, result_description = $2, callback_received_at = now() WHERE id = $3', [String(verification.ResultCode ?? 'verification_pending'), String(verification.ResultDesc ?? 'Awaiting Daraja payment verification.').slice(0, 500), payment.id])
+      response.status(503).json({ ResultCode: 1, ResultDesc: 'Payment is awaiting verification.' })
+      return
+    }
+
+    const client = await pool!.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('UPDATE mpesa_payment_requests SET status = $1, result_code = $2, result_description = $3, mpesa_receipt_number = $4, callback_received_at = now() WHERE id = $5', ['paid', '0', resultDescription, String(metadata.MpesaReceiptNumber), payment.id])
+      await client.query('UPDATE invoices SET status = $1 WHERE id = $2 AND workspace_id = $3 AND status = $4', ['paid', payment.invoice_id, payment.workspace_id, 'unpaid'])
+      await client.query('COMMIT')
+      response.status(200).json({ ResultCode: 0, ResultDesc: 'Payment verified.' })
+    } catch (error) { await client.query('ROLLBACK'); next(error) }
+    finally { client.release() }
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/integrations/readiness', (_request, response) => {
+  const callbackIsSecure = env.MPESA_ENV !== 'production' || env.MPESA_CALLBACK_URL?.startsWith('https://') === true
+  const mpesaReady = mpesaConfigured && callbackIsSecure
+  response.json({ mode: mpesaReady ? 'mpesa_configured' : 'setup_required', integrations: [
+    { id: 'kra_etims', status: 'provider_and_kra_approval_required' },
+    { id: 'mpesa', status: mpesaReady ? `configured_${env.MPESA_ENV}` : 'daraja_credentials_and_callback_required' },
+    { id: 'bank_feeds', status: 'open_banking_provider_required' },
+    { id: 'paye_shif_nssf_ahl', status: 'verified_payroll_and_filing_provider_required' },
+  ], note: 'M-Pesa STK Push is enabled only when server-side Daraja credentials and a callback URL are configured; other listed integrations are not implemented.' })
+})
 app.use((_request, response) => response.status(404).json({ error: 'Not found' }))
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   if (error instanceof SyntaxError) { response.status(400).json({ error: 'Invalid JSON request body' }); return }
