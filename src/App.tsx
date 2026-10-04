@@ -85,6 +85,7 @@ function App() {
   const [account, setAccount] = useState<Account | null>(null)
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
   const [bootstrapAvailable, setBootstrapAvailable] = useState(false)
+  const [showSetupFlow, setShowSetupFlow] = useState(false)
   const [starting, setStarting] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -101,6 +102,7 @@ function App() {
         const status = await request<{ bootstrapAvailable: boolean }>('/v1/auth/status')
         if (!active) return
         setBootstrapAvailable(status.bootstrapAvailable)
+        setShowSetupFlow(status.bootstrapAvailable)
         try {
           const signedIn = await request<Account>('/v1/auth/me')
           if (!active) return
@@ -128,10 +130,10 @@ function App() {
   async function submitAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
-      const route = bootstrapAvailable ? '/v1/auth/bootstrap' : '/v1/auth/login'
-      const body = bootstrapAvailable ? credentials : { email: credentials.email, password: credentials.password }
+      const route = showSetupFlow ? '/v1/auth/bootstrap' : '/v1/auth/login'
+      const body = showSetupFlow ? credentials : { email: credentials.email, password: credentials.password }
       const signedIn = await request<Account>(route, { method: 'POST', body: JSON.stringify(body) })
-      setAccount(signedIn); setBootstrapAvailable(false); await refresh()
+      setAccount(signedIn); setBootstrapAvailable(false); setShowSetupFlow(false); await refresh()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not sign in.')
     } finally { setBusy(false) }
@@ -176,19 +178,33 @@ function App() {
   if (!account) return <div className="auth-screen">
     <form className="auth-card" onSubmit={submitAuth}>
       <Brand />
-      <p className="auth-intro">{bootstrapAvailable ? 'Create the first workspace account.' : 'Sign in to your business workspace.'}</p>
-      {bootstrapAvailable && <label className="field-label">Business name
+      <p className="auth-intro">{showSetupFlow ? 'Create the first workspace account.' : 'Sign in to your business workspace.'}</p>
+      {showSetupFlow && <label className="field-label">Business name
         <input required maxLength={120} value={credentials.businessName} onChange={(event) => setCredentials({ ...credentials, businessName: event.target.value })} />
       </label>}
       <label className="field-label">Admin email
         <input type="email" required autoComplete="username" value={credentials.email} onChange={(event) => setCredentials({ ...credentials, email: event.target.value })} />
       </label>
       <label className="field-label">Password
-        <input type="password" required minLength={bootstrapAvailable ? 12 : 1} autoComplete={bootstrapAvailable ? 'new-password' : 'current-password'} value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
-        {bootstrapAvailable && <small>Use at least 12 characters.</small>}
+        <input type="password" required minLength={showSetupFlow ? 12 : 1} autoComplete={showSetupFlow ? 'new-password' : 'current-password'} value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
+        {showSetupFlow && <small>Use at least 12 characters.</small>}
       </label>
       {error && <p className="form-error" role="alert">{error}</p>}
-      <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : bootstrapAvailable ? 'Create workspace' : 'Sign in'}</button>
+      <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : showSetupFlow ? 'Create workspace' : 'Sign in'}</button>
+      {!showSetupFlow && bootstrapAvailable && (
+        <p style={{ marginTop: '12px', textAlign: 'center' }}>
+          <button type="button" style={{ background: 'transparent', border: 'none', color: '#5f46ca', fontWeight: 600, cursor: 'pointer', padding: 0 }} onClick={() => setShowSetupFlow(true)}>
+            Create admin email and password
+          </button>
+        </p>
+      )}
+      {showSetupFlow && (
+        <p style={{ marginTop: '12px', textAlign: 'center' }}>
+          <button type="button" style={{ background: 'transparent', border: 'none', color: '#5f46ca', fontWeight: 600, cursor: 'pointer', padding: 0 }} onClick={() => setShowSetupFlow(false)}>
+            Use sign in instead
+          </button>
+        </p>
+      )}
       <p className="auth-note">Your records are stored in your connected database. No external provider connections are enabled.</p>
     </form>
   </div>
