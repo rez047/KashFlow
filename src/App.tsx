@@ -25,7 +25,7 @@ const descriptions: Record<string, string> = {
   Banking: 'Bank feeds are not configured. Manually entered records remain available in the workspace ledger.',
   Sales: 'Create and track internal invoices saved in your workspace.',
   Expenses: 'Record and review expenses entered in your workspace.',
-  Payroll: 'Payroll records and statutory calculations are not configured.',
+  Payroll: 'Run a non-persisting, versioned Kenya payroll estimate. This is not payroll processing or statutory filing.',
   Customers: 'Customer details are recorded as part of invoices.',
   Suppliers: 'Supplier management has not been configured yet.',
   Inventory: 'Inventory management has not been configured yet.',
@@ -48,6 +48,12 @@ type Dashboard = {
 }
 type Account = { user: { email: string }; workspace: { id: string; name: string }; workspaces?: Array<{ id: string; name: string; role: string }> }
 type IntegrationReadiness = { integrations: Array<{ id: string; status: string }> }
+type PayrollEstimate = {
+  ruleSet: string; effectiveFrom: string; reviewRequired: true; grossMonthlyPay: number
+  nssfEmployee: number; shifEmployee: number; housingLevyEmployee: number; taxablePayEstimate: number
+  payeEstimate: number; netPayEstimate: number; nssfEmployer: number; housingLevyEmployer: number
+  employerPayrollCostEstimate: number; assumptions: string[]
+}
 type Modal = 'invoice' | 'transaction' | 'business' | 'invite' | null
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -99,6 +105,8 @@ function App() {
   const [transaction, setTransaction] = useState({ description: '', amount: '', direction: 'expense', account: '', date: today })
   const [invoice, setInvoice] = useState({ customer: '', description: '', amount: '', dueDate: '' })
   const [paymentPhone, setPaymentPhone] = useState('')
+  const [payrollInput, setPayrollInput] = useState({ grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0' })
+  const [payrollEstimate, setPayrollEstimate] = useState<PayrollEstimate | null>(null)
 
   const refresh = useCallback(async () => setDashboard(await request<Dashboard>('/v1/dashboard')), [])
 
@@ -213,6 +221,18 @@ function App() {
       setError(reason instanceof Error ? reason.message : 'Could not save invoice.')
     } finally { setBusy(false) }
   }
+
+  async function calculatePayroll(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError(''); setPayrollEstimate(null)
+    try {
+      const result = await request<PayrollEstimate>('/v1/payroll/kenya/estimate', { method: 'POST', body: JSON.stringify({ grossMonthlyPay: Number(payrollInput.grossMonthlyPay), otherTaxableDeductions: Number(payrollInput.otherTaxableDeductions), otherTaxReliefs: Number(payrollInput.otherTaxReliefs) }) })
+      setPayrollEstimate(result)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not calculate the payroll estimate.')
+    } finally { setBusy(false) }
+  }
+
+  const payrollMoney = (value: number) => `KSh ${value.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 
   const filtered = useMemo(() => (dashboard?.transactions ?? []).filter((row) =>
     `${row.description} ${row.account} ${row.direction}`.toLowerCase().includes(search.toLowerCase())), [dashboard, search])
@@ -354,7 +374,7 @@ function App() {
                   { name: 'KRA eTIMS', detail: 'Adapter, certification, and credentials not configured', status: 'Inactive', configured: false },
                   { name: 'Safaricom Daraja / M-Pesa', detail: mpesaConfigured ? `STK Push configured (${mpesaStatus.replace('configured_', '')})` : 'Credentials and public callback not configured', status: mpesaConfigured ? mpesaStatus.replace('configured_', '') : 'Inactive', configured: mpesaConfigured },
                   { name: 'Bank feeds', detail: 'Open banking provider not selected', status: 'Inactive', configured: false },
-                  { name: 'PAYE · SHIF · NSSF · AHL', detail: 'Verified calculations and filing route not implemented', status: 'Inactive', configured: false },
+                  { name: 'PAYE · SHIF · NSSF · AHL', detail: 'Versioned estimates available; filing not implemented', status: 'Estimate only', configured: false },
                 ].map(({ name, detail, status, configured }) => <div className="integration-row" key={name}>
                   <span className="compliance-icon blue"><Building2 size={16} /></span><span className="compliance-copy"><strong>{name}</strong><small>{detail}</small></span><span className={`status-pill ${configured ? 'green' : 'amber'}`}>{status}</span>
                 </div>)}
@@ -385,11 +405,40 @@ function App() {
             </article>
           </section>
           <footer className="page-footer"><span>© 2026 KashFlow Technologies</span><span><i className="secure-dot" /> Private workspace</span><button onClick={() => void logout()}>Sign out</button></footer>
-        </> : <section className="module-page">
+        </> : page === 'Payroll' ? <section className="module-page">
+          <div className="eyebrow"><span className="live-dot" /> KENYA PAYROLL ESTIMATE · {dashboard?.workspaceName}</div>
+          <h1>Payroll estimate</h1>
+          <p className="welcome-subtitle">Estimate employee NSSF, SHIF, Affordable Housing Levy, PAYE, and net pay using a dated rule set. Nothing entered here is saved.</p>
+          <div className="module-card">
+            <form onSubmit={calculatePayroll}>
+              <label className="field-label">Gross monthly pay (KSh)
+                <input required type="number" min="0" step="0.01" value={payrollInput.grossMonthlyPay} onChange={(event) => setPayrollInput({ ...payrollInput, grossMonthlyPay: event.target.value })} />
+              </label>
+              <div className="field-row">
+                <label className="field-label">Other allowable taxable deductions (KSh)
+                  <input type="number" min="0" step="0.01" value={payrollInput.otherTaxableDeductions} onChange={(event) => setPayrollInput({ ...payrollInput, otherTaxableDeductions: event.target.value })} />
+                </label>
+                <label className="field-label">Other tax reliefs (KSh)
+                  <input type="number" min="0" step="0.01" value={payrollInput.otherTaxReliefs} onChange={(event) => setPayrollInput({ ...payrollInput, otherTaxReliefs: event.target.value })} />
+                </label>
+              </div>
+              {error && <p className="form-error" role="alert">{error}</p>}
+              <button className="button button-primary" disabled={busy}>{busy ? 'Calculating…' : 'Calculate estimate'}</button>
+            </form>
+            {payrollEstimate && <div className="invoice-summary" aria-live="polite">
+              <strong>{payrollEstimate.ruleSet} · effective {payrollEstimate.effectiveFrom}</strong>
+              <p>Employee NSSF: {payrollMoney(payrollEstimate.nssfEmployee)} · SHIF: {payrollMoney(payrollEstimate.shifEmployee)} · employee AHL: {payrollMoney(payrollEstimate.housingLevyEmployee)}</p>
+              <p>Estimated PAYE: {payrollMoney(payrollEstimate.payeEstimate)} · estimated net pay: {payrollMoney(payrollEstimate.netPayEstimate)}</p>
+              <p>Employer NSSF: {payrollMoney(payrollEstimate.nssfEmployer)} · employer AHL: {payrollMoney(payrollEstimate.housingLevyEmployer)} · estimated employer cost: {payrollMoney(payrollEstimate.employerPayrollCostEstimate)}</p>
+              <ul>{payrollEstimate.assumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}</ul>
+            </div>}
+          </div>
+          <div className="module-footnote"><ShieldCheck size={16} /> Planning estimate only, not statutory payroll output or filing. Have current rates and individual relief eligibility reviewed by a qualified Kenyan payroll/tax professional.</div>
+        </section> : <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> WORKSPACE</div><h1>{page}</h1><p className="welcome-subtitle">{descriptions[page] ?? 'This module is not configured yet.'}</p>
           <div className="module-card"><div className="module-icon"><ShieldCheck size={23} /></div>
             <h2>{page === 'Kenya compliance' ? 'Integrations are inactive' : `${page} is not implemented yet`}</h2>
-            <p>{page === 'Kenya compliance' ? 'No KRA/eTIMS, bank, M-Pesa, or statutory filing provider is connected. Saved manual records remain available in your workspace.' : 'This area does not yet have live functionality. Use the overview to add a transaction or invoice to your workspace database.'}</p>
+            <p>{page === 'Kenya compliance' ? 'KRA/eTIMS and bank feeds are not connected, and statutory filing is unavailable. The payroll module provides estimates only. Saved manual records remain available in your workspace.' : 'This area does not yet have live functionality. Use the overview to add a transaction or invoice to your workspace database.'}</p>
             <div className="module-actions"><button className="button button-secondary" onClick={() => setPage('Overview')}>Back to overview</button></div>
           </div>
           <div className="module-footnote"><ShieldCheck size={16} /> Only records you or an authorized integration save to this workspace are displayed.</div>

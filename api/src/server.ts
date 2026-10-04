@@ -6,6 +6,7 @@ import rateLimit from 'express-rate-limit'
 import helmet from 'helmet'
 import { Pool } from 'pg'
 import { z } from 'zod'
+import { estimateKenyaPayroll } from './domain/kenyaPayroll.js'
 
 const scrypt = promisify(scryptCallback)
 const envSchema = z.object({
@@ -401,6 +402,16 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, async (reque
   } catch (error) { next(error) }
 })
 
+app.post('/v1/payroll/kenya/estimate', requirePool, verifyOrigin, requireSession, (request, response) => {
+  const input = z.object({
+    grossMonthlyPay: z.coerce.number().finite().min(0).max(1_000_000_000),
+    otherTaxableDeductions: z.coerce.number().finite().min(0).max(1_000_000_000).default(0),
+    otherTaxReliefs: z.coerce.number().finite().min(0).max(1_000_000_000).default(0),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide non-negative monthly gross pay and optional allowable deduction/relief amounts.' }); return }
+  response.json(estimateKenyaPayroll(input.data))
+})
+
 app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, requireSession, rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request: AuthedRequest, response, next) => {
   if (!mpesaConfigured) { response.status(503).json({ error: 'M-Pesa is not configured. Set all required MPESA_* API environment variables and a public callback URL.' }); return }
   if (env.MPESA_ENV === 'production' && !env.MPESA_CALLBACK_URL!.startsWith('https://')) { response.status(503).json({ error: 'Production Daraja requires a public HTTPS MPESA_CALLBACK_URL.' }); return }
@@ -502,9 +513,10 @@ app.get('/v1/integrations/readiness', (_request, response) => {
   response.json({ mode: mpesaReady ? 'mpesa_configured' : 'setup_required', integrations: [
     { id: 'kra_etims', status: 'provider_and_kra_approval_required' },
     { id: 'mpesa', status: mpesaReady ? `configured_${env.MPESA_ENV}` : 'daraja_credentials_and_callback_required' },
-    { id: 'bank_feeds', status: 'open_banking_provider_required' },
-    { id: 'paye_shif_nssf_ahl', status: 'verified_payroll_and_filing_provider_required' },
-  ], note: 'M-Pesa STK Push is enabled only when server-side Daraja credentials and a callback URL are configured; other listed integrations are not implemented.' })
+    { id: 'bank_feeds', status: 'licensed_open_banking_provider_required' },
+    { id: 'payroll_estimates', status: 'versioned_estimator_available_professional_review_required' },
+    { id: 'paye_shif_nssf_ahl_filing', status: 'statutory_filing_not_implemented' },
+  ], note: 'M-Pesa STK Push is enabled only when server-side Daraja credentials and a callback URL are configured. Kenya payroll estimates are not certified payroll outputs; KRA eTIMS, bank feeds, and statutory filing are unavailable.' })
 })
 app.use((_request, response) => response.status(404).json({ error: 'Not found' }))
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {

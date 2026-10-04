@@ -10,6 +10,7 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 - Saves manual income/expense records and internal invoice records to PostgreSQL.
 - Shows saved transactions, monthly totals, a daily cash-flow chart, and unpaid invoice totals.
 - Can initiate a Safaricom Daraja M-Pesa STK Push for a whole-KSh unpaid invoice when merchant credentials and a public callback URL are configured; it verifies the callback with Daraja's STK Query API before marking the invoice paid.
+- Provides a non-persisting, versioned Kenya payroll estimate API and Payroll screen for PAYE, employee/employer NSSF, SHIF, and Affordable Housing Levy, with explicit assumptions and review warnings.
 - Lets an administrator record an invitation with an email, built-in or custom role label, and target scope of the active business or all businesses they administer.
 - Uses Kenyan Shillings (KSh) in the finance UI and describes the intended local compliance integrations transparently.
 
@@ -17,17 +18,13 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 
 Do not treat UI labels, environment variables, or saved invitation records as working third-party integrations. The current repository does **not** include:
 
-- A KRA/eTIMS adapter, certification, live invoice submission, fiscal-device integration, or production credentials.
-- KRA/eTIMS integration, certification, live invoice submission, fiscal-device integration, or production credentials.
-- M-Pesa settlement/reconciliation, refunds, disbursements, or production verification of merchant account setup. Daraja STK Push works only with the optional server-side variables below and is not active until configured and tested.
-- Bank-feed providers, OAuth connections, transaction imports, or reconciliation.
-- Payroll processing or verified PAYE, SHIF, NSSF, or Affordable Housing Levy calculations/filing.
+- Payroll processing, payroll data storage, payroll runs, employee records, payslips, remittance payments, or statutory filing. The estimator accepts aggregate calculation inputs in memory only; its dated formula snapshot is not certified for payroll use, and rates/tax eligibility require professional verification.
 - Double-entry journal posting, chart of accounts, trial balance, financial statements, or period close.
 - Invoice email/delivery, customer payment collection, or complete payment/status management.
 - Invitation email delivery, invitation acceptance, membership provisioning, or fine-grained permission enforcement. Custom role values are labels only; invitation scope is recorded but does not grant the invitee access.
 - Automated backup/restore tools, audited integration-credential vault, document storage, inventory, projects, or a full audit trail.
 
-Only the M-Pesa STK Push status can become configured when its server-side Daraja settings are present; this does not certify live payments. KRA/eTIMS, bank feeds, and statutory filing remain unavailable. Production use requires qualified Kenyan accounting/payroll review, security/privacy review, provider onboarding, operational monitoring, and tested backup and recovery. Do not enter sensitive payroll, tax, banking, or personal data until those controls are in place.
+M-Pesa STK Push can become configured when its server-side Daraja settings are present; this does not certify live payments. Payroll offers estimates only, and KRA/eTIMS, bank feeds, payroll processing, and statutory filing remain unavailable. Production use requires qualified Kenyan accounting/payroll review, security/privacy review, provider onboarding, operational monitoring, and tested backup and recovery. Do not enter sensitive payroll, tax, banking, or personal data until those controls are in place.
 
 ## Deploy to Render (Blueprint)
 
@@ -69,18 +66,20 @@ These are the variables used by the **current code**. The Blueprint sets or link
 | `SESSION_SECRET` | API | Yes in production | Random secret, minimum 32 characters, used to sign sessions. Generate in Render; never commit or expose to the frontend. |
 | `VITE_API_BASE_URL` | Static site build | Yes | Public base URL for the API; not a secret. Vite embeds it in the browser build. |
 | `MPESA_ENV` | API | Optional | `sandbox` (default) or `production`. Do not select production until Safaricom has approved and provided live merchant details. |
-| `MPESA_CONSUMER_KEY` | API | Required for STK Push | Daraja app consumer key. Server-side secret/config only. |
+| `MPESA_CONSUMER_KEY` | API | Required for STK Push | Daraja app consumer key. Server-side configuration only. |
 | `MPESA_CONSUMER_SECRET` | API | Required for STK Push | Daraja app consumer secret. Keep private. |
 | `MPESA_SHORTCODE` | API | Required for STK Push | PayBill/Till shortcode enabled for the selected STK transaction type. |
 | `MPESA_PASSKEY` | API | Required for STK Push | Daraja STK Push passkey for that shortcode. Keep private. |
 | `MPESA_CALLBACK_URL` | API | Required for STK Push | Public callback URL ending `/v1/integrations/mpesa/callback`; production must use HTTPS and be reachable by Safaricom. |
 | `MPESA_TRANSACTION_TYPE` | API | Optional | `CustomerPayBillOnline` (default) or `CustomerBuyGoodsOnline`, according to merchant configuration. |
 
+Payroll estimation is available through the authenticated `POST /v1/payroll/kenya/estimate` endpoint and the Payroll screen. Rule set `KE-2026-01` (snapshot effective `2026-02-01`) uses employee/employer NSSF at 6% of pensionable pay up to KSh 108,000; employee SHIF at 2.75% with a KSh 300 minimum when gross pay is positive; employee and employer Housing Levy at 1.5% each; monthly resident PAYE bands of 10% on the first KSh 24,000, 25% on the next KSh 8,333, 30% on the next KSh 467,667, 32.5% on the next KSh 300,000, and 35% thereafter; and monthly personal relief up to KSh 2,400. These values are a code snapshot, not auto-updated legal rules. The estimator accepts aggregate values in memory, does not use environment variables, and does not persist inputs. Before relying on it, check current KRA, NSSF and SHA guidance, confirm staff-specific eligibility and deductions, and obtain qualified review. There is no payroll processing, remittance, or statutory filing configuration yet.
+
 No first-admin email/password is provided or required: the first user chooses these from the homepage. The API also uses local defaults for `NODE_ENV`, `PORT`, and `FRONTEND_ORIGIN` during development; production must have the required values above. For local development, copy [api/.env.example](api/.env.example) to `api/.env`, set `DATABASE_URL` and a random `SESSION_SECRET`, then copy [.env.example](.env.example) to `.env.local` and set `VITE_API_BASE_URL=http://localhost:3001`. The development-only in-memory `pg-mem` fallback loses data when the API restarts; do not use it for deployment.
 
 ### Other provider-specific variables (not implemented)
 
-There are no current KRA/eTIMS, bank-feed/open-banking, email-delivery, payroll, SHIF, NSSF, or Affordable Housing Levy adapters, so this repository does not define variables that can activate those services. KRA/eTIMS requires the appropriate KRA onboarding, device/API specification, certificates or credentials, and certification; payroll/statutory processing needs versioned calculations reviewed by qualified Kenyan professionals and authorized filing routes; bank feeds require selecting and onboarding a licensed provider. Do not invent environment variable names or store unrelated credentials hoping to enable these systems. Store all secrets only in server-side Render environment settings or an approved encrypted vault—not in `VITE_*`, source control, or README values.
+There is no current KRA/eTIMS, bank-feed/open-banking, email-delivery, or statutory filing adapter. As a result, this app has no KRA, bank, SHIF, NSSF, or AHL credential variable names to list or enter; adding arbitrary variables cannot enable unavailable code. KRA/eTIMS requires appropriate KRA onboarding, device/API specification, certificates or credentials, and certification; bank feeds require choosing and onboarding a licensed provider; payroll filing requires reviewed calculations and an authorized filing route. Do not invent variable names or store unrelated credentials hoping to enable these systems. Store secrets only in server-side Render settings or an approved encrypted vault—not in `VITE_*`, source control, or README values.
 
 The implemented M-Pesa setup flow covers invoice STK Push and callback/query verification only. It does not offer full merchant reconciliation, refunds, settlement reporting, or guarantee provider approval. A manual invoice is still not an eTIMS invoice.
 
