@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
 import {
-  Activity, ArrowDownLeft, ArrowRight, ArrowUpRight, Bell, BookOpen,
+  Activity, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Bell, BookOpen,
   BriefcaseBusiness, Building2, CalendarDays, Check, ChevronRight, CircleHelp,
   FileText, Filter, Gauge, Landmark, LayoutDashboard,
   LifeBuoy, LogOut, Menu, MoreHorizontal, Package, Plus, Search, Settings2,
@@ -117,6 +117,7 @@ function Brand() {
 
 function App() {
   const [page, setPage] = useState('Overview')
+  const [pageHistory, setPageHistory] = useState<string[]>([])
   const [search, setSearch] = useState('')
   const [modal, setModal] = useState<Modal>(null)
   const [toast, setToast] = useState('')
@@ -187,6 +188,19 @@ function App() {
     nssfEnabled: false,
     ahlEnabled: false,
   })
+
+  function navigateTo(nextPage: string) {
+    if (nextPage === page) return
+    setPageHistory((history) => [...history, page])
+    setPage(nextPage)
+  }
+
+  function navigateBack() {
+    const previous = pageHistory.at(-1)
+    if (!previous) { setPage('Overview'); return }
+    setPageHistory((history) => history.slice(0, -1))
+    setPage(previous)
+  }
 
   const refresh = useCallback(async () => setDashboard(await request<Dashboard>('/v1/dashboard')), [])
 
@@ -310,7 +324,7 @@ function App() {
 
   async function logout() {
     try { await request('/v1/auth/logout', { method: 'POST' }) } catch { /* Discard an expired local session. */ }
-    setAccount(null); setDashboard(null); setPage('Overview')
+    setAccount(null); setDashboard(null); setPageHistory([]); setPage('Overview')
   }
 
   async function createBusiness(event: FormEvent<HTMLFormElement>) {
@@ -773,10 +787,10 @@ function App() {
   </div>
 
   const metricCards = [
-    { title: 'Income this month', value: dashboard?.totals.monthIncome ?? '0', Icon: ArrowDownLeft, tone: 'purple-icon' },
-    { title: 'Expenses this month', value: dashboard?.totals.monthExpenses ?? '0', Icon: ArrowUpRight, tone: 'peach-icon' },
-    { title: 'Net movement', value: dashboard?.totals.monthNet ?? '0', Icon: Gauge, tone: 'blue-icon' },
-    { title: 'Unpaid invoices', value: dashboard?.invoices.unpaid_amount ?? '0', Icon: Wallet, tone: 'mint-icon' },
+    { title: 'Income this month', value: dashboard?.totals.monthIncome ?? '0', Icon: ArrowDownLeft, tone: 'purple-icon', destination: 'Accounting' },
+    { title: 'Expenses this month', value: dashboard?.totals.monthExpenses ?? '0', Icon: ArrowUpRight, tone: 'peach-icon', destination: 'Expenses' },
+    { title: 'Net movement', value: dashboard?.totals.monthNet ?? '0', Icon: Gauge, tone: 'blue-icon', destination: 'Accounting' },
+    { title: 'Unpaid invoices', value: dashboard?.invoices.unpaid_amount ?? '0', Icon: Wallet, tone: 'mint-icon', destination: 'Sales' },
   ]
 
   return <div className="app-shell">
@@ -790,15 +804,15 @@ function App() {
       <button className="nav-link bottom-link" onClick={() => { setModal('business'); setSidebarOpen(false) }}><Plus size={18} /> Add business</button>
       <nav className="side-nav" aria-label="Main navigation">
         {groups.map((group) => <div className="nav-group" key={group.title}><p className="nav-heading">{group.title}</p>
-          {group.items.map(([name, Icon]) => <button key={name} className={`nav-link ${page === name ? 'active' : ''}`} onClick={() => { setPage(name); setSidebarOpen(false) }}>
+          {group.items.map(([name, Icon]) => <button key={name} className={`nav-link ${page === name ? 'active' : ''}`} onClick={() => { navigateTo(name); setSidebarOpen(false) }}>
             <Icon size={18} strokeWidth={1.8} /><span>{name}</span>
           </button>)}
         </div>)}
       </nav>
       <div className="sidebar-bottom">
         <div className="help-card"><div className="help-icon"><ShieldCheck size={16} /></div><strong>Private workspace</strong><p>Records you enter are saved to your account database.</p></div>
-        <button className="nav-link bottom-link" onClick={() => setPage('Settings')}><Settings2 size={18} /> Settings</button>
-        <button className="nav-link bottom-link" onClick={() => setPage('Help')}><LifeBuoy size={18} /> Help & support</button>
+        <button className="nav-link bottom-link" onClick={() => navigateTo('Settings')}><Settings2 size={18} /> Settings</button>
+        <button className="nav-link bottom-link" onClick={() => navigateTo('Help')}><LifeBuoy size={18} /> Help & support</button>
         <div className="profile-row"><div className="profile-avatar">{account.user.email.slice(0, 1).toUpperCase()}</div>
           <div className="profile-copy"><strong>{account.user.email}</strong><small>{account.workspaces?.length ? `Business admin • ${account.workspaces.length} businesses` : 'Workspace admin'}</small></div>
           <button className="icon-button" onClick={() => void logout()} aria-label="Sign out"><LogOut size={16} /></button>
@@ -813,12 +827,13 @@ function App() {
         <div className="topbar-actions">
           <label className="search-box"><Search size={16} /><input aria-label="Search saved transactions" placeholder="Search records, settings, or help..." value={search} onChange={(event) => setSearch(event.target.value)} /><kbd>⌘ K</kbd></label>
           <button className="icon-button notification-button" aria-label="Workspace status" onClick={() => setStatusOpen((open) => !open)}><Bell size={18} /></button>
-          <button className="top-help" onClick={() => setPage('Help')}><CircleHelp size={17} /><span>Help</span></button>
+          <button className="top-help" onClick={() => navigateTo('Help')}><CircleHelp size={17} /><span>Help</span></button>
         </div>
         {statusOpen && <div className="notification-popover"><strong>{mpesaConfigured ? 'Daraja STK Push configured' : 'No external services connected'}</strong><p>Saved records are available in this workspace. KRA/eTIMS, bank feeds, and statutory filing remain inactive; verify any M-Pesa payment with Daraja and your merchant statement.</p><button onClick={() => setStatusOpen(false)}>Close</button></div>}
       </header>
 
       <div className="content-wrap">
+        {page !== 'Overview' && <div className="page-navigation"><button className="button button-secondary" onClick={navigateBack}><ArrowLeft size={15} /> Back</button></div>}
         {page === 'Overview' ? <>
           <section className="welcome-row"><div><div className="eyebrow"><span className="live-dot" /> PRIVATE WORKSPACE</div>
             <h1>{dashboard?.workspaceName}</h1><p className="welcome-subtitle">Your saved records for this month.</p>
@@ -829,10 +844,10 @@ function App() {
           </div></section>
 
           <section className="metric-grid" aria-label="Saved business totals">
-            {metricCards.map(({ title, value, Icon, tone }) => <article className="metric-card" key={title}>
+            {metricCards.map(({ title, value, Icon, tone, destination }) => <button type="button" className="metric-card metric-card-link" key={title} onClick={() => navigateTo(destination)} aria-label={`Open ${title} details`}>
               <div className="metric-top"><span>{title}</span><span className={`metric-icon ${tone}`}><Icon size={17} /></span></div>
-              <div className="metric-value">{money(value)}</div><div className="metric-foot"><span>Calculated from saved records</span></div>
-            </article>)}
+              <div className="metric-value">{money(value)}</div><div className="metric-foot"><span>View related records <ArrowRight size={12} /></span></div>
+            </button>)}
           </section>
 
           <section className="panel intake-panel" aria-label="Document and bank intake">
@@ -876,7 +891,7 @@ function App() {
                   <Area type="monotone" dataKey="expense" stroke="#48b99e" strokeWidth={2.5} fill="url(#expenseFill)" />
                 </AreaChart>
               </ResponsiveContainer></div> : <div className="empty-chart">No transactions recorded this month. Add one to see cash flow.</div>}
-              <div className="chart-footer"><span><span className="status-dot" /> Database-backed records</span><button onClick={() => setPage('Reports')}>View reports <ArrowRight size={14} /></button></div>
+              <div className="chart-footer"><span><span className="status-dot" /> Database-backed records</span><button onClick={() => navigateTo('Reports')}>View reports <ArrowRight size={14} /></button></div>
             </article>
 
             <article className="panel compliance-panel">
@@ -1042,7 +1057,7 @@ function App() {
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.kraEtimsLiveEnabled} onChange={(event) => setSettings({ ...settings, kraEtimsLiveEnabled: event.target.checked })} /> Permit live KRA eTIMS usage for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.statutoryFilingsEnabled} onChange={(event) => setSettings({ ...settings, statutoryFilingsEnabled: event.target.checked })} /> Permit statutory filing routes for this business</label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.shifEnabled} onChange={(event) => setSettings({ ...settings, shifEnabled: event.target.checked })} /> Enable SHIF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.nssfEnabled} onChange={(event) => setSettings({ ...settings, nssfEnabled: event.target.checked })} /> Enable NSSF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.ahlEnabled} onChange={(event) => setSettings({ ...settings, ahlEnabled: event.target.checked })} /> Enable AHL route</label></div>
             {error && <p className="form-error" role="alert">{error}</p>}
-            <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setPage('Overview')}>Back</button><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
+            <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
           </form>
         </section> : page === 'Help' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> HELP & SUPPORT · {dashboard?.workspaceName}</div>
@@ -1091,7 +1106,6 @@ function App() {
           <div className="module-card"><div className="module-icon"><ShieldCheck size={23} /></div>
             <h2>{page === 'Kenya compliance' ? 'Integrations are inactive' : `${page} is not implemented yet`}</h2>
             <p>{page === 'Kenya compliance' ? 'KRA/eTIMS and bank feeds are not connected, and statutory filing is unavailable. The payroll module provides estimates only. Saved manual records remain available in your workspace.' : 'This area does not yet have live functionality. Use the overview to add a transaction or invoice to your workspace database.'}</p>
-            <div className="module-actions"><button className="button button-secondary" onClick={() => setPage('Overview')}>Back to overview</button></div>
           </div>
           <div className="module-footnote"><ShieldCheck size={16} /> Only records you or an authorized integration save to this workspace are displayed.</div>
         </section>}
