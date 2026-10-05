@@ -65,4 +65,4 @@ databases:
   - name: kashflow-db
     databaseName: kashflow
     user: kashflow
-    plan: basic-256mb
+    plan: free
