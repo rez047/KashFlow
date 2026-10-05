@@ -497,6 +497,12 @@ const workspaceRecordSchemas = {
   projects: z.object({ name: z.string().trim().min(1).max(160), customer: z.string().trim().max(160).default(''), status: z.enum(['planned', 'active', 'on_hold', 'completed']).default('planned'), startDate: z.string().date().or(z.literal('')).default(''), endDate: z.string().date().or(z.literal('')).default(''), budget: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
 }
 type WorkspaceRecordType = typeof workspaceRecordTypes[number]
+const workspaceRecordDatabaseTypes: Record<WorkspaceRecordType, string> = {
+  customers: 'customer',
+  suppliers: 'supplier',
+  inventory: 'inventory',
+  projects: 'project',
+}
 function parseRecordType(value: string): WorkspaceRecordType | null {
   return workspaceRecordTypes.find((type) => type === value) ?? null
 }
@@ -504,7 +510,7 @@ app.get('/v1/records/:type', requirePool, requireSession, async (request: Authed
   const type = parseRecordType(String(request.params.type ?? ''))
   if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
   try {
-    const result = await pool!.query('SELECT id, data, created_at, updated_at FROM workspace_records WHERE workspace_id = $1 AND record_type = $2 ORDER BY updated_at DESC', [request.session!.workspaceId, type.slice(0, -1)])
+    const result = await pool!.query('SELECT id, data, created_at, updated_at FROM workspace_records WHERE workspace_id = $1 AND record_type = $2 ORDER BY updated_at DESC', [request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
     response.json({ records: result.rows })
   } catch (error) { next(error) }
 })
@@ -514,7 +520,7 @@ app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, async (
   const input = workspaceRecordSchemas[type].safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Check the required name and field values.' }); return }
   try {
-    const result = await pool!.query('INSERT INTO workspace_records (workspace_id, record_type, data) VALUES ($1, $2, $3::jsonb) RETURNING id, data, created_at, updated_at', [request.session!.workspaceId, type.slice(0, -1), JSON.stringify(input.data)])
+    const result = await pool!.query('INSERT INTO workspace_records (workspace_id, record_type, data) VALUES ($1, $2, $3::jsonb) RETURNING id, data, created_at, updated_at', [request.session!.workspaceId, workspaceRecordDatabaseTypes[type], JSON.stringify(input.data)])
     response.status(201).json({ record: result.rows[0] })
   } catch (error) { next(error) }
 })
@@ -696,7 +702,7 @@ app.put('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession
   const input = workspaceRecordSchemas[type].safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Check the required name and field values.' }); return }
   try {
-    const result = await pool!.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3 AND record_type = $4 RETURNING id, data, created_at, updated_at', [JSON.stringify(input.data), request.params.recordId, request.session!.workspaceId, type.slice(0, -1)])
+    const result = await pool!.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3 AND record_type = $4 RETURNING id, data, created_at, updated_at', [JSON.stringify(input.data), request.params.recordId, request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
     if (!result.rowCount) { response.status(404).json({ error: 'Record not found in this workspace.' }); return }
     response.json({ record: result.rows[0] })
   } catch (error) { next(error) }
@@ -705,7 +711,7 @@ app.delete('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSess
   const type = parseRecordType(String(request.params.type ?? ''))
   if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
   try {
-    const result = await pool!.query('DELETE FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = $3 RETURNING id', [request.params.recordId, request.session!.workspaceId, type.slice(0, -1)])
+    const result = await pool!.query('DELETE FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = $3 RETURNING id', [request.params.recordId, request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
     if (!result.rowCount) { response.status(404).json({ error: 'Record not found in this workspace.' }); return }
     response.status(204).end()
   } catch (error) { next(error) }
