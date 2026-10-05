@@ -20,6 +20,8 @@ services:
         fromDatabase:
           name: kashflow-db
           property: connectionString
+      - key: DATABASE_SSL_MODE
+        value: require
       - key: MPESA_ENV
         value: sandbox
       - key: MPESA_CONSUMER_KEY

@@ -14,6 +14,7 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65_535).default(3001),
   FRONTEND_ORIGIN: z.string().url().default('http://localhost:5173'),
   DATABASE_URL: z.string().url().optional(),
+  DATABASE_SSL_MODE: z.enum(['verify-full', 'require']).default('verify-full'),
   SESSION_SECRET: z.string().min(32).optional(),
   PAYROLL_DATA_ENCRYPTION_KEY: z.string().min(32).optional(),
   MPESA_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
@@ -62,7 +63,12 @@ if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET |
   process.exit(1)
 }
 async function createPool() {
-  if (env.DATABASE_URL) return new Pool({ connectionString: env.DATABASE_URL, max: 5, ssl: env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : undefined })
+  if (env.DATABASE_URL) {
+    const ssl = env.NODE_ENV !== 'production'
+      ? undefined
+      : { rejectUnauthorized: env.DATABASE_SSL_MODE === 'verify-full' }
+    return new Pool({ connectionString: env.DATABASE_URL, max: 5, ssl })
+  }
   if (env.NODE_ENV === 'production') return undefined
 
   try {
