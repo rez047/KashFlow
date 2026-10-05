@@ -33,6 +33,24 @@ services:
         sync: false
       - key: MPESA_TRANSACTION_TYPE
         value: CustomerPayBillOnline
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: MONO_PUBLIC_KEY
+        sync: false
+      - key: MONO_SECRET_KEY
+        sync: false
+      - key: MONO_WEBHOOK_SECRET
+        sync: false
+      - key: MONO_SYNC_INTERVAL_MINUTES
+        value: "60"
+      - key: KRA_ETIMS_ENV
+        value: sandbox
+      - key: KRA_ETIMS_LIVE_ENABLED
+        value: "false"
+      - key: KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY
+        generateValue: true
 
   - type: web
     name: kashflow-frontend

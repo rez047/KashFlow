@@ -4,10 +4,17 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 
 ## What it currently does
 
-- Lets a business owner create the first administrator account from the homepage using a business name, email or phone number, and their own password.
+- Lets each new business owner self-register a separate workspace and administrator account from the homepage using a business name, email or phone number, and a password of at least 12 characters. Reusing an existing email/phone requires signing in.
 - Provides password sign-in, signed HttpOnly session cookies, and sign-out.
 - Lets a signed-in user create additional businesses/workspaces and switch to the newly created business.
 - Saves manual income/expense records and internal invoice records to PostgreSQL.
+- Provides workspace-scoped customer, supplier, inventory, and project records, plus private document upload/download/delete (5 MB maximum per file).
+- Supports reviewed CSV bank-statement import and balanced journal posting, and a Mono-backed bank connection/sync/review path when Mono business approval and server API keys are configured. Mono coverage lists Kenya; verify target banks in the Mono dashboard. Feed data is imported for review and is not auto-posted into accounting.
+- Provides workspace-scoped, self-reported onboarding milestone tracking for eTIMS, bank feeds, and statutory filing; milestones do not assert verified certification.
+- Saves eTIMS invoice and payroll statutory-preparation drafts. The **Submit to authority** action uses the implemented KRA OSCU adapter for validated fiscal payloads when the device is initialized; live production remains kill-switched pending KRA certification/approval. Statutory submissions remain blocked pending an authorized return adapter.
+- Implements KRA OSCU sandbox/production HTTP calls for device initialization, code-list retrieval, and sales fiscalization. Taxpayer/device/CMC-key material is AES-256-GCM encrypted using a dedicated API-side key. Production is default-disabled and requires an explicit server kill switch, initialized KRA device, certification evidence, and a validated fiscal payload. An accepted KRA response is recorded distinctly from invoice payment.
+- Provides business report charts for recorded income and expenses and a preview/printable internal invoice.
+- Can send invoice email through Resend when a server-side API key and verified sender are configured; accepted messages are audited, but delivery to the recipient is not guaranteed.
 - Shows saved transactions, monthly totals, a daily cash-flow chart, and unpaid invoice totals.
 - Can initiate a Safaricom Daraja M-Pesa STK Push for a whole-KSh unpaid invoice when merchant credentials and a public callback URL are configured; it verifies the callback with Daraja's STK Query API before marking the invoice paid.
 - Provides a versioned Kenya payroll estimator for PAYE, employee/employer NSSF, SHIF, and Affordable Housing Levy, with explicit assumptions and review warnings.
@@ -23,11 +30,68 @@ Do not treat UI labels, environment variables, or saved invitation records as wo
 
 - Automatic employee payments, statutory remittance transfers, or filing/submission to KRA, SHIF/SHA, NSSF, or AHL. Remittances are only tracked after an external payment is made; payroll formula rules require professional review.
 - Financial statements, account reconciliation, journal edits/reversals, and audit certification. Journal posting, chart, trial balance, and close/reopen are implemented but require accounting review.
-- Invoice emailing/delivery or non-M-Pesa payment collection. Daraja STK push handles an optional payment prompt; it is not full invoice payment management.
+- Statutory filing/remittance integrations for PAYE, AHL, SHIF, and NSSF. Saved payroll summaries and review attestations do not submit authority returns.
 - Invitation email delivery, invitation acceptance, membership provisioning, or fine-grained permission enforcement. Custom role values are labels only; invitation scope is recorded but does not grant the invitee access.
-- Automated backup/restore tools, audited integration-credential vault, document storage, inventory, projects, or a full audit trail.
+- Automated backup/restore tools or an audited integration-credential vault. Document storage, inventory, projects, and supported audit events are implemented, but still require operational review before production use.
 
-M-Pesa STK Push can become configured when server-side Daraja settings are present; this does not certify live payments. Payroll drafts and accounting journals now persist data, but payroll rates are estimates and statutory payments/filing are unavailable. Employee/payslip fields are AES-256-GCM encrypted with `PAYROLL_DATA_ENCRYPTION_KEY`; protecting, backing up, and recovering that key is essential. Production use requires qualified Kenyan accounting/payroll review, security/privacy review, provider onboarding, operational monitoring, and tested backups and recovery.
+Mono bank feeds have an implementation path and are enabled only after Mono business/KYB onboarding and `MONO_PUBLIC_KEY`/`MONO_SECRET_KEY` are configured on the API service. Users link via Mono-hosted consent. Mono's listed Kenya coverage does not guarantee every Kenyan bank is available to a particular Mono app/account. Webhook secret verification and scheduled sync import feed entries for review; posting to the ledger requires a separate user review. KRA OSCU now has a documented direct API client for device initialization, current code retrieval, and sale submissions. This is **not KRA-certified software** and is not production-enabled by default: test it only with approved KRA sandbox credentials. Before production, complete taxpayer/device registration, OSCU certification, and KRA production approval; configure `KRA_ETIMS_ENV=production`, the KRA-issued credential encryption key, and then deliberately enable `KRA_ETIMS_LIVE_ENABLED=true` in the API service. User-entered certification references are not independently verified by KashFlow. The invoice-to-fiscal-data mapping remains explicit and must be reviewed against current KRA codes/tax treatment before any submission. Network timeout after submit is treated as indeterminate and must be reconciled with KRA before retrying to avoid duplicates.
+
+Statutory PAYE/AHL/SHIF/NSSF filing is still **not implemented as an authority adapter**. KRA's public PAYE guidance specifies the iTax return-workbook validation/upload workflow; this app has no published or authorized machine-to-machine endpoint, official return template, or approved filing credentials. SHIF/SHA, NSSF and AHL routes also require confirmation from each authority or an authorized provider. We will not automate portal login/password scraping or claim these are filed. Supply the official authorized API/partner contract, sandbox credentials and qualified reviewed return mapping before implementing a submission adapter. Payroll calculations remain estimates.
+
+## Simple step-by-step: what it takes to make integrations live
+
+This checklist uses plain language and real provider-issued credentials only. **Do not enter made-up values.** Turning on a switch in Business settings or adding secrets in Render does not, by itself, make a provider connection safe or live.
+
+### Before you start: understand the current limit
+
+- Render environment variables belong to the whole API service. In the current app, Daraja and Mono credentials are shared by all workspaces using that service; they are not per-user credentials.
+- The API now checks workspace administrator membership and the saved business opt-in for M-Pesa payment initiation and Mono link/manual sync. Scheduled and webhook-triggered Mono syncs skip businesses that have opted out. Production KRA device operations and submissions also check the workspace opt-in. These controls do not make credentials per-business: Daraja and Mono credentials in Render remain shared by every workspace, so do not use one shared merchant/provider account for unrelated businesses without explicit provider authorization and separate tenant-level credential handling.
+- KRA OSCU has API code, but this app is not KRA-certified. Only use production after KRA has approved the taxpayer/device/software and the fiscal invoice mapping has been professionally checked.
+- PAYE, AHL, SHIF/SHA, and NSSF filing adapters are not implemented. No Render variable can make those filings live today. Payroll figures are estimates, and remittance references are manual records only.
+
+### Step 1 — Deploy the app with its database
+
+1. Deploy the Render Blueprint using the instructions in **Deploy to Render (Blueprint)** below.
+2. In the Render **API service → Environment** page, confirm `DATABASE_URL`, `SESSION_SECRET`, `PAYROLL_DATA_ENCRYPTION_KEY`, and `FRONTEND_ORIGIN` are set. Render generates secrets for some Blueprint values; keep them private and do not replace encryption keys after saving real data without a planned key migration.
+3. In the **frontend static site → Environment** page, set `VITE_API_BASE_URL` to the API's public HTTPS address. This is an address, not a secret.
+4. Deploy both services. Open the site, create the business administrator, and test sign-in, adding a transaction, and creating an internal invoice. These app features do not require a provider integration.
+
+### Step 2 — Pick one provider and complete its onboarding
+
+Use the provider's official dashboard and obtain credentials issued to your organization. Do not borrow credentials from another business.
+
+- **Daraja / M-Pesa:** Complete Safaricom merchant and Daraja app onboarding. For testing, obtain sandbox credentials. For real payments, obtain production approval, shortcode, passkey, and production app credentials.
+- **Mono bank feeds:** Complete Mono partner/business onboarding and KYB, obtain the app keys, and confirm the business's bank is supported. A bank user must still approve access in Mono's consent flow.
+- **KRA eTIMS:** Register the taxpayer/device, complete KRA sandbox tests and the applicable software certification/production approval. Have a qualified tax professional verify the fiscal invoice fields and tax mapping. Self-entered approval references are not independently verified by this app.
+- **Email (optional):** Verify a sending domain with Resend and create an API key.
+
+### Step 3 — Put that provider's values in Render (API service only)
+
+In Render, open **API service → Environment**, add the relevant variables below using the exact values from the provider, save, and redeploy the API. Never put secret values in the frontend or in this README.
+
+- **Daraja:** `MPESA_ENV=sandbox`, `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, `MPESA_SHORTCODE`, `MPESA_PASSKEY`, and `MPESA_CALLBACK_URL`. Set the callback to the exact public API address shown by Render, followed by `/v1/integrations/mpesa/callback`. Use production mode and live credentials only after Safaricom approval; the callback must be HTTPS. `MPESA_TRANSACTION_TYPE` is optional and must match the merchant account.
+- **Mono:** `MONO_PUBLIC_KEY`, `MONO_SECRET_KEY`, and a strong `MONO_WEBHOOK_SECRET`. Configure Mono's webhook destination using the exact public API address shown by Render, followed by `/v1/integrations/mono/webhook`. The secret key and webhook secret stay on the API.
+- **KRA sandbox:** `KRA_ETIMS_ENV=sandbox` and `KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY` (a separate, stable random secret of at least 32 characters). Save the taxpayer/device credentials in the Kenya compliance page and initialize the device only with KRA-approved sandbox credentials.
+- **KRA production:** Only after KRA has approved production, change to `KRA_ETIMS_ENV=production` and set `KRA_ETIMS_LIVE_ENABLED=true`; keep the encryption key configured and use the approved production taxpayer/device credentials. The server kill switch is a final operator gate, not a substitute for certification or workspace access checks.
+- **Resend email:** `RESEND_API_KEY` and `EMAIL_FROM`, with `EMAIL_FROM` matching a sender/domain verified by Resend.
+
+### Step 4 — Test without risking real money or tax filings
+
+1. Start with provider sandbox/test credentials wherever the provider offers them. Keep KRA in sandbox and Daraja in sandbox during development.
+2. Test a complete flow with your own authorized test account: consent or payment request, provider callback/webhook, status verification, and resulting records in the correct business workspace.
+3. Confirm failed, duplicate, delayed, and cancelled callbacks do not falsely mark a payment or invoice complete. Check provider dashboards as well as KashFlow; a green UI label alone is not proof of success.
+4. For KRA, reconcile every sandbox response with the KRA test environment. Do not treat a sandbox receipt as a fiscal invoice.
+5. Before production, have the relevant provider, qualified reviewer, and business owner approve the cutover. Test a small controlled transaction where applicable and reconcile it against the provider's own records.
+
+### Step 5 — Do not mistake workspace preferences for per-business credentials
+
+Workspace provider switches are enforced for the currently implemented live-provider actions, and provider mutations require a workspace administrator. However, Render credentials are still API-service-wide, rather than isolated per business. Separate provider accounts/credentials require a supported provider arrangement and an encrypted, audited tenant credential store; do not use a shared credential for unrelated businesses' live money movement or compliance submissions unless the provider contract expressly permits it and the tenant controls have been independently reviewed and tested.
+
+### What cannot be switched on yet
+
+- **Statutory submissions:** PAYE, AHL, SHIF/SHA, and NSSF need approved authority/provider routes, implemented adapters, official formats, credentials, qualified review, and end-to-end tests. These are not available by setting environment variables.
+- **Per-business live provider credentials:** Not supported for Daraja or Mono by the current shared Render environment configuration. The workspace toggles alone do not provide this.
+- **Certified KRA production service:** The app's OSCU client is not itself proof of KRA certification. Production use must wait for KRA's explicit approvals and completion of the workspace authorization and operational safeguards above.
 
 ## Deploy to Render (Blueprint)
 
@@ -49,6 +113,7 @@ The repository includes [render.yaml](render.yaml), which describes a static fro
 9. Keep Render's generated `PAYROLL_DATA_ENCRYPTION_KEY` stable and securely backed up. If changing it, first implement/execute a decrypt-and-re-encrypt rotation; replacing it directly strands existing encrypted employee/payslip rows.
 10. Before production data: configure and test database backups/restore, access and security policies, monitoring/alerts, privacy notices, domain/TLS settings, and incident recovery. The app does not currently provide backup tooling or invitation email delivery.
 11. Optional M-Pesa setup: complete Daraja merchant/app onboarding, add every `MPESA_*` value in the API service environment, set the callback to `https://<your-api-host>/v1/integrations/mpesa/callback`, redeploy the API, then test with sandbox credentials and a Safaricom-reachable HTTPS callback before considering production mode.
+12. Optional invoice email: verify a sending domain in Resend, create an API key, set `RESEND_API_KEY` and `EMAIL_FROM` in the API service environment, then redeploy. Send a test invoice to an address you control and inspect Resend logs. Never add either value to the frontend or source control.
 
 ### Render deployment troubleshooting
 
@@ -78,6 +143,15 @@ These are the variables used by the **current code**. The Blueprint sets or link
 | `MPESA_PASSKEY` | API | Required for STK Push | Daraja STK Push passkey for that shortcode. Keep private. |
 | `MPESA_CALLBACK_URL` | API | Required for STK Push | Public callback URL ending `/v1/integrations/mpesa/callback`; production must use HTTPS and be reachable by Safaricom. |
 | `MPESA_TRANSACTION_TYPE` | API | Optional | `CustomerPayBillOnline` (default) or `CustomerBuyGoodsOnline`, according to merchant configuration. |
+| `RESEND_API_KEY` | API | Optional for invoice email | Resend server API key. Keep it private and configure only after creating a Resend account. |
+| `EMAIL_FROM` | API | Required with `RESEND_API_KEY` | Sender address/domain verified in Resend (for example `billing@yourdomain.co.ke`). |
+| `MONO_PUBLIC_KEY` | API response to authenticated frontend | Optional for bank feeds | Mono app public key; returned by the server only when the Mono adapter is configured. |
+| `MONO_SECRET_KEY` | API | Required for bank feeds | Mono secret API key; never expose it in the browser or any `VITE_*` setting. |
+| `MONO_WEBHOOK_SECRET` | API | Recommended for event-driven account refresh | Shared webhook secret configured on the Mono app; callback URL is `https://<your-api-host>/v1/integrations/mono/webhook`. |
+| `MONO_SYNC_INTERVAL_MINUTES` | API | Optional | Connected account polling interval in minutes (15–1440; default 60). A single API instance is recommended for the in-process scheduler. |
+| `KRA_ETIMS_ENV` | API | Optional | `sandbox` (default) or `production`; select production only after KRA approves the OSCU device and integration. |
+| `KRA_ETIMS_LIVE_ENABLED` | API | Required for production sends | Explicit kill switch, default `false`. Set `true` only after KRA production certification and approval. |
+| `KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY` | API | Required to save OSCU device credentials | Independent stable 32+ character secret for AES-256-GCM encrypted taxpayer PIN, device serial, and KRA communication key. Back it up securely; never put it in Vite/frontend variables. |
 
 Payroll estimation is available through the authenticated `POST /v1/payroll/kenya/estimate` endpoint and Payroll screen. Rule set `KE-2026-01` (snapshot effective `2026-02-01`) uses employee/employer NSSF at 6% of pensionable earnings, capped at KSh 108,000; the KSh 9,000 lower earnings limit defines Tier I and is included in the contribution base. Other snapshot parameters are employee SHIF at 2.75% with a KSh 300 minimum when gross pay is positive; employee/employer Housing Levy at 1.5% each; monthly resident PAYE bands of 10% on the first KSh 24,000, 25% on the next KSh 8,333, 30% on the next KSh 467,667, 32.5% on the next KSh 300,000, and 35% thereafter; and monthly personal relief up to KSh 2,400. These values are a code snapshot, not auto-updated legal rules. Payroll runs persist employee and payslip fields encrypted with `PAYROLL_DATA_ENCRYPTION_KEY`. Before relying on results, check current official guidance and obtain qualified review. Remittance references are tracked manually; no statutory payments or filing are performed.
 
@@ -85,7 +159,9 @@ No first-admin email/password is provided or required: the first user chooses th
 
 ### Other provider-specific variables (not implemented)
 
-There is no current KRA/eTIMS, bank-feed/open-banking, email-delivery, or statutory filing adapter. As a result, this app has no KRA, bank, SHIF, NSSF, or AHL credential variable names to list or enter; adding arbitrary variables cannot enable unavailable code. KRA/eTIMS requires appropriate KRA onboarding, device/API specification, certificates or credentials, and certification; bank feeds require choosing and onboarding a licensed provider; payroll filing requires reviewed calculations and an authorized filing route. Do not invent variable names or store unrelated credentials hoping to enable these systems. Store secrets only in server-side Render settings or an approved encrypted vault—not in `VITE_*`, source control, or README values.
+The application has Resend invoice email and an optional Mono financial-data adapter. Mono requires partner dashboard registration, business/KYB approval, app keys, funded live API account, and checking institution coverage. KRA offers OSCU for always-online invoicing systems and VSCU for bulk invoicing that may not always be online. KRA's published path requires development, testing, vetting, and certification for self-integrators or software vendors. The taxpayer must be registered on eTIMS and choose OSCU/VSCU. Obtain KRA's specifications, register in its sandbox, complete required test cases, submit vendor/taxpayer information and supporting documents, pass vetting, and receive certification before issuing fiscal invoices. Begin at the [official eTIMS system-to-system integration page](https://www.kra.go.ke/business/etims-electronic-tax-invoice-management-system/learn-about-etims/etims-system-to-system-integration) and [eTIMS onboarding guide](https://www.kra.go.ke/business/etims-electronic-tax-invoice-management-system/learn-about-etims/how-to-onboard-on-etims). KRA's published PAYE process uses iTax: employers with a PAYE obligation download/complete and validate the official return workbook, upload the generated return package, and receive an acknowledgment; filing and payment are due by the 9th of the following month. This repository does not have an authorized statutory-return submission API or official current return templates. For SHIF/SHA, NSSF, and AHL, obtain the employer registration and submission route from each authority and any authorized provider in writing. Before implementing submission, obtain qualified Kenyan payroll/tax approval of the current rates, employee data mapping, return formats, error handling, payment references, and reconciliation. Never put secrets in `VITE_*`, source control, chat, or README values. Configure secrets only in server-side Render settings or an approved encrypted vault.
+
+The Kenya Compliance page now records the selected OSCU/VSCU solution, taxpayer PIN, sandbox/certification/production approval references, and separate PAYE/AHL/SHIF/NSSF filing-route declarations. It also records the statutory provider and route confirmation reference. These are operational tracking/evidence fields only; they are self-reported and do not prove approval. Statutory draft review requires reviewer name, qualification, professional registration/member number, review reference, and all four route declarations. The submit endpoint verifies those fields exist, then still fails closed because no certified KRA adapter or authorized statutory adapter is installed. Do not enter login passwords, private keys, API tokens, or certificates in those forms; issued secrets belong in server-side Render settings or an approved vault.
 
 The implemented M-Pesa setup flow covers invoice STK Push and callback/query verification only. It does not offer full merchant reconciliation, refunds, settlement reporting, or guarantee provider approval. A manual invoice is still not an eTIMS invoice.
 

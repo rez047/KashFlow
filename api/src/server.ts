@@ -23,6 +23,15 @@ const envSchema = z.object({
   MPESA_PASSKEY: z.string().trim().optional(),
   MPESA_CALLBACK_URL: z.string().url().optional(),
   MPESA_TRANSACTION_TYPE: z.enum(['CustomerPayBillOnline', 'CustomerBuyGoodsOnline']).default('CustomerPayBillOnline'),
+  RESEND_API_KEY: z.string().trim().optional(),
+  EMAIL_FROM: z.string().trim().max(200).optional(),
+  MONO_PUBLIC_KEY: z.string().trim().optional(),
+  MONO_SECRET_KEY: z.string().trim().optional(),
+  MONO_WEBHOOK_SECRET: z.string().trim().optional(),
+  MONO_SYNC_INTERVAL_MINUTES: z.coerce.number().int().min(15).max(1440).default(60),
+  KRA_ETIMS_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
+  KRA_ETIMS_LIVE_ENABLED: z.enum(['true', 'false']).default('false'),
+  KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY: z.string().min(32).optional(),
 })
 const parsed = envSchema.safeParse(process.env)
 if (!parsed.success) {
@@ -40,6 +49,12 @@ const mpesaConfig = {
   transactionType: env.MPESA_TRANSACTION_TYPE,
 }
 const mpesaConfigured = Object.values(mpesaConfig).every((value) => Boolean(value))
+const emailConfigured = Boolean(env.RESEND_API_KEY && env.EMAIL_FROM)
+const monoConfigured = Boolean(env.MONO_PUBLIC_KEY && env.MONO_SECRET_KEY)
+const kraEtimsLiveEnabled = env.KRA_ETIMS_ENV === 'production' && env.KRA_ETIMS_LIVE_ENABLED === 'true'
+const kraEtimsApiBase = env.KRA_ETIMS_ENV === 'production'
+  ? 'https://etims-api.kra.go.ke/etims-api'
+  : 'https://etims-api-sbx.kra.go.ke/etims-api'
 const mpesaApiBase = env.MPESA_ENV === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke'
 let cachedDarajaToken: { value: string; expiresAt: number } | undefined
 if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET || !env.PAYROLL_DATA_ENCRYPTION_KEY)) {
@@ -47,7 +62,7 @@ if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET |
   process.exit(1)
 }
 async function createPool() {
-  if (env.DATABASE_URL) return new Pool({ connectionString: env.DATABASE_URL, max: 5, ssl: env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined })
+  if (env.DATABASE_URL) return new Pool({ connectionString: env.DATABASE_URL, max: 5, ssl: env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : undefined })
   if (env.NODE_ENV === 'production') return undefined
 
   try {
@@ -83,6 +98,23 @@ const pool = await createPool()
 const app = express()
 const cookieName = 'kashflow_session'
 const sessionTtlSeconds = 60 * 60 * 12
+const defaultWorkspaceSettings = {
+  businessName: '',
+  currency: 'KES',
+  timezone: 'Africa/Nairobi',
+  invoiceTerms: 'Net 14',
+  emailAlerts: true,
+  auditTrail: true,
+  twoFactor: false,
+  backupSchedule: 'Daily automatic',
+  monoEnabled: false,
+  darajaEnabled: false,
+  kraEtimsLiveEnabled: false,
+  statutoryFilingsEnabled: false,
+  shifEnabled: false,
+  nssfEnabled: false,
+  ahlEnabled: false,
+} as const
 function nairobiToday() {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date())
   const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]))
@@ -179,6 +211,24 @@ function decryptPayrollData<T>(encoded: string): T {
   const plaintext = Buffer.concat([decipher.update(Buffer.from(dataText, 'base64')), decipher.final()]).toString('utf8')
   return JSON.parse(plaintext) as T
 }
+function kraCredentialKey() {
+  if (!env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY) throw new Error('Set KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY on the API service before storing KRA OSCU credentials.')
+  return createHash('sha256').update(env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY).digest()
+}
+function encryptKraCredentials(value: unknown) {
+  const nonce = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', kraCredentialKey(), nonce)
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value), 'utf8'), cipher.final()])
+  return `${nonce.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ciphertext.toString('base64')}`
+}
+function decryptKraCredentials<T>(encoded: string): T {
+  const [nonceText, tagText, dataText] = encoded.split(':')
+  if (!nonceText || !tagText || !dataText) throw new Error('Encrypted KRA credential record has an invalid format.')
+  const decipher = createDecipheriv('aes-256-gcm', kraCredentialKey(), Buffer.from(nonceText, 'base64'))
+  decipher.setAuthTag(Buffer.from(tagText, 'base64'))
+  const plaintext = Buffer.concat([decipher.update(Buffer.from(dataText, 'base64')), decipher.final()]).toString('utf8')
+  return JSON.parse(plaintext) as T
+}
 const defaultChartOfAccounts = [
   { code: '1000', name: 'Cash and bank', type: 'asset' },
   { code: '1100', name: 'Accounts receivable', type: 'asset' },
@@ -187,6 +237,7 @@ const defaultChartOfAccounts = [
   { code: '2110', name: 'SHIF payable', type: 'liability' },
   { code: '2120', name: 'NSSF payable', type: 'liability' },
   { code: '2130', name: 'Affordable Housing Levy payable', type: 'liability' },
+  { code: '2140', name: 'Other employee deductions payable', type: 'liability' },
   { code: '3000', name: 'Retained earnings', type: 'equity' },
   { code: '4000', name: 'Sales income', type: 'income' },
   { code: '5000', name: 'Salaries expense', type: 'expense' },
@@ -227,10 +278,14 @@ function requirePool(_request: express.Request, response: express.Response, next
   if (!pool) { response.status(503).json({ error: 'Database is not configured. Set DATABASE_URL.' }); return }
   next()
 }
-function requireSession(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
+async function requireSession(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
   request.session = readSession(cookies(request.headers.cookie)[cookieName]) ?? undefined
-  if (!request.session) { response.status(401).json({ error: 'Sign in to access this workspace.' }); return }
-  next()
+  if (!request.session) { response.status(401).json({ error: 'Authentication is required to access this workspace.' }); return }
+  try {
+    const membership = await pool!.query('SELECT 1 FROM workspace_members WHERE user_id = $1 AND workspace_id = $2', [request.session.userId, request.session.workspaceId])
+    if (!membership.rowCount) { response.status(401).json({ error: 'Workspace membership has been revoked or is no longer valid.' }); return }
+    next()
+  } catch (error) { next(error) }
 }
 async function requireWorkspaceAdmin(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
   try {
@@ -238,6 +293,20 @@ async function requireWorkspaceAdmin(request: AuthedRequest, response: express.R
     if (!result.rowCount) { response.status(403).json({ error: 'Workspace administrator access is required for this operation.' }); return }
     next()
   } catch (error) { next(error) }
+}
+function requireWorkspaceProviderPreference(preference: 'monoEnabled' | 'darajaEnabled' | 'kraEtimsLiveEnabled', productionOnly = false) {
+  return async (request: AuthedRequest, response: express.Response, next: express.NextFunction) => {
+    if (productionOnly && env.KRA_ETIMS_ENV !== 'production') { next(); return }
+    try {
+      const result = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId])
+      const preferences = result.rows[0]?.preferences ?? {}
+      if (preferences[preference] !== true) {
+        response.status(403).json({ error: `This business has not enabled ${preference === 'monoEnabled' ? 'Mono bank feeds' : preference === 'darajaEnabled' ? 'Daraja / M-Pesa' : 'live KRA eTIMS'} in its workspace settings.` })
+        return
+      }
+      next()
+    } catch (error) { next(error) }
+  }
 }
 function requirePayrollEncryption(_request: express.Request, response: express.Response, next: express.NextFunction) {
   if (!env.PAYROLL_DATA_ENCRYPTION_KEY) { response.status(503).json({ error: 'Encrypted payroll storage is unavailable until PAYROLL_DATA_ENCRYPTION_KEY is configured.' }); return }
@@ -298,9 +367,16 @@ async function queryDarajaPayment(checkoutRequestId: string) {
 }
 app.disable('x-powered-by')
 app.use(helmet())
-app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH'], allowedHeaders: ['Content-Type'] }))
-app.use(express.json({ limit: '32kb', type: 'application/json' }))
-app.use(rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-8', legacyHeaders: false }))
+app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type'] }))
+app.use(express.json({ limit: '8mb', type: 'application/json' }))
+app.use(rateLimit({
+  windowMs: 60_000,
+  limit: 240,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  skip: (request) => request.path.startsWith('/v1/auth/') || request.path === '/v1/integrations/mpesa/callback',
+  handler: (_request, response) => response.status(429).json({ error: 'This service received too many requests from this network. Please wait a minute and try again.' }),
+}))
 
 app.get('/healthz', async (_request, response) => {
   if (!pool) { response.status(503).json({ status: 'degraded', database: 'not_configured' }); return }
@@ -315,7 +391,7 @@ app.get('/v1/auth/status', requirePool, async (_request, response, next) => {
   } catch (error) { next(error) }
 })
 
-app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request, response, next) => {
+app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many account-creation attempts from this network. Please wait 15 minutes and try again.' } }), async (request, response, next) => {
   const input = z.object({
     identifier: z.string().trim().min(1).max(254),
     password: passwordSchema,
@@ -333,10 +409,12 @@ app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 
     await client.query('BEGIN')
     await client.query('SELECT pg_advisory_xact_lock(748201)')
     const existing = await client.query('SELECT id FROM users WHERE ($1::text IS NOT NULL AND email = $1) OR ($2::text IS NOT NULL AND phone = $2) LIMIT 1', [email, phone])
-    if (existing.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'That email or phone number is already in use.' }); return }
+    if (existing.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'An account already uses that email or phone. Sign in instead, or use a different identifier to register another business.' }); return }
 
-    const workspace = await client.query('INSERT INTO workspaces (name) VALUES ($1) RETURNING id', [input.data.businessName])
-    const user = await client.query('INSERT INTO users (workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, workspace_id, email, phone', [workspace.rows[0].id, email, phone, await hashPassword(input.data.password)])
+    const workspaceId = randomUUID()
+    const userId = randomUUID()
+    const workspace = await client.query('INSERT INTO workspaces (id, name) VALUES ($1, $2) RETURNING id', [workspaceId, input.data.businessName])
+    const user = await client.query('INSERT INTO users (id, workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, workspace_id, email, phone', [userId, workspace.rows[0].id, email, phone, await hashPassword(input.data.password)])
     await client.query('INSERT INTO workspace_members (user_id, workspace_id, role) VALUES ($1, $2, $3)', [user.rows[0].id, workspace.rows[0].id, 'admin'])
     for (const account of defaultChartOfAccounts) {
       await client.query('INSERT INTO workspace_accounts (id, workspace_id, code, name, account_type) VALUES ($1, $2, $3, $4, $5)', [randomUUID(), workspace.rows[0].id, account.code, account.name, account.type])
@@ -349,7 +427,7 @@ app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 
   finally { client.release() }
 })
 
-app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 10 }), async (request, response, next) => {
+app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many sign-in attempts from this network. Please wait 15 minutes and try again.' } }), async (request, response, next) => {
   const input = z.object({
     identifier: z.string().trim().min(1).max(254).optional(),
     email: emailSchema.optional(),
@@ -402,6 +480,299 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
     ])
     const asDateString = (value: unknown) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
     response.json({ workspaceName: workspace.rows[0]?.name ?? '', totals: { monthIncome: totals.rows[0].month_income, monthExpenses: totals.rows[0].month_expenses, monthNet: (Number(totals.rows[0].month_income) - Number(totals.rows[0].month_expenses)).toFixed(2) }, transactions: transactions.rows.map((row: Record<string, unknown>) => ({ ...row, transaction_date: asDateString(row.transaction_date) })), cashflow: cashflow.rows.map((row: Record<string, unknown>) => ({ ...row, date: asDateString(row.date) })), invoices: invoices.rows[0] })
+  } catch (error) { next(error) }
+})
+
+const workspaceRecordTypes = ['customers', 'suppliers', 'inventory', 'projects'] as const
+const workspaceRecordSchemas = {
+  customers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default('') }),
+  suppliers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default('') }),
+  inventory: z.object({ name: z.string().trim().min(1).max(160), sku: z.string().trim().max(80).default(''), quantity: z.coerce.number().finite().min(0).default(0), unit: z.string().trim().max(30).default('unit'), cost: z.coerce.number().finite().min(0).default(0), price: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
+  projects: z.object({ name: z.string().trim().min(1).max(160), customer: z.string().trim().max(160).default(''), status: z.enum(['planned', 'active', 'on_hold', 'completed']).default('planned'), startDate: z.string().date().or(z.literal('')).default(''), endDate: z.string().date().or(z.literal('')).default(''), budget: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
+}
+type WorkspaceRecordType = typeof workspaceRecordTypes[number]
+function parseRecordType(value: string): WorkspaceRecordType | null {
+  return workspaceRecordTypes.find((type) => type === value) ?? null
+}
+app.get('/v1/records/:type', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const type = parseRecordType(String(request.params.type ?? ''))
+  if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
+  try {
+    const result = await pool!.query('SELECT id, data, created_at, updated_at FROM workspace_records WHERE workspace_id = $1 AND record_type = $2 ORDER BY updated_at DESC', [request.session!.workspaceId, type.slice(0, -1)])
+    response.json({ records: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const type = parseRecordType(String(request.params.type ?? ''))
+  if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
+  const input = workspaceRecordSchemas[type].safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Check the required name and field values.' }); return }
+  try {
+    const result = await pool!.query('INSERT INTO workspace_records (workspace_id, record_type, data) VALUES ($1, $2, $3::jsonb) RETURNING id, data, created_at, updated_at', [request.session!.workspaceId, type.slice(0, -1), JSON.stringify(input.data)])
+    response.status(201).json({ record: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.post('/v1/bank-imports', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ rows: z.array(z.object({ date: z.string().date(), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), direction: z.enum(['income', 'expense']) })).min(1).max(500) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide 1 to 500 reviewed rows with valid dates, descriptions, amounts, and directions.' }); return }
+  await ensureDefaultAccounts(request.session!.workspaceId)
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    for (const row of input.data.rows) {
+      const id = randomUUID()
+      await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [id, request.session!.workspaceId, row.description, row.amount.toFixed(2), row.direction, 'Imported bank statement', row.date])
+      const lines: JournalLineInput[] = row.direction === 'income'
+        ? [{ accountCode: '1000', debit: row.amount, credit: 0 }, { accountCode: '4000', debit: 0, credit: row.amount }]
+        : [{ accountCode: '6000', debit: row.amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: row.amount }]
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: row.date, description: row.description, sourceType: 'bank_statement_import', sourceId: id, lines })
+    }
+    await client.query('COMMIT')
+    response.status(201).json({ importedCount: input.data.rows.length })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+
+type MonoApiObject = { id?: string; data?: unknown; message?: string; status?: string; meta?: Record<string, unknown> }
+async function monoRequest(path: string, init?: RequestInit): Promise<MonoApiObject> {
+  if (!monoConfigured) throw new Error('Mono bank feeds are not configured. Complete Mono business onboarding and set MONO_PUBLIC_KEY and MONO_SECRET_KEY on the API service.')
+  const response = await fetch(`https://api.withmono.com${path}`, { ...init, headers: { accept: 'application/json', 'content-type': 'application/json', 'mono-sec-key': env.MONO_SECRET_KEY!, ...init?.headers }, signal: AbortSignal.timeout(25_000) })
+  const payload = await response.json().catch(() => ({})) as MonoApiObject
+  if (!response.ok) throw new Error(`Mono API request failed (${response.status}): ${String(payload.message ?? 'provider rejected the request').slice(0, 300)}`)
+  return payload
+}
+function monoAccountPayload(value: MonoApiObject) {
+  const data = (value.data && typeof value.data === 'object' ? value.data : value) as Record<string, unknown>
+  const account = (data.account && typeof data.account === 'object' ? data.account : data) as Record<string, unknown>
+  const institution = (account.institution && typeof account.institution === 'object' ? account.institution : {}) as Record<string, unknown>
+  const meta = (data.meta && typeof data.meta === 'object' ? data.meta : {}) as Record<string, unknown>
+  const id = String(account.id ?? account._id ?? data.id ?? '')
+  if (!id) throw new Error('Mono linked account response did not include an account identifier.')
+  const number = String(account.account_number ?? account.accountNumber ?? '')
+  return { id, name: String(account.name ?? ''), accountNumberMasked: number ? `••••${number.slice(-4)}` : '', institutionName: String(institution.name ?? ''), currency: String(account.currency ?? 'KES'), accountType: String(account.type ?? ''), dataStatus: String(meta.data_status ?? account.data_status ?? 'PROCESSING') }
+}
+async function syncMonoAccount(workspaceId: string, connectedAccountId: string, providerAccountId: string) {
+  const accountPayload = await monoRequest(`/v2/accounts/${encodeURIComponent(providerAccountId)}`)
+  const accountInfo = monoAccountPayload(accountPayload)
+  const transactionPayload = await monoRequest(`/v2/accounts/${encodeURIComponent(providerAccountId)}/transactions?paginate=false`)
+  const root = (transactionPayload.data && typeof transactionPayload.data === 'object' ? transactionPayload.data : transactionPayload) as Record<string, unknown>
+  const rawTransactions = Array.isArray(transactionPayload.data) ? transactionPayload.data : Array.isArray(root.transactions) ? root.transactions : []
+  let importedCount = 0
+  for (const raw of rawTransactions) {
+    if (!raw || typeof raw !== 'object') continue
+    const row = raw as Record<string, unknown>
+    const externalId = String(row.id ?? row._id ?? '')
+    const rawDate = String(row.date ?? row.created_at ?? '')
+    const parsedDate = new Date(rawDate)
+    const rawAmount = Number(row.amount)
+    const directionText = String(row.type ?? '').toLowerCase()
+    if (!externalId || !Number.isFinite(parsedDate.getTime()) || !Number.isFinite(rawAmount) || rawAmount < 0 || !['credit', 'debit', 'income', 'expense'].includes(directionText)) continue
+    const cents = Math.round(rawAmount)
+    const amount = (cents / 100).toFixed(2)
+    const direction = directionText === 'credit' || directionText === 'income' ? 'income' : 'expense'
+    const saved = await pool!.query(`INSERT INTO bank_feed_transactions (workspace_id, connected_account_id, provider_transaction_id, transaction_date, narration, amount, direction, currency, provider_data)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+      ON CONFLICT (connected_account_id, provider_transaction_id) DO UPDATE SET narration = EXCLUDED.narration, amount = EXCLUDED.amount, direction = EXCLUDED.direction, currency = EXCLUDED.currency, provider_data = EXCLUDED.provider_data, updated_at = now()
+      WHERE bank_feed_transactions.review_status = 'needs_review'`, [workspaceId, connectedAccountId, externalId, parsedDate.toISOString().slice(0, 10), String(row.narration ?? row.description ?? '').slice(0, 500), amount, direction, accountInfo.currency, JSON.stringify(row)])
+    importedCount += saved.rowCount ?? 0
+  }
+  await pool!.query('UPDATE connected_bank_accounts SET account_name = $1, account_number_masked = $2, institution_name = $3, currency = $4, account_type = $5, data_status = $6, last_synced_at = now(), updated_at = now() WHERE id = $7 AND workspace_id = $8', [accountInfo.name, accountInfo.accountNumberMasked, accountInfo.institutionName, accountInfo.currency, accountInfo.accountType, accountInfo.dataStatus, connectedAccountId, workspaceId])
+  return { importedCount, dataStatus: accountInfo.dataStatus }
+}
+app.get('/v1/banking/mono/config', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const settings = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId])
+    const enabled = monoConfigured && settings.rows[0]?.preferences?.monoEnabled === true
+    response.json({ enabled, publicKey: enabled ? env.MONO_PUBLIC_KEY : null, provider: 'Mono', countryCoverage: 'Kenya is listed by Mono; confirm your bank is available in the Mono dashboard before activation.', setupRequired: monoConfigured ? enabled ? [] : ['Enable Mono for this business in Settings'] : ['Mono business/partner onboarding and KYB approval', 'Mono app public key', 'Mono secret key configured only on the API server', 'A public HTTPS callback URL for Mono account update webhooks'] })
+  } catch (error) { next(error) }
+})
+app.post('/v1/banking/mono/link', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requireWorkspaceProviderPreference('monoEnabled'), async (request: AuthedRequest, response, next) => {
+  if (!monoConfigured) { response.status(503).json({ error: 'Mono is not configured. Complete Mono business onboarding and configure MONO_PUBLIC_KEY and MONO_SECRET_KEY on the API service.' }); return }
+  const input = z.object({ code: z.string().trim().min(1).max(500) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Mono Connect did not return a valid authorization code.' }); return }
+  try {
+    const exchanged = await monoRequest('/v2/accounts/auth', { method: 'POST', body: JSON.stringify({ code: input.data.code }) })
+    const exchangedData = (exchanged.data && typeof exchanged.data === 'object' ? exchanged.data : exchanged) as Record<string, unknown>
+    const providerAccountId = String(exchangedData.id ?? exchangedData.account_id ?? '')
+    if (!providerAccountId) { response.status(502).json({ error: 'Mono did not return an account ID. Check Mono onboarding and the Connect callback code.' }); return }
+    const details = await monoRequest(`/v2/accounts/${encodeURIComponent(providerAccountId)}`)
+    const accountInfo = monoAccountPayload(details)
+    const stored = await pool!.query(`INSERT INTO connected_bank_accounts (workspace_id, provider_account_id, account_name, account_number_masked, institution_name, currency, account_type, data_status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (workspace_id, provider, provider_account_id) DO UPDATE SET account_name = EXCLUDED.account_name, account_number_masked = EXCLUDED.account_number_masked, institution_name = EXCLUDED.institution_name, currency = EXCLUDED.currency, account_type = EXCLUDED.account_type, data_status = EXCLUDED.data_status, connection_status = 'connected', updated_at = now()
+      RETURNING id, account_name, account_number_masked, institution_name, currency, account_type, data_status, last_synced_at`, [request.session!.workspaceId, accountInfo.id, accountInfo.name, accountInfo.accountNumberMasked, accountInfo.institutionName, accountInfo.currency, accountInfo.accountType, accountInfo.dataStatus])
+    let sync = { importedCount: 0, dataStatus: accountInfo.dataStatus }
+    if (accountInfo.dataStatus === 'AVAILABLE' || accountInfo.dataStatus === 'PARTIAL') sync = await syncMonoAccount(request.session!.workspaceId, String(stored.rows[0].id), accountInfo.id)
+    response.status(201).json({ account: stored.rows[0], sync, provider: 'Mono', notice: 'Account linked using Mono consent flow. Transactions have been imported for review and are not automatically posted to the ledger.' })
+  } catch (error) { next(error) }
+})
+app.get('/v1/banking/accounts', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, provider, account_name, account_number_masked, institution_name, currency, account_type, data_status, connection_status, last_synced_at, created_at FROM connected_bank_accounts WHERE workspace_id = $1 ORDER BY created_at DESC', [request.session!.workspaceId])
+    response.json({ accounts: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/banking/accounts/:accountId/sync', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requireWorkspaceProviderPreference('monoEnabled'), async (request: AuthedRequest, response, next) => {
+  if (!monoConfigured) { response.status(503).json({ error: 'Mono bank-feed API credentials are not configured.' }); return }
+  try {
+    const account = await pool!.query("SELECT id, provider_account_id FROM connected_bank_accounts WHERE id = $1 AND workspace_id = $2 AND provider = 'mono' AND connection_status = 'connected'", [request.params.accountId, request.session!.workspaceId])
+    if (!account.rowCount) { response.status(404).json({ error: 'Connected Mono bank account not found.' }); return }
+    const sync = await syncMonoAccount(request.session!.workspaceId, String(account.rows[0].id), String(account.rows[0].provider_account_id))
+    response.json({ sync, notice: 'Feed synchronized. Transactions remain pending your review and ledger posting.' })
+  } catch (error) { next(error) }
+})
+app.get('/v1/banking/transactions', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const status = z.enum(['needs_review', 'ignored', 'posted']).optional().safeParse(request.query.status)
+  if (!status.success) { response.status(400).json({ error: 'Invalid review status filter.' }); return }
+  try {
+    const result = await pool!.query(`SELECT t.id, t.connected_account_id, t.provider_transaction_id, t.transaction_date, t.narration, t.amount::text, t.direction, t.currency, t.review_status, t.posted_transaction_id, a.institution_name, a.account_name
+      FROM bank_feed_transactions t JOIN connected_bank_accounts a ON a.id = t.connected_account_id
+      WHERE t.workspace_id = $1 AND ($2::text IS NULL OR t.review_status = $2) ORDER BY t.transaction_date DESC, t.created_at DESC LIMIT 300`, [request.session!.workspaceId, status.data ?? null])
+    response.json({ transactions: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/banking/transactions/:transactionId/review', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ action: z.enum(['post', 'ignore']) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Choose post or ignore.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query("SELECT id, transaction_date, narration, amount::text, direction, currency, review_status FROM bank_feed_transactions WHERE id = $1 AND workspace_id = $2 FOR UPDATE", [request.params.transactionId, request.session!.workspaceId])
+    const item = result.rows[0]
+    if (!item) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Bank-feed transaction not found.' }); return }
+    if (item.review_status !== 'needs_review') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only a transaction awaiting review can be changed.' }); return }
+    if (input.data.action === 'ignore') {
+      await client.query("UPDATE bank_feed_transactions SET review_status = 'ignored', updated_at = now() WHERE id = $1", [item.id])
+      await client.query('COMMIT'); response.json({ status: 'ignored' }); return
+    }
+    if (String(item.currency).toUpperCase() !== 'KES') { await client.query('ROLLBACK'); response.status(409).json({ error: `This account is denominated in ${item.currency}; convert to KSh before posting to this KSh ledger.` }); return }
+    await ensureDefaultAccounts(request.session!.workspaceId)
+    const transactionId = randomUUID()
+    const description = String(item.narration || 'Bank-feed transaction').slice(0, 240)
+    await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [transactionId, request.session!.workspaceId, description, item.amount, item.direction, 'Mono bank feed', item.transaction_date])
+    const amount = Number(item.amount)
+    const lines: JournalLineInput[] = item.direction === 'income' ? [{ accountCode: '1000', debit: amount, credit: 0 }, { accountCode: '4000', debit: 0, credit: amount }] : [{ accountCode: '6000', debit: amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: amount }]
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: String(item.transaction_date).slice(0, 10), description, sourceType: 'mono_bank_feed', sourceId: String(item.id), lines })
+    await client.query("UPDATE bank_feed_transactions SET review_status = 'posted', posted_transaction_id = $1, updated_at = now() WHERE id = $2", [transactionId, item.id])
+    await client.query('COMMIT')
+    response.status(201).json({ status: 'posted', transactionId })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+app.post('/v1/integrations/mono/webhook', requirePool, async (request, response, next) => {
+  if (!env.MONO_WEBHOOK_SECRET || request.header('mono-webhook-secret') !== env.MONO_WEBHOOK_SECRET) { response.status(401).json({ error: 'Invalid Mono webhook secret.' }); return }
+  const input = z.object({ event: z.string(), event_id: z.string().optional(), data: z.record(z.string(), z.unknown()) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Invalid Mono webhook payload.' }); return }
+  if (input.data.event === 'mono.events.account_updated' || input.data.event === 'mono.events.account_connected') {
+    const accountData = (input.data.data.account && typeof input.data.data.account === 'object' ? input.data.data.account : input.data.data) as Record<string, unknown>
+    const providerAccountId = String(accountData._id ?? accountData.id ?? '')
+    if (providerAccountId) {
+      try {
+        const connected = await pool!.query("SELECT id, workspace_id FROM connected_bank_accounts WHERE provider_account_id = $1 AND provider = 'mono' AND connection_status = 'connected'", [providerAccountId])
+        for (const account of connected.rows) {
+          const settings = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [account.workspace_id])
+          if (settings.rows[0]?.preferences?.monoEnabled === true) await syncMonoAccount(String(account.workspace_id), String(account.id), providerAccountId)
+        }
+      } catch (error) { next(error); return }
+    }
+  }
+  response.status(200).json({ received: true })
+})
+app.put('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const type = parseRecordType(String(request.params.type ?? ''))
+  if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
+  const input = workspaceRecordSchemas[type].safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Check the required name and field values.' }); return }
+  try {
+    const result = await pool!.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3 AND record_type = $4 RETURNING id, data, created_at, updated_at', [JSON.stringify(input.data), request.params.recordId, request.session!.workspaceId, type.slice(0, -1)])
+    if (!result.rowCount) { response.status(404).json({ error: 'Record not found in this workspace.' }); return }
+    response.json({ record: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.delete('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const type = parseRecordType(String(request.params.type ?? ''))
+  if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
+  try {
+    const result = await pool!.query('DELETE FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = $3 RETURNING id', [request.params.recordId, request.session!.workspaceId, type.slice(0, -1)])
+    if (!result.rowCount) { response.status(404).json({ error: 'Record not found in this workspace.' }); return }
+    response.status(204).end()
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/settings', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId])
+    const workspaceResult = await pool!.query('SELECT name FROM workspaces WHERE id = $1', [request.session!.workspaceId])
+    const preferences = { ...defaultWorkspaceSettings, ...(result.rows[0]?.preferences ?? {}) }
+    const businessName = workspaceResult.rows[0]?.name ?? preferences.businessName ?? ''
+    response.json({ settings: { ...preferences, businessName } })
+  } catch (error) { next(error) }
+})
+app.put('/v1/settings', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    businessName: z.string().trim().min(1).max(120),
+    currency: z.enum(['KES', 'USD', 'GBP']),
+    timezone: z.enum(['Africa/Nairobi', 'UTC', 'Africa/Kampala']),
+    invoiceTerms: z.enum(['Net 7', 'Net 14', 'Net 30']),
+    emailAlerts: z.boolean(),
+    auditTrail: z.boolean(),
+    twoFactor: z.boolean(),
+    backupSchedule: z.enum(['Daily automatic', 'Weekly automatic', 'Manual only']),
+    monoEnabled: z.boolean().default(false),
+    darajaEnabled: z.boolean().default(false),
+    kraEtimsLiveEnabled: z.boolean().default(false),
+    statutoryFilingsEnabled: z.boolean().default(false),
+    shifEnabled: z.boolean().default(false),
+    nssfEnabled: z.boolean().default(false),
+    ahlEnabled: z.boolean().default(false),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'One or more settings are invalid.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('UPDATE workspaces SET name = $1 WHERE id = $2', [input.data.businessName, request.session!.workspaceId])
+    const preferences = { ...defaultWorkspaceSettings, ...input.data, businessName: input.data.businessName }
+    await client.query('INSERT INTO workspace_settings (workspace_id, preferences) VALUES ($1, $2::jsonb) ON CONFLICT (workspace_id) DO UPDATE SET preferences = EXCLUDED.preferences, updated_at = now()', [request.session!.workspaceId, JSON.stringify(preferences)])
+    await client.query('COMMIT')
+    response.json({ settings: preferences })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+app.get('/v1/documents', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, file_name, mime_type, file_size, created_at FROM workspace_documents WHERE workspace_id = $1 ORDER BY created_at DESC', [request.session!.workspaceId])
+    response.json({ documents: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/documents', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ fileName: z.string().trim().min(1).max(255), mimeType: z.string().trim().min(1).max(150), fileData: z.string().min(1).max(7_000_000) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a file up to 5 MB with a valid name and content.' }); return }
+  const data = Buffer.from(input.data.fileData, 'base64')
+  if (!data.length || data.length > 5 * 1024 * 1024 || data.toString('base64') !== input.data.fileData.replace(/\s/g, '')) { response.status(413).json({ error: 'Documents must be valid base64 files no larger than 5 MB.' }); return }
+  try {
+    const result = await pool!.query('INSERT INTO workspace_documents (workspace_id, file_name, mime_type, file_size, file_data) VALUES ($1, $2, $3, $4, $5) RETURNING id, file_name, mime_type, file_size, created_at', [request.session!.workspaceId, input.data.fileName.replace(/[\\/\0]/g, '_'), input.data.mimeType, data.length, data])
+    response.status(201).json({ document: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.get('/v1/documents/:documentId/content', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT file_name, mime_type, file_data FROM workspace_documents WHERE id = $1 AND workspace_id = $2', [request.params.documentId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Document not found in this workspace.' }); return }
+    response.json({ fileName: result.rows[0].file_name, mimeType: result.rows[0].mime_type, fileData: Buffer.from(result.rows[0].file_data).toString('base64') })
+  } catch (error) { next(error) }
+})
+app.delete('/v1/documents/:documentId', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('DELETE FROM workspace_documents WHERE id = $1 AND workspace_id = $2 RETURNING id', [request.params.documentId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Document not found in this workspace.' }); return }
+    response.status(204).end()
   } catch (error) { next(error) }
 })
 
@@ -461,8 +832,53 @@ app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, r
 
 app.get('/v1/invoices', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT id, customer, description, amount::text, due_date, status, created_at FROM invoices WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
+    const result = await pool!.query('SELECT id, customer, customer_email, description, amount::text, due_date, status, created_at FROM invoices WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
     response.json({ invoices: result.rows })
+  } catch (error) { next(error) }
+})
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character] ?? character)
+}
+app.post('/v1/invoices/:invoiceId/email', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.' }); return }
+  try {
+    const result = await pool!.query('SELECT id, customer, customer_email, description, amount::text, due_date, status FROM invoices WHERE id = $1 AND workspace_id = $2', [request.params.invoiceId, request.session!.workspaceId])
+    const invoiceRow = result.rows[0]
+    if (!invoiceRow) { response.status(404).json({ error: 'Invoice not found in this business.' }); return }
+    const recipient = String(invoiceRow.customer_email ?? '').trim()
+    if (!recipient) { response.status(409).json({ error: 'Add a customer email to this invoice before sending.' }); return }
+    if (invoiceRow.status === 'void') { response.status(409).json({ error: 'Voided invoices cannot be sent.' }); return }
+    const invoiceNumber = String(invoiceRow.id).slice(0, 8).toUpperCase()
+    const customer = escapeHtml(String(invoiceRow.customer))
+    const description = escapeHtml(String(invoiceRow.description))
+    const dueDate = escapeHtml(new Date(String(invoiceRow.due_date)).toISOString().slice(0, 10))
+    const amount = Number(invoiceRow.amount).toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    const origin = await pool!.query('SELECT name FROM workspaces WHERE id = $1', [request.session!.workspaceId])
+    const businessName = String(origin.rows[0]?.name ?? 'KashFlow business')
+    const html = `<main style="font-family:Arial,sans-serif;color:#242537;max-width:640px;margin:auto"><h1>Invoice ${invoiceNumber}</h1><p>Hello ${customer},</p><p>Please find your invoice from ${escapeHtml(businessName)}.</p><table style="border-collapse:collapse;width:100%"><tr><th align="left" style="padding:12px;border-bottom:1px solid #ddd">Description</th><th align="right" style="padding:12px;border-bottom:1px solid #ddd">Amount (KSh)</th></tr><tr><td style="padding:12px;border-bottom:1px solid #ddd">${description}</td><td align="right" style="padding:12px;border-bottom:1px solid #ddd">${amount}</td></tr></table><p>Due date: ${dueDate}</p><p>This is an internal invoice, not a KRA/eTIMS fiscal tax invoice.</p></main>`
+    const providerResponse = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: env.EMAIL_FROM, to: [recipient], subject: `Invoice ${invoiceNumber} from ${businessName}`, html, text: `Hello ${String(invoiceRow.customer)},\n\nInvoice ${invoiceNumber} from ${businessName}: ${String(invoiceRow.description)} — KSh ${amount}. Due ${dueDate}.\n\nThis is not a KRA/eTIMS fiscal tax invoice.` }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    const providerPayload = await providerResponse.json().catch(() => ({})) as { id?: string; message?: string }
+    const deliveryId = randomUUID()
+    if (!providerResponse.ok || !providerPayload.id) {
+      await pool!.query('INSERT INTO email_delivery_events (id, workspace_id, invoice_id, recipient, provider, status, failure_reason) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, invoiceRow.id, recipient, 'resend', 'failed', String(providerPayload.message ?? `Provider returned HTTP ${providerResponse.status}`).slice(0, 500)])
+      response.status(502).json({ error: 'Email provider did not accept the invoice. Check the API service logs and Resend sender-domain configuration.' }); return
+    }
+    await pool!.query('INSERT INTO email_delivery_events (id, workspace_id, invoice_id, recipient, provider, status, provider_message_id) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, invoiceRow.id, recipient, 'resend', 'accepted', providerPayload.id])
+    response.status(202).json({ delivery: { id: deliveryId, status: 'accepted', providerMessageId: providerPayload.id, recipient }, message: 'Email accepted by Resend; recipient delivery is not guaranteed.' })
+  } catch (error) { next(error) }
+})
+app.get('/v1/invoices/:invoiceId/email-history', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const invoice = await pool!.query('SELECT id FROM invoices WHERE id = $1 AND workspace_id = $2', [request.params.invoiceId, request.session!.workspaceId])
+    if (!invoice.rowCount) { response.status(404).json({ error: 'Invoice not found in this business.' }); return }
+    const result = await pool!.query('SELECT id, recipient, provider, status, provider_message_id, failure_reason, created_at FROM email_delivery_events WHERE invoice_id = $1 AND workspace_id = $2 ORDER BY created_at DESC LIMIT 20', [request.params.invoiceId, request.session!.workspaceId])
+    response.json({ events: result.rows })
   } catch (error) { next(error) }
 })
 
@@ -501,13 +917,13 @@ app.post('/v1/transactions', requirePool, verifyOrigin, requireSession, async (r
 })
 
 app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ customer: z.string().trim().min(1).max(160), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), dueDate: z.string().date() }).safeParse(request.body)
+  const input = z.object({ customer: z.string().trim().min(1).max(160), customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), dueDate: z.string().date() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a customer, description, positive amount, and valid due date.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
     const id = randomUUID()
-    const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, customer, description, amount::text, due_date, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.description, input.data.amount.toFixed(2), input.data.dueDate])
+    const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, customer_email, description, amount::text, due_date, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.customerEmail, input.data.description, input.data.amount.toFixed(2), input.data.dueDate])
     await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${input.data.customer} — ${input.data.description}`, sourceType: 'invoice', sourceId: id, lines: [{ accountCode: '1100', debit: input.data.amount, credit: 0 }, { accountCode: '4000', debit: 0, credit: input.data.amount }] })
     await client.query('COMMIT')
     response.status(201).json({ invoice: result.rows[0] })
@@ -624,11 +1040,11 @@ app.get('/v1/payroll/employees', requirePool, requireSession, requireWorkspaceAd
 })
 
 app.post('/v1/payroll/employees', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ employeeNumber: z.string().trim().min(1).max(40), fullName: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).optional().or(z.literal('')), phone: z.string().trim().max(30).optional(), grossMonthlyPay: z.coerce.number().finite().positive().max(100_000_000), otherTaxableDeductions: z.coerce.number().finite().min(0).default(0), otherTaxReliefs: z.coerce.number().finite().min(0).default(0) }).safeParse(request.body)
+  const input = z.object({ employeeNumber: z.string().trim().min(1).max(40), fullName: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).optional().or(z.literal('')), phone: z.string().trim().max(30).optional(), grossMonthlyPay: z.coerce.number().finite().positive().max(100_000_000), otherTaxableDeductions: z.coerce.number().finite().min(0).default(0), otherTaxReliefs: z.coerce.number().finite().min(0).default(0), deductions: z.array(z.object({ name: z.string().trim().min(1).max(100), kind: z.enum(['taxable_base', 'tax_relief', 'post_tax']), amount: z.coerce.number().finite().positive().max(100_000_000) })).max(30).default([]) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter an employee number, name, and positive gross monthly pay.' }); return }
   try {
     const id = randomUUID()
-    const employee = { ...input.data, email: input.data.email?.toLowerCase() || '' }
+    const employee = { ...input.data, email: input.data.email?.toLowerCase() || '', otherTaxableDeductions: input.data.deductions.filter((item) => item.kind === 'taxable_base').reduce((sum, item) => sum + item.amount, input.data.otherTaxableDeductions), otherTaxReliefs: input.data.deductions.filter((item) => item.kind === 'tax_relief').reduce((sum, item) => sum + item.amount, input.data.otherTaxReliefs) }
     await pool!.query('INSERT INTO employees (id, workspace_id, employee_data_encrypted) VALUES ($1, $2, $3)', [id, request.session!.workspaceId, encryptPayrollData(employee)])
     const client = await pool!.connect()
     try {
@@ -661,12 +1077,22 @@ app.get('/v1/payroll/runs', requirePool, requireSession, requireWorkspaceAdmin, 
 app.post('/v1/payroll/runs', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
   const input = z.object({ period: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a payroll period in YYYY-MM format.' }); return }
+  if (input.data.period < '2026-02') { response.status(409).json({ error: 'The installed KE-2026-01 payroll estimate snapshot is effective from 2026-02 only. Do not calculate historical payroll with this rule set.' }); return }
   try {
     const rows = await pool!.query('SELECT id, employee_data_encrypted FROM employees WHERE workspace_id = $1 AND active = true', [request.session!.workspaceId])
     if (!rows.rowCount) { response.status(409).json({ error: 'Add at least one active employee before preparing a payroll run.' }); return }
+    for (const row of rows.rows) {
+      const employee = decryptPayrollData<Record<string, unknown>>(String(row.employee_data_encrypted))
+      const estimate = estimateKenyaPayroll({ grossMonthlyPay: Number(employee.grossMonthlyPay), otherTaxableDeductions: Number(employee.otherTaxableDeductions ?? 0), otherTaxReliefs: Number(employee.otherTaxReliefs ?? 0) })
+      if (estimate.netPayEstimate < 0) { response.status(409).json({ error: `Current estimate deductions exceed gross pay for employee ${String(employee.employeeNumber)}. Obtain qualified payroll review and correct the inputs before creating this run.` }); return }
+      const postTaxDeductions = Array.isArray(employee.deductions) ? (employee.deductions as Array<{ kind: string; amount: number }>).filter((item) => item.kind === 'post_tax').reduce((sum, item) => sum + Number(item.amount), 0) : 0
+      if (postTaxDeductions > estimate.netPayEstimate) { response.status(409).json({ error: `Post-tax deductions exceed estimated net pay for employee ${String(employee.employeeNumber)}. Correct the deduction before creating this payroll run.` }); return }
+    }
     const items = rows.rows.map((row: Record<string, unknown>) => {
       const employee = decryptPayrollData<Record<string, unknown>>(String(row.employee_data_encrypted))
       const estimate = estimateKenyaPayroll({ grossMonthlyPay: Number(employee.grossMonthlyPay), otherTaxableDeductions: Number(employee.otherTaxableDeductions ?? 0), otherTaxReliefs: Number(employee.otherTaxReliefs ?? 0) })
+      const postTaxDeductions = Array.isArray(employee.deductions) ? (employee.deductions as Array<{ kind: string; amount: number }>).filter((item) => item.kind === 'post_tax').reduce((sum, item) => sum + Number(item.amount), 0) : 0
+      estimate.netPayEstimate = Math.round((estimate.netPayEstimate - postTaxDeductions + Number.EPSILON) * 100) / 100
       return { employeeId: String(row.id), employee, estimate }
     })
     const sum = (field: keyof KenyaPayrollEstimate) => items.reduce((total: number, item: { estimate: KenyaPayrollEstimate }) => total + Number(item.estimate[field]), 0)
@@ -695,6 +1121,7 @@ app.get('/v1/payroll/runs/:runId/payslips', requirePool, requireSession, require
 })
 
 app.post('/v1/payroll/runs/:runId/post', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  await ensureDefaultAccounts(request.session!.workspaceId)
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
@@ -704,6 +1131,13 @@ app.post('/v1/payroll/runs/:runId/post', requirePool, verifyOrigin, requireSessi
     if (run.status !== 'draft') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only a draft payroll run can be posted.' }); return }
     const nssfTotal = Number(run.nssf_employee_total) + Number(run.nssf_employer_total)
     const housingTotal = Number(run.housing_employee_total) + Number(run.housing_employer_total)
+    const runItems = await client.query('SELECT payslip_encrypted FROM payroll_run_items WHERE payroll_run_id = $1', [run.id])
+    const otherDeductionsTotal = runItems.rows.reduce((total: number, row: Record<string, unknown>) => {
+      const payslip = decryptPayrollData<Record<string, unknown>>(String(row.payslip_encrypted))
+      const employee = payslip.employee as Record<string, unknown> | undefined
+      const deductions = Array.isArray(employee?.deductions) ? employee.deductions as Array<{ kind: string; amount: number }> : []
+      return total + deductions.filter((item) => item.kind === 'post_tax').reduce((sum, item) => sum + Number(item.amount), 0)
+    }, 0)
     const lines: JournalLineInput[] = [
       { accountCode: '5000', debit: Number(run.gross_total), credit: 0 },
       { accountCode: '5010', debit: Number(run.nssf_employer_total), credit: 0 },
@@ -713,6 +1147,7 @@ app.post('/v1/payroll/runs/:runId/post', requirePool, verifyOrigin, requireSessi
       { accountCode: '2110', debit: 0, credit: Number(run.shif_total) },
       { accountCode: '2120', debit: 0, credit: nssfTotal },
       { accountCode: '2130', debit: 0, credit: housingTotal },
+      { accountCode: '2140', debit: 0, credit: otherDeductionsTotal },
     ].filter((line) => line.debit > 0 || line.credit > 0)
     const [year = 2026, month = 1] = String(run.period).split('-').map(Number)
     const entryDate = `${year}-${String(month).padStart(2, '0')}-${String(new Date(year, month, 0).getDate()).padStart(2, '0')}`
@@ -769,10 +1204,12 @@ app.post('/v1/payroll/kenya/estimate', requirePool, verifyOrigin, requireSession
     otherTaxReliefs: z.coerce.number().finite().min(0).max(1_000_000_000).default(0),
   }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Provide non-negative monthly gross pay and optional allowable deduction/relief amounts.' }); return }
-  response.json(estimateKenyaPayroll(input.data))
+  const estimate = estimateKenyaPayroll(input.data)
+  if (estimate.netPayEstimate < 0) { response.status(409).json({ error: 'The installed estimate produces deductions greater than gross pay for these inputs. Do not use this result; review it with a qualified Kenyan payroll professional.' }); return }
+  response.json(estimate)
 })
 
-app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, requireSession, rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request: AuthedRequest, response, next) => {
+app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requireWorkspaceProviderPreference('darajaEnabled'), rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request: AuthedRequest, response, next) => {
   if (!mpesaConfigured) { response.status(503).json({ error: 'M-Pesa is not configured. Set all required MPESA_* API environment variables and a public callback URL.' }); return }
   if (env.MPESA_ENV === 'production' && !env.MPESA_CALLBACK_URL!.startsWith('https://')) { response.status(503).json({ error: 'Production Daraja requires a public HTTPS MPESA_CALLBACK_URL.' }); return }
 
@@ -782,14 +1219,22 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
   if (!phone) { response.status(400).json({ error: 'Use a valid Kenyan mobile number, such as 0712345678 or 254712345678.' }); return }
 
   try {
-    const invoiceResult = await pool!.query('SELECT id, amount, status FROM invoices WHERE id = $1 AND workspace_id = $2', [request.params.invoiceId, request.session!.workspaceId])
-    if (!invoiceResult.rowCount) { response.status(404).json({ error: 'Invoice not found in this business.' }); return }
-    const invoiceAmount = Number(invoiceResult.rows[0].amount)
-    if (invoiceResult.rows[0].status !== 'unpaid') { response.status(409).json({ error: 'Only unpaid invoices can be sent for M-Pesa payment.' }); return }
-    if (!Number.isSafeInteger(invoiceAmount) || invoiceAmount < 1) { response.status(400).json({ error: 'M-Pesa STK Push requires a whole-number KSh invoice amount.' }); return }
-
+    const client = await pool!.connect()
+    let invoiceAmount: number
     const paymentId = randomUUID()
-    await pool!.query('INSERT INTO mpesa_payment_requests (id, workspace_id, invoice_id, customer_phone, amount, status) VALUES ($1, $2, $3, $4, $5, $6)', [paymentId, request.session!.workspaceId, request.params.invoiceId, phone, invoiceAmount.toFixed(2), 'initiating'])
+    try {
+      await client.query('BEGIN')
+      const invoiceResult = await client.query('SELECT id, amount, status FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.invoiceId, request.session!.workspaceId])
+      if (!invoiceResult.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invoice not found in this business.' }); return }
+      invoiceAmount = Number(invoiceResult.rows[0].amount)
+      if (invoiceResult.rows[0].status !== 'unpaid') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only unpaid invoices can be sent for M-Pesa payment.' }); return }
+      if (!Number.isSafeInteger(invoiceAmount) || invoiceAmount < 1) { await client.query('ROLLBACK'); response.status(400).json({ error: 'M-Pesa STK Push requires a whole-number KSh invoice amount.' }); return }
+      const activeRequest = await client.query("SELECT 1 FROM mpesa_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 AND status IN ('initiating', 'pending', 'verification_required') LIMIT 1", [request.params.invoiceId, request.session!.workspaceId])
+      if (activeRequest.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'A payment request is already in progress for this invoice. Check its status before trying again.' }); return }
+      await client.query('INSERT INTO mpesa_payment_requests (id, workspace_id, invoice_id, customer_phone, amount, status) VALUES ($1, $2, $3, $4, $5, $6)', [paymentId, request.session!.workspaceId, request.params.invoiceId, phone, invoiceAmount.toFixed(2), 'initiating'])
+      await client.query('COMMIT')
+    } catch (error) { await client.query('ROLLBACK'); throw error }
+    finally { client.release() }
     const timestamp = darajaTimestamp()
     try {
       const result = await darajaPost('/mpesa/stkpush/v1/processrequest', {
@@ -877,16 +1322,309 @@ app.post('/v1/integrations/mpesa/callback', requirePool, rateLimit({ windowMs: 6
   } catch (error) { next(error) }
 })
 
-app.get('/v1/integrations/readiness', (_request, response) => {
-  const callbackIsSecure = env.MPESA_ENV !== 'production' || env.MPESA_CALLBACK_URL?.startsWith('https://') === true
-  const mpesaReady = mpesaConfigured && callbackIsSecure
-  response.json({ mode: mpesaReady ? 'mpesa_configured' : 'setup_required', integrations: [
-    { id: 'kra_etims', status: 'provider_and_kra_approval_required' },
-    { id: 'mpesa', status: mpesaReady ? `configured_${env.MPESA_ENV}` : 'daraja_credentials_and_callback_required' },
-    { id: 'bank_feeds', status: 'licensed_open_banking_provider_required' },
-    { id: 'payroll', status: `encrypted_internal_runs_${env.PAYROLL_DATA_ENCRYPTION_KEY ? 'configured' : 'encryption_key_required'}_statutory_filing_unavailable` },
-    { id: 'paye_shif_nssf_ahl_filing', status: 'statutory_filing_not_implemented' },
-  ], note: 'M-Pesa STK Push is enabled only when server-side Daraja credentials and a callback URL are configured. Kenya payroll estimates are not certified payroll outputs; KRA eTIMS, bank feeds, and statutory filing are unavailable.' })
+const complianceIntegration = z.enum(['kra_etims', 'bank_feeds', 'statutory_filing'])
+const kraFiscalPayloadSchema = z.object({
+  salesTyCd: z.string().trim().min(1).max(5),
+  rcptTyCd: z.string().trim().min(1).max(5),
+  salesSttsCd: z.string().trim().min(1).max(5),
+  cfmDt: z.string().regex(/^\d{14}$/),
+  salesDt: z.string().regex(/^\d{8}$/),
+  stockRlsDt: z.string().regex(/^\d{14}$/).nullable().optional(),
+  custTin: z.string().trim().max(11).nullable().optional(),
+  custNm: z.string().trim().max(60).nullable().optional(),
+  pmtTyCd: z.string().trim().max(5).nullable().optional(),
+  taxblAmtA: z.coerce.number().finite().min(0), taxblAmtB: z.coerce.number().finite().min(0), taxblAmtC: z.coerce.number().finite().min(0), taxblAmtD: z.coerce.number().finite().min(0), taxblAmtE: z.coerce.number().finite().min(0),
+  taxRtA: z.coerce.number().finite().min(0), taxRtB: z.coerce.number().finite().min(0), taxRtC: z.coerce.number().finite().min(0), taxRtD: z.coerce.number().finite().min(0), taxRtE: z.coerce.number().finite().min(0),
+  taxAmtA: z.coerce.number().finite().min(0), taxAmtB: z.coerce.number().finite().min(0), taxAmtC: z.coerce.number().finite().min(0), taxAmtD: z.coerce.number().finite().min(0), taxAmtE: z.coerce.number().finite().min(0),
+  totItemCnt: z.coerce.number().int().positive().max(1000),
+  totTaxblAmt: z.coerce.number().finite().min(0), totTaxAmt: z.coerce.number().finite().min(0), totAmt: z.coerce.number().finite().positive(),
+  prchrAcptcYn: z.enum(['Y', 'N']),
+  remark: z.string().max(400).nullable().optional(),
+  receipt: z.object({ custTin: z.string().max(11).nullable().optional(), custMblNo: z.string().max(20).nullable().optional(), rcptPbctDt: z.string().regex(/^\d{14}$/), trdeNm: z.string().max(20).nullable().optional(), adrs: z.string().max(200).nullable().optional(), topMsg: z.string().max(20).nullable().optional(), btmMsg: z.string().max(20).nullable().optional(), prchrAcptcYn: z.enum(['Y', 'N']) }),
+  itemList: z.array(z.object({ itemSeq: z.coerce.number().int().positive(), itemClsCd: z.string().trim().max(10).nullable().optional(), itemCd: z.string().trim().min(1).max(20), itemNm: z.string().trim().min(1).max(200), bcd: z.string().max(20).nullable().optional(), pkgUnitCd: z.string().trim().min(1).max(5), pkg: z.coerce.number().finite().min(0), qtyUnitCd: z.string().trim().min(1).max(5), qty: z.coerce.number().finite().positive(), prc: z.coerce.number().finite().min(0), splyAmt: z.coerce.number().finite().min(0), dcRt: z.coerce.number().finite().min(0).default(0), dcAmt: z.coerce.number().finite().min(0).default(0), taxTyCd: z.enum(['A', 'B', 'C', 'D', 'E']), taxblAmt: z.coerce.number().finite().min(0), taxAmt: z.coerce.number().finite().min(0), totAmt: z.coerce.number().finite().min(0) })).min(1).max(1000),
+}).superRefine((payload, context) => {
+  const cents = (value: number) => Math.round((value + Number.EPSILON) * 100)
+  const categories = ['A', 'B', 'C', 'D', 'E'] as const
+  const totalTaxable = payload.itemList.reduce((sum, item) => sum + cents(item.taxblAmt), 0)
+  const totalTax = payload.itemList.reduce((sum, item) => sum + cents(item.taxAmt), 0)
+  const totalAmount = payload.itemList.reduce((sum, item) => sum + cents(item.totAmt), 0)
+  if (payload.totItemCnt !== payload.itemList.length) context.addIssue({ code: 'custom', path: ['totItemCnt'], message: 'Must equal the number of itemList entries.' })
+  if (cents(payload.totTaxblAmt) !== totalTaxable || cents(payload.totTaxAmt) !== totalTax || cents(payload.totAmt) !== totalAmount) context.addIssue({ code: 'custom', path: ['totAmt'], message: 'Document totals must match the sums of its item lines.' })
+  for (const category of categories) {
+    const categoryTaxable = payload.itemList.filter((item) => item.taxTyCd === category).reduce((sum, item) => sum + cents(item.taxblAmt), 0)
+    const categoryTax = payload.itemList.filter((item) => item.taxTyCd === category).reduce((sum, item) => sum + cents(item.taxAmt), 0)
+    if (cents(payload[`taxblAmt${category}`]) !== categoryTaxable || cents(payload[`taxAmt${category}`]) !== categoryTax) context.addIssue({ code: 'custom', path: [`taxblAmt${category}`], message: `Tax category ${category} totals must match itemList.` })
+  }
+})
+type KraOsuCredentials = { taxpayerPin: string; branchId: string; deviceSerial: string; cmcKey?: string }
+async function kraOsuRequest<T extends Record<string, unknown>>(path: string, payload: Record<string, unknown>): Promise<T> {
+  const response = await fetch(`${kraEtimsApiBase}${path}`, {
+    method: 'POST',
+    headers: { accept: 'application/json', 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(25_000),
+  })
+  const result = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) throw new Error(`KRA OSCU returned HTTP ${response.status}: ${String(result.resultMsg ?? 'request failed').slice(0, 300)}`)
+  return result as T
+}
+function assertKraSuccess(result: Record<string, unknown>) {
+  const code = String(result.resultCd ?? '')
+  if (code !== '000') throw Object.assign(new Error(`KRA eTIMS rejected the request (${code || 'no result code'}): ${String(result.resultMsg ?? 'unknown KRA response').slice(0, 400)}`), { kraResult: result })
+}
+app.get('/v1/integrations/etims/config', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT environment, device_id, sdc_id, mrc_no, initialized_at, updated_at FROM kra_oscu_workspaces WHERE workspace_id = $1', [request.session!.workspaceId])
+    const row = result.rows[0]
+    response.json({ configured: Boolean(row), environment: env.KRA_ETIMS_ENV, liveSubmissionsEnabled: kraEtimsLiveEnabled, initialized: Boolean(row?.initialized_at), device: row ? { deviceId: row.device_id, sdcId: row.sdc_id, mrcNo: row.mrc_no, initializedAt: row.initialized_at } : null, credentialsEncryptionReady: Boolean(env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY), apiBase: kraEtimsApiBase })
+  } catch (error) { next(error) }
+})
+app.put('/v1/integrations/etims/device', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requireWorkspaceProviderPreference('kraEtimsLiveEnabled', true), async (request: AuthedRequest, response, next) => {
+  if (!env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY) { response.status(503).json({ error: 'Set KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY on the API service before configuring OSCU credentials.' }); return }
+  if (env.KRA_ETIMS_ENV === 'production' && !kraEtimsLiveEnabled) { response.status(503).json({ error: 'Production OSCU is disabled. Verify KRA production approval, then explicitly set KRA_ETIMS_LIVE_ENABLED=true on the API service.' }); return }
+  const input = z.object({ taxpayerPin: z.string().trim().regex(/^[A-Z0-9]{11}$/i), branchId: z.string().trim().regex(/^\d{2}$/), deviceSerial: z.string().trim().min(1).max(100) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide an 11-character KRA PIN, two-character branch ID (00 for head office), and KRA-approved device serial.' }); return }
+  try {
+    const encrypted = encryptKraCredentials({ taxpayerPin: input.data.taxpayerPin.toUpperCase(), branchId: input.data.branchId, deviceSerial: input.data.deviceSerial })
+    await pool!.query(`INSERT INTO kra_oscu_workspaces (workspace_id, credentials_encrypted, environment) VALUES ($1, $2, $3)
+      ON CONFLICT (workspace_id) DO UPDATE SET credentials_encrypted = EXCLUDED.credentials_encrypted, environment = EXCLUDED.environment, device_id = NULL, sdc_id = NULL, mrc_no = NULL, initialized_at = NULL, updated_at = now()`, [request.session!.workspaceId, encrypted, env.KRA_ETIMS_ENV])
+    response.status(200).json({ configured: true, initialized: false, environment: env.KRA_ETIMS_ENV, notice: 'Device details saved encrypted. Initialize only after KRA has approved this taxpayer/device for the selected OSCU environment.' })
+  } catch (error) { next(error) }
+})
+app.post('/v1/integrations/etims/initialize', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requireWorkspaceProviderPreference('kraEtimsLiveEnabled', true), async (request: AuthedRequest, response, next) => {
+  if (!env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY) { response.status(503).json({ error: 'KRA OSCU credential encryption is not configured on the API service.' }); return }
+  if (env.KRA_ETIMS_ENV === 'production' && !kraEtimsLiveEnabled) { response.status(503).json({ error: 'Production OSCU is disabled until its server-side kill switch is explicitly enabled after KRA approval.' }); return }
+  try {
+    const row = await pool!.query('SELECT credentials_encrypted FROM kra_oscu_workspaces WHERE workspace_id = $1', [request.session!.workspaceId])
+    if (!row.rowCount) { response.status(409).json({ error: 'Save the KRA PIN, branch, and approved device serial first.' }); return }
+    const credentials = decryptKraCredentials<KraOsuCredentials>(String(row.rows[0].credentials_encrypted))
+    const result = await kraOsuRequest<Record<string, unknown>>('/selectInitOsdcInfo', { tin: credentials.taxpayerPin, bhfId: credentials.branchId, dvcSrlNo: credentials.deviceSerial })
+    assertKraSuccess(result)
+    const data = (result.data && typeof result.data === 'object' ? result.data : {}) as Record<string, unknown>
+    const info = (data.info && typeof data.info === 'object' ? data.info : {}) as Record<string, unknown>
+    const cmcKey = String(info.cmcKey ?? '')
+    if (!cmcKey) { response.status(502).json({ error: 'KRA initialization returned success but no communication key; do not submit invoices until device activation is resolved with KRA.' }); return }
+    const encrypted = encryptKraCredentials({ ...credentials, cmcKey })
+    await pool!.query('UPDATE kra_oscu_workspaces SET credentials_encrypted = $1, device_id = $2, sdc_id = $3, mrc_no = $4, initialized_at = now(), updated_at = now() WHERE workspace_id = $5', [encrypted, String(info.dvcId ?? ''), String(info.sdcId ?? info.sdicId ?? ''), String(info.mrcNo ?? ''), request.session!.workspaceId])
+    response.json({ initialized: true, environment: env.KRA_ETIMS_ENV, device: { deviceId: info.dvcId ?? null, sdcId: info.sdcId ?? info.sdicId ?? null, mrcNo: info.mrcNo ?? null }, notice: 'KRA device initialization succeeded. Communication credentials are encrypted at rest and were not returned to the browser.' })
+  } catch (error) {
+    if (error instanceof Error && 'kraResult' in error) { response.status(502).json({ error: error.message, providerResponse: (error as Error & { kraResult?: unknown }).kraResult }); return }
+    next(error)
+  }
+})
+app.get('/v1/integrations/etims/codes', requirePool, requireSession, requireWorkspaceProviderPreference('kraEtimsLiveEnabled', true), async (request: AuthedRequest, response, next) => {
+  if (!env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY) { response.status(503).json({ error: 'KRA OSCU credential encryption is not configured.' }); return }
+  try {
+    const row = await pool!.query('SELECT credentials_encrypted, initialized_at FROM kra_oscu_workspaces WHERE workspace_id = $1', [request.session!.workspaceId])
+    if (!row.rowCount || !row.rows[0].initialized_at) { response.status(409).json({ error: 'Initialize the KRA OSCU device before requesting official tax and item codes.' }); return }
+    const credentials = decryptKraCredentials<KraOsuCredentials>(String(row.rows[0].credentials_encrypted))
+    const result = await kraOsuRequest<Record<string, unknown>>('/selectCodeList', { tin: credentials.taxpayerPin, bhfId: credentials.branchId, cmcKey: credentials.cmcKey, lastReqDt: '20180101000000' })
+    assertKraSuccess(result)
+    response.json({ result, source: 'KRA eTIMS OSCU', environment: env.KRA_ETIMS_ENV })
+  } catch (error) {
+    if (error instanceof Error && 'kraResult' in error) { response.status(502).json({ error: error.message, providerResponse: (error as Error & { kraResult?: unknown }).kraResult }); return }
+    next(error)
+  }
+})
+
+app.get('/v1/integrations/onboarding', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT integration_type, milestone, self_reported_note, details, updated_at FROM integration_onboarding WHERE workspace_id = $1 ORDER BY integration_type', [request.session!.workspaceId])
+    response.json({ onboarding: result.rows, notice: 'Milestones are self-reported workspace tracking only; they do not establish provider approval or certification.' })
+  } catch (error) { next(error) }
+})
+app.put('/v1/integrations/onboarding/:integrationType', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const type = complianceIntegration.safeParse(request.params.integrationType)
+  const input = z.object({ milestone: z.enum(['not_started', 'application_in_progress', 'sandbox_testing', 'certification_review', 'certified']), note: z.string().trim().max(1000).default(''), details: z.record(z.string(), z.union([z.string().trim().max(500), z.boolean()])).default({}) }).safeParse(request.body)
+  if (!type.success || !input.success) { response.status(400).json({ error: 'Choose a supported integration and valid onboarding milestone.' }); return }
+  if (input.data.milestone === 'certified' && type.data !== 'kra_etims') { response.status(400).json({ error: 'The certification milestone applies only to eTIMS; statutory routes and bank-feed approvals are tracked separately.' }); return }
+  const safeDetails = { ...input.data.details }
+  if (type.data === 'kra_etims') {
+    const allowed = ['solution', 'taxpayerPin', 'sandboxReference', 'certificationReference', 'productionApprovalReference']
+    if (Object.keys(safeDetails).some((key) => !allowed.includes(key))) { response.status(400).json({ error: 'KRA profile accepts only route and non-secret certification references. Never submit passwords or private keys here.' }); return }
+    delete safeDetails.taxpayerPin
+    if (input.data.milestone === 'sandbox_testing' && (!input.data.details.solution || !input.data.details.sandboxReference)) { response.status(400).json({ error: 'Select OSCU/VSCU and record the KRA sandbox registration reference before marking sandbox testing.' }); return }
+    if (input.data.milestone === 'certified' && (!input.data.details.solution || !input.data.details.sandboxReference || !input.data.details.certificationReference || !input.data.details.productionApprovalReference)) { response.status(400).json({ error: 'A self-reported certified milestone requires the solution, sandbox reference, certification reference, and production approval reference. This will still not verify certification.' }); return }
+  }
+  if (type.data === 'statutory_filing') {
+    const allowed = ['payeRoute', 'ahlRoute', 'shifRoute', 'nssfRoute', 'providerName', 'routeConfirmationReference', 'routesConfirmed']
+    if (Object.keys(input.data.details).some((key) => !allowed.includes(key))) { response.status(400).json({ error: 'Statutory profile accepts filing-route details and non-secret evidence references only. Do not enter passwords or API keys.' }); return }
+  }
+  try {
+    const result = await pool!.query('INSERT INTO integration_onboarding (workspace_id, integration_type, milestone, self_reported_note, details, updated_by) VALUES ($1, $2, $3, $4, $5::jsonb, $6) ON CONFLICT (workspace_id, integration_type) DO UPDATE SET milestone = EXCLUDED.milestone, self_reported_note = EXCLUDED.self_reported_note, details = EXCLUDED.details, updated_by = EXCLUDED.updated_by, updated_at = now() RETURNING integration_type, milestone, self_reported_note, details, updated_at', [request.session!.workspaceId, type.data, input.data.milestone, input.data.note, JSON.stringify(safeDetails), request.session!.userId])
+    response.json({ onboarding: result.rows[0], verified: false, notice: 'Details are self-reported, not verified. Do not store secrets in this profile.' })
+  } catch (error) { next(error) }
+})
+app.get('/v1/integrations/drafts', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, integration_type, source_type, source_id, payload_version, draft_payload, workflow_status, provider_status, external_invoice_number, fiscal_receipt_signature, reviewer_name, reviewer_qualification, reviewer_registration, reviewer_reference, reviewer_attested_at, created_at, updated_at FROM compliance_submission_drafts WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
+    response.json({ drafts: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/integrations/etims/drafts/:invoiceId', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const invoiceResult = await pool!.query('SELECT i.id, i.customer, i.customer_email, i.description, i.amount::text, i.due_date, i.status, w.name AS business_name FROM invoices i JOIN workspaces w ON w.id = i.workspace_id WHERE i.id = $1 AND i.workspace_id = $2', [request.params.invoiceId, request.session!.workspaceId])
+    const invoiceRow = invoiceResult.rows[0]
+    if (!invoiceRow) { response.status(404).json({ error: 'Invoice not found in this workspace.' }); return }
+    const draftPayload = { invoiceId: invoiceRow.id, businessName: invoiceRow.business_name, customer: invoiceRow.customer, customerEmail: invoiceRow.customer_email, description: invoiceRow.description, amount: invoiceRow.amount, dueDate: invoiceRow.due_date, internalStatus: invoiceRow.status, taxBreakdown: null, note: 'Internal invoice snapshot only. Map tax types, rates, trader and item fields using the current KRA OSCU/VSCU specification before submission.' }
+    const result = await pool!.query("INSERT INTO compliance_submission_drafts (workspace_id, integration_type, source_type, source_id, payload_version, draft_payload, created_by) VALUES ($1, 'kra_etims', 'invoice', $2, 'kashflow-etims-draft-v1', $3::jsonb, $4) ON CONFLICT (workspace_id, integration_type, source_type, source_id) DO NOTHING RETURNING id, integration_type, source_type, source_id, payload_version, draft_payload, workflow_status, provider_status, created_at, updated_at", [request.session!.workspaceId, invoiceRow.id, JSON.stringify(draftPayload), request.session!.userId])
+    const draft = result.rows[0] ?? (await pool!.query("SELECT id, integration_type, source_type, source_id, payload_version, draft_payload, workflow_status, provider_status, created_at, updated_at FROM compliance_submission_drafts WHERE workspace_id = $1 AND integration_type = 'kra_etims' AND source_type = 'invoice' AND source_id = $2", [request.session!.workspaceId, invoiceRow.id])).rows[0]
+    response.status(201).json({ draft, providerSubmission: 'blocked_uncertified_adapter', notice: 'Draft created only. No request was sent to KRA and this is not a fiscal invoice.' })
+  } catch (error) { next(error) }
+})
+app.put('/v1/integrations/etims/drafts/:draftId/fiscal-payload', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = kraFiscalPayloadSchema.safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Fiscal payload is invalid or totals do not reconcile.', issues: input.error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })) }); return }
+  try {
+    const draft = await pool!.query("SELECT id, source_id FROM compliance_submission_drafts WHERE id = $1 AND workspace_id = $2 AND integration_type = 'kra_etims' AND source_type = 'invoice' AND workflow_status = 'draft' AND provider_status IN ('blocked_no_certified_adapter', 'rejected_by_kra')", [request.params.draftId, request.session!.workspaceId])
+    if (!draft.rowCount) { response.status(404).json({ error: 'Editable KRA eTIMS invoice draft not found.' }); return }
+    const invoice = await pool!.query('SELECT amount::text, status FROM invoices WHERE id = $1 AND workspace_id = $2', [draft.rows[0].source_id, request.session!.workspaceId])
+    if (!invoice.rowCount || invoice.rows[0].status === 'void') { response.status(409).json({ error: 'Invoice is unavailable or void.' }); return }
+    if (Math.round(Number(invoice.rows[0].amount) * 100) !== Math.round(input.data.totAmt * 100)) { response.status(409).json({ error: 'KRA fiscal total must exactly match the saved internal invoice total. Edit the internal invoice or fiscal data first.' }); return }
+    const result = await pool!.query("UPDATE compliance_submission_drafts SET draft_payload = jsonb_set(draft_payload, '{fiscalPayload}', $1::jsonb, true), provider_status = 'blocked_no_certified_adapter', provider_result = NULL, external_invoice_number = NULL, fiscal_receipt_signature = NULL, provider_submitted_at = NULL, updated_at = now() WHERE id = $2 AND workspace_id = $3 RETURNING id, payload_version, workflow_status, updated_at", [JSON.stringify(input.data), request.params.draftId, request.session!.workspaceId])
+    response.json({ draft: result.rows[0], notice: 'KRA payload saved for review. Codes must be selected from current KRA code lists; no request was sent.' })
+  } catch (error) { next(error) }
+})
+app.post('/v1/integrations/statutory/drafts/:runId', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  try {
+    const runResult = await pool!.query('SELECT id, period, status, rule_set, employee_count, gross_total::text, net_total::text, paye_total::text, shif_total::text, nssf_employee_total::text, nssf_employer_total::text, housing_employee_total::text, housing_employer_total::text FROM payroll_runs WHERE id = $1 AND workspace_id = $2', [request.params.runId, request.session!.workspaceId])
+    const run = runResult.rows[0]
+    if (!run) { response.status(404).json({ error: 'Payroll run not found in this workspace.' }); return }
+    if (run.status === 'draft') { response.status(409).json({ error: 'Review and post this payroll run before preparing its filing package.' }); return }
+    const routeProfile = await pool!.query("SELECT details FROM integration_onboarding WHERE workspace_id = $1 AND integration_type = 'statutory_filing'", [request.session!.workspaceId])
+    const draftPayload = { payrollRunId: run.id, period: run.period, payrollStatus: run.status, ruleSet: run.rule_set, employeeCount: run.employee_count, totals: { gross: run.gross_total, net: run.net_total, paye: run.paye_total, shif: run.shif_total, nssfEmployee: run.nssf_employee_total, nssfEmployer: run.nssf_employer_total, housingEmployee: run.housing_employee_total, housingEmployer: run.housing_employer_total }, returnMappings: null, routePlan: routeProfile.rows[0]?.details ?? {}, note: 'Preparation summary only, not a statutory return. Validate current rates, employee-level data and form schemas with qualified Kenyan payroll professionals and each authority/provider.' }
+    const result = await pool!.query("INSERT INTO compliance_submission_drafts (workspace_id, integration_type, source_type, source_id, payload_version, draft_payload, created_by) VALUES ($1, 'statutory_filing', 'payroll_run', $2, 'kashflow-statutory-draft-v1', $3::jsonb, $4) ON CONFLICT (workspace_id, integration_type, source_type, source_id) DO NOTHING RETURNING id, integration_type, source_type, source_id, payload_version, draft_payload, workflow_status, provider_status, created_at, updated_at", [request.session!.workspaceId, run.id, JSON.stringify(draftPayload), request.session!.userId])
+    const draft = result.rows[0] ?? (await pool!.query("SELECT id, integration_type, source_type, source_id, payload_version, draft_payload, workflow_status, provider_status, reviewer_name, reviewer_qualification, reviewer_registration, reviewer_reference, reviewer_attested_at, created_at, updated_at FROM compliance_submission_drafts WHERE workspace_id = $1 AND integration_type = 'statutory_filing' AND source_type = 'payroll_run' AND source_id = $2", [request.session!.workspaceId, run.id])).rows[0]
+    response.status(201).json({ draft, providerSubmission: 'blocked_no_authorized_filing_adapter', notice: 'Preparation draft only. No tax or contribution authority was contacted and no payment or return was filed.' })
+  } catch (error) { next(error) }
+})
+app.patch('/v1/integrations/drafts/:draftId', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ workflowStatus: z.enum(['draft', 'reviewed', 'cancelled']), reviewerName: z.string().trim().min(2).max(160).optional(), reviewerQualification: z.string().trim().min(2).max(160).optional(), reviewerRegistration: z.string().trim().min(2).max(100).optional(), reviewerReference: z.string().trim().min(2).max(200).optional() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Workflow status must be draft, reviewed, or cancelled.' }); return }
+  try {
+    const existing = await pool!.query('SELECT integration_type, draft_payload FROM compliance_submission_drafts WHERE id = $1 AND workspace_id = $2', [request.params.draftId, request.session!.workspaceId])
+    if (!existing.rowCount) { response.status(404).json({ error: 'Draft not found in this workspace.' }); return }
+    const isStatutory = existing.rows[0].integration_type === 'statutory_filing'
+    const isKraEtims = existing.rows[0].integration_type === 'kra_etims'
+    if (input.data.workflowStatus === 'reviewed' && isKraEtims) {
+      const fiscal = kraFiscalPayloadSchema.safeParse((existing.rows[0].draft_payload as Record<string, unknown>)?.fiscalPayload)
+      if (!fiscal.success) { response.status(409).json({ error: 'Save a complete KRA OSCU fiscal payload with reconciled totals before marking this invoice draft reviewed.' }); return }
+      const device = await pool!.query('SELECT initialized_at FROM kra_oscu_workspaces WHERE workspace_id = $1 AND environment = $2', [request.session!.workspaceId, env.KRA_ETIMS_ENV])
+      if (!device.rowCount || !device.rows[0].initialized_at) { response.status(409).json({ error: `Configure and initialize a KRA ${env.KRA_ETIMS_ENV} OSCU device before review.` }); return }
+      if (env.KRA_ETIMS_ENV === 'production') {
+        const profile = await pool!.query("SELECT milestone, details FROM integration_onboarding WHERE workspace_id = $1 AND integration_type = 'kra_etims'", [request.session!.workspaceId])
+        const details = (profile.rows[0]?.details ?? {}) as Record<string, unknown>
+        if (!kraEtimsLiveEnabled || profile.rows[0]?.milestone !== 'certified' || !details.certificationReference || !details.productionApprovalReference) { response.status(409).json({ error: 'Production review is blocked until the server production switch is enabled and KRA certification/production approval references are recorded. References are self-reported and not independently verified.' }); return }
+      }
+    }
+    if (input.data.workflowStatus === 'reviewed' && isStatutory && (!input.data.reviewerName || !input.data.reviewerQualification || !input.data.reviewerRegistration || !input.data.reviewerReference)) {
+      response.status(400).json({ error: 'Statutory review requires reviewer name, qualification, professional registration/member number, and review reference.' }); return
+    }
+    if (input.data.workflowStatus === 'reviewed' && isStatutory) {
+      const profile = await pool!.query("SELECT details FROM integration_onboarding WHERE workspace_id = $1 AND integration_type = 'statutory_filing'", [request.session!.workspaceId])
+      const details = (profile.rows[0]?.details ?? {}) as Record<string, unknown>
+      if (details.routesConfirmed !== true || !details.routeConfirmationReference || !details.payeRoute || !details.ahlRoute || !details.shifRoute || !details.nssfRoute) { response.status(409).json({ error: 'Confirm and record PAYE, AHL, SHIF, and NSSF routes plus the authority/provider confirmation reference before marking this draft reviewed. This route record is self-reported, not verified.' }); return }
+      if ([details.payeRoute, details.ahlRoute, details.shifRoute, details.nssfRoute].includes('authorized_provider') && !details.providerName) { response.status(409).json({ error: 'Provide the authorized provider name and its reference for provider-routed submissions.' }); return }
+    }
+    const result = await pool!.query('UPDATE compliance_submission_drafts SET workflow_status = $1, reviewer_name = COALESCE($2, reviewer_name), reviewer_qualification = COALESCE($3, reviewer_qualification), reviewer_registration = COALESCE($4, reviewer_registration), reviewer_reference = COALESCE($5, reviewer_reference), reviewer_attested_at = CASE WHEN $6 THEN now() ELSE reviewer_attested_at END, updated_at = now() WHERE id = $7 AND workspace_id = $8 AND provider_status = $9 RETURNING id, integration_type, source_type, workflow_status, provider_status, reviewer_name, reviewer_qualification, reviewer_registration, reviewer_reference, reviewer_attested_at, updated_at', [input.data.workflowStatus, input.data.reviewerName ?? null, input.data.reviewerQualification ?? null, input.data.reviewerRegistration ?? null, input.data.reviewerReference ?? null, isStatutory && input.data.workflowStatus === 'reviewed', request.params.draftId, request.session!.workspaceId, 'blocked_no_certified_adapter'])
+    if (!result.rowCount) { response.status(404).json({ error: 'Draft not found in this workspace.' }); return }
+    response.json({ draft: result.rows[0], notice: isStatutory && input.data.workflowStatus === 'reviewed' ? 'Reviewer details are self-reported and unverified; this is not legal approval. No provider submission occurred.' : 'This changes internal draft workflow only; no provider submission occurred.' })
+  } catch (error) { next(error) }
+})
+app.post('/v1/integrations/drafts/:draftId/submit', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requireWorkspaceProviderPreference('kraEtimsLiveEnabled', true), async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, integration_type, source_type, source_id, draft_payload, workflow_status, provider_status, external_invoice_number, provider_result FROM compliance_submission_drafts WHERE id = $1 AND workspace_id = $2', [request.params.draftId, request.session!.workspaceId])
+    const draft = result.rows[0]
+    if (!draft) { response.status(404).json({ error: 'Draft not found in this workspace.' }); return }
+    if (draft.integration_type === 'kra_etims' && draft.provider_status === 'accepted_by_kra') { response.json({ submissionStatus: 'accepted_by_kra', result: draft.provider_result, externalInvoiceNumber: draft.external_invoice_number, duplicateRequest: true }); return }
+    if (draft.integration_type === 'kra_etims' && ['submitted_to_kra', 'submission_unknown'].includes(String(draft.provider_status))) { response.status(409).json({ error: 'A prior KRA request may have reached KRA. Do not retry and create a duplicate fiscal invoice; reconcile this draft with KRA before any retry.', submissionStatus: draft.provider_status, externalInvoiceNumber: draft.external_invoice_number }); return }
+    if (draft.workflow_status !== 'reviewed') { response.status(409).json({ error: 'Mark the draft internally reviewed before requesting an authority submission.' }); return }
+    const integrationType = String(draft.integration_type)
+    if (integrationType === 'statutory_filing') {
+      const [review, routeProfile] = await Promise.all([
+        pool!.query('SELECT reviewer_name, reviewer_qualification, reviewer_registration, reviewer_reference FROM compliance_submission_drafts WHERE id = $1 AND workspace_id = $2', [draft.id, request.session!.workspaceId]),
+        pool!.query("SELECT details FROM integration_onboarding WHERE workspace_id = $1 AND integration_type = 'statutory_filing'", [request.session!.workspaceId]),
+      ])
+      const routeDetails = (routeProfile.rows[0]?.details ?? {}) as Record<string, unknown>
+      if (!review.rows[0]?.reviewer_name || !review.rows[0]?.reviewer_qualification || !review.rows[0]?.reviewer_registration || !review.rows[0]?.reviewer_reference) { response.status(409).json({ error: 'Qualified Kenyan payroll/tax review details and professional registration are required. No submission was sent.' }); return }
+      if (routeDetails.routesConfirmed !== true || !routeDetails.routeConfirmationReference || !routeDetails.payeRoute || !routeDetails.ahlRoute || !routeDetails.shifRoute || !routeDetails.nssfRoute) { response.status(409).json({ error: 'Record and confirm the filing route and authority/provider reference for PAYE, AHL, SHIF, and NSSF before attempting filing. Route confirmation is self-reported, not verified. No submission was sent.' }); return }
+      if ([routeDetails.payeRoute, routeDetails.ahlRoute, routeDetails.shifRoute, routeDetails.nssfRoute].includes('authorized_provider') && !routeDetails.providerName) { response.status(409).json({ error: 'Record the authorized provider name and approval reference for the selected provider route. No submission was sent.' }); return }
+      const provider = 'authorized statutory filing adapter'
+      response.status(503).json({ error: `Submission is blocked: no ${provider} is installed and verified for this business.`, submissionStatus: 'not_submitted', required: ['Obtain qualified Kenyan payroll/tax review and verify reviewer registration', 'Confirm PAYE, AHL, SHIF, and NSSF routes with authorities/providers', 'Obtain official return specifications and authorized machine-to-machine access', 'Implement and certify each separate return adapter'] })
+      return
+    } else if (integrationType === 'kra_etims') {
+      if (!env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY) { response.status(503).json({ error: 'KRA credential encryption is not configured on the API service.', submissionStatus: 'not_submitted' }); return }
+      if (!draft.draft_payload || typeof draft.draft_payload !== 'object' || !('fiscalPayload' in draft.draft_payload)) { response.status(409).json({ error: 'Complete and save KRA fiscal data from current official code lists before submission.', submissionStatus: 'not_submitted' }); return }
+      const fiscal = kraFiscalPayloadSchema.safeParse((draft.draft_payload as Record<string, unknown>).fiscalPayload)
+      if (!fiscal.success) { response.status(409).json({ error: 'Saved KRA fiscal payload is invalid; update and review it before submission.', submissionStatus: 'not_submitted' }); return }
+      const sourceInvoice = await pool!.query('SELECT amount::text, status FROM invoices WHERE id = $1 AND workspace_id = $2', [draft.source_id, request.session!.workspaceId])
+      if (!sourceInvoice.rowCount || sourceInvoice.rows[0].status === 'void') { response.status(409).json({ error: 'The source invoice is missing or void. No KRA request was sent.', submissionStatus: 'not_submitted' }); return }
+      if (Math.round(Number(sourceInvoice.rows[0].amount) * 100) !== Math.round(fiscal.data.totAmt * 100)) { response.status(409).json({ error: 'The saved invoice total changed after draft review. Update and review the fiscal payload again before submitting.', submissionStatus: 'not_submitted' }); return }
+      if (env.KRA_ETIMS_ENV === 'production') {
+        if (!kraEtimsLiveEnabled) { response.status(503).json({ error: 'Production eTIMS is disabled by KRA_ETIMS_LIVE_ENABLED. Keep sandbox mode until KRA production certification/approval and customer credentials have been confirmed.', submissionStatus: 'not_submitted' }); return }
+        if (!env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY) { response.status(503).json({ error: 'Production eTIMS requires persistent server-side credential encryption.', submissionStatus: 'not_submitted' }); return }
+      }
+      const profile = await pool!.query("SELECT milestone, details FROM integration_onboarding WHERE workspace_id = $1 AND integration_type = 'kra_etims'", [request.session!.workspaceId])
+      const profileRow = profile.rows[0]
+      const details = (profileRow?.details ?? {}) as Record<string, unknown>
+      if (env.KRA_ETIMS_ENV === 'production' && (profileRow?.milestone !== 'certified' || !details.solution || !details.sandboxReference || !details.certificationReference || !details.productionApprovalReference)) {
+        response.status(409).json({ error: 'Record the OSCU/VSCU solution, sandbox, certification and production approval references before production submission. These entries are self-reported and KRA approval is not verified by KashFlow. No submission was sent.' }); return
+      }
+      const device = await pool!.query('SELECT credentials_encrypted, initialized_at FROM kra_oscu_workspaces WHERE workspace_id = $1 AND environment = $2', [request.session!.workspaceId, env.KRA_ETIMS_ENV])
+      if (!device.rowCount || !device.rows[0].initialized_at) { response.status(409).json({ error: `Configure and initialize an approved KRA ${env.KRA_ETIMS_ENV} OSCU device first.`, submissionStatus: 'not_submitted' }); return }
+      const credentials = decryptKraCredentials<KraOsuCredentials>(String(device.rows[0].credentials_encrypted))
+      if (!credentials.cmcKey) { response.status(409).json({ error: 'KRA device communication key is missing; initialize the device again.', submissionStatus: 'not_submitted' }); return }
+      const counterClient = await pool!.connect()
+      let invoiceNumber: number
+      try {
+        await counterClient.query('BEGIN')
+        await counterClient.query('INSERT INTO kra_oscu_invoice_counters (workspace_id, last_invoice_number) VALUES ($1, 0) ON CONFLICT (workspace_id) DO NOTHING', [request.session!.workspaceId])
+        const counter = await counterClient.query('SELECT last_invoice_number FROM kra_oscu_invoice_counters WHERE workspace_id = $1 FOR UPDATE', [request.session!.workspaceId])
+        invoiceNumber = Number(counter.rows[0].last_invoice_number) + 1
+        await counterClient.query('UPDATE kra_oscu_invoice_counters SET last_invoice_number = $1 WHERE workspace_id = $2', [invoiceNumber, request.session!.workspaceId])
+        const reservation = await counterClient.query("UPDATE compliance_submission_drafts SET provider_status = 'submitted_to_kra', external_invoice_number = $1, provider_submitted_at = now(), updated_at = now() WHERE id = $2 AND workspace_id = $3 AND provider_status IN ('blocked_no_certified_adapter', 'rejected_by_kra') RETURNING id", [String(invoiceNumber), draft.id, request.session!.workspaceId])
+        if (!reservation.rowCount) { await counterClient.query('ROLLBACK'); response.status(409).json({ error: 'A concurrent request already reserved this KRA invoice. Reconcile its provider status before retrying.' }); return }
+        await counterClient.query('COMMIT')
+      } catch (error) { await counterClient.query('ROLLBACK'); throw error }
+      finally { counterClient.release() }
+      const requestPayload = { tin: credentials.taxpayerPin, bhfId: credentials.branchId, cmcKey: credentials.cmcKey, trdInvcNo: `KF-${String(draft.source_id).replace(/-/g, '').slice(0, 40)}`, invcNo: invoiceNumber, orgInvcNo: 0, ...fiscal.data }
+      try {
+        const providerResult = await kraOsuRequest<Record<string, unknown>>('/saveTrnsSalesOsdc', requestPayload)
+        const success = String(providerResult.resultCd ?? '') === '000'
+        const data = providerResult.data && typeof providerResult.data === 'object' ? providerResult.data : null
+        await pool!.query(`UPDATE compliance_submission_drafts SET provider_status = $1, provider_result = $2::jsonb, fiscal_receipt_signature = $3,
+          workflow_status = CASE WHEN $4 THEN workflow_status ELSE 'draft' END,
+          external_invoice_number = CASE WHEN $4 THEN external_invoice_number ELSE NULL END,
+          provider_submitted_at = CASE WHEN $4 THEN provider_submitted_at ELSE NULL END,
+          updated_at = now() WHERE id = $5 AND workspace_id = $6`, [success ? 'accepted_by_kra' : 'rejected_by_kra', JSON.stringify(providerResult), data && typeof data === 'object' ? String((data as Record<string, unknown>).rcptSign ?? '') : null, success, draft.id, request.session!.workspaceId])
+        response.status(success ? 200 : 502).json({ submissionStatus: success ? 'accepted_by_kra' : 'rejected_by_kra', externalInvoiceNumber: String(invoiceNumber), result: providerResult, environment: env.KRA_ETIMS_ENV, notice: success ? 'KRA OSCU accepted the fiscalization request. Verify the returned receipt/signature in KRA records.' : 'KRA rejected the fiscalization request; correct the provider response issues before creating a replacement request.' })
+      } catch (error) {
+        await pool!.query("UPDATE compliance_submission_drafts SET provider_status = 'submission_unknown', provider_result = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3", [JSON.stringify({ message: error instanceof Error ? error.message.slice(0, 500) : 'Network result unknown.' }), draft.id, request.session!.workspaceId])
+        response.status(504).json({ error: 'KRA request outcome is unknown due to a network/provider error. Do not retry automatically; reconcile by taxpayer PIN and reserved invoice number first.', submissionStatus: 'submission_unknown', externalInvoiceNumber: String(invoiceNumber) })
+      }
+      return
+    }
+    response.status(400).json({ error: 'Unsupported authority submission type.' })
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/integrations/readiness', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const workspaceSettings = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId])
+    const settings = { ...defaultWorkspaceSettings, ...(workspaceSettings.rows[0]?.preferences ?? {}) }
+    const callbackIsSecure = env.MPESA_ENV !== 'production' || env.MPESA_CALLBACK_URL?.startsWith('https://') === true
+    const mpesaReady = Boolean(settings.darajaEnabled && mpesaConfigured && callbackIsSecure)
+    const kraReady = Boolean(settings.kraEtimsLiveEnabled && env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY && kraEtimsLiveEnabled)
+    const monoReady = Boolean(settings.monoEnabled && monoConfigured)
+    response.json({ mode: mpesaReady ? 'mpesa_configured' : 'setup_required', integrations: [
+      { id: 'kra_etims', status: kraReady ? 'oscu_production_switches_enabled_approval_and_device_still_required' : settings.kraEtimsLiveEnabled ? `oscu_${env.KRA_ETIMS_ENV}_live_disabled` : 'oscu_workspace_disabled' },
+      { id: 'mpesa', status: mpesaReady ? `configured_${env.MPESA_ENV}` : settings.darajaEnabled ? 'daraja_credentials_and_callback_required' : 'workspace_daraja_disabled' },
+      { id: 'bank_feeds', status: monoReady ? 'mono_configured_consent_required' : settings.monoEnabled ? 'mono_business_approval_and_server_keys_required' : 'workspace_mono_disabled' },
+      { id: 'email', status: emailConfigured ? 'resend_configured' : 'resend_api_key_and_verified_sender_required' },
+      { id: 'payroll', status: `encrypted_internal_runs_${env.PAYROLL_DATA_ENCRYPTION_KEY ? 'configured' : 'encryption_key_required'}_statutory_filing_not_implemented` },
+      { id: 'paye_shif_nssf_ahl_filing', status: 'statutory_filing_not_implemented' },
+    ], note: `Workspace preferences are enforced on Daraja payment initiation, Mono linking/sync, and production KRA OSCU operations. Render provider credentials remain shared across businesses. KRA readiness here only reports that operator/workspace switches and encryption config are present; KRA approval, certification, initialized production device, fiscal mapping review, and reconciliation are still required. Statutory filing adapters are not implemented, regardless of saved preferences. Payroll estimates remain internal and are not certified.` })
+  } catch (error) { next(error) }
 })
 app.use((_request, response) => response.status(404).json({ error: 'Not found' }))
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
@@ -908,7 +1646,21 @@ async function start() {
     const workspaces = await pool.query('SELECT id FROM workspaces')
     for (const workspace of workspaces.rows) await ensureDefaultAccounts(String(workspace.id))
   }
-  return app.listen(env.PORT, () => console.info(`KashFlow API listening on port ${env.PORT}`))
+  const server = app.listen(env.PORT, () => console.info(`KashFlow API listening on port ${env.PORT}`))
+  if (pool && monoConfigured) {
+    const syncInterval = setInterval(() => {
+      void (async () => {
+        const accounts = await pool!.query("SELECT a.id, a.workspace_id, a.provider_account_id, s.preferences FROM connected_bank_accounts a LEFT JOIN workspace_settings s ON s.workspace_id = a.workspace_id WHERE a.provider = 'mono' AND a.connection_status = 'connected'")
+        for (const account of accounts.rows) {
+          if (account.preferences?.monoEnabled !== true) continue
+          try { await syncMonoAccount(String(account.workspace_id), String(account.id), String(account.provider_account_id)) }
+          catch (error) { console.error('Scheduled Mono bank sync failed:', error instanceof Error ? error.message : String(error)) }
+        }
+      })().catch((error: unknown) => console.error('Mono bank sync scheduler failed:', error))
+    }, env.MONO_SYNC_INTERVAL_MINUTES * 60_000)
+    syncInterval.unref()
+  }
+  return server
 }
 const server = await start()
 async function shutdown() { server.close(); await pool?.end() }
