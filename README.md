@@ -20,6 +20,8 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 - Provides a versioned Kenya payroll estimator for PAYE, employee/employer NSSF, SHIF, and Affordable Housing Levy, with explicit assumptions and review warnings.
 - Provides encrypted employee records and payslips, monthly payroll drafts, double-entry payroll posting, payroll payment recording, and manual statutory remittance-reference tracking for admins.
 - Seeds a per-business chart of accounts; posts balanced journal entries for manual transactions, invoices, and posted payroll; exposes a trial balance and journal history.
+- Provides date-ranged income statement and as-of balance sheet management reports calculated from posted journals. These are operational reports only, depend on correct opening balances/account mappings, and are not audited or tax-certified financial statements.
+- Supports single-line customer estimates that can be accepted and converted into invoices, accounts-payable bills with full-payment ledger postings, and manual bank statement reconciliation by matching posted transactions to a statement period and balance.
 - Supports accounting period close and reopen, with posting blocked in closed periods.
 - Lets an administrator record an invitation with an email, built-in or custom role label, and target scope of the active business or all businesses they administer.
 - Uses Kenyan Shillings (KSh) in the finance UI and describes the intended local compliance integrations transparently.
@@ -29,7 +31,8 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 Do not treat UI labels, environment variables, or saved invitation records as working third-party integrations. The current repository does **not** include:
 
 - Automatic employee payments, statutory remittance transfers, or filing/submission to KRA, SHIF/SHA, NSSF, or AHL. Remittances are only tracked after an external payment is made; payroll formula rules require professional review.
-- Financial statements, account reconciliation, journal edits/reversals, and audit certification. Journal posting, chart, trial balance, and close/reopen are implemented but require accounting review.
+- Journal edits/reversals and audit certification. Bank reconciliation currently supports manual matching to already-posted ledger transactions; it does not ingest statement lines into a matching queue or reconcile provider-feed entries before posting. Financial statements exist but remain unaudited and require accounting review.
+- Multi-line/tax-aware and recurring estimates/invoices, automated reminders, partial bill payments, bill approvals, purchase orders, inventory movements/valuation/reordering, time sheets/project cost allocation, and budget/forecast workflows.
 - Statutory filing/remittance integrations for PAYE, AHL, SHIF, and NSSF. Saved payroll summaries and review attestations do not submit authority returns.
 - Invitation email delivery, invitation acceptance, membership provisioning, or fine-grained permission enforcement. Custom role values are labels only; invitation scope is recorded but does not grant the invitee access.
 - Automated backup/restore tools or an audited integration-credential vault. Document storage, inventory, projects, and supported audit events are implemented, but still require operational review before production use.

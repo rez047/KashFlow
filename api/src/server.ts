@@ -244,6 +244,7 @@ const defaultChartOfAccounts = [
   { code: '2120', name: 'NSSF payable', type: 'liability' },
   { code: '2130', name: 'Affordable Housing Levy payable', type: 'liability' },
   { code: '2140', name: 'Other employee deductions payable', type: 'liability' },
+  { code: '2200', name: 'Accounts payable', type: 'liability' },
   { code: '3000', name: 'Retained earnings', type: 'equity' },
   { code: '4000', name: 'Sales income', type: 'income' },
   { code: '5000', name: 'Salaries expense', type: 'expense' },
@@ -943,6 +944,97 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, async (reque
   finally { client.release() }
 })
 
+app.get('/v1/estimates', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, customer, customer_email, description, amount::text, valid_until, status, invoice_id, created_at FROM estimates WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 200', [request.session!.workspaceId])
+    response.json({ estimates: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/estimates', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ customer: z.string().trim().min(1).max(160), customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), validUntil: z.string().date() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a customer, description, positive amount, and valid expiry date.' }); return }
+  try {
+    const result = await pool!.query('INSERT INTO estimates (id, workspace_id, customer, customer_email, description, amount, valid_until) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, customer_email, description, amount::text, valid_until, status, created_at', [randomUUID(), request.session!.workspaceId, input.data.customer, input.data.customerEmail, input.data.description, input.data.amount.toFixed(2), input.data.validUntil])
+    response.status(201).json({ estimate: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.patch('/v1/estimates/:estimateId/status', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ status: z.enum(['sent', 'accepted', 'declined', 'void']) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Choose a valid estimate status.' }); return }
+  try {
+    const result = await pool!.query("UPDATE estimates SET status = $1, updated_at = now() WHERE id = $2 AND workspace_id = $3 AND status IN ('draft', 'sent', 'accepted', 'declined') RETURNING id, status", [input.data.status, request.params.estimateId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Estimate not found or already converted.' }); return }
+    response.json({ estimate: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.post('/v1/estimates/:estimateId/convert', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query("SELECT id, customer, customer_email, description, amount::text FROM estimates WHERE id = $1 AND workspace_id = $2 AND status = 'accepted' AND invoice_id IS NULL FOR UPDATE", [request.params.estimateId, request.session!.workspaceId])
+    const estimate = found.rows[0]
+    if (!estimate) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only an accepted estimate that has not been converted can become an invoice.' }); return }
+    const invoiceId = randomUUID()
+    const dueDate = z.string().date().safeParse(request.body?.dueDate)
+    if (!dueDate.success) { await client.query('ROLLBACK'); response.status(400).json({ error: 'Provide a valid invoice due date.' }); return }
+    const invoice = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, amount::text, due_date, status', [invoiceId, request.session!.workspaceId, estimate.customer, estimate.customer_email, estimate.description, estimate.amount, dueDate.data])
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${estimate.customer} — ${estimate.description}`, sourceType: 'invoice', sourceId: invoiceId, lines: [{ accountCode: '1100', debit: Number(estimate.amount), credit: 0 }, { accountCode: '4000', debit: 0, credit: Number(estimate.amount) }] })
+    await client.query("UPDATE estimates SET status = 'converted', invoice_id = $1, updated_at = now() WHERE id = $2", [invoiceId, estimate.id])
+    await client.query('COMMIT')
+    response.status(201).json({ invoice: invoice.rows[0] })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+
+app.get('/v1/bills', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, supplier, description, amount::text, bill_date, due_date, status, created_at FROM vendor_bills WHERE workspace_id = $1 ORDER BY due_date, created_at DESC LIMIT 200', [request.session!.workspaceId])
+    response.json({ bills: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/bills', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ supplier: z.string().trim().min(1).max(160), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), billDate: z.string().date(), dueDate: z.string().date() }).safeParse(request.body)
+  if (!input.success || input.data.billDate > input.data.dueDate) { response.status(400).json({ error: 'Enter a supplier, description, positive amount, and valid bill/due dates.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    await ensureDefaultAccounts(request.session!.workspaceId)
+    const id = randomUUID()
+    const bill = await client.query('INSERT INTO vendor_bills (id, workspace_id, supplier, description, amount, bill_date, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, supplier, description, amount::text, bill_date, due_date, status', [id, request.session!.workspaceId, input.data.supplier, input.data.description, input.data.amount.toFixed(2), input.data.billDate, input.data.dueDate])
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.billDate, description: `Bill: ${input.data.supplier} — ${input.data.description}`, sourceType: 'vendor_bill', sourceId: id, lines: [{ accountCode: '6000', debit: input.data.amount, credit: 0 }, { accountCode: '2200', debit: 0, credit: input.data.amount }] })
+    await client.query('COMMIT')
+    response.status(201).json({ bill: bill.rows[0] })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+app.post('/v1/bills/:billId/payments', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ amount: z.coerce.number().finite().positive().max(999999999999), paymentDate: z.string().date() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a positive payment amount and valid payment date.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query("SELECT id, supplier, description, amount::text FROM vendor_bills WHERE id = $1 AND workspace_id = $2 AND status = 'unpaid' FOR UPDATE", [request.params.billId, request.session!.workspaceId])
+    const bill = found.rows[0]
+    if (!bill) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Unpaid bill not found.' }); return }
+    const amount = Number(bill.amount)
+    if (Math.round(input.data.amount * 100) !== Math.round(amount * 100)) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Partial payments are not supported yet; pay the full bill amount.' }); return }
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.paymentDate, description: `Bill payment: ${bill.supplier} — ${bill.description}`, sourceType: 'vendor_bill_payment', sourceId: String(bill.id), lines: [{ accountCode: '2200', debit: amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: amount }] })
+    await client.query("UPDATE vendor_bills SET status = 'paid', updated_at = now() WHERE id = $1 AND workspace_id = $2", [bill.id, request.session!.workspaceId])
+    await client.query('COMMIT')
+    response.json({ status: 'paid' })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+
 app.get('/v1/accounting/chart', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
     await ensureDefaultAccounts(request.session!.workspaceId)
@@ -960,6 +1052,167 @@ app.get('/v1/accounting/trial-balance', requirePool, requireSession, async (requ
     const accounts = result.rows.map((row: Record<string, unknown>) => ({ ...row, debit: String(row.debit), credit: String(row.credit), balance: (Number(row.debit) - Number(row.credit)).toFixed(2) }))
     response.json({ accounts, totals: { debit: accounts.reduce((total: number, row: { debit: string }) => total + Number(row.debit), 0).toFixed(2), credit: accounts.reduce((total: number, row: { credit: string }) => total + Number(row.credit), 0).toFixed(2) } })
   } catch (error) { next(error) }
+})
+
+app.get('/v1/accounting/reports/financial-statements', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const today = nairobiToday()
+  const input = z.object({
+    from: z.string().date().default(`${today.slice(0, 4)}-01-01`),
+    to: z.string().date().default(today),
+  }).safeParse(request.query)
+  if (!input.success || input.data.from > input.data.to) {
+    response.status(400).json({ error: 'Use a valid date range with from on or before to.' })
+    return
+  }
+  try {
+    await ensureDefaultAccounts(request.session!.workspaceId)
+    const result = await pool!.query(`SELECT a.code, a.name, a.account_type AS type,
+      COALESCE(SUM(CASE WHEN e.entry_date >= $2 THEN l.debit ELSE 0 END), 0)::text AS period_debit,
+      COALESCE(SUM(CASE WHEN e.entry_date >= $2 THEN l.credit ELSE 0 END), 0)::text AS period_credit,
+      COALESCE(SUM(l.debit), 0)::text AS balance_debit,
+      COALESCE(SUM(l.credit), 0)::text AS balance_credit
+      FROM workspace_accounts a
+      LEFT JOIN journal_lines l ON l.account_id = a.id
+      LEFT JOIN journal_entries e ON e.id = l.journal_entry_id
+        AND e.workspace_id = a.workspace_id AND e.entry_date <= $3
+      WHERE a.workspace_id = $1
+      GROUP BY a.code, a.name, a.account_type
+      ORDER BY a.code`, [request.session!.workspaceId, input.data.from, input.data.to])
+
+    const rows: Array<{ code: string; name: string; type: string; periodDebit: number; periodCredit: number; balanceDebit: number; balanceCredit: number }> = result.rows.map((row: Record<string, unknown>) => ({
+      code: String(row.code),
+      name: String(row.name),
+      type: String(row.type),
+      periodDebit: Number(row.period_debit),
+      periodCredit: Number(row.period_credit),
+      balanceDebit: Number(row.balance_debit),
+      balanceCredit: Number(row.balance_credit),
+    }))
+    const nonZero = (amount: number) => Math.round(amount * 100) !== 0
+    const incomeAccounts = rows.filter((row) => row.type === 'income').map((row) => ({ code: row.code, name: row.name, amount: row.periodCredit - row.periodDebit })).filter((row) => nonZero(row.amount))
+    const expenseAccounts = rows.filter((row) => row.type === 'expense').map((row) => ({ code: row.code, name: row.name, amount: row.periodDebit - row.periodCredit })).filter((row) => nonZero(row.amount))
+    const totalIncome = incomeAccounts.reduce((sum, row) => sum + row.amount, 0)
+    const totalExpenses = expenseAccounts.reduce((sum, row) => sum + row.amount, 0)
+    const assets = rows.filter((row) => row.type === 'asset').map((row) => ({ code: row.code, name: row.name, amount: row.balanceDebit - row.balanceCredit })).filter((row) => nonZero(row.amount))
+    const liabilities = rows.filter((row) => row.type === 'liability').map((row) => ({ code: row.code, name: row.name, amount: row.balanceCredit - row.balanceDebit })).filter((row) => nonZero(row.amount))
+    const equity = rows.filter((row) => row.type === 'equity').map((row) => ({ code: row.code, name: row.name, amount: row.balanceCredit - row.balanceDebit })).filter((row) => nonZero(row.amount))
+    const accumulatedEarnings = rows.filter((row) => row.type === 'income').reduce((sum, row) => sum + row.balanceCredit - row.balanceDebit, 0)
+      - rows.filter((row) => row.type === 'expense').reduce((sum, row) => sum + row.balanceDebit - row.balanceCredit, 0)
+    const totalAssets = assets.reduce((sum, row) => sum + row.amount, 0)
+    const totalLiabilities = liabilities.reduce((sum, row) => sum + row.amount, 0)
+    const totalEquity = equity.reduce((sum, row) => sum + row.amount, 0) + accumulatedEarnings
+    response.json({
+      from: input.data.from,
+      to: input.data.to,
+      incomeStatement: {
+        income: incomeAccounts,
+        expenses: expenseAccounts,
+        totalIncome,
+        totalExpenses,
+        netIncome: totalIncome - totalExpenses,
+      },
+      balanceSheet: {
+        asOf: input.data.to,
+        assets,
+        liabilities,
+        equity,
+        accumulatedEarnings,
+        totalAssets,
+        totalLiabilities,
+        totalEquity,
+        liabilitiesAndEquity: totalLiabilities + totalEquity,
+        difference: totalAssets - totalLiabilities - totalEquity,
+      },
+    })
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/accounting/reconciliations', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT r.id, r.account_label, r.period_start, r.period_end, r.opening_balance::text,
+      r.statement_ending_balance::text, r.status, r.completed_at,
+      count(m.transaction_id)::int AS matched_count,
+      COALESCE(SUM(CASE WHEN t.direction = 'income' THEN t.amount ELSE -t.amount END), 0)::text AS matched_net
+      FROM bank_reconciliations r
+      LEFT JOIN bank_reconciliation_matches m ON m.reconciliation_id = r.id
+      LEFT JOIN ledger_transactions t ON t.id = m.transaction_id
+      WHERE r.workspace_id = $1
+      GROUP BY r.id ORDER BY r.period_end DESC, r.created_at DESC LIMIT 100`, [request.session!.workspaceId])
+    response.json({ reconciliations: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/accounting/reconciliations', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ accountLabel: z.string().trim().min(1).max(120), periodStart: z.string().date(), periodEnd: z.string().date(), openingBalance: z.coerce.number().finite(), statementEndingBalance: z.coerce.number().finite() }).safeParse(request.body)
+  if (!input.success || input.data.periodStart > input.data.periodEnd) { response.status(400).json({ error: 'Enter an account, valid dates, and statement balances.' }); return }
+  try {
+    const id = randomUUID()
+    const result = await pool!.query(`INSERT INTO bank_reconciliations (id, workspace_id, account_label, period_start, period_end, opening_balance, statement_ending_balance)
+      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, account_label, period_start, period_end, opening_balance::text, statement_ending_balance::text, status`,
+    [id, request.session!.workspaceId, input.data.accountLabel, input.data.periodStart, input.data.periodEnd, input.data.openingBalance.toFixed(2), input.data.statementEndingBalance.toFixed(2)])
+    response.status(201).json({ reconciliation: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.get('/v1/accounting/reconciliations/:reconciliationId', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT id, account_label, period_start, period_end, opening_balance::text, statement_ending_balance::text, status, completed_at
+      FROM bank_reconciliations WHERE id = $1 AND workspace_id = $2`, [request.params.reconciliationId, request.session!.workspaceId])
+    const reconciliation = result.rows[0]
+    if (!reconciliation) { response.status(404).json({ error: 'Reconciliation not found.' }); return }
+    const transactions = await pool!.query(`SELECT t.id, t.description, t.amount::text, t.direction, t.account, t.transaction_date,
+      (m.transaction_id IS NOT NULL) AS matched
+      FROM ledger_transactions t
+      LEFT JOIN bank_reconciliation_matches m ON m.transaction_id = t.id
+      WHERE t.workspace_id = $1 AND t.account = $2 AND t.transaction_date BETWEEN $3 AND $4
+      ORDER BY t.transaction_date, t.created_at`,
+    [request.session!.workspaceId, reconciliation.account_label, reconciliation.period_start, reconciliation.period_end])
+    const matchedNet = transactions.rows.reduce((sum: number, item: Record<string, unknown>) => item.matched === true ? sum + (item.direction === 'income' ? Number(item.amount) : -Number(item.amount)) : sum, 0)
+    response.json({ reconciliation, transactions: transactions.rows, matchedNet: matchedNet.toFixed(2), calculatedEndingBalance: (Number(reconciliation.opening_balance) + matchedNet).toFixed(2), difference: (Number(reconciliation.statement_ending_balance) - Number(reconciliation.opening_balance) - matchedNet).toFixed(2) })
+  } catch (error) { next(error) }
+})
+app.put('/v1/accounting/reconciliations/:reconciliationId/matches/:transactionId', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ matched: z.boolean() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Specify whether this transaction is matched.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query("SELECT id, account_label, period_start, period_end, status FROM bank_reconciliations WHERE id = $1 AND workspace_id = $2 FOR UPDATE", [request.params.reconciliationId, request.session!.workspaceId])
+    const reconciliation = result.rows[0]
+    if (!reconciliation) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Reconciliation not found.' }); return }
+    if (reconciliation.status !== 'in_progress') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Completed reconciliations cannot be changed.' }); return }
+    if (input.data.matched) {
+      const transaction = await client.query('SELECT id FROM ledger_transactions WHERE id = $1 AND workspace_id = $2 AND account = $3 AND transaction_date BETWEEN $4 AND $5', [request.params.transactionId, request.session!.workspaceId, reconciliation.account_label, reconciliation.period_start, reconciliation.period_end])
+      if (!transaction.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Transaction is outside this account or reconciliation date range.' }); return }
+      await client.query('INSERT INTO bank_reconciliation_matches (reconciliation_id, transaction_id) VALUES ($1, $2) ON CONFLICT (reconciliation_id, transaction_id) DO NOTHING', [reconciliation.id, request.params.transactionId])
+    } else {
+      await client.query('DELETE FROM bank_reconciliation_matches WHERE reconciliation_id = $1 AND transaction_id = $2', [reconciliation.id, request.params.transactionId])
+    }
+    await client.query('COMMIT')
+    response.json({ matched: input.data.matched })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && 'code' in error && error.code === '23505') { response.status(409).json({ error: 'This transaction is already matched to another reconciliation.' }); return }
+    next(error)
+  } finally { client.release() }
+})
+app.post('/v1/accounting/reconciliations/:reconciliationId/complete', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query('SELECT id, opening_balance::text, statement_ending_balance::text, status FROM bank_reconciliations WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.reconciliationId, request.session!.workspaceId])
+    const reconciliation = result.rows[0]
+    if (!reconciliation) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Reconciliation not found.' }); return }
+    if (reconciliation.status !== 'in_progress') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Reconciliation is already completed.' }); return }
+    const net = await client.query(`SELECT COALESCE(SUM(CASE WHEN t.direction = 'income' THEN t.amount ELSE -t.amount END), 0)::text AS matched_net
+      FROM bank_reconciliation_matches m JOIN ledger_transactions t ON t.id = m.transaction_id WHERE m.reconciliation_id = $1`, [reconciliation.id])
+    const calculated = Math.round((Number(reconciliation.opening_balance) + Number(net.rows[0].matched_net)) * 100)
+    const expected = Math.round(Number(reconciliation.statement_ending_balance) * 100)
+    if (calculated !== expected) { await client.query('ROLLBACK'); response.status(409).json({ error: `Reconciliation does not balance. Difference: KSh ${((expected - calculated) / 100).toLocaleString('en-KE', { minimumFractionDigits: 2 })}.` }); return }
+    await client.query("UPDATE bank_reconciliations SET status = 'completed', completed_by = $1, completed_at = now() WHERE id = $2", [request.session!.userId, reconciliation.id])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'bank_reconciliation.completed', entityType: 'bank_reconciliation', entityId: String(reconciliation.id), eventData: { endingBalance: reconciliation.statement_ending_balance, matchedNet: net.rows[0].matched_net } })
+    await client.query('COMMIT')
+    response.json({ status: 'completed', endingBalance: reconciliation.statement_ending_balance })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
 })
 
 app.get('/v1/accounting/journals', requirePool, requireSession, async (request: AuthedRequest, response, next) => {

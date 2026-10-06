@@ -16,6 +16,7 @@ function nairobiDate() {
   return `${values.year}-${values.month}-${values.day}`
 }
 const today = nairobiDate()
+const yearStart = `${today.slice(0, 4)}-01-01`
 const groups = [
   { title: 'WORKSPACE', items: [['Overview', LayoutDashboard], ['Banking', Landmark], ['Sales', ArrowUpRight], ['Expenses', ArrowDownLeft], ['Payroll', Users]] },
   { title: 'MANAGE', items: [['Customers', Users], ['Suppliers', ShoppingBag], ['Inventory', Package], ['Projects', BriefcaseBusiness], ['Accounting', BookOpen]] },
@@ -58,6 +59,10 @@ type Employee = { id: string; employeeNumber: string; fullName: string; email?: 
 type PayrollRun = { id: string; period: string; status: 'draft' | 'posted' | 'paid'; rule_set: string; employee_count: number; gross_total: string; net_total: string; paye_total: string; shif_total: string }
 type Remittance = { id: string; remittance_type: string; amount: string; status: string; payment_reference?: string; payroll_run_id: string }
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; due_date: string; status: string }
+type EstimateRecord = { id: string; customer: string; customer_email: string; description: string; amount: string; valid_until: string; status: string; invoice_id?: string | null }
+type VendorBill = { id: string; supplier: string; description: string; amount: string; bill_date: string; due_date: string; status: string }
+type Reconciliation = { id: string; account_label: string; period_start: string; period_end: string; opening_balance: string; statement_ending_balance: string; status: string; matched_count: number }
+type ReconciliationDetail = { reconciliation: Reconciliation; transactions: Array<{ id: string; description: string; amount: string; direction: 'income' | 'expense'; account: string; transaction_date: string; matched: boolean }>; matchedNet: string; calculatedEndingBalance: string; difference: string }
 type WorkspaceRecord = { id: string; data: Record<string, string | number>; created_at: string; updated_at: string }
 type StoredDocument = { id: string; file_name: string; mime_type: string; file_size: number; created_at: string }
 type ComplianceDraft = { id: string; integration_type: 'kra_etims' | 'statutory_filing'; source_type: 'invoice' | 'payroll_run'; source_id: string; payload_version: string; draft_payload: Record<string, unknown>; workflow_status: 'draft' | 'reviewed' | 'cancelled'; provider_status: string; external_invoice_number?: string; fiscal_receipt_signature?: string; reviewer_name?: string; reviewer_qualification?: string; reviewer_registration?: string; reviewer_reference?: string; created_at: string }
@@ -67,6 +72,13 @@ type MonoBankConfig = { enabled: boolean; publicKey: string | null; provider: st
 type ConnectedBankAccount = { id: string; provider: string; account_name: string; account_number_masked: string; institution_name: string; currency: string; account_type: string; data_status: string; connection_status: string; last_synced_at: string | null }
 type BankFeedTransaction = { id: string; connected_account_id: string; transaction_date: string; narration: string; amount: string; direction: 'income' | 'expense'; currency: string; review_status: 'needs_review' | 'ignored' | 'posted'; institution_name: string; account_name: string }
 type AccountSummary = { code: string; name: string; type: string; debit: string; credit: string; balance: string }
+type StatementLine = { code: string; name: string; amount: number }
+type FinancialStatements = {
+  from: string
+  to: string
+  incomeStatement: { income: StatementLine[]; expenses: StatementLine[]; totalIncome: number; totalExpenses: number; netIncome: number }
+  balanceSheet: { asOf: string; assets: StatementLine[]; liabilities: StatementLine[]; equity: StatementLine[]; accumulatedEarnings: number; totalAssets: number; totalLiabilities: number; totalEquity: number; liabilitiesAndEquity: number; difference: number }
+}
 type Modal = 'invoice' | 'transaction' | 'business' | 'invite' | null
 type AccountingPeriod = { period: string; status: 'open' | 'closed'; closed_at?: string }
 
@@ -138,6 +150,9 @@ function App() {
   const [credentials, setCredentials] = useState({ identifier: '', password: '', businessName: '' })
   const [transaction, setTransaction] = useState({ description: '', amount: '', direction: 'expense', account: '', date: today })
   const [invoice, setInvoice] = useState({ customer: '', customerEmail: '', description: '', amount: '', dueDate: '' })
+  const [estimateInput, setEstimateInput] = useState({ customer: '', customerEmail: '', description: '', amount: '', validUntil: today })
+  const [billInput, setBillInput] = useState({ supplier: '', description: '', amount: '', billDate: today, dueDate: today })
+  const [reconciliationInput, setReconciliationInput] = useState({ accountLabel: 'Imported bank statement', periodStart: today.slice(0, 7) + '-01', periodEnd: today, openingBalance: '0', statementEndingBalance: '0' })
   const [paymentPhone, setPaymentPhone] = useState('')
   const [payrollInput, setPayrollInput] = useState({ grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0' })
   const [payrollEstimate, setPayrollEstimate] = useState<PayrollEstimate | null>(null)
@@ -145,7 +160,14 @@ function App() {
   const [payrollRuns, setPayrollRuns] = useState<PayrollRun[]>([])
   const [remittances, setRemittances] = useState<Remittance[]>([])
   const [invoicesList, setInvoicesList] = useState<InvoiceRecord[]>([])
+  const [estimates, setEstimates] = useState<EstimateRecord[]>([])
+  const [bills, setBills] = useState<VendorBill[]>([])
+  const [reconciliations, setReconciliations] = useState<Reconciliation[]>([])
+  const [reconciliationDetail, setReconciliationDetail] = useState<ReconciliationDetail | null>(null)
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
+  const [financialStatements, setFinancialStatements] = useState<FinancialStatements | null>(null)
+  const [reportFrom, setReportFrom] = useState(yearStart)
+  const [reportTo, setReportTo] = useState(today)
   const [journalEntries, setJournalEntries] = useState<Array<{ id: string; entry_date: string; description: string; lines: Array<{ code: string; debit: string; credit: string }> }>>([])
   const [trialTotals, setTrialTotals] = useState({ debit: '0', credit: '0' })
   const [accountingPeriods, setAccountingPeriods] = useState<AccountingPeriod[]>([])
@@ -260,16 +282,21 @@ function App() {
         request<{ accounts: AccountSummary[]; totals: { debit: string; credit: string } }>('/v1/accounting/trial-balance').then((result) => { setAccounts(result.accounts); setTrialTotals(result.totals) }),
         request<{ entries: typeof journalEntries }>('/v1/accounting/journals').then((result) => setJournalEntries(result.entries)),
         request<{ periods: AccountingPeriod[] }>('/v1/accounting/periods').then((result) => setAccountingPeriods(result.periods)),
+        request<FinancialStatements>(`/v1/accounting/reports/financial-statements?from=${yearStart}&to=${today}`).then(setFinancialStatements),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load accounting records.'))
     }
     if (page === 'Sales') {
-      void request<{ invoices: InvoiceRecord[] }>('/v1/invoices').then((result) => setInvoicesList(result.invoices)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load invoices.'))
+      void Promise.all([
+        request<{ invoices: InvoiceRecord[] }>('/v1/invoices').then((result) => setInvoicesList(result.invoices)),
+        request<{ estimates: EstimateRecord[] }>('/v1/estimates').then((result) => setEstimates(result.estimates)),
+      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load sales records.'))
     }
     if (page === 'Banking') {
       void Promise.all([
         request<MonoBankConfig>('/v1/banking/mono/config').then((result) => setMonoConfig(result)),
         request<{ accounts: ConnectedBankAccount[] }>('/v1/banking/accounts').then((result) => setConnectedBankAccounts(result.accounts)),
         request<{ transactions: BankFeedTransaction[] }>('/v1/banking/transactions?status=needs_review').then((result) => setBankFeedTransactions(result.transactions)),
+        request<{ reconciliations: Reconciliation[] }>('/v1/accounting/reconciliations').then((result) => setReconciliations(result.reconciliations)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load connected bank feeds.'))
     }
     if (page === 'Kenya compliance') {
@@ -282,6 +309,7 @@ function App() {
     }
     const recordType = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Projects: 'projects' } as Record<string, string>)[page]
     if (recordType) void request<{ records: WorkspaceRecord[] }>(`/v1/records/${recordType}`).then((result) => setRecords((current) => ({ ...current, [recordType]: result.records }))).catch((reason) => setError(reason instanceof Error ? reason.message : `Could not load ${page.toLowerCase()}.`))
+    if (page === 'Suppliers') void request<{ bills: VendorBill[] }>('/v1/bills').then((result) => setBills(result.bills)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load supplier bills.'))
     if (page === 'Documents' || page === 'Overview') void request<{ documents: StoredDocument[] }>('/v1/documents').then((result) => setStoredDocuments(result.documents)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load stored documents.'))
     if (page === 'Settings') void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
     else if (account) void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
@@ -386,6 +414,58 @@ function App() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not save invoice.')
     } finally { setBusy(false) }
+  }
+
+  async function saveEstimate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      await request('/v1/estimates', { method: 'POST', body: JSON.stringify({ ...estimateInput, amount: Number(estimateInput.amount) }) })
+      setEstimateInput({ customer: '', customerEmail: '', description: '', amount: '', validUntil: today })
+      const result = await request<{ estimates: EstimateRecord[] }>('/v1/estimates')
+      setEstimates(result.estimates); notify('Estimate saved; it has not been posted to the ledger.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save estimate.') }
+    finally { setBusy(false) }
+  }
+
+  async function saveBill(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      await request('/v1/bills', { method: 'POST', body: JSON.stringify({ ...billInput, amount: Number(billInput.amount) }) })
+      setBillInput({ supplier: '', description: '', amount: '', billDate: today, dueDate: today })
+      const result = await request<{ bills: VendorBill[] }>('/v1/bills')
+      setBills(result.bills); await refresh(); notify('Bill recorded in accounts payable.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save supplier bill.') }
+    finally { setBusy(false) }
+  }
+
+  async function payBill(bill: VendorBill) {
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/bills/${bill.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(bill.amount), paymentDate: today }) })
+      const result = await request<{ bills: VendorBill[] }>('/v1/bills')
+      setBills(result.bills); await refresh(); notify('Full bill payment recorded in the ledger.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not record bill payment.') }
+    finally { setBusy(false) }
+  }
+
+  async function updateEstimateStatus(estimate: EstimateRecord, status: 'sent' | 'accepted' | 'declined' | 'void') {
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/estimates/${estimate.id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) })
+      setEstimates((current) => current.map((item) => item.id === estimate.id ? { ...item, status } : item))
+      notify(`Estimate marked ${status}.`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not update estimate.') }
+    finally { setBusy(false) }
+  }
+
+  async function convertEstimate(estimate: EstimateRecord) {
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/estimates/${estimate.id}/convert`, { method: 'POST', body: JSON.stringify({ dueDate: today }) })
+      const [updatedEstimates, updatedInvoices] = await Promise.all([request<{ estimates: EstimateRecord[] }>('/v1/estimates'), request<{ invoices: InvoiceRecord[] }>('/v1/invoices')])
+      setEstimates(updatedEstimates.estimates); setInvoicesList(updatedInvoices.invoices); await refresh(); notify('Accepted estimate converted to an invoice.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not convert estimate.') }
+    finally { setBusy(false) }
   }
 
   async function sendInvoiceEmail(invoiceId: string) {
@@ -598,6 +678,47 @@ function App() {
     setConnectedBankAccounts(accountsResult.accounts); setBankFeedTransactions(transactionsResult.transactions)
   }
 
+  async function refreshReconciliations() {
+    const result = await request<{ reconciliations: Reconciliation[] }>('/v1/accounting/reconciliations')
+    setReconciliations(result.reconciliations)
+  }
+
+  async function createReconciliation(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      const result = await request<{ reconciliation: Reconciliation }>('/v1/accounting/reconciliations', { method: 'POST', body: JSON.stringify({ ...reconciliationInput, openingBalance: Number(reconciliationInput.openingBalance), statementEndingBalance: Number(reconciliationInput.statementEndingBalance) }) })
+      await refreshReconciliations(); await openReconciliation(result.reconciliation.id); notify('Reconciliation started; match cleared transactions to continue.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not start reconciliation.') }
+    finally { setBusy(false) }
+  }
+
+  async function openReconciliation(reconciliationId: string) {
+    try {
+      const result = await request<ReconciliationDetail>(`/v1/accounting/reconciliations/${reconciliationId}`)
+      setReconciliationDetail(result)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not load reconciliation.') }
+  }
+
+  async function setReconciliationMatch(transactionId: string, matched: boolean) {
+    if (!reconciliationDetail) return
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/accounting/reconciliations/${reconciliationDetail.reconciliation.id}/matches/${transactionId}`, { method: 'PUT', body: JSON.stringify({ matched }) })
+      await openReconciliation(reconciliationDetail.reconciliation.id)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not update reconciliation match.') }
+    finally { setBusy(false) }
+  }
+
+  async function completeReconciliation() {
+    if (!reconciliationDetail) return
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/accounting/reconciliations/${reconciliationDetail.reconciliation.id}/complete`, { method: 'POST', body: '{}' })
+      await openReconciliation(reconciliationDetail.reconciliation.id); await refreshReconciliations(); notify('Reconciliation completed and recorded in the audit log.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Reconciliation could not be completed.') }
+    finally { setBusy(false) }
+  }
+
   async function linkMonoBank() {
     if (!monoConfig?.enabled || !monoConfig.publicKey) { setError('Mono bank feeds are not configured on the API service yet.'); return }
     const customerName = monoCustomerName.trim() || dashboard?.workspaceName.trim() || ''
@@ -703,8 +824,24 @@ function App() {
   }
 
   async function refreshAccounting() {
-    const [trial, journal, periods] = await Promise.all([request<{ accounts: AccountSummary[]; totals: { debit: string; credit: string } }>('/v1/accounting/trial-balance'), request<{ entries: typeof journalEntries }>('/v1/accounting/journals'), request<{ periods: AccountingPeriod[] }>('/v1/accounting/periods')])
-    setAccounts(trial.accounts); setTrialTotals(trial.totals); setJournalEntries(journal.entries); setAccountingPeriods(periods.periods)
+    const [trial, journal, periods, statements] = await Promise.all([
+      request<{ accounts: AccountSummary[]; totals: { debit: string; credit: string } }>('/v1/accounting/trial-balance'),
+      request<{ entries: typeof journalEntries }>('/v1/accounting/journals'),
+      request<{ periods: AccountingPeriod[] }>('/v1/accounting/periods'),
+      request<FinancialStatements>(`/v1/accounting/reports/financial-statements?from=${encodeURIComponent(reportFrom)}&to=${encodeURIComponent(reportTo)}`),
+    ])
+    setAccounts(trial.accounts); setTrialTotals(trial.totals); setJournalEntries(journal.entries); setAccountingPeriods(periods.periods); setFinancialStatements(statements)
+  }
+
+  async function runFinancialStatements(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setBusy(true); setError('')
+    try {
+      const result = await request<FinancialStatements>(`/v1/accounting/reports/financial-statements?from=${encodeURIComponent(reportFrom)}&to=${encodeURIComponent(reportTo)}`)
+      setFinancialStatements(result)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not prepare financial statements.')
+    } finally { setBusy(false) }
   }
 
   async function closeAccountingPeriod(period: string) {
@@ -972,12 +1109,30 @@ function App() {
         </section> : page === 'Accounting' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> DOUBLE-ENTRY LEDGER · {dashboard?.workspaceName}</div><h1>Accounting</h1><p className="welcome-subtitle">Posted manual transactions, invoices, and payroll runs create balanced, immutable journal entries.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
+          <article className="module-card"><div className="panel-header"><div><h2>Financial statements</h2><p>Built from posted journal entries in this workspace.</p></div></div>
+            <form className="record-form-grid statement-filters" onSubmit={runFinancialStatements}><label className="field-label">Income statement from<input required type="date" value={reportFrom} max={reportTo} onChange={(event) => setReportFrom(event.target.value)} /></label><label className="field-label">Through<input required type="date" value={reportTo} min={reportFrom} onChange={(event) => setReportTo(event.target.value)} /></label><button className="button button-primary" disabled={busy}>{busy ? 'Preparing…' : 'Run reports'}</button></form>
+            {financialStatements && <div className="statement-grid">
+              <section className="statement-panel"><h3>Income statement</h3><p className="statement-caption">{financialStatements.from} to {financialStatements.to}</p>
+                <h4>Income</h4>{financialStatements.incomeStatement.income.map((line) => <div className="statement-line" key={`income-${line.code}`}><span>{line.name}</span><strong>{money(line.amount)}</strong></div>)}<div className="statement-total"><span>Total income</span><strong>{money(financialStatements.incomeStatement.totalIncome)}</strong></div>
+                <h4>Expenses</h4>{financialStatements.incomeStatement.expenses.map((line) => <div className="statement-line" key={`expense-${line.code}`}><span>{line.name}</span><strong>{money(line.amount)}</strong></div>)}<div className="statement-total"><span>Total expenses</span><strong>{money(financialStatements.incomeStatement.totalExpenses)}</strong></div>
+                <div className="statement-grand-total"><span>Net income</span><strong>{money(financialStatements.incomeStatement.netIncome)}</strong></div>
+              </section>
+              <section className="statement-panel"><h3>Balance sheet</h3><p className="statement-caption">As of {financialStatements.balanceSheet.asOf}</p>
+                <h4>Assets</h4>{financialStatements.balanceSheet.assets.map((line) => <div className="statement-line" key={`asset-${line.code}`}><span>{line.name}</span><strong>{money(line.amount)}</strong></div>)}<div className="statement-total"><span>Total assets</span><strong>{money(financialStatements.balanceSheet.totalAssets)}</strong></div>
+                <h4>Liabilities</h4>{financialStatements.balanceSheet.liabilities.map((line) => <div className="statement-line" key={`liability-${line.code}`}><span>{line.name}</span><strong>{money(line.amount)}</strong></div>)}<div className="statement-total"><span>Total liabilities</span><strong>{money(financialStatements.balanceSheet.totalLiabilities)}</strong></div>
+                <h4>Equity</h4>{financialStatements.balanceSheet.equity.map((line) => <div className="statement-line" key={`equity-${line.code}`}><span>{line.name}</span><strong>{money(line.amount)}</strong></div>)}<div className="statement-line"><span>Accumulated earnings (unclosed)</span><strong>{money(financialStatements.balanceSheet.accumulatedEarnings)}</strong></div>
+                <div className="statement-total"><span>Total equity</span><strong>{money(financialStatements.balanceSheet.totalEquity)}</strong></div><div className="statement-grand-total"><span>Liabilities + equity</span><strong>{money(financialStatements.balanceSheet.liabilitiesAndEquity)}</strong></div>
+                <p className={`statement-balance ${Math.round(financialStatements.balanceSheet.difference * 100) === 0 ? 'balanced' : 'unbalanced'}`}>{Math.round(financialStatements.balanceSheet.difference * 100) === 0 ? 'Balances' : `Out of balance by ${money(Math.abs(financialStatements.balanceSheet.difference))}`}</p>
+              </section>
+            </div>}
+            <p className="statement-disclaimer">Management reports only—not audited or tax-certified. These reports reflect posted journals available in KashFlow; review opening balances and account mappings with an accountant.</p>
+          </article>
           <article className="module-card"><h2>Chart of accounts</h2>{accounts.map((account) => <div className="transaction-row" key={account.code}><span><strong>{account.code} · {account.name}</strong><small>{account.type}</small></span><strong>{money(account.balance)}</strong></div>)}</article>
           <article className="module-card"><h2>Trial balance</h2><div className="invoice-summary"><strong>Debits {money(trialTotals.debit)} · Credits {money(trialTotals.credit)}</strong><p>{Number(trialTotals.debit) === Number(trialTotals.credit) ? 'Balanced' : 'Out of balance — investigate before closing a period.'}</p></div></article>
           <article className="module-card"><h2>Journal entries</h2>{journalEntries.map((entry) => <div className="invoice-summary" key={entry.id}><strong>{entry.entry_date} · {entry.description}</strong><p>{entry.lines.map((line) => `${line.code}: Dr ${money(line.debit)} / Cr ${money(line.credit)}`).join(' · ')}</p></div>)}</article>
           <article className="module-card"><h2>Accounting periods</h2>{accountingPeriods.map((period) => <div className="transaction-row" key={period.period}><strong>{period.period}</strong><span>{period.status}</span>{period.status === 'open' ? <button className="button button-small" disabled={busy} onClick={() => void closeAccountingPeriod(period.period)}>Close period</button> : <button className="button button-small" disabled={busy} onClick={() => void reopenAccountingPeriod(period.period)}>Reopen</button>}</div>)}{!accountingPeriods.length && <div className="empty-state">Periods appear as journal entries are posted.</div>}</article>
           <button className="button button-secondary" onClick={() => void refreshAccounting()}>Refresh ledger</button>
-          <div className="module-footnote"><ShieldCheck size={16} /> Financial statements, account reconciliation, journal edits/reversals, and audit certification are not yet implemented.</div>
+          <div className="module-footnote"><ShieldCheck size={16} /> Bank reconciliation, journal edits/reversals, and audit certification still require further work and qualified review.</div>
         </section> : page === 'Banking' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> BANKING · {dashboard?.workspaceName}</div><h1>Bank accounts</h1><p className="welcome-subtitle">Connect your bank, then review imported transactions before adding them to your books.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
@@ -990,6 +1145,15 @@ function App() {
             {bankImportRows.map((row, index) => <div className="transaction-row" key={`${row.date}-${index}`}><span><strong>{row.description}</strong><small>{row.date} · {row.direction}</small></span><strong>{money(row.amount)}</strong></div>)}
             {bankImportRows.length > 0 && <div className="button-row"><button className="button button-secondary" onClick={() => setBankImportRows([])}>Discard preview</button><button className="button button-primary" disabled={busy} onClick={() => void postBankImport()}>{busy ? 'Posting…' : `Post ${bankImportRows.length} reviewed rows`}</button></div>}
           </details></article>
+          <article className="module-card"><h2>Reconcile a statement</h2><p>Match posted transactions for an account and date range. Reconciliation completes only when opening balance plus matched activity equals your statement balance.</p>
+            <form className="record-form-grid" onSubmit={createReconciliation}><label className="field-label">Ledger account label<input required maxLength={120} value={reconciliationInput.accountLabel} onChange={(event) => setReconciliationInput({ ...reconciliationInput, accountLabel: event.target.value })} /></label><label className="field-label">From<input required type="date" value={reconciliationInput.periodStart} onChange={(event) => setReconciliationInput({ ...reconciliationInput, periodStart: event.target.value })} /></label><label className="field-label">To<input required type="date" min={reconciliationInput.periodStart} value={reconciliationInput.periodEnd} onChange={(event) => setReconciliationInput({ ...reconciliationInput, periodEnd: event.target.value })} /></label><label className="field-label">Opening balance (KSh)<input required type="number" step="0.01" value={reconciliationInput.openingBalance} onChange={(event) => setReconciliationInput({ ...reconciliationInput, openingBalance: event.target.value })} /></label><label className="field-label">Statement ending balance (KSh)<input required type="number" step="0.01" value={reconciliationInput.statementEndingBalance} onChange={(event) => setReconciliationInput({ ...reconciliationInput, statementEndingBalance: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Start reconciliation</button></form>
+            {reconciliations.map((item) => <div className="transaction-row" key={item.id}><span><strong>{item.account_label} · {item.period_start} to {item.period_end}</strong><small>{item.matched_count ?? 0} matched · ending {money(item.statement_ending_balance)} · {item.status}</small></span><button className="button button-small" onClick={() => void openReconciliation(item.id)}>{item.status === 'completed' ? 'View reconciliation' : 'Continue matching'}</button></div>)}
+            {reconciliationDetail && <div className="reconciliation-detail"><h3>{reconciliationDetail.reconciliation.account_label} matching</h3><p>Calculated ending {money(reconciliationDetail.calculatedEndingBalance)} · statement {money(reconciliationDetail.reconciliation.statement_ending_balance)} · difference {money(reconciliationDetail.difference)}</p>
+              {reconciliationDetail.transactions.map((item) => <label className="transaction-row reconciliation-item" key={item.id}><input type="checkbox" checked={item.matched} disabled={busy || reconciliationDetail.reconciliation.status !== 'in_progress'} onChange={(event) => void setReconciliationMatch(item.id, event.target.checked)} /><span><strong>{item.description}</strong><small>{item.transaction_date} · {item.account} · {item.direction}</small></span><strong>{item.direction === 'expense' ? '− ' : '+ '}{money(item.amount)}</strong></label>)}
+              {!reconciliationDetail.transactions.length && <div className="empty-state">No posted transactions for this account and date range. Post reviewed bank rows first.</div>}
+              {reconciliationDetail.reconciliation.status === 'in_progress' && <button className="button button-primary" disabled={busy || Math.round(Number(reconciliationDetail.difference) * 100) !== 0} onClick={() => void completeReconciliation()}>Complete balanced reconciliation</button>}
+            </div>}
+          </article>
         </section> : page === 'Expenses' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> EXPENSES · SAVED TRANSACTIONS</div><h1>Expenses</h1><p className="welcome-subtitle">Create and review expenses. Saving a record posts its balanced ledger entry.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
@@ -1007,6 +1171,10 @@ function App() {
             {error && <p className="form-error" role="alert">{error}</p>}
             <form className="module-card" onSubmit={(event) => void saveWorkspaceRecord(event, type)}><h2>{editingRecordId ? 'Edit' : 'Add'} {page.slice(0, -1).toLowerCase()}</h2><div className="record-form-grid">{fields[type].map((field) => <label className="field-label" key={field.name}>{field.label}{field.kind === 'status' ? <select value={recordForm[field.name] ?? 'planned'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="planned">Planned</option><option value="active">Active</option><option value="on_hold">On hold</option><option value="completed">Completed</option></select> : <input required={field.name === 'name'} type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : field.kind ?? 'text'} min={field.kind === 'number' ? '0' : undefined} step={field.kind === 'number' ? '0.01' : undefined} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} />}</label>)}</div><div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : `${editingRecordId ? 'Update' : 'Save'} ${page.slice(0, -1).toLowerCase()}`}</button>{editingRecordId && <button type="button" className="button button-secondary" onClick={() => { setEditingRecordId(''); setRecordForm({}) }}>Cancel edit</button>}</div></form>
             <article className="module-card"><h2>Saved {page.toLowerCase()} ({records[type].length})</h2>{records[type].map((record) => <div className="transaction-row" key={record.id}><span><strong>{record.data.name}</strong><small>{type === 'inventory' ? `SKU ${record.data.sku || '—'} · Qty ${record.data.quantity} ${record.data.unit}` : type === 'projects' ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}` : `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'}`}</small></span><div className="button-row"><button className="button button-small" onClick={() => { setEditingRecordId(record.id); setRecordForm(Object.fromEntries(Object.entries(record.data).map(([key, value]) => [key, String(value ?? '')]))) }}>Edit</button><button className="button button-small" onClick={() => void deleteWorkspaceRecord(type, record.id)}>Delete</button></div></div>)}{!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}</article>
+            {type === 'suppliers' && <article className="module-card"><h2>Vendor bills and payments</h2><p>Recording a bill posts it to operating expenses and accounts payable. Paying the bill currently requires a single full payment.</p><form className="record-form-grid" onSubmit={saveBill}><label className="field-label">Supplier<input required value={billInput.supplier} onChange={(event) => setBillInput({ ...billInput, supplier: event.target.value })} /></label><label className="field-label">Description<input required value={billInput.description} onChange={(event) => setBillInput({ ...billInput, description: event.target.value })} /></label><label className="field-label">Amount (KSh)<input required type="number" min="0.01" step="0.01" value={billInput.amount} onChange={(event) => setBillInput({ ...billInput, amount: event.target.value })} /></label><label className="field-label">Bill date<input required type="date" value={billInput.billDate} onChange={(event) => setBillInput({ ...billInput, billDate: event.target.value })} /></label><label className="field-label">Due date<input required type="date" min={billInput.billDate} value={billInput.dueDate} onChange={(event) => setBillInput({ ...billInput, dueDate: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Record bill</button></form>
+              {bills.map((bill) => <div className="transaction-row" key={bill.id}><span><strong>{bill.supplier} · {bill.description}</strong><small>Due {bill.due_date} · {bill.status}</small></span><strong>{money(bill.amount)}</strong>{bill.status === 'unpaid' && <button className="button button-small" disabled={busy} onClick={() => void payBill(bill)}>Record full payment</button>}</div>)}
+              {!bills.length && <div className="empty-state">No bills yet.</div>}
+            </article>}
           </section>
         })() : page === 'Kenya compliance' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> KENYA COMPLIANCE · {dashboard?.workspaceName}</div><h1>Taxes and compliance</h1><p className="welcome-subtitle">See what’s connected and manage your tax setup. Estimates and drafts are not official filings or tax invoices.</p>
@@ -1054,6 +1222,9 @@ function App() {
           <div className="eyebrow"><span className="live-dot" /> SALES · {dashboard?.workspaceName}</div><h1>Invoices</h1><p className="welcome-subtitle">Internal invoices and payment status. Invoice emailing and KRA/eTIMS fiscalization are not available.</p>
           <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice</button>
           <div className="module-card">{error && <p className="form-error" role="alert">{error}</p>}{invoicesList.map((invoiceRow) => <div className="transaction-row" key={invoiceRow.id}><span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · {invoiceRow.status}</small></span><strong>{money(invoiceRow.amount)}</strong><button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button></div>)}{!invoicesList.length && <div className="empty-state">No invoices yet. Create one to review and preview it here.</div>}</div>
+          <article className="module-card"><h2>Estimates and quotes</h2><p>Estimates do not post to the ledger. Accept one before converting it to an invoice.</p><form className="record-form-grid" onSubmit={saveEstimate}><label className="field-label">Customer<input required value={estimateInput.customer} onChange={(event) => setEstimateInput({ ...estimateInput, customer: event.target.value })} /></label><label className="field-label">Customer email<input type="email" value={estimateInput.customerEmail} onChange={(event) => setEstimateInput({ ...estimateInput, customerEmail: event.target.value })} /></label><label className="field-label">Description<input required value={estimateInput.description} onChange={(event) => setEstimateInput({ ...estimateInput, description: event.target.value })} /></label><label className="field-label">Amount (KSh)<input required type="number" min="0.01" step="0.01" value={estimateInput.amount} onChange={(event) => setEstimateInput({ ...estimateInput, amount: event.target.value })} /></label><label className="field-label">Valid until<input required type="date" value={estimateInput.validUntil} onChange={(event) => setEstimateInput({ ...estimateInput, validUntil: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Save estimate</button></form>
+            {estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'sent')}>Mark sent</button>}{['draft', 'sent'].includes(estimate.status) && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'accepted')}>Accept</button>}{estimate.status === 'accepted' && <button className="button button-primary" disabled={busy} onClick={() => void convertEstimate(estimate)}>Convert to invoice</button>}</div></div>)}
+          </article>
         </section> : page === 'Settings' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> SETTINGS · {dashboard?.workspaceName}</div>
           <h1>Business settings</h1>

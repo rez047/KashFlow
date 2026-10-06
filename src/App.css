@@ -30,3 +30,27 @@
 .banking-connect-card .panel-header>div{min-width:0}
 .banking-connect-card .panel-header p{margin-top:5px;color:#858497}
 @media(max-width:900px){.compliance-overview-grid{grid-template-columns:1fr}}
+.statement-filters{align-items:end}
+.statement-filters .button{min-height:37px}
+.statement-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:10px}
+.statement-panel{min-width:0;border:1px solid #ececf4;border-radius:10px;padding:15px}
+.statement-panel h3{margin:0;color:#363449;font-size:14px}
+.statement-panel h4{margin:16px 0 7px;color:#6053a8;font-size:11px}
+.statement-caption,.statement-disclaimer{color:#858497;font-size:10px;line-height:1.5;margin-top:5px}
+.statement-line,.statement-total,.statement-grand-total{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid #f0eff5;font-size:10px}
+.statement-line span{color:#717184}
+.statement-line strong,.statement-total strong,.statement-grand-total strong{white-space:nowrap}
+.statement-total{font-weight:650;color:#48465a}
+.statement-grand-total{margin-top:5px;border-bottom:0;border-top:1px solid #ddd8f2;padding-top:10px;font-size:11px;font-weight:700;color:#37334c}
+.statement-balance{margin:12px 0 0;padding:8px 10px;border-radius:7px;font-size:10px;font-weight:650}
+.statement-balance.balanced{background:#eaf8f2;color:#277a5d}
+.statement-balance.unbalanced{background:#fff1e8;color:#a74f2d}
+.statement-disclaimer{margin-top:12px}
+@media(max-width:700px){.statement-grid{grid-template-columns:1fr}.statement-filters{grid-template-columns:1fr}.statement-filters .field-label:last-child:nth-child(odd){grid-column:auto}}
+.reconciliation-detail{margin-top:18px;border:1px solid #ececf4;border-radius:10px;padding:14px}
+.reconciliation-detail h3{margin:0;font-size:13px;color:#363449}
+.reconciliation-detail>p{margin:6px 0 10px;color:#747587;font-size:11px}
+.reconciliation-item{display:flex;align-items:center}
+.reconciliation-item input[type=checkbox]{width:auto;flex:0 0 auto}
+.reconciliation-item>span{flex:1;min-width:0}
+.reconciliation-item small{display:block;color:#858497;margin-top:4px}
