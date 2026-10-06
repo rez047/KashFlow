@@ -90,6 +90,8 @@ type InvoiceRecord = { id: string; customer: string; customer_email?: string; de
 type InvoiceMpesaPayment = { id: string; status: string; amount: string; result_description?: string | null; mpesa_receipt_number?: string | null; created_at: string }
 type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number }
 type PosReceipt = { invoiceId: string; customer: string; amount: number; paymentMethod: 'cash' | 'mpesa'; status: string; lines: PosCartLine[] }
+type PosCustomerSale = { id: string; description: string; amount: string; amount_paid: string; due_date: string; status: string; created_at: string }
+type PosCustomerHistory = { sales: PosCustomerSale[]; summary: { sale_count: number; lifetime_sales: string } }
 type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[] }
 type EstimateRecord = { id: string; customer: string; customer_email: string; description: string; amount: string; valid_until: string; status: string; invoice_id?: string | null }
 type VendorBill = { id: string; supplier: string; description: string; amount: string; amount_paid?: string; amount_due?: string; bill_date: string; due_date: string; status: string; approval_status?: string }
@@ -257,6 +259,13 @@ function App() {
   const [posCustomer, setPosCustomer] = useState('')
   const [posCustomerType, setPosCustomerType] = useState<'walk_in' | 'remote'>('walk_in')
   const [posCustomerEmail, setPosCustomerEmail] = useState('')
+  const [posSavedCustomerId, setPosSavedCustomerId] = useState('')
+  const posSavedCustomerIdRef = useRef('')
+  const [posAddCustomerOpen, setPosAddCustomerOpen] = useState(false)
+  const [posNewCustomer, setPosNewCustomer] = useState({ name: '', email: '', phone: '' })
+  const [posCustomerHistory, setPosCustomerHistory] = useState<PosCustomerHistory | null>(null)
+  const [posCustomerHistoryLoading, setPosCustomerHistoryLoading] = useState(false)
+  const [posCustomerHistoryForId, setPosCustomerHistoryForId] = useState('')
   const [posPaymentMethod, setPosPaymentMethod] = useState<'cash' | 'mpesa'>('cash')
   const [posPaymentPhone, setPosPaymentPhone] = useState('')
   const [posReceipt, setPosReceipt] = useState<PosReceipt | null>(null)
@@ -955,6 +964,57 @@ function App() {
     })
   }
 
+  async function loadPosCustomerHistory(customerId: string) {
+    setPosCustomerHistoryForId(customerId)
+    setPosCustomerHistory(null)
+    if (!customerId) { setPosCustomerHistoryLoading(false); return }
+    setPosCustomerHistoryLoading(true)
+    try {
+      const history = await request<PosCustomerHistory>(`/v1/records/customers/${customerId}/sales-history`)
+      setPosCustomerHistory((current) => customerId === posSavedCustomerIdRef.current ? history : current)
+    } catch (reason) {
+      if (customerId === posSavedCustomerIdRef.current) {
+        setPosCustomerHistory(null)
+        setError(reason instanceof Error ? reason.message : 'Could not load this customer’s sale history.')
+      }
+    } finally {
+      if (customerId === posSavedCustomerIdRef.current) setPosCustomerHistoryLoading(false)
+    }
+  }
+
+  function selectPosSavedCustomer(customerId: string) {
+    const customer = records.customers.find((record) => record.id === customerId)
+    posSavedCustomerIdRef.current = customerId
+    setPosSavedCustomerId(customerId)
+    setPosCustomer(customer ? String(customer.data.name ?? '') : '')
+    setPosCustomerEmail(customer ? String(customer.data.email ?? '') : '')
+    setPosPaymentPhone(customer ? String(customer.data.phone ?? '') : '')
+    void loadPosCustomerHistory(customerId)
+  }
+
+  async function savePosCustomer(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ record: WorkspaceRecord }>('/v1/records/customers', {
+        method: 'POST',
+        body: JSON.stringify({ ...posNewCustomer, address: '', taxPin: '', notes: '' }),
+      })
+      setRecords((current) => ({ ...current, customers: [result.record, ...current.customers] }))
+      setPosNewCustomer({ name: '', email: '', phone: '' })
+      setPosAddCustomerOpen(false)
+      posSavedCustomerIdRef.current = result.record.id
+      setPosSavedCustomerId(result.record.id)
+      setPosCustomer(String(result.record.data.name ?? ''))
+      setPosCustomerEmail(String(result.record.data.email ?? ''))
+      setPosPaymentPhone(String(result.record.data.phone ?? ''))
+      void loadPosCustomerHistory(result.record.id)
+      notify('Customer saved and selected for this sale.')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not save the POS customer.')
+    } finally { setBusy(false) }
+  }
+
   function scanPosBarcode(event: KeyboardEvent<HTMLInputElement>) {
     if (event.key !== 'Enter') return
     const code = event.currentTarget.value.trim().toLowerCase()
@@ -975,7 +1035,10 @@ function App() {
 
   function queueOfflinePosSale() {
     if (!account || !posCart.length || posPaymentMethod !== 'cash') return
-    const customer = posCustomerType === 'walk_in' ? 'Walk-in customer' : posCustomer.trim()
+    const savedCustomer = records.customers.find((record) => record.id === posSavedCustomerId)
+    const customer = savedCustomer
+      ? String(savedCustomer.data.name ?? 'Saved customer')
+      : posCustomerType === 'walk_in' ? 'Walk-in customer' : posCustomer.trim()
     const lines = posCart.map((line) => ({ ...line }))
     const draft: OfflinePosDraft = {
       id: crypto.randomUUID(),
@@ -983,7 +1046,7 @@ function App() {
       createdAt: new Date().toISOString(),
       idempotencyKey: posIdempotencyKey,
       customer,
-      customerEmail: posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
+      customerEmail: savedCustomer ? String(savedCustomer.data.email ?? '') : posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
       locationId: posLocationId,
       amount: lines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0),
       lines,
@@ -994,6 +1057,11 @@ function App() {
     setPosCustomer('')
     setPosCustomerType('walk_in')
     setPosCustomerEmail('')
+    setPosPaymentPhone('')
+    posSavedCustomerIdRef.current = ''
+    setPosSavedCustomerId('')
+    setPosCustomerHistory(null)
+    setPosCustomerHistoryForId('')
     notify('Offline sale draft saved on this device only. It is not yet an invoice, payment, or stock deduction.')
   }
 
@@ -1045,11 +1113,14 @@ function App() {
       setError('Enter the customer’s M-Pesa phone number before requesting payment.')
       return
     }
-    if (posCustomerType === 'remote' && !posCustomer.trim()) {
+    const savedCustomer = records.customers.find((record) => record.id === posSavedCustomerId)
+    if (posCustomerType === 'remote' && !savedCustomer && !posCustomer.trim()) {
       setError('Enter the remote customer’s name before checkout.')
       return
     }
-    const customer = posCustomerType === 'walk_in' ? 'Walk-in customer' : posCustomer.trim()
+    const customer = savedCustomer
+      ? String(savedCustomer.data.name ?? 'Saved customer')
+      : posCustomerType === 'walk_in' ? 'Walk-in customer' : posCustomer.trim()
     const saleLines = posCart.map((line) => ({ ...line }))
     const total = saleLines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
     if (total <= 0) {
@@ -1072,7 +1143,7 @@ function App() {
         method: 'POST',
         body: JSON.stringify({
           customer,
-          customerEmail: posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
+          customerEmail: savedCustomer ? String(savedCustomer.data.email ?? '') : posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
           locationId: posLocationId || undefined,
           idempotencyKey: posIdempotencyKey,
           dueDate: today,
@@ -1086,6 +1157,10 @@ function App() {
       setPosCustomer('')
       setPosCustomerType('walk_in')
       setPosCustomerEmail('')
+      posSavedCustomerIdRef.current = ''
+      setPosSavedCustomerId('')
+      setPosCustomerHistory(null)
+      setPosCustomerHistoryForId('')
       setPosPaymentPhone('')
 
       if (posPaymentMethod === 'cash') {
@@ -2648,7 +2723,24 @@ function App() {
             <aside className="module-card pos-checkout" aria-label="Current sale">
               <div className="pos-cart-title"><div><h2>Current sale</h2><p>{posCart.reduce((count, line) => count + line.quantity, 0)} items</p></div><button type="button" className="button button-small" disabled={!posCart.length} onClick={() => setPosCart([])}>Clear</button></div>
               <fieldset className="pos-payment-choice"><legend>Customer type</legend><button type="button" className={posCustomerType === 'walk_in' ? 'selected' : ''} aria-pressed={posCustomerType === 'walk_in'} onClick={() => setPosCustomerType('walk_in')}>Walk-in customer</button><button type="button" className={posCustomerType === 'remote' ? 'selected' : ''} aria-pressed={posCustomerType === 'remote'} onClick={() => setPosCustomerType('remote')}>Remote customer</button></fieldset>
-              {posCustomerType === 'remote' && <><label className="field-label">Remote customer name<input required maxLength={160} list="pos-customer-records" placeholder="Customer name" value={posCustomer} onChange={(event) => setPosCustomer(event.target.value)} /><datalist id="pos-customer-records">{records.customers.map((customer) => <option key={customer.id} value={String(customer.data.name ?? '')} />)}</datalist></label><label className="field-label">Customer email (optional)<input type="email" maxLength={254} autoComplete="email" value={posCustomerEmail} onChange={(event) => setPosCustomerEmail(event.target.value)} /></label></>}
+              <label className="field-label">Saved customer (optional)<select value={posSavedCustomerId} onChange={(event) => selectPosSavedCustomer(event.target.value)}><option value="">No saved customer · {posCustomerType === 'walk_in' ? 'walk-in sale' : 'enter remote details'}</option>{records.customers.map((customer) => <option key={customer.id} value={customer.id}>{String(customer.data.name ?? 'Customer')}{customer.data.email ? ` · ${customer.data.email}` : ''}</option>)}</select></label>
+              <button type="button" className="button button-secondary pos-add-customer" onClick={() => setPosAddCustomerOpen((open) => !open)}><Plus size={14} />Add saved customer</button>
+              {posAddCustomerOpen && <form className="pos-add-customer-form" onSubmit={(event) => void savePosCustomer(event)}>
+                <h3>Add a customer to this business</h3>
+                <label className="field-label">Customer name<input required maxLength={160} value={posNewCustomer.name} onChange={(event) => setPosNewCustomer({ ...posNewCustomer, name: event.target.value })} /></label>
+                <label className="field-label">Email (optional)<input type="email" maxLength={254} autoComplete="email" value={posNewCustomer.email} onChange={(event) => setPosNewCustomer({ ...posNewCustomer, email: event.target.value })} /></label>
+                <label className="field-label">Phone (optional)<input type="tel" maxLength={30} autoComplete="tel" value={posNewCustomer.phone} onChange={(event) => setPosNewCustomer({ ...posNewCustomer, phone: event.target.value })} /></label>
+                <div className="button-row"><button type="submit" className="button button-primary" disabled={busy || !posNewCustomer.name.trim()}>{busy ? 'Saving…' : 'Save and select customer'}</button><button type="button" className="button button-small" disabled={busy} onClick={() => setPosAddCustomerOpen(false)}>Cancel</button></div>
+              </form>}
+              {posCustomerType === 'remote' && !posSavedCustomerId && <><label className="field-label">Remote customer name<input required maxLength={160} placeholder="Customer name" value={posCustomer} onChange={(event) => { setPosCustomer(event.target.value); posSavedCustomerIdRef.current = ''; setPosSavedCustomerId('') }} /></label><label className="field-label">Customer email (optional)<input type="email" maxLength={254} autoComplete="email" value={posCustomerEmail} onChange={(event) => setPosCustomerEmail(event.target.value)} /></label></>}
+              {posSavedCustomerId && <article className="pos-customer-history" aria-live="polite">
+                <div className="panel-header"><div><h3>Customer loyalty snapshot</h3><p>Past recorded sales for {posCustomer || 'this customer'}; no points are earned or redeemed.</p></div><button type="button" className="button button-small" onClick={() => void loadPosCustomerHistory(posSavedCustomerId)}>Refresh</button></div>
+                {posCustomerHistoryLoading && posCustomerHistoryForId === posSavedCustomerId && <p className="dialog-note">Loading sale history…</p>}
+                {posCustomerHistory && posCustomerHistoryForId === posSavedCustomerId && <><div className="pos-customer-summary"><span><strong>{posCustomerHistory.summary.sale_count}</strong><small>past sales</small></span><span><strong>{money(Number(posCustomerHistory.summary.lifetime_sales))}</strong><small>lifetime invoiced</small></span></div>
+                  <div className="pos-customer-sales">{posCustomerHistory.sales.map((sale) => <div className="transaction-row" key={sale.id}><span><strong>{sale.description}</strong><small>{new Date(sale.created_at).toLocaleDateString('en-KE')} · {sale.status}</small></span><strong>{money(Number(sale.amount))}</strong></div>)}
+                    {!posCustomerHistory.sales.length && <div className="empty-state">No previous sales found for this customer.</div>}
+                  </div></>}
+              </article>}
               <div className="pos-cart-lines">{posCart.map((line) => <div className="pos-cart-line" key={line.itemId}>
                 <div className="pos-line-main"><strong>{line.description}</strong><small>{money(line.unitPrice)} each · {line.onHand} available</small></div>
                 <div className="pos-quantity"><button type="button" aria-label={`Remove one ${line.description}`} onClick={() => changePosQuantity(line.itemId, line.quantity - 1)}><Minus size={14} /></button><span>{line.quantity}</span><button type="button" aria-label={`Add one ${line.description}`} disabled={line.quantity >= line.onHand} onClick={() => changePosQuantity(line.itemId, line.quantity + 1)}><Plus size={14} /></button></div>

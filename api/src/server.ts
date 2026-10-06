@@ -731,6 +731,27 @@ app.get('/v1/records/:type', requirePool, requireSession, async (request: Authed
     response.json({ records: result.rows })
   } catch (error) { next(error) }
 })
+app.get('/v1/records/customers/:customerId/sales-history', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const customerResult = await pool!.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'customer'", [request.params.customerId, request.session!.workspaceId])
+    const customer = customerResult.rows[0]?.data as Record<string, unknown> | undefined
+    if (!customer) { response.status(404).json({ error: 'Saved customer not found in this business.' }); return }
+    const email = String(customer.email ?? '').trim().toLowerCase()
+    const name = String(customer.name ?? '').trim().toLowerCase()
+    const history = await pool!.query(`SELECT i.id, i.customer, i.description, i.amount::text, i.amount_paid::text, i.due_date, i.status, i.created_at
+      FROM invoices i
+      WHERE i.workspace_id = $1 AND i.status <> 'void'
+        AND (($2 <> '' AND LOWER(i.customer_email) = $2) OR (COALESCE(i.customer_email, '') = '' AND LOWER(i.customer) = $3))
+      ORDER BY i.created_at DESC LIMIT 25`,
+    [request.session!.workspaceId, email, name])
+    const summary = await pool!.query(`SELECT COUNT(*)::int AS sale_count, COALESCE(SUM(i.amount), 0)::text AS lifetime_sales
+      FROM invoices i
+      WHERE i.workspace_id = $1 AND i.status <> 'void'
+        AND (($2 <> '' AND LOWER(i.customer_email) = $2) OR (COALESCE(i.customer_email, '') = '' AND LOWER(i.customer) = $3))`,
+    [request.session!.workspaceId, email, name])
+    response.json({ sales: history.rows, summary: summary.rows[0] })
+  } catch (error) { next(error) }
+})
 app.get('/v1/inventory/locations', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   const client = await pool!.connect()
   try {
