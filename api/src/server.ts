@@ -9,6 +9,7 @@ import helmet from 'helmet'
 import { Pool, type PoolClient } from 'pg'
 import { z } from 'zod'
 import { estimateKenyaPayroll, type KenyaPayrollEstimate } from './domain/kenyaPayroll.js'
+import { createDatabaseBackup, isBackupInProgress, listDatabaseBackups, restoreDatabaseBackup, type BackupSettings } from './operations/databaseBackups.js'
 
 const scrypt = promisify(scryptCallback)
 const envSchema = z.object({
@@ -36,6 +37,13 @@ const envSchema = z.object({
   KRA_ETIMS_LIVE_ENABLED: z.enum(['true', 'false']).default('false'),
   KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY: z.string().min(32).optional(),
   ONLINE_COMMERCE_ENCRYPTION_KEY: z.string().min(32).optional(),
+  BACKUP_OPERATOR_TOKEN: z.string().min(32).optional(),
+  BACKUP_RESTORE_MAINTENANCE_MODE: z.enum(['true', 'false']).default('false'),
+  BACKUP_S3_ENDPOINT: z.string().url().optional(),
+  BACKUP_S3_REGION: z.string().trim().min(1).optional(),
+  BACKUP_S3_BUCKET: z.string().trim().min(3).optional(),
+  BACKUP_S3_ACCESS_KEY_ID: z.string().trim().min(1).optional(),
+  BACKUP_S3_SECRET_ACCESS_KEY: z.string().min(1).optional(),
 })
 const parsed = envSchema.safeParse(process.env)
 if (!parsed.success) {
@@ -43,6 +51,9 @@ if (!parsed.success) {
   process.exit(1)
 }
 const env = parsed.data
+const backupSettings: BackupSettings | null = env.DATABASE_URL && env.BACKUP_S3_ENDPOINT && env.BACKUP_S3_REGION && env.BACKUP_S3_BUCKET && env.BACKUP_S3_ACCESS_KEY_ID && env.BACKUP_S3_SECRET_ACCESS_KEY
+  ? { databaseUrl: env.DATABASE_URL, endpoint: env.BACKUP_S3_ENDPOINT, region: env.BACKUP_S3_REGION, bucket: env.BACKUP_S3_BUCKET, accessKeyId: env.BACKUP_S3_ACCESS_KEY_ID, secretAccessKey: env.BACKUP_S3_SECRET_ACCESS_KEY }
+  : null
 const mpesaConfig = {
   environment: env.MPESA_ENV,
   consumerKey: env.MPESA_CONSUMER_KEY,
@@ -313,7 +324,7 @@ type JournalLineInput = { accountCode: string; description?: string; debit: numb
 async function recordAudit(client: PoolClient, input: { workspaceId: string; actorUserId: string | null; eventType: string; entityType: string; entityId?: string; eventData?: Record<string, unknown> }) {
   await client.query('INSERT INTO audit_events (id, workspace_id, actor_user_id, event_type, entity_type, entity_id, event_data) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)', [randomUUID(), input.workspaceId, input.actorUserId, input.eventType, input.entityType, input.entityId ?? null, JSON.stringify(input.eventData ?? {})])
 }
-async function insertJournal(client: PoolClient, input: { workspaceId: string; userId: string | null; date: string; description: string; sourceType: string; sourceId?: string; lines: JournalLineInput[] }) {
+async function insertJournal(client: PoolClient, input: { workspaceId: string; userId: string | null; date: string; description: string; sourceType: string; sourceId?: string; reversalOf?: string; correctionReason?: string; lines: JournalLineInput[] }) {
   const debitCents = input.lines.reduce((sum, line) => sum + Math.round(line.debit * 100), 0)
   const creditCents = input.lines.reduce((sum, line) => sum + Math.round(line.credit * 100), 0)
   if (input.lines.length < 2 || debitCents <= 0 || debitCents !== creditCents) throw new Error('Journal entry must contain at least two lines with equal positive debits and credits.')
@@ -324,7 +335,7 @@ async function insertJournal(client: PoolClient, input: { workspaceId: string; u
   const accounts = await client.query('SELECT id, code FROM workspace_accounts WHERE workspace_id = $1 AND active = true', [input.workspaceId])
   const ids = new Map(accounts.rows.map((account) => [String(account.code), String(account.id)]))
   const entryId = randomUUID()
-  await client.query('INSERT INTO journal_entries (id, workspace_id, entry_date, description, source_type, source_id, posted_by) VALUES ($1, $2, $3, $4, $5, $6, $7)', [entryId, input.workspaceId, input.date, input.description, input.sourceType, input.sourceId ?? null, input.userId])
+  await client.query('INSERT INTO journal_entries (id, workspace_id, entry_date, description, source_type, source_id, posted_by, reversal_of, correction_reason) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [entryId, input.workspaceId, input.date, input.description, input.sourceType, input.sourceId ?? null, input.userId, input.reversalOf ?? null, input.correctionReason ?? null])
   for (const line of input.lines) {
     const accountId = ids.get(line.accountCode)
     if (!accountId) throw new Error(`Account ${line.accountCode} is not in this business chart of accounts.`)
@@ -476,7 +487,7 @@ async function queryDarajaPayment(checkoutRequestId: string) {
 }
 app.disable('x-powered-by')
 app.use(helmet())
-app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type'] }))
+app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization'] }))
 app.use(express.json({ limit: '8mb', type: 'application/json' }))
 app.use(rateLimit({
   windowMs: 60_000,
@@ -486,11 +497,67 @@ app.use(rateLimit({
   skip: (request) => request.path.startsWith('/v1/auth/') || request.path === '/v1/integrations/mpesa/callback',
   handler: (_request, response) => response.status(429).json({ error: 'This service received too many requests from this network. Please wait a minute and try again.' }),
 }))
+app.use((request, response, next) => {
+  if (env.BACKUP_RESTORE_MAINTENANCE_MODE !== 'true') { next(); return }
+  if (request.path.startsWith('/v1/platform/backups') || request.path === '/health' || request.path === '/ready') { next(); return }
+  response.status(503).json({ error: 'This API instance is in database restore maintenance mode.' })
+})
 
 app.get('/healthz', async (_request, response) => {
   if (!pool) { response.status(503).json({ status: 'degraded', database: 'not_configured' }); return }
   try { await pool.query('SELECT 1'); response.json({ status: 'ok', database: 'available' }) }
   catch { response.status(503).json({ status: 'degraded', database: 'unavailable' }) }
+})
+
+function requireBackupOperator(request: express.Request, response: express.Response, next: express.NextFunction) {
+  const provided = request.get('authorization')?.replace(/^Bearer\s+/i, '') ?? ''
+  const expected = env.BACKUP_OPERATOR_TOKEN ?? ''
+  const matches = provided.length === expected.length && expected.length > 0 && timingSafeEqual(Buffer.from(provided), Buffer.from(expected))
+  if (!matches) { response.status(403).json({ error: 'Valid platform backup operator authorization is required.' }); return }
+  if (!backupSettings) { response.status(503).json({ error: 'S3 backup storage and DATABASE_URL must be configured on the API service.' }); return }
+  next()
+}
+async function withBackupLock<T>(operation: () => Promise<T>) {
+  if (!pool) throw new Error('Database is not configured.')
+  const client = await pool.connect()
+  try {
+    const result = await client.query('SELECT pg_try_advisory_lock(74010062026) AS acquired')
+    if (!result.rows[0]?.acquired) throw new Error('Another API instance is currently backing up or restoring the database.')
+    try { return await operation() }
+    finally { await client.query('SELECT pg_advisory_unlock(74010062026)') }
+  } finally { client.release() }
+}
+
+const backupOperatorLimit = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false })
+app.get('/v1/platform/backups', backupOperatorLimit, requireBackupOperator, async (_request, response, next) => {
+  try {
+    const backups = await listDatabaseBackups(backupSettings!)
+    response.json({ enabled: true, cadence: 'hourly', retainedSlots: 24, backups, backupInProgress: isBackupInProgress(), restoreScope: 'entire PostgreSQL database; coordinate downtime with the platform operator' })
+  } catch (error) { next(error) }
+})
+app.post('/v1/platform/backups', backupOperatorLimit, requireBackupOperator, async (_request, response, next) => {
+  try {
+    const backup = await withBackupLock(() => createDatabaseBackup(backupSettings!))
+    response.status(201).json({ backup, note: 'Full PostgreSQL custom-format backup uploaded to S3-compatible storage with server-side AES256 encryption.' })
+  } catch (error) { next(error) }
+})
+app.post('/v1/platform/backups/restore', backupOperatorLimit, requireBackupOperator, async (request, response, next) => {
+  if (env.BACKUP_RESTORE_MAINTENANCE_MODE !== 'true') {
+    response.status(503).json({ error: 'Restore is disabled. Start a single API instance in BACKUP_RESTORE_MAINTENANCE_MODE=true after stopping all other API instances and workers.' })
+    return
+  }
+  const input = z.object({ key: z.string().min(1).max(240), confirmation: z.literal('RESTORE THE ENTIRE DATABASE') }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Supply a retained backup key and the exact confirmation RESTORE THE ENTIRE DATABASE.' }); return }
+  if (!/^database-backups\/hourly-(?:0[0-9]|1[0-9]|2[0-3])\.dump$/.test(input.data.key)) { response.status(400).json({ error: 'Choose a valid hourly backup object.' }); return }
+  try {
+    const result = await withBackupLock(async () => {
+      const safetyKey = 'database-safety/pre-restore.dump'
+      const safetyBackup = await createDatabaseBackup(backupSettings!, new Date(), safetyKey)
+      await restoreDatabaseBackup(backupSettings!, input.data.key)
+      return { restoredKey: input.data.key, safetyBackupKey: safetyBackup.key }
+    })
+    response.json({ ...result, note: 'The selected full logical dump was restored for objects in the archive. Restart the normal deployment, apply migrations, and verify all business data before resuming traffic.' })
+  } catch (error) { next(error) }
 })
 
 app.get('/v1/auth/status', requirePool, async (_request, response, next) => {
@@ -1623,7 +1690,19 @@ app.get('/v1/projects/:projectId/summary', requirePool, requireSession, async (r
       COALESCE(SUM(hours * hourly_cost) FILTER (WHERE status = 'approved' AND billable), 0)::text AS billable_value,
       COALESCE(SUM(hours * hourly_cost) FILTER (WHERE status = 'submitted'), 0)::text AS pending_cost
       FROM project_time_entries WHERE workspace_id = $1 AND project_id = $2`, [request.session!.workspaceId, request.params.projectId])
-    response.json({ project: project.rows[0].data, ...result.rows[0] })
+    const data = project.rows[0].data as Record<string, unknown>
+    const approvedCost = Number(result.rows[0].approved_cost)
+    const billableValueEstimate = Number(result.rows[0].billable_value)
+    const budget = Number(data.budget ?? 0)
+    response.json({
+      project: data,
+      ...result.rows[0],
+      billableValueEstimate: billableValueEstimate.toFixed(2),
+      estimatedBillableMargin: (billableValueEstimate - approvedCost).toFixed(2),
+      budget: budget.toFixed(2),
+      remainingBudgetEstimate: (budget - approvedCost).toFixed(2),
+      profitabilityNote: 'Billable value is approved billable time valued at its entered hourly cost, not invoiced revenue. This is an estimate, not realized profit.',
+    })
   } catch (error) { next(error) }
 })
 
@@ -3072,7 +3151,9 @@ app.post('/v1/accounting/reconciliations/:reconciliationId/complete', requirePoo
 
 app.get('/v1/accounting/journals', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const entries = await pool!.query('SELECT id, entry_date, description, source_type, source_id, created_at FROM journal_entries WHERE workspace_id = $1 ORDER BY entry_date DESC, created_at DESC LIMIT 100', [request.session!.workspaceId])
+    const entries = await pool!.query(`SELECT e.id, e.entry_date, e.description, e.source_type, e.source_id, e.reversal_of, e.correction_reason, e.created_at,
+      (SELECT r.id FROM journal_entries r WHERE r.reversal_of = e.id LIMIT 1) AS reversed_by
+      FROM journal_entries e WHERE e.workspace_id = $1 ORDER BY e.entry_date DESC, e.created_at DESC LIMIT 100`, [request.session!.workspaceId])
     const result = []
     for (const entry of entries.rows) {
       const lines = await pool!.query('SELECT a.code, a.name, l.description, l.debit::text, l.credit::text FROM journal_lines l JOIN workspace_accounts a ON a.id = l.account_id WHERE l.journal_entry_id = $1 ORDER BY a.code', [entry.id])
@@ -3080,6 +3161,39 @@ app.get('/v1/accounting/journals', requirePool, requireSession, async (request: 
     }
     response.json({ entries: result })
   } catch (error) { next(error) }
+})
+
+app.post('/v1/accounting/journals/:journalId/reverse', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ date: z.string().date(), reason: z.string().trim().min(5).max(240) }).safeParse(request.body)
+  if (!input.success || !z.string().uuid().safeParse(request.params.journalId).success) { response.status(400).json({ error: 'Provide a valid correction date and a reason of at least five characters.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const original = await client.query('SELECT id, description, reversal_of FROM journal_entries WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.journalId, request.session!.workspaceId])
+    if (!original.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Journal entry not found in this business.' }); return }
+    if (original.rows[0].reversal_of) { await client.query('ROLLBACK'); response.status(409).json({ error: 'A reversal entry cannot itself be reversed. Correct the original entry with a replacement journal if needed.' }); return }
+    const prior = await client.query('SELECT id FROM journal_entries WHERE reversal_of = $1', [request.params.journalId])
+    if (prior.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This journal entry already has a reversal.' }); return }
+    const lines = await client.query('SELECT a.code, l.description, l.debit::text, l.credit::text FROM journal_lines l JOIN workspace_accounts a ON a.id = l.account_id WHERE l.journal_entry_id = $1 ORDER BY a.code', [request.params.journalId])
+    const reversalId = await insertJournal(client, {
+      workspaceId: request.session!.workspaceId,
+      userId: request.session!.userId,
+      date: input.data.date,
+      description: `Reversal of ${String(original.rows[0].description).slice(0, 180)}`,
+      sourceType: 'journal_reversal',
+      sourceId: String(original.rows[0].id),
+      reversalOf: String(original.rows[0].id),
+      correctionReason: input.data.reason,
+      lines: lines.rows.map((line: Record<string, unknown>) => ({ accountCode: String(line.code), description: line.description ? `Reversal: ${String(line.description).slice(0, 120)}` : undefined, debit: Number(line.credit), credit: Number(line.debit) })),
+    })
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'journal.reversed', entityType: 'journal_entry', entityId: String(original.rows[0].id), eventData: { reversalId, date: input.data.date, reason: input.data.reason } })
+    await client.query('COMMIT')
+    response.status(201).json({ originalJournalId: original.rows[0].id, reversalJournalId: reversalId, status: 'reversed' })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
 })
 
 app.get('/v1/accounting/periods', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
@@ -3832,7 +3946,7 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
 })
 
 async function start() {
-  if (pool) {
+  if (pool && env.BACKUP_RESTORE_MAINTENANCE_MODE !== 'true') {
     const { readdir, readFile } = await import('node:fs/promises')
     const { fileURLToPath } = await import('node:url')
     const migrationDir = fileURLToPath(new URL('../migrations', import.meta.url))
@@ -3845,6 +3959,29 @@ async function start() {
     for (const workspace of workspaces.rows) await ensureDefaultAccounts(String(workspace.id))
   }
   const server = app.listen(env.PORT, () => console.info(`KashFlow API listening on port ${env.PORT}`))
+  if (pool && backupSettings && env.BACKUP_RESTORE_MAINTENANCE_MODE !== 'true') {
+    const runHourlyBackup = async () => {
+      try {
+        const result = await withBackupLock(() => createDatabaseBackup(backupSettings))
+        console.info(`Hourly full database backup completed: ${result.key}`)
+      } catch (error) {
+        console.error('Hourly full database backup failed:', error instanceof Error ? error.message : String(error))
+      }
+    }
+    const now = new Date()
+    const nextHour = new Date(now)
+    nextHour.setUTCHours(now.getUTCHours() + 1, 0, 0, 0)
+    let backupInterval: ReturnType<typeof setInterval> | undefined
+    const firstBackup = setTimeout(() => {
+      void runHourlyBackup()
+      backupInterval = setInterval(() => { void runHourlyBackup() }, 60 * 60_000)
+    }, nextHour.getTime() - now.getTime())
+    server.on('close', () => {
+      clearTimeout(firstBackup)
+      if (backupInterval) clearInterval(backupInterval)
+    })
+    console.info('Hourly full database backups enabled; one encrypted S3 object per UTC hour is retained and overwritten every 24 hours.')
+  }
   if (pool && monoConfigured) {
     const syncInterval = setInterval(() => {
       void (async () => {

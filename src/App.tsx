@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { OnlineStoreApp } from './OnlineStore'
 import { languages, useTranslation, type LanguageCode } from './i18n'
 import {
@@ -88,6 +88,7 @@ type Remittance = { id: string; remittance_type: string; amount: string; status:
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
 type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number }
 type PosReceipt = { invoiceId: string; customer: string; amount: number; paymentMethod: 'cash' | 'mpesa'; status: string; lines: PosCartLine[] }
+type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[] }
 type EstimateRecord = { id: string; customer: string; customer_email: string; description: string; amount: string; valid_until: string; status: string; invoice_id?: string | null }
 type VendorBill = { id: string; supplier: string; description: string; amount: string; amount_paid?: string; amount_due?: string; bill_date: string; due_date: string; status: string; approval_status?: string }
 type DraftLine = { itemId?: string; description: string; quantity: string; unitPrice: string; discountAmount: string; taxAmount: string; recoverableTaxAmount?: string }
@@ -128,6 +129,7 @@ type Modal = 'invoice' | 'transaction' | 'business' | 'invite' | 'return' | null
 type ReturnLine = { id: string; item_id?: string | null; description: string; quantity: string; returned_quantity: string; unit_price: string; discount_amount: string; tax_amount: string }
 type AccountingPeriod = { period: string; status: 'open' | 'closed'; closed_at?: string }
 type AuditEvent = { id: string; actor_user_id?: string | null; event_type: string; entity_type: string; entity_id?: string | null; event_data: Record<string, unknown>; created_at: string }
+type DatabaseBackup = { key: string; lastModified: string | null; size: number }
 type ImportType = 'customers' | 'suppliers' | 'inventory' | 'projects'
 type RecordImportPreview = { type: ImportType; totalRows: number; wouldImport: number; duplicateRows: number[] }
 
@@ -252,6 +254,10 @@ function App() {
   const [posPaymentPhone, setPosPaymentPhone] = useState('')
   const [posReceipt, setPosReceipt] = useState<PosReceipt | null>(null)
   const [posIdempotencyKey, setPosIdempotencyKey] = useState(() => crypto.randomUUID())
+  const [offlinePosDrafts, setOfflinePosDrafts] = useState<OfflinePosDraft[]>([])
+  const [isOnline, setIsOnline] = useState(() => navigator.onLine)
+  const offlinePosWorkspaceLoaded = useRef<string | null>(null)
+  const posCatalogWorkspaceLoaded = useRef<string | null>(null)
   const [estimateInput, setEstimateInput] = useState({ customer: '', customerEmail: '', description: '', amount: '', validUntil: today })
   const [billInput, setBillInput] = useState({ supplier: '', description: '', amount: '', billDate: today, dueDate: today, requiresApproval: false })
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([])
@@ -305,10 +311,15 @@ function App() {
   const [financialStatements, setFinancialStatements] = useState<FinancialStatements | null>(null)
   const [reportFrom, setReportFrom] = useState(yearStart)
   const [reportTo, setReportTo] = useState(today)
-  const [journalEntries, setJournalEntries] = useState<Array<{ id: string; entry_date: string; description: string; lines: Array<{ code: string; debit: string; credit: string }> }>>([])
+  const [journalEntries, setJournalEntries] = useState<Array<{ id: string; entry_date: string; description: string; source_type?: string; reversal_of?: string | null; reversed_by?: string | null; correction_reason?: string | null; lines: Array<{ code: string; debit: string; credit: string }> }>>([])
   const [trialTotals, setTrialTotals] = useState({ debit: '0', credit: '0' })
   const [accountingPeriods, setAccountingPeriods] = useState<AccountingPeriod[]>([])
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([])
+  const [backupOperatorToken, setBackupOperatorToken] = useState('')
+  const [databaseBackups, setDatabaseBackups] = useState<DatabaseBackup[]>([])
+  const [restoreBackupKey, setRestoreBackupKey] = useState('')
+  const [restoreConfirmation, setRestoreConfirmation] = useState('')
+  const [backupStatus, setBackupStatus] = useState('')
   const [exportBusy, setExportBusy] = useState(false)
   const [recordImportType, setRecordImportType] = useState<ImportType>('customers')
   const [recordImportRows, setRecordImportRows] = useState<Array<Record<string, string>>>([])
@@ -440,6 +451,62 @@ function App() {
     void initialize()
     return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    const setOnline = () => setIsOnline(navigator.onLine)
+    window.addEventListener('online', setOnline)
+    window.addEventListener('offline', setOnline)
+    return () => {
+      window.removeEventListener('online', setOnline)
+      window.removeEventListener('offline', setOnline)
+    }
+  }, [])
+
+  useEffect(() => {
+    const workspaceId = account?.workspace.id
+    if (!workspaceId) return
+    const storageKey = `kashflow-pos-offline-${workspaceId}`
+    try {
+      const saved = localStorage.getItem(storageKey)
+      const drafts: unknown = saved ? JSON.parse(saved) : []
+      if (!Array.isArray(drafts) || drafts.some((item) => !item || typeof item !== 'object' || (item as OfflinePosDraft).workspaceId !== workspaceId || typeof (item as OfflinePosDraft).idempotencyKey !== 'string' || !Array.isArray((item as OfflinePosDraft).lines))) {
+        throw new Error('Saved offline POS drafts are invalid; do not discard them until they have been reviewed.')
+      }
+      setOfflinePosDrafts(drafts as OfflinePosDraft[])
+      offlinePosWorkspaceLoaded.current = workspaceId
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not load offline POS drafts from this browser.')
+    }
+    try {
+      const catalog = localStorage.getItem(`kashflow-pos-catalog-${workspaceId}`)
+      if (catalog) {
+        const parsedCatalog: unknown = JSON.parse(catalog)
+        if (!parsedCatalog || typeof parsedCatalog !== 'object' || !Array.isArray((parsedCatalog as { inventory?: unknown }).inventory)) throw new Error('Cached POS inventory is invalid.')
+        const values = parsedCatalog as { inventory: WorkspaceRecord[]; locations?: InventoryLocation[]; stock?: InventoryLocationStock[] }
+        setRecords((current) => ({ ...current, inventory: values.inventory }))
+        setInventoryLocations(values.locations ?? [])
+        setInventoryLocationStock(values.stock ?? [])
+      }
+      posCatalogWorkspaceLoaded.current = workspaceId
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not load cached POS inventory.')
+    }
+  }, [account?.workspace.id])
+
+  useEffect(() => {
+    const workspaceId = account?.workspace.id
+    if (!workspaceId || offlinePosWorkspaceLoaded.current !== workspaceId) return
+    try { localStorage.setItem(`kashflow-pos-offline-${workspaceId}`, JSON.stringify(offlinePosDrafts)) }
+    catch (reason) { setError(reason instanceof Error ? `Offline POS drafts could not be saved on this device: ${reason.message}` : 'Offline POS drafts could not be saved on this device.') }
+  }, [offlinePosDrafts, account?.workspace.id])
+
+  useEffect(() => {
+    const workspaceId = account?.workspace.id
+    if (!workspaceId || posCatalogWorkspaceLoaded.current !== workspaceId) return
+    try {
+      localStorage.setItem(`kashflow-pos-catalog-${workspaceId}`, JSON.stringify({ inventory: records.inventory, locations: inventoryLocations, stock: inventoryLocationStock }))
+    } catch (reason) { setError(reason instanceof Error ? `POS catalog could not be cached on this device: ${reason.message}` : 'POS catalog could not be cached on this device.') }
+  }, [records.inventory, inventoryLocations, inventoryLocationStock, account?.workspace.id])
 
   useEffect(() => {
     if (!account) return
@@ -890,6 +957,69 @@ function App() {
       : cart.map((line) => line.itemId === itemId ? { ...line, quantity: Math.min(quantity, line.onHand) } : line))
   }
 
+  function queueOfflinePosSale() {
+    if (!account || !posCart.length || posPaymentMethod !== 'cash') return
+    const customer = posCustomerType === 'walk_in' ? 'Walk-in customer' : posCustomer.trim()
+    const lines = posCart.map((line) => ({ ...line }))
+    const draft: OfflinePosDraft = {
+      id: crypto.randomUUID(),
+      workspaceId: account.workspace.id,
+      createdAt: new Date().toISOString(),
+      idempotencyKey: posIdempotencyKey,
+      customer,
+      customerEmail: posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
+      locationId: posLocationId,
+      amount: lines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0),
+      lines,
+    }
+    setOfflinePosDrafts((current) => [...current, draft])
+    setPosIdempotencyKey(crypto.randomUUID())
+    setPosCart([])
+    setPosCustomer('')
+    setPosCustomerType('walk_in')
+    setPosCustomerEmail('')
+    notify('Offline sale draft saved on this device only. It is not yet an invoice, payment, or stock deduction.')
+  }
+
+  async function syncOfflinePosDraft(draft: OfflinePosDraft) {
+    if (!account || draft.workspaceId !== account.workspace.id) {
+      setError('This offline sale belongs to a different business workspace and cannot be synced here.')
+      return
+    }
+    setBusy(true); setError('')
+    try {
+      const created = await request<{ invoice: { id: string } }>('/v1/invoices', {
+        method: 'POST',
+        body: JSON.stringify({
+          customer: draft.customer,
+          customerEmail: draft.customerEmail,
+          locationId: draft.locationId || undefined,
+          idempotencyKey: draft.idempotencyKey,
+          dueDate: today,
+          lines: draft.lines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: 0 })),
+        }),
+      })
+      setOfflinePosDrafts((current) => current.filter((item) => item.id !== draft.id))
+      setPosReceipt({ invoiceId: created.invoice.id, customer: draft.customer, amount: draft.amount, paymentMethod: 'cash', status: 'Created after reconnect · payment not recorded', lines: draft.lines })
+      notify(`Offline draft synced as invoice ${created.invoice.id.slice(0, 8)}. Review payment and stock before releasing goods.`)
+      const [inventory, listedInvoices, locationStock] = await Promise.all([
+        request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
+        request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
+        request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock'),
+      ])
+      setRecords((current) => ({ ...current, inventory: inventory.records }))
+      setInvoicesList(listedInvoices.invoices)
+      setInventoryLocationStock(locationStock.stock)
+      await refresh()
+    } catch (reason) { setError(reason instanceof Error ? `Offline sale was not fully synced: ${reason.message}` : 'Offline sale was not fully synced. Keep the draft and retry.') }
+    finally { setBusy(false) }
+  }
+
+  function discardOfflinePosDraft(draft: OfflinePosDraft) {
+    if (!window.confirm(`Discard this local-only sale draft for ${draft.customer} (${money(draft.amount)})? It has not been posted to the workspace.`)) return
+    setOfflinePosDrafts((current) => current.filter((item) => item.id !== draft.id))
+  }
+
   async function checkoutPos() {
     if (!posCart.length || posCart.some((line) => line.quantity <= 0 || line.quantity > line.onHand)) {
       setError('Add available stock items to the cart before checkout.')
@@ -912,6 +1042,11 @@ function App() {
     }
     if (posPaymentMethod === 'mpesa' && (!Number.isSafeInteger(total) || total < 1)) {
       setError('M-Pesa STK Push requires a whole-KSh total. Adjust item prices or quantities before checkout.')
+      return
+    }
+    if (!navigator.onLine) {
+      if (posPaymentMethod !== 'cash') { setError('M-Pesa requests require an active connection. No offline M-Pesa payment can be requested.'); return }
+      queueOfflinePosSale()
       return
     }
     setBusy(true)
@@ -971,7 +1106,10 @@ function App() {
         setError((message) => [message, `Sale was saved, but the workspace view could not refresh: ${reason instanceof Error ? reason.message : 'reload the page.'}`].filter(Boolean).join(' '))
       }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not save the sale.')
+      if (reason instanceof TypeError && posPaymentMethod === 'cash') {
+        queueOfflinePosSale()
+        setError('The API could not be reached. The sale was saved as a local-only draft; it is not posted, paid, or deducted from stock.')
+      } else setError(reason instanceof Error ? reason.message : 'Could not save the sale.')
     } finally {
       setBusy(false)
     }
@@ -1758,6 +1896,45 @@ function App() {
     } finally { setBusy(false) }
   }
 
+  async function loadDatabaseBackups() {
+    setBusy(true); setError(''); setBackupStatus('')
+    try {
+      if (!backupOperatorToken) throw new Error('Enter the platform backup operator token.')
+      const result = await request<{ backups: DatabaseBackup[] }>('/v1/platform/backups', { headers: { Authorization: `Bearer ${backupOperatorToken}` } })
+      setDatabaseBackups(result.backups)
+      setBackupStatus(`Connected. ${result.backups.length} retained hourly snapshot(s) found.`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not load platform backups.') }
+    finally { setBusy(false) }
+  }
+
+  async function createDatabaseBackupNow() {
+    setBusy(true); setError(''); setBackupStatus('')
+    try {
+      if (!backupOperatorToken) throw new Error('Enter the platform backup operator token.')
+      const result = await request<{ backup: { key: string; createdAt: string } }>('/v1/platform/backups', { method: 'POST', headers: { Authorization: `Bearer ${backupOperatorToken}` }, body: '{}' })
+      setBackupStatus(`Backup saved: ${result.backup.key} (${new Date(result.backup.createdAt).toLocaleString('en-KE')}).`)
+      await loadDatabaseBackups()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create a database backup.') }
+    finally { setBusy(false) }
+  }
+
+  async function restoreDatabaseBackupNow(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError(''); setBackupStatus('')
+    try {
+      if (!backupOperatorToken) throw new Error('Enter the platform backup operator token.')
+      if (restoreConfirmation !== 'RESTORE THE ENTIRE DATABASE') throw new Error('Enter the exact restore confirmation phrase.')
+      const result = await request<{ restoredKey: string; safetyBackupKey: string }>('/v1/platform/backups/restore', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${backupOperatorToken}` },
+        body: JSON.stringify({ key: restoreBackupKey, confirmation: restoreConfirmation }),
+      })
+      setRestoreConfirmation('')
+      setBackupStatus(`Restored archived database objects from ${result.restoredKey}. Pre-restore safety snapshot: ${result.safetyBackupKey}. Restart the normal deployment, apply migrations, and verify business data before resuming traffic.`)
+      await loadDatabaseBackups()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not restore the database backup.') }
+    finally { setBusy(false) }
+  }
+
   async function previewRecordImport(file: File) {
     setBusy(true); setError(''); setRecordImportPreview(null); setRecordImportRows([])
     try {
@@ -1833,6 +2010,20 @@ function App() {
     setBusy(true); setError('')
     try { await request(`/v1/accounting/periods/${period}/reopen`, { method: 'POST', body: '{}' }); await refreshAccounting(); notify(`${period} reopened`) }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not reopen accounting period.') }
+    finally { setBusy(false) }
+  }
+
+  async function reverseJournalEntry(entry: (typeof journalEntries)[number]) {
+    const date = window.prompt('Enter the date for the correcting reversal (YYYY-MM-DD).', today)
+    if (!date) return
+    const reason = window.prompt('Why is this journal being corrected? A reversal is immutable; post a replacement journal separately.')
+    if (!reason?.trim()) return
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/accounting/journals/${entry.id}/reverse`, { method: 'POST', body: JSON.stringify({ date, reason }) })
+      await refreshAccounting()
+      notify('Journal reversed with a linked, balanced correcting entry. Post a separate replacement journal if needed.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not reverse journal entry.') }
     finally { setBusy(false) }
   }
 
@@ -2184,10 +2375,10 @@ function App() {
           </article>
           <article className="module-card"><h2>Chart of accounts</h2>{accounts.map((account) => <div className="transaction-row" key={account.code}><span><strong>{account.code} · {account.name}</strong><small>{account.type}</small></span><strong>{money(account.balance)}</strong></div>)}</article>
           <article className="module-card"><h2>Trial balance</h2><div className="invoice-summary"><strong>Debits {money(trialTotals.debit)} · Credits {money(trialTotals.credit)}</strong><p>{Number(trialTotals.debit) === Number(trialTotals.credit) ? 'Balanced' : 'Out of balance — investigate before closing a period.'}</p></div></article>
-          <article className="module-card"><h2>Journal entries</h2>{journalEntries.map((entry) => <div className="invoice-summary" key={entry.id}><strong>{entry.entry_date} · {entry.description}</strong><p>{entry.lines.map((line) => `${line.code}: Dr ${money(line.debit)} / Cr ${money(line.credit)}`).join(' · ')}</p></div>)}</article>
+          <article className="module-card"><h2>Journal entries</h2><p>Posted entries stay immutable. Use a linked reversal in an open period to correct an entry, then post a separate replacement journal if required.</p>{journalEntries.map((entry) => <div className="invoice-summary" key={entry.id}><strong>{entry.entry_date} · {entry.description}</strong><p>{entry.lines.map((line) => `${line.code}: Dr ${money(line.debit)} / Cr ${money(line.credit)}`).join(' · ')}</p>{entry.reversal_of && <p className="dialog-note">Reversal of {entry.reversal_of.slice(0, 8)}{entry.correction_reason ? ` · ${entry.correction_reason}` : ''}</p>}{entry.reversed_by && <p className="dialog-note">Reversed by {entry.reversed_by.slice(0, 8)}</p>}{!entry.reversal_of && !entry.reversed_by && <button className="button button-small" disabled={busy} onClick={() => void reverseJournalEntry(entry)}>Create correcting reversal</button>}</div>)}</article>
           <article className="module-card"><h2>Accounting periods</h2>{accountingPeriods.map((period) => <div className="transaction-row" key={period.period}><strong>{period.period}</strong><span>{period.status}</span>{period.status === 'open' ? <button className="button button-small" disabled={busy} onClick={() => void closeAccountingPeriod(period.period)}>Close period</button> : <button className="button button-small" disabled={busy} onClick={() => void reopenAccountingPeriod(period.period)}>Reopen</button>}</div>)}{!accountingPeriods.length && <div className="empty-state">Periods appear as journal entries are posted.</div>}</article>
           <button className="button button-secondary" onClick={() => void refreshAccounting()}>Refresh ledger</button>
-          <div className="module-footnote"><ShieldCheck size={16} /> Bank reconciliation, journal edits/reversals, and audit certification still require further work and qualified review.</div>
+          <div className="module-footnote"><ShieldCheck size={16} /> Posted journals are corrected through a linked immutable reversal and a separately reviewed replacement; journal edits and audit certification are not supported. Have a qualified accountant review corrections.</div>
         </section> : page === 'Banking' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> BANKING · {dashboard?.workspaceName}</div><h1>Bank accounts</h1><p className="welcome-subtitle">Connect your bank, then review imported transactions before adding them to your books.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
@@ -2268,7 +2459,7 @@ function App() {
             </article>}
             {type === 'projects' && <article className="module-card"><h2>Time and project costing</h2><p>Approved time is a management cost estimate and billable value, not a payroll posting or invoice.</p><label className="field-label">Project<select value={timeInput.projectId} onChange={(event) => void loadProjectTime(event.target.value)}><option value="">Select project</option>{records.projects.map((project) => <option key={project.id} value={project.id}>{String(project.data.name)}</option>)}</select></label>
               {timeInput.projectId && <><form className="record-form-grid" onSubmit={saveTimeEntry}><label className="field-label">Work description<input required value={timeInput.description} onChange={(event) => setTimeInput({ ...timeInput, description: event.target.value })} /></label><label className="field-label">Date<input required type="date" value={timeInput.workDate} onChange={(event) => setTimeInput({ ...timeInput, workDate: event.target.value })} /></label><label className="field-label">Hours<input required min="0.01" max="24" step="0.01" type="number" value={timeInput.hours} onChange={(event) => setTimeInput({ ...timeInput, hours: event.target.value })} /></label><label className="field-label">Hourly cost (KSh)<input required min="0" step="0.01" type="number" value={timeInput.hourlyCost} onChange={(event) => setTimeInput({ ...timeInput, hourlyCost: event.target.value })} /></label><label className="field-label"><input type="checkbox" checked={timeInput.billable} onChange={(event) => setTimeInput({ ...timeInput, billable: event.target.checked })} /> Billable time</label><button className="button button-primary" disabled={busy}>Submit time</button></form>
-                {projectSummary && <div className="transaction-row"><span><strong>Approved project costing</strong><small>{projectSummary.approved_hours} hours · pending cost {money(projectSummary.pending_cost)}</small></span><strong>Cost {money(projectSummary.approved_cost)} · billable {money(projectSummary.billable_value)}</strong></div>}
+                {projectSummary && <div className="invoice-summary"><strong>Project profitability estimate</strong><p>{projectSummary.approved_hours} approved hours · pending cost {money(projectSummary.pending_cost)}</p><p>Approved cost {money(projectSummary.approved_cost)} · billable value estimate {money(projectSummary.billableValueEstimate)} · estimated margin {money(projectSummary.estimatedBillableMargin)}</p>{Number(projectSummary.budget) > 0 && <p>Budget {money(projectSummary.budget)} · estimated budget remaining {money(projectSummary.remainingBudgetEstimate)}</p>}<small>{projectSummary.profitabilityNote}</small></div>}
                 {timeEntries.map((entry) => <div className="transaction-row" key={entry.id}><span><strong>{entry.description}</strong><small>{entry.work_date} · {entry.hours} hours · {entry.status}{entry.billable ? ' · billable' : ''}</small></span><strong>{money(Number(entry.hours) * Number(entry.hourly_cost))}</strong>{entry.status === 'submitted' && <div className="button-row"><button className="button button-small" onClick={() => void reviewTimeEntry(entry, 'approved')}>Approve</button><button className="button button-small" onClick={() => void reviewTimeEntry(entry, 'rejected')}>Reject</button></div>}</div>)}
               </>}
             </article>}
@@ -2325,7 +2516,13 @@ function App() {
           <div className="eyebrow"><span className="live-dot" /> POINT OF SALE · {dashboard?.workspaceName}</div>
           <h1>{t('Counter checkout')}</h1>
           <p className="welcome-subtitle">Sell from saved inventory. Checkout creates an internal invoice, deducts stock, and records cash payments in your workspace.</p>
+          <p className={`pos-connectivity ${isOnline ? 'online' : 'offline'}`} role="status">{isOnline ? 'Online · inventory and prices are current when refreshed.' : 'Offline · using this business’s last cached catalog; stock may have changed. Sales save locally and are not posted until synced.'}</p>
+          <p className="dialog-note">Offline drafts and the cached catalog are stored in this browser and are not encrypted by KashFlow. Use offline checkout only on a device protected by your organization.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
+          {offlinePosDrafts.filter((draft) => draft.workspaceId === account?.workspace.id).length > 0 && <article className="module-card offline-pos-queue">
+            <div className="panel-header"><div><h2>Offline sale drafts ({offlinePosDrafts.filter((draft) => draft.workspaceId === account?.workspace.id).length})</h2><p>Stored only in this browser for {dashboard?.workspaceName}; not posted, paid, or deducted from stock.</p></div></div>
+            {offlinePosDrafts.filter((draft) => draft.workspaceId === account?.workspace.id).map((draft) => <div className="transaction-row" key={draft.id}><span><strong>{draft.customer} · {money(draft.amount)}</strong><small>{new Date(draft.createdAt).toLocaleString('en-KE')} · {draft.lines.length} item line(s) · location {inventoryLocations.find((location) => location.id === draft.locationId)?.name ?? 'not selected'}</small></span><div className="button-row"><button className="button button-primary button-small" disabled={busy || !isOnline} onClick={() => void syncOfflinePosDraft(draft)}>Sync and validate stock</button><button className="button button-small" disabled={busy} onClick={() => discardOfflinePosDraft(draft)}>Discard</button></div></div>)}
+          </article>}
           <div className="pos-layout">
             <section className="module-card pos-catalog" aria-label="Sellable inventory">
               <div className="pos-catalog-head"><div><h2>Items</h2><p>{records.inventory.length} inventory items · {records.inventory.filter((item) => Number(item.data.quantity ?? 0) > 0).length} in stock</p></div>
@@ -2390,13 +2587,29 @@ function App() {
             <div className="field-row"><label className="field-label">Business name<input value={settings.businessName || dashboard?.workspaceName || ''} onChange={(event) => setSettings({ ...settings, businessName: event.target.value })} /></label><label className="field-label">Currency<select value={settings.currency} onChange={(event) => setSettings({ ...settings, currency: event.target.value })}><option value="KES">KES</option><option value="USD">USD</option><option value="GBP">GBP</option></select></label></div>
             <div className="field-row"><label className="field-label">Timezone<select value={settings.timezone} onChange={(event) => setSettings({ ...settings, timezone: event.target.value })}><option value="Africa/Nairobi">Africa/Nairobi</option><option value="UTC">UTC</option><option value="Africa/Kampala">Africa/Kampala</option></select></label><label className="field-label">Default invoice terms<select value={settings.invoiceTerms} onChange={(event) => setSettings({ ...settings, invoiceTerms: event.target.value })}><option value="Net 7">Net 7</option><option value="Net 14">Net 14</option><option value="Net 30">Net 30</option></select></label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.emailAlerts} onChange={(event) => setSettings({ ...settings, emailAlerts: event.target.checked })} /> Email alert preference (delivery not configured)</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.auditTrail} onChange={(event) => setSettings({ ...settings, auditTrail: event.target.checked })} /> Audit log preference (supported events are recorded)</label></div>
-            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.twoFactor} onChange={(event) => setSettings({ ...settings, twoFactor: event.target.checked })} /> Two-factor preference (login enforcement unavailable)</label><label className="field-label">Backup preference (no scheduled job)<select value={settings.backupSchedule} onChange={(event) => setSettings({ ...settings, backupSchedule: event.target.value })}><option value="Daily automatic">Daily preference</option><option value="Weekly automatic">Weekly preference</option><option value="Manual only">Manual only</option></select></label></div>
+            <div className="field-row"><div className="field-label"><strong>Multi-factor authentication</strong><p className="dialog-note">MFA login enforcement is not implemented. The old preference toggle did not add a second factor; use an identity provider that enforces MFA for production accounts.</p></div><div className="field-label"><strong>Automatic backup cadence</strong><p className="dialog-note">Platform-level hourly backups rotate 24 snapshots when the API operator configures S3 storage and PostgreSQL backup tools. Manage snapshots below with platform authorization.</p></div></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.monoEnabled} onChange={(event) => setSettings({ ...settings, monoEnabled: event.target.checked })} /> Allow Mono bank-feed connections for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.darajaEnabled} onChange={(event) => setSettings({ ...settings, darajaEnabled: event.target.checked })} /> Allow Daraja / M-Pesa for this business</label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.kraEtimsLiveEnabled} onChange={(event) => setSettings({ ...settings, kraEtimsLiveEnabled: event.target.checked })} /> Permit live KRA eTIMS usage for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.statutoryFilingsEnabled} onChange={(event) => setSettings({ ...settings, statutoryFilingsEnabled: event.target.checked })} /> Permit statutory filing routes for this business</label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.shifEnabled} onChange={(event) => setSettings({ ...settings, shifEnabled: event.target.checked })} /> Enable SHIF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.nssfEnabled} onChange={(event) => setSettings({ ...settings, nssfEnabled: event.target.checked })} /> Enable NSSF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.ahlEnabled} onChange={(event) => setSettings({ ...settings, ahlEnabled: event.target.checked })} /> Enable AHL route</label></div>
             {error && <p className="form-error" role="alert">{error}</p>}
             <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
           </form>
+            <section className="module-card">
+              <h2>Platform database backups</h2>
+              <p>Automatic hourly full-database backups require the API operator to configure S3-compatible storage and `pg_dump`/`pg_restore`. The service rotates 24 UTC hourly slots; a slot is overwritten every 24 hours. Restore affects every business in the database, first creates a safety backup, and should be done during planned downtime.</p>
+              <label className="field-label">Platform backup operator token<input type="password" autoComplete="off" value={backupOperatorToken} onChange={(event) => setBackupOperatorToken(event.target.value)} /></label>
+              <div className="button-row"><button type="button" className="button button-secondary" disabled={busy || !backupOperatorToken} onClick={() => void loadDatabaseBackups()}>Load backup list</button><button type="button" className="button button-primary" disabled={busy || !backupOperatorToken} onClick={() => void createDatabaseBackupNow()}>{busy ? 'Working…' : 'Create backup now'}</button></div>
+              {backupStatus && <p role="status" className="dialog-note">{backupStatus}</p>}
+              {databaseBackups.length > 0 && <><div className="backup-list">{databaseBackups.map((backup) => <div className="transaction-row" key={backup.key}><span><strong>{backup.key}</strong><small>{backup.lastModified ? new Date(backup.lastModified).toLocaleString('en-KE') : 'Timestamp unavailable'} · {(backup.size / (1024 * 1024)).toFixed(1)} MB</small></span></div>)}</div>
+                <form className="module-card backup-restore-form" onSubmit={(event) => void restoreDatabaseBackupNow(event)}>
+                  <h3>Restore full database</h3>
+                  <label className="field-label">Hourly backup<select required value={restoreBackupKey} onChange={(event) => setRestoreBackupKey(event.target.value)}><option value="">Choose a backup</option>{databaseBackups.map((backup) => <option key={backup.key} value={backup.key}>{backup.lastModified ? new Date(backup.lastModified).toLocaleString('en-KE') : backup.key}</option>)}</select></label>
+                  <label className="field-label">Type RESTORE THE ENTIRE DATABASE to confirm<input required autoComplete="off" value={restoreConfirmation} onChange={(event) => setRestoreConfirmation(event.target.value)} /></label>
+                  <button className="button button-primary backup-restore-button" disabled={busy || !restoreBackupKey || restoreConfirmation !== 'RESTORE THE ENTIRE DATABASE'}>Restore selected backup</button>
+                </form>
+              </>}
+              <p className="dialog-note">Backups contain every business and encrypted payroll/integration secrets. S3 server-side AES256 is requested; also enable private-bucket access controls and retention/versioning policies in your provider console. Store the operator token outside the app and rotate it if exposed.</p>
+            </section>
             <section className="module-card">
               <h2>Export workspace data</h2>
               <p>Download business-scoped CSV files for reporting, migration, or accountant review. Exports are limited to 50,000 rows and require administrator access.</p>
