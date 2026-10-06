@@ -87,6 +87,7 @@ type Employee = { id: string; employeeNumber: string; fullName: string; email?: 
 type PayrollRun = { id: string; period: string; status: 'draft' | 'posted' | 'partially_paid' | 'paid'; rule_set: string; employee_count: number; gross_total: string; net_total: string; paid_total?: string; outstanding_total?: string; paye_total: string; shif_total: string }
 type Remittance = { id: string; remittance_type: string; amount: string; status: string; payment_reference?: string; payroll_run_id: string }
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
+type InvoiceMpesaPayment = { id: string; status: string; amount: string; result_description?: string | null; mpesa_receipt_number?: string | null; created_at: string }
 type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number }
 type PosReceipt = { invoiceId: string; customer: string; amount: number; paymentMethod: 'cash' | 'mpesa'; status: string; lines: PosCartLine[] }
 type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[] }
@@ -246,6 +247,10 @@ function App() {
   const [estimateLines, setEstimateLines] = useState<DraftLine[]>([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])
   const [billLines, setBillLines] = useState<DraftLine[]>([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0', recoverableTaxAmount: '0' }])
   const [paymentAmounts, setPaymentAmounts] = useState<Record<string, string>>({})
+  const [invoiceMpesaPhones, setInvoiceMpesaPhones] = useState<Record<string, string>>({})
+  const [invoiceMpesaPayments, setInvoiceMpesaPayments] = useState<Record<string, InvoiceMpesaPayment[]>>({})
+  const [mpesaPromptInvoiceId, setMpesaPromptInvoiceId] = useState<string | null>(null)
+  const [mpesaPromptSubmitting, setMpesaPromptSubmitting] = useState(false)
   const [posSearch, setPosSearch] = useState('')
   const [posLocationId, setPosLocationId] = useState('')
   const [posCart, setPosCart] = useState<PosCartLine[]>([])
@@ -1240,6 +1245,31 @@ function App() {
       setInvoicesList(result.invoices); setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: '' })); await refresh(); notify('Invoice payment recorded in the ledger.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not record invoice payment.') }
     finally { setBusy(false) }
+  }
+
+  async function loadInvoiceMpesaPayments(invoiceId: string) {
+    try {
+      const result = await request<{ payments: InvoiceMpesaPayment[] }>(`/v1/invoices/${invoiceId}/payments/mpesa`)
+      setInvoiceMpesaPayments((current) => ({ ...current, [invoiceId]: result.payments }))
+      const invoices = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+      setInvoicesList(invoices.invoices)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not load this invoice’s M-Pesa status.')
+    }
+  }
+
+  async function sendInvoiceMpesaPrompt(invoiceRow: InvoiceRecord) {
+    const phone = invoiceMpesaPhones[invoiceRow.id]?.trim()
+    if (!phone) { setError('Enter the customer’s M-Pesa number before sending a prompt.'); return }
+    setMpesaPromptSubmitting(true); setError('')
+    try {
+      const result = await request<{ customerMessage: string }>(`/v1/invoices/${invoiceRow.id}/payments/mpesa`, { method: 'POST', body: JSON.stringify({ phone }) })
+      await loadInvoiceMpesaPayments(invoiceRow.id)
+      notify(result.customerMessage)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not start the M-Pesa prompt. The invoice remains unpaid.')
+      await loadInvoiceMpesaPayments(invoiceRow.id)
+    } finally { setMpesaPromptSubmitting(false) }
   }
 
   async function recordStockMovement(event: FormEvent<HTMLFormElement>) {
@@ -2565,7 +2595,41 @@ function App() {
         </section> : page === 'Sales' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> SALES · {dashboard?.workspaceName}</div><h1>Invoices</h1><p className="welcome-subtitle">Internal invoices support itemized lines and recorded payments. They are not KRA/eTIMS fiscal tax invoices.</p>
           <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice</button>
-          <div className="module-card">{error && <p className="form-error" role="alert">{error}</p>}{invoicesList.map((invoiceRow) => <div className="transaction-row" key={invoiceRow.id}><span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · {invoiceRow.status} · paid {money(invoiceRow.amount_paid ?? 0)} · due {money(invoiceRow.amount_due ?? invoiceRow.amount)}</small></span><strong>{money(invoiceRow.amount)}</strong><button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button>{invoiceRow.status !== 'void' && <button className="button button-small" disabled={busy} onClick={() => void shareInvoice(invoiceRow)}>Share invoice</button>}{invoiceRow.status === 'unpaid' && <button className="button button-small" disabled={busy || !invoiceRow.customer_email} title={!invoiceRow.customer_email ? 'Add a customer email to this invoice first.' : undefined} onClick={() => void sendInvoiceReminder(invoiceRow)}>Send reminder</button>}{invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}{invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <><label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label><button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button></>}</div>)}{!invoicesList.length && <div className="empty-state">No invoices yet. Create one to review and preview it here.</div>}</div>
+          <div className="module-card">{error && <p className="form-error" role="alert">{error}</p>}{invoicesList.map((invoiceRow) => {
+            const latestMpesaPayment = invoiceMpesaPayments[invoiceRow.id]?.[0]
+            const promptOpen = mpesaPromptInvoiceId === invoiceRow.id
+            const paidAmount = Number(invoiceRow.amount_paid ?? 0)
+            const invoiceStatusLabel = invoiceRow.status === 'paid' ? 'Paid' : invoiceRow.status === 'void' ? 'Void' : paidAmount > 0 ? 'Partially paid' : 'Not paid'
+            return <div className="invoice-payment-card" key={invoiceRow.id}>
+              <div className="transaction-row">
+                <span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · paid {money(invoiceRow.amount_paid ?? 0)} · due {money(invoiceRow.amount_due ?? invoiceRow.amount)}</small></span>
+                <span className={`status-pill ${invoiceRow.status === 'paid' ? 'green' : 'amber'}`}>{invoiceStatusLabel}</span>
+                <strong>{money(invoiceRow.amount)}</strong>
+                <button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button>
+                {invoiceRow.status !== 'void' && <button className="button button-small" disabled={busy} onClick={() => void shareInvoice(invoiceRow)}>Share invoice</button>}
+                {invoiceRow.status === 'unpaid' && <button className="button button-small" disabled={busy || !invoiceRow.customer_email} title={!invoiceRow.customer_email ? 'Add a customer email to this invoice first.' : undefined} onClick={() => void sendInvoiceReminder(invoiceRow)}>Send reminder</button>}
+                {invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}
+                {invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <>
+                  <label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
+                  <button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button>
+                  <button className="button button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting} title={!mpesaConfigured ? 'Daraja M-Pesa is not configured for this business.' : undefined} onClick={() => {
+                    if (promptOpen) { setMpesaPromptInvoiceId(null); return }
+                    setMpesaPromptInvoiceId(invoiceRow.id)
+                    if (!(invoiceRow.id in invoiceMpesaPayments)) void loadInvoiceMpesaPayments(invoiceRow.id)
+                  }}>M-Pesa prompt{!mpesaConfigured && ' · setup needed'}</button>
+                </>}
+                {latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}</span>}
+              </div>
+              {promptOpen && invoiceRow.status === 'unpaid' && <div className="invoice-mpesa-prompt">
+                <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="0712345678" value={invoiceMpesaPhones[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaPhones((current) => ({ ...current, [invoiceRow.id]: event.target.value }))} /></label>
+                <button className="button button-primary button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting || !invoiceMpesaPhones[invoiceRow.id]?.trim() || ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment?.status ?? '')} onClick={() => void sendInvoiceMpesaPrompt(invoiceRow)}>{mpesaPromptSubmitting ? 'Sending…' : 'Send prompt'}</button>
+                {latestMpesaPayment && ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment.status) && <p className="dialog-note">A request is already {latestMpesaPayment.status.replaceAll('_', ' ')} for this invoice. Refresh its status before sending another prompt.</p>}
+                {latestMpesaPayment?.result_description && latestMpesaPayment.status === 'failed' && <p className="form-error" role="alert">Last M-Pesa attempt failed: {latestMpesaPayment.result_description}</p>}
+                <button className="button button-small" disabled={mpesaPromptSubmitting} onClick={() => void loadInvoiceMpesaPayments(invoiceRow.id)}>Refresh payment status</button>
+                <p className="dialog-note">The invoice remains unpaid until Daraja confirms payment. Verify the result before releasing goods.</p>
+              </div>}
+            </div>
+          })}{!invoicesList.length && <div className="empty-state">No invoices yet. Create one to review and preview it here.</div>}</div>
           <article className="module-card"><h2>Estimates and quotes</h2><p>Estimates do not post to the ledger. Tax amounts are entered by you after qualified review; these documents are not tax invoices.</p><form className="record-form-grid" onSubmit={saveEstimate}><label className="field-label">Customer<input required value={estimateInput.customer} onChange={(event) => setEstimateInput({ ...estimateInput, customer: event.target.value })} /></label><label className="field-label">Customer email<input type="email" value={estimateInput.customerEmail} onChange={(event) => setEstimateInput({ ...estimateInput, customerEmail: event.target.value })} /></label><DraftLineEditor lines={estimateLines} inventoryItems={records.inventory} onChange={(index, key, value) => setEstimateLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setEstimateLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])} onRemove={(index) => setEstimateLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} /><p>Estimate total: <strong>{money(draftDocumentTotal(estimateLines))}</strong></p><label className="field-label">Valid until<input required type="date" value={estimateInput.validUntil} onChange={(event) => setEstimateInput({ ...estimateInput, validUntil: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Save estimate</button></form>
             {estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'sent')}>Mark sent</button>}{['draft', 'sent'].includes(estimate.status) && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'accepted')}>Accept</button>}{estimate.status === 'accepted' && !salesOrders.some((order) => order.estimate_id === estimate.id) && <button className="button button-primary" disabled={busy} onClick={() => void createSalesOrder(estimate)}>Create sales order</button>}</div></div>)}
             <h3>Sales order lifecycle</h3>{salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>)}{!salesOrders.length && <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
