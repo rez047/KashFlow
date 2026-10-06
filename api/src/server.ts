@@ -575,20 +575,30 @@ app.get('/v1/auth/me', requirePool, requireSession, async (request: AuthedReques
 })
 
 app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const today = nairobiToday()
+  const defaultFrom = `${today.slice(0, 7)}-01`
+  const query = z.object({ from: z.string().date().default(defaultFrom), to: z.string().date().default(today) }).safeParse(request.query)
+  if (!query.success || query.data.from > query.data.to) { response.status(400).json({ error: 'Choose a valid date range with a start date on or before the end date.' }); return }
   try {
     const workspaceId = request.session!.workspaceId
-    const dateParts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit' }).formatToParts(new Date())
-    const dateValues = Object.fromEntries(dateParts.map(({ type, value }) => [type, value]))
-    const monthStart = `${dateValues.year}-${dateValues.month}-01`
+    const monthStart = `${today.slice(0, 7)}-01`
     const [workspace, totals, transactions, cashflow, invoices] = await Promise.all([
       pool!.query('SELECT name FROM workspaces WHERE id = $1', [workspaceId]),
-      pool!.query(`SELECT COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= $2), 0)::text AS month_income, COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $2), 0)::text AS month_expenses, COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS all_income, COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS all_expenses FROM ledger_transactions WHERE workspace_id = $1`, [workspaceId, monthStart]),
+      pool!.query(`SELECT COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= $2 AND transaction_date <= $3), 0)::text AS income,
+        COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $2 AND transaction_date <= $3), 0)::text AS expenses,
+        COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= $4 AND transaction_date <= $5), 0)::text AS month_income,
+        COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $4 AND transaction_date <= $5), 0)::text AS month_expenses
+        FROM ledger_transactions WHERE workspace_id = $1`,
+      [workspaceId, query.data.from, query.data.to, monthStart, today]),
       pool!.query('SELECT id, description, amount::text, direction, account, transaction_date, created_at FROM ledger_transactions WHERE workspace_id = $1 ORDER BY transaction_date DESC, created_at DESC LIMIT 20', [workspaceId]),
-      pool!.query(`SELECT transaction_date AS date, COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS income, COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS expense FROM ledger_transactions WHERE workspace_id = $1 AND transaction_date >= $2 GROUP BY transaction_date ORDER BY transaction_date`, [workspaceId, monthStart]),
+      pool!.query(`SELECT transaction_date AS date, COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS income,
+        COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS expense
+        FROM ledger_transactions WHERE workspace_id = $1 AND transaction_date >= $2 GROUP BY transaction_date ORDER BY transaction_date`,
+      [workspaceId, monthStart]),
       pool!.query("SELECT count(*)::int AS count, COALESCE(SUM(amount) FILTER (WHERE status = 'unpaid'), 0)::text AS unpaid_amount FROM invoices WHERE workspace_id = $1", [workspaceId]),
     ])
     const asDateString = (value: unknown) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
-    response.json({ workspaceName: workspace.rows[0]?.name ?? '', totals: { monthIncome: totals.rows[0].month_income, monthExpenses: totals.rows[0].month_expenses, monthNet: (Number(totals.rows[0].month_income) - Number(totals.rows[0].month_expenses)).toFixed(2) }, transactions: transactions.rows.map((row: Record<string, unknown>) => ({ ...row, transaction_date: asDateString(row.transaction_date) })), cashflow: cashflow.rows.map((row: Record<string, unknown>) => ({ ...row, date: asDateString(row.date) })), invoices: invoices.rows[0] })
+    response.json({ workspaceName: workspace.rows[0]?.name ?? '', period: query.data, totals: { income: totals.rows[0].income, expenses: totals.rows[0].expenses, net: (Number(totals.rows[0].income) - Number(totals.rows[0].expenses)).toFixed(2), monthIncome: totals.rows[0].month_income, monthExpenses: totals.rows[0].month_expenses }, transactions: transactions.rows.map((row: Record<string, unknown>) => ({ ...row, transaction_date: asDateString(row.transaction_date) })), cashflow: cashflow.rows.map((row: Record<string, unknown>) => ({ ...row, date: asDateString(row.date) })), invoices: invoices.rows[0] })
   } catch (error) { next(error) }
 })
 
@@ -749,6 +759,73 @@ app.post('/v1/inventory/counts', requirePool, verifyOrigin, requireSession, requ
     response.status(201).json({ delta, quantity: input.data.countedQuantity })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
+})
+app.post('/v1/imports/records/:type', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const type = parseRecordType(String(request.params.type ?? ''))
+  if (!type) { response.status(404).json({ error: 'Choose customers, suppliers, inventory, or projects.' }); return }
+  const input = z.object({ rows: z.array(z.record(z.string(), z.unknown())).min(1).max(500), commit: z.boolean().default(false) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide between 1 and 500 CSV rows.' }); return }
+  const parsedRows: Array<{ index: number; data: Record<string, unknown> }> = []
+  for (const [index, row] of input.data.rows.entries()) {
+    const parsed = workspaceRecordSchemas[type].safeParse(row)
+    if (!parsed.success) {
+      const detail = parsed.error.issues[0]?.message ?? 'Invalid values.'
+      response.status(400).json({ error: `CSV row ${index + 2}: ${detail}` })
+      return
+    }
+    parsedRows.push({ index: index + 2, data: parsed.data as Record<string, unknown> })
+  }
+  const workspaceId = request.session!.workspaceId
+  const recordType = workspaceRecordDatabaseTypes[type]
+  const client = await pool!.connect()
+  try {
+    if (input.data.commit) await client.query('BEGIN')
+    const lockValue = createHash('sha256').update(`${workspaceId}:${recordType}:import`).digest().readBigInt64BE(0).toString()
+    await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [lockValue])
+    const existing = await client.query('SELECT data FROM workspace_records WHERE workspace_id = $1 AND record_type = $2', [workspaceId, recordType])
+    const names = new Set(existing.rows.map((row: { data: Record<string, unknown> }) => String(row.data.name ?? '').trim().toLocaleLowerCase()))
+    const duplicateRows: number[] = []
+    const eligible: Array<{ index: number; data: Record<string, unknown> }> = []
+    for (const row of parsedRows) {
+      const key = String(row.data.name ?? '').trim().toLocaleLowerCase()
+      if (names.has(key)) duplicateRows.push(row.index)
+      else { names.add(key); eligible.push(row) }
+    }
+    if (!input.data.commit) {
+      response.json({ preview: { type, totalRows: parsedRows.length, wouldImport: eligible.length, duplicateRows } })
+      return
+    }
+    let imported = 0
+    for (const row of eligible) {
+      if (type === 'suppliers') {
+        const invalidLinks = await validateSupplierItemLinks(client, workspaceId, row.data.supplyItemIds as string[])
+        if (invalidLinks) { await client.query('ROLLBACK'); response.status(400).json({ error: `CSV row ${row.index}: ${invalidLinks}` }); return }
+      }
+      const id = randomUUID()
+      await client.query('INSERT INTO workspace_records (id, workspace_id, record_type, data) VALUES ($1, $2, $3, $4::jsonb)', [id, workspaceId, recordType, JSON.stringify(row.data)])
+      if (type === 'inventory') {
+        const quantity = Number(row.data.quantity ?? 0)
+        const cost = Number(row.data.cost ?? 0)
+        if (quantity > 0) {
+          const locationId = await ensureDefaultInventoryLocation(client, workspaceId)
+          const movementId = randomUUID()
+          const value = Number((quantity * cost).toFixed(2))
+          await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, $4, 'opening', $5, $6, 'Opening stock import', $7, $8)", [movementId, workspaceId, id, locationId, quantity.toFixed(3), cost.toFixed(2), nairobiToday(), request.session!.userId])
+          if (value > 0) {
+            await ensureDefaultAccounts(workspaceId)
+            await insertJournal(client, { workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Opening inventory import: ${String(row.data.name)}`, sourceType: 'inventory_opening_import', sourceId: movementId, lines: [{ accountCode: '1200', debit: value, credit: 0 }, { accountCode: '3000', debit: 0, credit: value }] })
+          }
+        }
+      }
+      imported += 1
+    }
+    await recordAudit(client, { workspaceId, actorUserId: request.session!.userId, eventType: 'records.csv_imported', entityType: recordType, eventData: { imported, duplicatesSkipped: duplicateRows.length } })
+    if (input.data.commit) await client.query('COMMIT')
+    response.status(201).json({ imported, duplicateRows, message: `${imported} record${imported === 1 ? '' : 's'} imported; ${duplicateRows.length} duplicate row${duplicateRows.length === 1 ? '' : 's'} skipped.` })
+  } catch (error) {
+    if (input.data.commit) await client.query('ROLLBACK')
+    next(error)
+  } finally { client.release() }
 })
 app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const type = parseRecordType(String(request.params.type ?? ''))
@@ -1810,6 +1887,71 @@ app.delete('/v1/documents/:documentId', requirePool, verifyOrigin, requireSessio
   } catch (error) { next(error) }
 })
 
+function csvValue(value: unknown) {
+  const text = value == null ? '' : typeof value === 'string' ? value : typeof value === 'object' ? JSON.stringify(value) : String(value)
+  const safe = /^[\t\r\n ]*[=+\-@]/.test(text) && !/^-?\d+(?:\.\d+)?$/.test(text) ? `'${text}` : text
+  return `"${safe.replace(/"/g, '""')}"`
+}
+app.get('/v1/exports/:type', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const type = z.enum(['customers', 'suppliers', 'inventory', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit']).safeParse(request.params.type)
+  if (!type.success) { response.status(404).json({ error: 'Choose customers, suppliers, inventory, projects, invoices, bills, transactions, journals, or audit.' }); return }
+  try {
+    const workspaceId = request.session!.workspaceId
+    let headers: string[]
+    let rows: Record<string, unknown>[]
+    if (['customers', 'suppliers', 'inventory', 'projects'].includes(type.data)) {
+      const columnsByType: Record<string, string[]> = {
+        customers: ['name', 'email', 'phone', 'address', 'taxPin', 'notes'],
+        suppliers: ['name', 'email', 'phone', 'address', 'taxPin', 'notes'],
+        inventory: ['name', 'sku', 'barcode', 'quantity', 'unit', 'cost', 'price', 'reorderPoint', 'notes'],
+        projects: ['name', 'customer', 'status', 'startDate', 'endDate', 'budget', 'notes'],
+      }
+      const columns = columnsByType[type.data] ?? []
+      headers = ['id', ...columns, 'createdAt', 'updatedAt']
+      const result = await pool!.query(`SELECT id, data, created_at, updated_at FROM workspace_records
+        WHERE workspace_id = $1 AND record_type = $2 ORDER BY created_at LIMIT 50000`,
+      [workspaceId, workspaceRecordDatabaseTypes[type.data as keyof typeof workspaceRecordDatabaseTypes]])
+      rows = result.rows.map((row: Record<string, unknown>) => {
+        const data = row.data as Record<string, unknown>
+        const output: Record<string, unknown> = { id: row.id }
+        for (const key of columns) output[key] = data[key]
+        output.createdAt = row.created_at
+        output.updatedAt = row.updated_at
+        return output
+      })
+    } else if (type.data === 'invoices') {
+      headers = ['id', 'customer', 'customerEmail', 'description', 'amount', 'amountPaid', 'dueDate', 'status', 'createdAt']
+      const result = await pool!.query('SELECT id, customer, customer_email, description, amount, amount_paid, due_date, status, created_at FROM invoices WHERE workspace_id = $1 ORDER BY created_at LIMIT 50000', [workspaceId])
+      rows = result.rows.map((row: Record<string, unknown>) => ({ id: row.id, customer: row.customer, customerEmail: row.customer_email, description: row.description, amount: row.amount, amountPaid: row.amount_paid, dueDate: row.due_date, status: row.status, createdAt: row.created_at }))
+    } else if (type.data === 'bills') {
+      headers = ['id', 'supplier', 'description', 'amount', 'amountPaid', 'billDate', 'dueDate', 'status', 'approvalStatus', 'createdAt']
+      const result = await pool!.query('SELECT id, supplier, description, amount, amount_paid, bill_date, due_date, status, approval_status, created_at FROM vendor_bills WHERE workspace_id = $1 ORDER BY created_at LIMIT 50000', [workspaceId])
+      rows = result.rows.map((row: Record<string, unknown>) => ({ id: row.id, supplier: row.supplier, description: row.description, amount: row.amount, amountPaid: row.amount_paid, billDate: row.bill_date, dueDate: row.due_date, status: row.status, approvalStatus: row.approval_status, createdAt: row.created_at }))
+    } else if (type.data === 'transactions') {
+      headers = ['id', 'description', 'amount', 'direction', 'account', 'date', 'createdAt']
+      const result = await pool!.query('SELECT id, description, amount, direction, account, transaction_date, created_at FROM ledger_transactions WHERE workspace_id = $1 ORDER BY transaction_date, created_at LIMIT 50000', [workspaceId])
+      rows = result.rows.map((row: Record<string, unknown>) => ({ id: row.id, description: row.description, amount: row.amount, direction: row.direction, account: row.account, date: row.transaction_date, createdAt: row.created_at }))
+    } else if (type.data === 'journals') {
+      headers = ['journalId', 'date', 'description', 'sourceType', 'accountCode', 'accountName', 'lineDescription', 'debit', 'credit']
+      const result = await pool!.query(`SELECT e.id, e.entry_date, e.description, e.source_type, a.code, a.name AS account_name,
+          l.description AS line_description, l.debit, l.credit
+        FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
+        JOIN workspace_accounts a ON a.id = l.account_id
+        WHERE e.workspace_id = $1 ORDER BY e.entry_date, e.id, a.code LIMIT 50000`, [workspaceId])
+      rows = result.rows.map((row: Record<string, unknown>) => ({ journalId: row.id, date: row.entry_date, description: row.description, sourceType: row.source_type, accountCode: row.code, accountName: row.account_name, lineDescription: row.line_description, debit: row.debit, credit: row.credit }))
+    } else {
+      headers = ['id', 'actorUserId', 'eventType', 'entityType', 'entityId', 'eventData', 'createdAt']
+      const result = await pool!.query('SELECT id, actor_user_id, event_type, entity_type, entity_id, event_data, created_at FROM audit_events WHERE workspace_id = $1 ORDER BY created_at LIMIT 50000', [workspaceId])
+      rows = result.rows.map((row: Record<string, unknown>) => ({ id: row.id, actorUserId: row.actor_user_id, eventType: row.event_type, entityType: row.entity_type, entityId: row.entity_id, eventData: row.event_data, createdAt: row.created_at }))
+    }
+    const csv = [headers, ...rows.map((row) => headers.map((header) => row[header] ?? row[header.charAt(0).toLowerCase() + header.slice(1)] ?? ''))]
+      .map((line) => line.map(csvValue).join(',')).join('\r\n')
+    response.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    response.setHeader('Content-Disposition', `attachment; filename="kashflow-${type.data}-${new Date().toISOString().slice(0, 10)}.csv"`)
+    response.send(`\uFEFF${csv}`)
+  } catch (error) { next(error) }
+})
+
 app.post('/v1/workspaces', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
   const input = z.object({ name: z.string().trim().min(1).max(120) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a business name.' }); return }
@@ -1968,16 +2110,35 @@ app.get('/v1/workspaces/:workspaceId/members', requirePool, requireSession, requ
 })
 app.put('/v1/workspaces/:workspaceId/members/:userId/permissions', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Members can only be managed for the active business.' }); return }
-  const input = z.object({ permissions: z.array(z.enum(workspacePermissionNames)).max(workspacePermissionNames.length) }).safeParse(request.body)
-  if (!input.success || new Set(input.data.permissions).size !== input.data.permissions.length) {
-    response.status(400).json({ error: 'Choose a unique list of supported permissions.' }); return
+  const input = z.object({
+    role: z.string().trim().min(1).max(80).optional(),
+    permissions: z.array(z.enum(workspacePermissionNames)).max(workspacePermissionNames.length).nullable().optional(),
+  }).refine((value) => value.role !== undefined || value.permissions !== undefined).safeParse(request.body)
+  if (!input.success || (Array.isArray(input.data.permissions) && new Set(input.data.permissions).size !== input.data.permissions.length)) {
+    response.status(400).json({ error: 'Choose a valid role and a unique list of supported permissions, or inherit the role permissions.' }); return
   }
   try {
-    const result = await pool!.query(`UPDATE workspace_members SET permissions = $1::jsonb
-      WHERE workspace_id = $2 AND user_id = $3 AND role <> 'admin'
-      RETURNING user_id, role, permissions`, [JSON.stringify(input.data.permissions), request.session!.workspaceId, request.params.userId])
+    if (input.data.role) {
+      if (input.data.role === 'admin') { response.status(400).json({ error: 'Administrator access is protected. Assign an administrator through the workspace owner workflow.' }); return }
+      const builtInRole = ['accountant', 'staff', 'viewer'].includes(input.data.role)
+      if (!builtInRole) {
+        const role = await pool!.query('SELECT 1 FROM custom_workspace_roles WHERE workspace_id = $1 AND role_key = $2', [request.session!.workspaceId, input.data.role])
+        if (!role.rowCount) { response.status(400).json({ error: 'Choose a built-in or custom role that exists in this business.' }); return }
+      }
+    }
+    const permissions = input.data.permissions === undefined
+      ? input.data.role ? null : undefined
+      : input.data.permissions === null ? null : JSON.stringify(input.data.permissions)
+    const result = await pool!.query(`UPDATE workspace_members SET
+        role = COALESCE($1, role),
+        permissions = CASE WHEN $2 THEN $3::jsonb ELSE permissions END
+      WHERE workspace_id = $4 AND user_id = $5 AND role <> 'admin'
+      RETURNING user_id, role, permissions`,
+    [input.data.role ?? null, permissions !== undefined, permissions ?? null, request.session!.workspaceId, request.params.userId])
     if (!result.rowCount) { response.status(404).json({ error: 'Non-admin workspace member not found.' }); return }
-    response.json({ member: result.rows[0] })
+    const member = result.rows[0]
+    const defaults = await pool!.query('SELECT permissions FROM custom_workspace_roles WHERE workspace_id = $1 AND role_key = $2', [request.session!.workspaceId, member.role])
+    response.json({ member: { userId: String(member.user_id), role: String(member.role), permissions: member.permissions, defaultPermissions: rolePermissionDefaults[String(member.role)] ?? defaults.rows[0]?.permissions ?? [] } })
   } catch (error) { next(error) }
 })
 app.post('/v1/invitations/accept', requirePool, verifyOrigin, async (request, response, next) => {
@@ -2095,6 +2256,91 @@ app.get('/v1/invoices/:invoiceId/lines', requirePool, requireSession, async (req
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character] ?? character)
 }
+async function createInvoicePublicLink(workspaceId: string, invoiceId: string, userId: string) {
+  const token = randomBytes(32).toString('base64url')
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+  await pool!.query(`INSERT INTO invoice_public_links (workspace_id, invoice_id, token_hash, expires_at, created_by)
+    VALUES ($1, $2, $3, $4, $5)`,
+  [workspaceId, invoiceId, createHash('sha256').update(token).digest('hex'), expiresAt.toISOString(), userId])
+  return { url: new URL(`/invoice/${token}`, env.FRONTEND_ORIGIN).toString(), expiresAt: expiresAt.toISOString() }
+}
+app.get('/v1/public/invoices/:token', requirePool, rateLimit({ windowMs: 15 * 60_000, limit: 60 }), async (request, response, next) => {
+  const token = z.string().regex(/^[A-Za-z0-9_-]{40,50}$/).safeParse(request.params.token)
+  if (!token.success) { response.status(404).json({ error: 'Invoice link is invalid or has expired.' }); return }
+  try {
+    const result = await pool!.query(`SELECT i.id, i.customer, i.description, i.amount::text, i.amount_paid::text, i.due_date, i.status,
+        w.name AS business_name, l.expires_at
+      FROM invoice_public_links l JOIN invoices i ON i.id = l.invoice_id AND i.workspace_id = l.workspace_id
+      JOIN workspaces w ON w.id = i.workspace_id
+      WHERE l.token_hash = $1 AND l.revoked_at IS NULL AND l.expires_at > now() AND i.status <> 'void'`,
+    [createHash('sha256').update(token.data).digest('hex')])
+    const invoice = result.rows[0]
+    if (!invoice) { response.status(404).json({ error: 'Invoice link is invalid or has expired.' }); return }
+    const [lines, returns] = await Promise.all([
+      pool!.query('SELECT description, quantity::text, unit_price::text, total_amount::text FROM invoice_lines WHERE invoice_id = $1 ORDER BY line_number', [invoice.id]),
+      pool!.query('SELECT COALESCE(SUM(amount), 0)::text AS returned, COALESCE(SUM(refund_amount), 0)::text AS refunded FROM sales_returns WHERE invoice_id = $1', [invoice.id]),
+    ])
+    const amountDue = Math.max(0, Number(invoice.amount) - Number(invoice.amount_paid) - Number(returns.rows[0].returned) + Number(returns.rows[0].refunded))
+    response.json({ invoice: { id: invoice.id, customer: invoice.customer, description: invoice.description, amount: invoice.amount, amountPaid: invoice.amount_paid, amountDue: amountDue.toFixed(2), dueDate: invoice.due_date, status: invoice.status, businessName: invoice.business_name, expiresAt: invoice.expires_at }, lines: lines.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/invoices/:invoiceId/customer-link', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  try {
+    const invoice = await pool!.query("SELECT id FROM invoices WHERE id = $1 AND workspace_id = $2 AND status <> 'void'", [request.params.invoiceId, request.session!.workspaceId])
+    if (!invoice.rowCount) { response.status(404).json({ error: 'Open invoice not found.' }); return }
+    response.status(201).json({ link: await createInvoicePublicLink(request.session!.workspaceId, String(invoice.rows[0].id), request.session!.userId) })
+  } catch (error) { next(error) }
+})
+app.post('/v1/invoices/:invoiceId/reminders', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.' }); return }
+  try {
+    const result = await pool!.query(`SELECT i.id, i.customer, i.customer_email, i.description, i.amount::text, i.amount_paid::text, i.due_date,
+        COALESCE(r.returned, 0)::text AS returned, COALESCE(r.refunded, 0)::text AS refunded
+      FROM invoices i LEFT JOIN (
+        SELECT invoice_id, SUM(amount) AS returned, SUM(refund_amount) AS refunded FROM sales_returns WHERE workspace_id = $1 GROUP BY invoice_id
+      ) r ON r.invoice_id = i.id
+      WHERE i.id = $2 AND i.workspace_id = $1 AND i.status = 'unpaid'`,
+    [request.session!.workspaceId, request.params.invoiceId])
+    const invoice = result.rows[0]
+    if (!invoice) { response.status(404).json({ error: 'Open invoice not found.' }); return }
+    const recipient = String(invoice.customer_email ?? '').trim()
+    if (!recipient) { response.status(409).json({ error: 'Add a customer email to this invoice before sending a reminder.' }); return }
+    const amountDue = Number(invoice.amount) - Number(invoice.amount_paid) - Number(invoice.returned) + Number(invoice.refunded)
+    if (amountDue <= 0) { response.status(409).json({ error: 'This invoice has no outstanding balance.' }); return }
+    const publicLink = await createInvoicePublicLink(request.session!.workspaceId, String(invoice.id), request.session!.userId)
+    const business = await pool!.query('SELECT name FROM workspaces WHERE id = $1', [request.session!.workspaceId])
+    const businessName = String(business.rows[0]?.name ?? 'KashFlow business')
+    const amount = amountDue.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    const invoiceNumber = String(invoice.id).slice(0, 8).toUpperCase()
+    const responseFromProvider = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: env.EMAIL_FROM,
+        to: [recipient],
+        subject: `Payment reminder · Invoice ${invoiceNumber} · ${businessName}`,
+        html: `<main style="font-family:Arial,sans-serif;color:#242537;max-width:640px;margin:auto"><h1>Payment reminder</h1><p>Hello ${escapeHtml(String(invoice.customer))},</p><p>Invoice ${invoiceNumber} from ${escapeHtml(businessName)} has an outstanding balance of <strong>KSh ${amount}</strong>.</p><p><a href="${escapeHtml(publicLink.url)}">View invoice details</a></p><p>This is an internal invoice, not a KRA/eTIMS fiscal tax invoice. This reminder does not collect payment.</p></main>`,
+        text: `Hello ${String(invoice.customer)},\n\nInvoice ${invoiceNumber} from ${businessName} has an outstanding balance of KSh ${amount}.\nView invoice details: ${publicLink.url}\n\nThis is not a KRA/eTIMS fiscal tax invoice. This reminder does not collect payment.`,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    const providerPayload = await responseFromProvider.json().catch(() => ({})) as { id?: string; message?: string }
+    const accepted = responseFromProvider.ok && Boolean(providerPayload.id)
+    await pool!.query(`INSERT INTO invoice_reminder_events (workspace_id, invoice_id, recipient, delivery_status, provider_message_id, failure_reason, sent_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [request.session!.workspaceId, invoice.id, recipient, accepted ? 'accepted' : 'failed', providerPayload.id ?? null, accepted ? null : String(providerPayload.message ?? `Provider returned HTTP ${responseFromProvider.status}`).slice(0, 500), request.session!.userId])
+    if (!accepted) { response.status(502).json({ error: 'Email provider did not accept the reminder. Check the API service logs and sender-domain configuration.' }); return }
+    response.status(202).json({ status: 'accepted', recipient, message: 'Reminder accepted by the email provider; recipient delivery is not guaranteed.' })
+  } catch (error) { next(error) }
+})
+app.get('/v1/invoices/:invoiceId/reminders', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT id, recipient, delivery_status, provider_message_id, failure_reason, created_at
+      FROM invoice_reminder_events WHERE workspace_id = $1 AND invoice_id = $2 ORDER BY created_at DESC LIMIT 30`,
+    [request.session!.workspaceId, request.params.invoiceId])
+    response.json({ events: result.rows })
+  } catch (error) { next(error) }
+})
 app.post('/v1/invoices/:invoiceId/email', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.' }); return }
   try {
@@ -2306,6 +2552,7 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
     customer: z.string().trim().min(1).max(160),
     customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''),
     locationId: z.string().uuid().optional(),
+    idempotencyKey: z.string().uuid().optional(),
     description: z.string().trim().min(1).max(240).optional(),
     amount: z.coerce.number().finite().positive().max(999999999999).optional(),
     lines: z.array(commercialLineSchema.omit({ recoverableTaxAmount: true })).min(1).max(100).optional(),
@@ -2321,13 +2568,42 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
   } catch (error) { response.status(400).json({ error: error instanceof Error ? error.message : 'Invoice line amounts are invalid.' }); return }
   if (financials.total <= 0) { response.status(400).json({ error: 'Invoice total must be greater than zero.' }); return }
   const description = input.data.description ?? financials.lines.map((line) => line.description).join('; ').slice(0, 240)
+  const requestHash = input.data.idempotencyKey
+    ? createHash('sha256').update(JSON.stringify({ ...input.data, idempotencyKey: undefined })).digest('hex')
+    : null
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
+    if (input.data.idempotencyKey && requestHash) {
+      const lockId = createHash('sha256').update(`${request.session!.workspaceId}:${input.data.idempotencyKey}`).digest().readBigInt64BE(0).toString()
+      await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [lockId])
+      const prior = await client.query('SELECT request_hash, invoice_id FROM invoice_idempotency_keys WHERE workspace_id = $1 AND idempotency_key = $2 FOR UPDATE', [request.session!.workspaceId, input.data.idempotencyKey])
+      if (prior.rowCount) {
+        if (prior.rows[0].request_hash !== requestHash) {
+          await client.query('ROLLBACK')
+          response.status(409).json({ error: 'This checkout retry key was already used for different sale details. Start a new checkout.' })
+          return
+        }
+        if (!prior.rows[0]?.invoice_id) {
+          await client.query('ROLLBACK')
+          response.status(409).json({ error: 'The earlier checkout is still being finalized. Retry it shortly.' })
+          return
+        }
+        const priorInvoice = await client.query('SELECT id, customer, customer_email, description, amount::text, due_date, status, created_at FROM invoices WHERE id = $1 AND workspace_id = $2', [prior.rows[0].invoice_id, request.session!.workspaceId])
+        if (!priorInvoice.rowCount) throw new Error('A checkout retry key references an invoice that is no longer available.')
+        await client.query('COMMIT')
+        response.status(200).json({ invoice: priorInvoice.rows[0], idempotentReplay: true })
+        return
+      }
+      await client.query('INSERT INTO invoice_idempotency_keys (workspace_id, idempotency_key, request_hash) VALUES ($1, $2, $3)', [request.session!.workspaceId, input.data.idempotencyKey, requestHash])
+    }
     const id = randomUUID()
     const locationId = financials.lines.some((line) => line.itemId) || input.data.locationId ? await ensureInventoryLocation(client, request.session!.workspaceId, input.data.locationId) : null
     if (financials.lines.some((line) => line.itemId) && !locationId) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active stock location not found.' }); return }
     const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date, location_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, customer, customer_email, description, amount::text, due_date, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.customerEmail, description, financials.total.toFixed(2), input.data.dueDate, locationId])
+    if (input.data.idempotencyKey) {
+      await client.query('UPDATE invoice_idempotency_keys SET invoice_id = $1 WHERE workspace_id = $2 AND idempotency_key = $3', [id, request.session!.workspaceId, input.data.idempotencyKey])
+    }
     let costOfGoodsSold = 0
     for (const [index, line] of financials.lines.entries()) {
       if (line.itemId) {
@@ -2888,6 +3164,9 @@ const employeeRecordSchema = z.object({
   fullName: z.string().trim().min(1).max(160),
   email: z.string().trim().email().max(254).optional().or(z.literal('')),
   phone: z.string().trim().max(30).optional(),
+  bankName: z.string().trim().max(100).optional(),
+  bankAccountName: z.string().trim().max(160).optional(),
+  bankAccountNumber: z.string().trim().max(34).optional(),
   grossMonthlyPay: z.coerce.number().finite().positive().max(100_000_000),
   otherTaxableDeductions: z.coerce.number().finite().min(0).default(0),
   otherTaxReliefs: z.coerce.number().finite().min(0).default(0),
@@ -2964,25 +3243,41 @@ app.get('/v1/payroll/runs', requirePool, requireSession, requireWorkspaceAdmin, 
 })
 
 app.post('/v1/payroll/runs', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ period: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/) }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Enter a payroll period in YYYY-MM format.' }); return }
+  const input = z.object({
+    period: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/),
+    employeeIds: z.array(z.string().uuid()).min(1).max(500).optional(),
+    bonuses: z.array(z.object({ employeeId: z.string().uuid(), amount: z.coerce.number().finite().min(0).max(100_000_000) })).max(500).optional(),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a valid payroll period and at least one valid employee selection.' }); return }
   if (input.data.period < '2026-02') { response.status(409).json({ error: 'The installed KE-2026-01 payroll estimate snapshot is effective from 2026-02 only. Do not calculate historical payroll with this rule set.' }); return }
   try {
-    const rows = await pool!.query('SELECT id, employee_data_encrypted FROM employees WHERE workspace_id = $1 AND active = true', [request.session!.workspaceId])
-    if (!rows.rowCount) { response.status(409).json({ error: 'Add at least one active employee before preparing a payroll run.' }); return }
-    for (const row of rows.rows) {
+    const activeRows = await pool!.query('SELECT id, employee_data_encrypted FROM employees WHERE workspace_id = $1 AND active = true', [request.session!.workspaceId])
+    const selectedIds = input.data.employeeIds ? new Set(input.data.employeeIds) : null
+    if (selectedIds && selectedIds.size !== input.data.employeeIds?.length) { response.status(400).json({ error: 'An employee can only appear once in a payroll run.' }); return }
+    const selectedRows = selectedIds ? activeRows.rows.filter((row: Record<string, unknown>) => selectedIds.has(String(row.id))) : activeRows.rows
+    if (!selectedRows.length || (selectedIds && selectedRows.length !== selectedIds.size)) { response.status(409).json({ error: 'Select one or more active employees from this business before preparing payroll.' }); return }
+    const includedIds = new Set(selectedRows.map((row: Record<string, unknown>) => String(row.id)))
+    const bonusByEmployee = new Map<string, number>()
+    for (const bonus of input.data.bonuses ?? []) {
+      if (bonusByEmployee.has(bonus.employeeId) || !includedIds.has(bonus.employeeId)) { response.status(400).json({ error: 'Each bonus must be unique and belong to an employee selected for this payroll run.' }); return }
+      bonusByEmployee.set(bonus.employeeId, bonus.amount)
+    }
+    for (const row of selectedRows) {
       const employee = decryptPayrollData<Record<string, unknown>>(String(row.employee_data_encrypted))
-      const estimate = estimateKenyaPayroll({ grossMonthlyPay: Number(employee.grossMonthlyPay), otherTaxableDeductions: Number(employee.otherTaxableDeductions ?? 0), otherTaxReliefs: Number(employee.otherTaxReliefs ?? 0) })
+      const grossSalary = Number(employee.grossMonthlyPay)
+      const bonusAmount = bonusByEmployee.get(String(row.id)) ?? 0
+      const estimate = estimateKenyaPayroll({ grossMonthlyPay: grossSalary + bonusAmount, otherTaxableDeductions: Number(employee.otherTaxableDeductions ?? 0), otherTaxReliefs: Number(employee.otherTaxReliefs ?? 0) })
       if (estimate.netPayEstimate < 0) { response.status(409).json({ error: `Current estimate deductions exceed gross pay for employee ${String(employee.employeeNumber)}. Obtain qualified payroll review and correct the inputs before creating this run.` }); return }
       const postTaxDeductions = Array.isArray(employee.deductions) ? (employee.deductions as Array<{ kind: string; amount: number }>).filter((item) => item.kind === 'post_tax').reduce((sum, item) => sum + Number(item.amount), 0) : 0
       if (postTaxDeductions > estimate.netPayEstimate) { response.status(409).json({ error: `Post-tax deductions exceed estimated net pay for employee ${String(employee.employeeNumber)}. Correct the deduction before creating this payroll run.` }); return }
     }
-    const items = rows.rows.map((row: Record<string, unknown>) => {
+    const items = selectedRows.map((row: Record<string, unknown>) => {
       const employee = decryptPayrollData<Record<string, unknown>>(String(row.employee_data_encrypted))
-      const estimate = estimateKenyaPayroll({ grossMonthlyPay: Number(employee.grossMonthlyPay), otherTaxableDeductions: Number(employee.otherTaxableDeductions ?? 0), otherTaxReliefs: Number(employee.otherTaxReliefs ?? 0) })
+      const bonusAmount = bonusByEmployee.get(String(row.id)) ?? 0
+      const estimate = estimateKenyaPayroll({ grossMonthlyPay: Number(employee.grossMonthlyPay) + bonusAmount, otherTaxableDeductions: Number(employee.otherTaxableDeductions ?? 0), otherTaxReliefs: Number(employee.otherTaxReliefs ?? 0) })
       const postTaxDeductions = Array.isArray(employee.deductions) ? (employee.deductions as Array<{ kind: string; amount: number }>).filter((item) => item.kind === 'post_tax').reduce((sum, item) => sum + Number(item.amount), 0) : 0
       estimate.netPayEstimate = Math.round((estimate.netPayEstimate - postTaxDeductions + Number.EPSILON) * 100) / 100
-      return { employeeId: String(row.id), employee, estimate }
+      return { employeeId: String(row.id), employee, bonusAmount, estimate }
     })
     const sum = (field: keyof KenyaPayrollEstimate) => items.reduce((total: number, item: { estimate: KenyaPayrollEstimate }) => total + Number(item.estimate[field]), 0)
     const id = randomUUID()
@@ -2991,7 +3286,7 @@ app.post('/v1/payroll/runs', requirePool, verifyOrigin, requireSession, requireW
     try {
       await client.query('BEGIN')
       await client.query('INSERT INTO payroll_runs (id, workspace_id, period, rule_set, employee_count, gross_total, net_total, paye_total, shif_total, nssf_employee_total, nssf_employer_total, housing_employee_total, housing_employer_total, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)', [id, request.session!.workspaceId, input.data.period, 'KE-2026-01', items.length, totals.gross.toFixed(2), totals.net.toFixed(2), totals.paye.toFixed(2), totals.shif.toFixed(2), totals.nssfEmployee.toFixed(2), totals.nssfEmployer.toFixed(2), totals.housingEmployee.toFixed(2), totals.housingEmployer.toFixed(2), request.session!.userId])
-      for (const item of items) await client.query('INSERT INTO payroll_run_items (id, payroll_run_id, employee_id, payslip_encrypted) VALUES ($1, $2, $3, $4)', [randomUUID(), id, item.employeeId, encryptPayrollData({ period: input.data.period, employee: item.employee, estimate: item.estimate })])
+      for (const item of items) await client.query('INSERT INTO payroll_run_items (id, payroll_run_id, employee_id, payslip_encrypted) VALUES ($1, $2, $3, $4)', [randomUUID(), id, item.employeeId, encryptPayrollData({ period: input.data.period, employee: item.employee, bonusAmount: item.bonusAmount, estimate: item.estimate })])
         await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'payroll_run.draft_created', entityType: 'payroll_run', entityId: id, eventData: { period: input.data.period, employeeCount: items.length, ruleSet: 'KE-2026-01', gross: totals.gross.toFixed(2) } })
       await client.query('COMMIT')
       response.status(201).json({ run: { id, period: input.data.period, status: 'draft', ruleSet: 'KE-2026-01', employeeCount: items.length, ...totals }, reviewRequired: true })
@@ -3072,7 +3367,7 @@ app.post('/v1/payroll/runs/:runId/pay', requirePool, verifyOrigin, requireSessio
     const status = paidTotal >= Number(run.net_total) ? 'paid' : 'partially_paid'
     const paymentId = randomUUID()
     await client.query('INSERT INTO payroll_payments (id, payroll_run_id, workspace_id, amount, payment_reference, payment_date, recorded_by) VALUES ($1, $2, $3, $4, $5, $6, $7)', [paymentId, run.id, request.session!.workspaceId, input.data.amount.toFixed(2), input.data.paymentReference, input.data.paymentDate, request.session!.userId])
-    await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [paymentId, request.session!.workspaceId, `Net payroll paid ${run.period}`, input.data.amount.toFixed(2), 'expense', `Payroll · ${input.data.paymentReference}`, input.data.paymentDate])
+    await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [paymentId, request.session!.workspaceId, `Net payroll paid ${run.period} · ${input.data.paymentReference}`, input.data.amount.toFixed(2), 'expense', 'Payroll', input.data.paymentDate])
     await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.paymentDate, description: `Net payroll paid ${run.period}`, sourceType: 'payroll_payment', sourceId: paymentId, lines: [{ accountCode: '2000', debit: input.data.amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: input.data.amount }] })
     await client.query('UPDATE payroll_runs SET paid_total = $1, status = $2 WHERE id = $3', [paidTotal.toFixed(2), status, run.id])
     await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'payroll_run.payment_recorded', entityType: 'payroll_run', entityId: String(run.id), eventData: { period: run.period, amount: input.data.amount.toFixed(2), outstanding: (Number(run.net_total) - paidTotal).toFixed(2), paymentReference: input.data.paymentReference } })

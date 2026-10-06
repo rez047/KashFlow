@@ -19,6 +19,30 @@ function nairobiDate() {
 }
 const today = nairobiDate()
 const yearStart = `${today.slice(0, 4)}-01-01`
+type OverviewRange = 'today' | 'last_week' | 'last_30_days' | 'mtd' | 'ytd' | 'custom'
+const overviewRangeNames: Record<OverviewRange, string> = {
+  today: 'Today',
+  last_week: 'Last week',
+  last_30_days: 'Last 30 days',
+  mtd: 'Month to date',
+  ytd: 'Year to date',
+  custom: 'Custom dates',
+}
+function shiftDate(date: string, days: number) {
+  const [year = 2000, month = 1, day = 1] = date.split('-').map(Number)
+  return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10)
+}
+function overviewPeriod(range: OverviewRange, from: string, to: string) {
+  if (range === 'custom') return { from, to }
+  if (range === 'today') return { from: today, to: today }
+  if (range === 'last_30_days') return { from: shiftDate(today, -29), to: today }
+  if (range === 'mtd') return { from: `${today.slice(0, 7)}-01`, to: today }
+  if (range === 'ytd') return { from: `${today.slice(0, 4)}-01-01`, to: today }
+  const weekday = new Date(`${today}T00:00:00Z`).getUTCDay()
+  const daysSinceMonday = (weekday + 6) % 7
+  const thisWeekMonday = shiftDate(today, -daysSinceMonday)
+  return { from: shiftDate(thisWeekMonday, -7), to: shiftDate(thisWeekMonday, -1) }
+}
 const groups = [
   { title: 'WORKSPACE', items: [['Overview', LayoutDashboard], ['Point of sale', ShoppingBag], ['Banking', Landmark], ['Sales', ArrowUpRight], ['Expenses', ArrowDownLeft], ['Payroll', Users]] },
   { title: 'MANAGE', items: [['Customers', Users], ['Suppliers', ShoppingBag], ['Inventory', Package], ['Projects', BriefcaseBusiness], ['Accounting', BookOpen]] },
@@ -44,7 +68,8 @@ type Transaction = {
 }
 type Dashboard = {
   workspaceName: string
-  totals: { monthIncome: string; monthExpenses: string; monthNet: string }
+  period: { from: string; to: string }
+  totals: { income: string; expenses: string; net: string; monthIncome: string; monthExpenses: string }
   transactions: Transaction[]
   cashflow: Array<{ date: string; income: string; expense: string }>
   invoices: { count: number; unpaid_amount: string }
@@ -57,7 +82,7 @@ type PayrollEstimate = {
   payeEstimate: number; netPayEstimate: number; nssfEmployer: number; housingLevyEmployer: number
   employerPayrollCostEstimate: number; assumptions: string[]
 }
-type Employee = { id: string; employeeNumber: string; fullName: string; email?: string; phone?: string; grossMonthlyPay: number; otherTaxableDeductions?: number; otherTaxReliefs?: number; deductions?: Array<{ name: string; kind: 'taxable_base' | 'tax_relief' | 'post_tax'; amount: number }>; active: boolean }
+type Employee = { id: string; employeeNumber: string; fullName: string; email?: string; phone?: string; bankName?: string; bankAccountName?: string; bankAccountNumber?: string; grossMonthlyPay: number; otherTaxableDeductions?: number; otherTaxReliefs?: number; deductions?: Array<{ name: string; kind: 'taxable_base' | 'tax_relief' | 'post_tax'; amount: number }>; active: boolean }
 type PayrollRun = { id: string; period: string; status: 'draft' | 'posted' | 'partially_paid' | 'paid'; rule_set: string; employee_count: number; gross_total: string; net_total: string; paid_total?: string; outstanding_total?: string; paye_total: string; shif_total: string }
 type Remittance = { id: string; remittance_type: string; amount: string; status: string; payment_reference?: string; payroll_run_id: string }
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
@@ -102,6 +127,9 @@ type FinancialStatements = {
 type Modal = 'invoice' | 'transaction' | 'business' | 'invite' | 'return' | null
 type ReturnLine = { id: string; item_id?: string | null; description: string; quantity: string; returned_quantity: string; unit_price: string; discount_amount: string; tax_amount: string }
 type AccountingPeriod = { period: string; status: 'open' | 'closed'; closed_at?: string }
+type AuditEvent = { id: string; actor_user_id?: string | null; event_type: string; entity_type: string; entity_id?: string | null; event_data: Record<string, unknown>; created_at: string }
+type ImportType = 'customers' | 'suppliers' | 'inventory' | 'projects'
+type RecordImportPreview = { type: ImportType; totalRows: number; wouldImport: number; duplicateRows: number[] }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -185,6 +213,10 @@ function App() {
   const { language, setLanguage, t } = useTranslation()
   const [page, setPage] = useState('Overview')
   const [pageHistory, setPageHistory] = useState<string[]>([])
+  const [overviewRange, setOverviewRange] = useState<OverviewRange>('mtd')
+  const [overviewFrom, setOverviewFrom] = useState(`${today.slice(0, 7)}-01`)
+  const [overviewTo, setOverviewTo] = useState(today)
+  const [overviewLoading, setOverviewLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [modal, setModal] = useState<Modal>(null)
   const [toast, setToast] = useState('')
@@ -219,6 +251,7 @@ function App() {
   const [posPaymentMethod, setPosPaymentMethod] = useState<'cash' | 'mpesa'>('cash')
   const [posPaymentPhone, setPosPaymentPhone] = useState('')
   const [posReceipt, setPosReceipt] = useState<PosReceipt | null>(null)
+  const [posIdempotencyKey, setPosIdempotencyKey] = useState(() => crypto.randomUUID())
   const [estimateInput, setEstimateInput] = useState({ customer: '', customerEmail: '', description: '', amount: '', validUntil: today })
   const [billInput, setBillInput] = useState({ supplier: '', description: '', amount: '', billDate: today, dueDate: today, requiresApproval: false })
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([])
@@ -238,6 +271,8 @@ function App() {
   const [wooCredentials, setWooCredentials] = useState({ storeUrl: '', consumerKey: '', consumerSecret: '' })
   const [teamMembers, setTeamMembers] = useState<WorkspaceMember[]>([])
   const [memberPermissionDrafts, setMemberPermissionDrafts] = useState<Record<string, MemberPermission[]>>({})
+  const [memberRoleDrafts, setMemberRoleDrafts] = useState<Record<string, string>>({})
+  const [memberPermissionOverrides, setMemberPermissionOverrides] = useState<Record<string, boolean>>({})
   const [customRoles, setCustomRoles] = useState<CustomRole[]>([])
   const [customRoleDraft, setCustomRoleDraft] = useState({ name: '', permissions: [] as MemberPermission[] })
   const [editingCustomRoleKey, setEditingCustomRoleKey] = useState('')
@@ -273,11 +308,18 @@ function App() {
   const [journalEntries, setJournalEntries] = useState<Array<{ id: string; entry_date: string; description: string; lines: Array<{ code: string; debit: string; credit: string }> }>>([])
   const [trialTotals, setTrialTotals] = useState({ debit: '0', credit: '0' })
   const [accountingPeriods, setAccountingPeriods] = useState<AccountingPeriod[]>([])
-  const [employeeInput, setEmployeeInput] = useState({ employeeNumber: '', fullName: '', email: '', phone: '', grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0', deductions: [] as Array<{ name: string; kind: 'taxable_base' | 'tax_relief' | 'post_tax'; amount: string }> })
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([])
+  const [exportBusy, setExportBusy] = useState(false)
+  const [recordImportType, setRecordImportType] = useState<ImportType>('customers')
+  const [recordImportRows, setRecordImportRows] = useState<Array<Record<string, string>>>([])
+  const [recordImportPreview, setRecordImportPreview] = useState<RecordImportPreview | null>(null)
+  const [employeeInput, setEmployeeInput] = useState({ employeeNumber: '', fullName: '', email: '', phone: '', bankName: '', bankAccountName: '', bankAccountNumber: '', grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0', deductions: [] as Array<{ name: string; kind: 'taxable_base' | 'tax_relief' | 'post_tax'; amount: string }> })
   const [editingEmployeeId, setEditingEmployeeId] = useState('')
   const [payrollPeriod, setPayrollPeriod] = useState(today.slice(0, 7))
+  const [payrollIncludedEmployeeIds, setPayrollIncludedEmployeeIds] = useState<string[]>([])
+  const [payrollBonuses, setPayrollBonuses] = useState<Record<string, string>>({})
   const [payrollPaymentInputs, setPayrollPaymentInputs] = useState<Record<string, { amount: string; paymentReference: string }>>({})
-  const [payslips, setPayslips] = useState<Array<{ id: string; period: string; employee: { fullName: string; employeeNumber: string }; estimate: PayrollEstimate }>>([])
+  const [payslips, setPayslips] = useState<Array<{ id: string; period: string; employee: Omit<Employee, 'active'>; bonusAmount?: number; estimate: PayrollEstimate }>>([])
   const [records, setRecords] = useState<Record<string, WorkspaceRecord[]>>({ customers: [], suppliers: [], inventory: [], projects: [] })
   const [recordForm, setRecordForm] = useState<Record<string, string>>({})
   const [editingRecordId, setEditingRecordId] = useState('')
@@ -332,7 +374,30 @@ function App() {
     setPage(previous)
   }
 
-  const refresh = useCallback(async () => setDashboard(await request<Dashboard>('/v1/dashboard')), [])
+  const refresh = useCallback(async () => {
+    const period = overviewPeriod(overviewRange, overviewFrom, overviewTo)
+    const query = new URLSearchParams(period)
+    setDashboard(await request<Dashboard>(`/v1/dashboard?${query}`))
+  }, [overviewFrom, overviewRange, overviewTo])
+
+  async function loadOverviewPeriod(range: OverviewRange, from = overviewFrom, to = overviewTo) {
+    const period = overviewPeriod(range, from, to)
+    if (!period.from || !period.to || period.from > period.to) {
+      setError('Choose a valid overview date range with a start date on or before the end date.')
+      return
+    }
+    setOverviewLoading(true); setError('')
+    try {
+      const query = new URLSearchParams(period)
+      const result = await request<Dashboard>(`/v1/dashboard?${query}`)
+      setOverviewRange(range)
+      setOverviewFrom(period.from)
+      setOverviewTo(period.to)
+      setDashboard(result)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not load totals for this overview period.')
+    } finally { setOverviewLoading(false) }
+  }
 
   useEffect(() => {
     function handleSessionExpired(event: Event) {
@@ -381,7 +446,12 @@ function App() {
     void request<IntegrationReadiness>('/v1/integrations/readiness').then(setIntegrationReadiness).catch(() => undefined)
     if (page === 'Payroll') {
       void Promise.all([
-        request<{ employees: Employee[] }>('/v1/payroll/employees').then((result) => setEmployees(result.employees)),
+        request<{ employees: Employee[] }>('/v1/payroll/employees').then((result) => {
+          setEmployees(result.employees)
+          setPayrollIncludedEmployeeIds((current) => current.length
+            ? current.filter((id) => result.employees.some((employee) => employee.id === id && employee.active))
+            : result.employees.filter((employee) => employee.active).map((employee) => employee.id))
+        }),
         request<{ runs: PayrollRun[] }>('/v1/payroll/runs').then((result) => setPayrollRuns(result.runs)),
         request<{ remittances: Remittance[] }>('/v1/payroll/remittances').then((result) => setRemittances(result.remittances)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load payroll records.'))
@@ -414,6 +484,7 @@ function App() {
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load point-of-sale items.'))
     }
     if (page === 'Inventory') void Promise.all([
+      request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
       request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders').then((result) => setPurchaseOrders(result.purchaseOrders)),
       request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setStockMovementInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })); setPurchaseOrderInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })) }),
       request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock').then((result) => setInventoryLocationStock(result.stock)),
@@ -463,6 +534,8 @@ function App() {
         request<{ members: WorkspaceMember[] }>(`/v1/workspaces/${account.workspace.id}/members`).then((result) => {
           setTeamMembers(result.members)
           setMemberPermissionDrafts(Object.fromEntries(result.members.map((member) => [member.userId, member.permissions ?? member.defaultPermissions])))
+          setMemberRoleDrafts(Object.fromEntries(result.members.map((member) => [member.userId, member.role])))
+          setMemberPermissionOverrides(Object.fromEntries(result.members.map((member) => [member.userId, member.permissions !== null])))
         }),
         request<{ roles: CustomRole[] }>(`/v1/workspaces/${account.workspace.id}/roles`).then((result) => setCustomRoles(result.roles)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load store, WooCommerce, or team settings.'))
@@ -534,12 +607,40 @@ function App() {
   async function saveMemberPermissions(member: WorkspaceMember) {
     setBusy(true); setError('')
     try {
-      const permissions = memberPermissionDrafts[member.userId] ?? []
-      await request(`/v1/workspaces/${account?.workspace.id}/members/${member.userId}/permissions`, { method: 'PUT', body: JSON.stringify({ permissions }) })
-      setTeamMembers((current) => current.map((item) => item.userId === member.userId ? { ...item, permissions } : item))
-      notify(`Permissions saved for ${member.email || member.phone}.`)
+      const role = memberRoleDrafts[member.userId] ?? member.role
+      const permissions = memberPermissionOverrides[member.userId]
+        ? memberPermissionDrafts[member.userId] ?? member.defaultPermissions
+        : null
+      const result = await request<{ member: WorkspaceMember }>(`/v1/workspaces/${account?.workspace.id}/members/${member.userId}/permissions`, { method: 'PUT', body: JSON.stringify({ role, permissions }) })
+      setTeamMembers((current) => current.map((item) => item.userId === member.userId ? result.member : item))
+      setMemberRoleDrafts((current) => ({ ...current, [member.userId]: result.member.role }))
+      setMemberPermissionOverrides((current) => ({ ...current, [member.userId]: result.member.permissions !== null }))
+      setMemberPermissionDrafts((current) => ({ ...current, [member.userId]: result.member.permissions ?? result.member.defaultPermissions }))
+      notify(`Role and permissions saved for ${member.email || member.phone}.`)
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save member permissions.') }
     finally { setBusy(false) }
+  }
+
+  function permissionsForRole(role: string) {
+    const custom = customRoles.find((item) => item.roleKey === role)
+    if (custom) return custom.permissions
+    if (role === 'accountant') return ['operations.write', 'sales.write', 'inventory.write', 'accounting.write', 'banking.write'] as MemberPermission[]
+    if (role === 'staff') return ['operations.write', 'sales.write', 'inventory.write'] as MemberPermission[]
+    return []
+  }
+
+  function assignMemberRole(userId: string, role: string) {
+    setMemberRoleDrafts((current) => ({ ...current, [userId]: role }))
+    setMemberPermissionDrafts((current) => ({ ...current, [userId]: permissionsForRole(role) }))
+    setMemberPermissionOverrides((current) => ({ ...current, [userId]: false }))
+  }
+
+  async function refreshTeamMembers() {
+    const result = await request<{ members: WorkspaceMember[] }>(`/v1/workspaces/${account?.workspace.id}/members`)
+    setTeamMembers(result.members)
+    setMemberPermissionDrafts(Object.fromEntries(result.members.map((member) => [member.userId, member.permissions ?? member.defaultPermissions])))
+    setMemberRoleDrafts(Object.fromEntries(result.members.map((member) => [member.userId, member.role])))
+    setMemberPermissionOverrides(Object.fromEntries(result.members.map((member) => [member.userId, member.permissions !== null])))
   }
 
   function toggleMemberPermission(userId: string, permission: MemberPermission, enabled: boolean) {
@@ -563,6 +664,7 @@ function App() {
       const url = `/v1/workspaces/${account?.workspace.id}/roles${editingCustomRoleKey ? `/${encodeURIComponent(editingCustomRoleKey)}` : ''}`
       const result = await request<{ role: CustomRole }>(url, { method: editingCustomRoleKey ? 'PUT' : 'POST', body: JSON.stringify({ name: customRoleDraft.name, permissions: customRoleDraft.permissions }) })
       setCustomRoles((current) => editingCustomRoleKey ? current.map((role) => role.roleKey === editingCustomRoleKey ? result.role : role) : [...current, result.role])
+      await refreshTeamMembers()
       setEditingCustomRoleKey(''); setCustomRoleDraft({ name: '', permissions: [] }); notify('Custom role saved.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save custom role.') }
     finally { setBusy(false) }
@@ -821,10 +923,12 @@ function App() {
           customer,
           customerEmail: posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
           locationId: posLocationId || undefined,
+          idempotencyKey: posIdempotencyKey,
           dueDate: today,
           lines: saleLines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: 0 })),
         }),
       })
+      setPosIdempotencyKey(crypto.randomUUID())
       const receipt: PosReceipt = { invoiceId: created.invoice.id, customer, amount: total, paymentMethod: posPaymentMethod, status: 'Payment not yet recorded', lines: saleLines }
       setPosReceipt(receipt)
       setPosCart([])
@@ -1307,9 +1411,15 @@ function App() {
     try {
       const body = { ...employeeInput, grossMonthlyPay: Number(employeeInput.grossMonthlyPay), otherTaxableDeductions: Number(employeeInput.otherTaxableDeductions), otherTaxReliefs: Number(employeeInput.otherTaxReliefs), deductions: employeeInput.deductions.map((item) => ({ ...item, amount: Number(item.amount) })) }
       await request(editingEmployeeId ? `/v1/payroll/employees/${editingEmployeeId}` : '/v1/payroll/employees', { method: editingEmployeeId ? 'PUT' : 'POST', body: JSON.stringify(body) })
-      setEmployeeInput({ employeeNumber: '', fullName: '', email: '', phone: '', grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0', deductions: [] })
+      setEmployeeInput({ employeeNumber: '', fullName: '', email: '', phone: '', bankName: '', bankAccountName: '', bankAccountNumber: '', grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0', deductions: [] })
       setEditingEmployeeId('')
-      const result = await request<{ employees: Employee[] }>('/v1/payroll/employees'); setEmployees(result.employees); notify('Encrypted employee record saved')
+      const result = await request<{ employees: Employee[] }>('/v1/payroll/employees')
+      setEmployees(result.employees)
+      setPayrollIncludedEmployeeIds((current) => {
+        const activeIds = result.employees.filter((employee) => employee.active).map((employee) => employee.id)
+        return current.length ? [...new Set([...current.filter((id) => activeIds.includes(id)), ...(editingEmployeeId ? [] : activeIds.filter((id) => !employees.some((employee) => employee.id === id)))])] : activeIds
+      })
+      notify('Encrypted employee record saved')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save employee record.') }
     finally { setBusy(false) }
   }
@@ -1323,6 +1433,9 @@ function App() {
       fullName: employee.fullName,
       email: employee.email ?? '',
       phone: employee.phone ?? '',
+      bankName: employee.bankName ?? '',
+      bankAccountName: employee.bankAccountName ?? '',
+      bankAccountNumber: employee.bankAccountNumber ?? '',
       grossMonthlyPay: String(employee.grossMonthlyPay),
       otherTaxableDeductions: String(Math.max(0, Number(employee.otherTaxableDeductions ?? 0) - namedTaxableDeductions)),
       otherTaxReliefs: String(Math.max(0, Number(employee.otherTaxReliefs ?? 0) - namedTaxReliefs)),
@@ -1520,8 +1633,16 @@ function App() {
   async function createPayrollRun(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
-      const result = await request<{ run: PayrollRun }>('/v1/payroll/runs', { method: 'POST', body: JSON.stringify({ period: payrollPeriod }) })
-      setPayrollRuns((current) => [result.run, ...current.filter((run) => run.id !== result.run.id)]); notify('Draft payroll run created; verify before posting')
+      if (!payrollIncludedEmployeeIds.length) throw new Error('Choose at least one employee to include in this payroll run.')
+      const result = await request<{ run: PayrollRun }>('/v1/payroll/runs', { method: 'POST', body: JSON.stringify({
+        period: payrollPeriod,
+        employeeIds: payrollIncludedEmployeeIds,
+        bonuses: payrollIncludedEmployeeIds.map((employeeId) => ({ employeeId, amount: Number(payrollBonuses[employeeId] || 0) })),
+      }) })
+      setPayrollRuns((current) => [result.run, ...current.filter((run) => run.id !== result.run.id)])
+      const payslipResult = await request<{ payslips: typeof payslips }>(`/v1/payroll/runs/${result.run.id}/payslips`)
+      setPayslips(payslipResult.payslips)
+      notify('Draft payroll created with the selected employees and bonuses; review the line-by-line estimates before posting.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create payroll run.') }
     finally { setBusy(false) }
   }
@@ -1576,6 +1697,106 @@ function App() {
       notify('Settings saved successfully')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not save settings.')
+    } finally { setBusy(false) }
+  }
+
+  async function exportWorkspaceData(type: string) {
+    setExportBusy(true); setError('')
+    try {
+      const response = await fetch(`${API_BASE}/v1/exports/${encodeURIComponent(type)}`, { credentials: 'include' })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { error?: string }
+        throw new Error(payload.error || `Export failed (${response.status})`)
+      }
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `kashflow-${type}-${today}.csv`
+      document.body.append(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+      notify(`${type[0].toUpperCase()}${type.slice(1)} CSV downloaded.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not export workspace data.')
+    } finally { setExportBusy(false) }
+  }
+
+  async function shareInvoice(invoiceRow: InvoiceRecord) {
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ link: { url: string; expiresAt: string } }>(`/v1/invoices/${invoiceRow.id}/customer-link`, { method: 'POST', body: '{}' })
+      try {
+        await navigator.clipboard.writeText(result.link.url)
+        notify('Secure invoice link copied. It expires in 30 days.')
+      } catch {
+        setError(`Copy this secure invoice link before sharing: ${result.link.url}`)
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not create the customer invoice link.')
+    } finally { setBusy(false) }
+  }
+
+  async function sendInvoiceReminder(invoiceRow: InvoiceRecord) {
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ message: string }>(`/v1/invoices/${invoiceRow.id}/reminders`, { method: 'POST', body: '{}' })
+      notify(result.message)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not send the invoice reminder.')
+    } finally { setBusy(false) }
+  }
+
+  async function loadAuditEvents() {
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ events: AuditEvent[] }>('/v1/accounting/audit-events')
+      setAuditEvents(result.events)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not load the audit log.')
+    } finally { setBusy(false) }
+  }
+
+  async function previewRecordImport(file: File) {
+    setBusy(true); setError(''); setRecordImportPreview(null); setRecordImportRows([])
+    try {
+      if (file.size > 5 * 1024 * 1024) throw new Error('Choose a CSV file no larger than 5 MB.')
+      const lines = (await file.text()).split(/\r?\n/).filter((line) => line.trim())
+      if (lines.length < 2 || lines.length > 501) throw new Error('CSV must include a header and between 1 and 500 data rows.')
+      const headers = parseCsvRow(lines[0] ?? []).map((header) => header.toLowerCase().replace(/[^a-z0-9]/g, ''))
+      const allowed: Record<ImportType, string[]> = {
+        customers: ['name', 'email', 'phone', 'address', 'taxpin', 'notes'],
+        suppliers: ['name', 'email', 'phone', 'address', 'taxpin', 'notes'],
+        inventory: ['name', 'sku', 'barcode', 'reorderpoint', 'quantity', 'unit', 'cost', 'price', 'notes'],
+        projects: ['name', 'customer', 'status', 'startdate', 'enddate', 'budget', 'notes'],
+      }
+      const headerNames: Record<string, string> = { taxpin: 'taxPin', reorderpoint: 'reorderPoint', startdate: 'startDate', enddate: 'endDate' }
+      const selectedColumns = headers.map((header) => allowed[recordImportType].includes(header) ? (headerNames[header] ?? header) : '')
+      if (!selectedColumns.includes('name')) throw new Error('CSV needs a name column. Use the field names shown in the import guide.')
+      const rows = lines.slice(1).map((line) => {
+        const values = parseCsvRow(line)
+        return Object.fromEntries(selectedColumns.flatMap((column, index) => column ? [[column, values[index] ?? '']] : []))
+      })
+      const result = await request<{ preview: RecordImportPreview }>(`/v1/imports/records/${recordImportType}`, { method: 'POST', body: JSON.stringify({ rows, commit: false }) })
+      setRecordImportRows(rows)
+      setRecordImportPreview(result.preview)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not preview this CSV import.')
+    } finally { setBusy(false) }
+  }
+
+  async function commitRecordImport() {
+    if (!recordImportPreview || !recordImportRows.length) return
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ imported: number; message: string }>(`/v1/imports/records/${recordImportPreview.type}`, { method: 'POST', body: JSON.stringify({ rows: recordImportRows, commit: true }) })
+      const refreshed = await request<{ records: WorkspaceRecord[] }>(`/v1/records/${recordImportPreview.type}`)
+      setRecords((current) => ({ ...current, [recordImportPreview.type]: refreshed.records }))
+      setRecordImportRows([]); setRecordImportPreview(null)
+      notify(result.message)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not import these records.')
     } finally { setBusy(false) }
   }
 
@@ -1687,14 +1908,19 @@ function App() {
     </form>
   </div>
 
+  const periodLabel = overviewRangeNames[overviewRange]
+  const activePayrollEmployees = employees.filter((employee) => employee.active)
+  const selectedPayrollEmployees = activePayrollEmployees.filter((employee) => payrollIncludedEmployeeIds.includes(employee.id))
+  const selectedPayrollSalaryTotal = selectedPayrollEmployees.reduce((sum, employee) => sum + Number(employee.grossMonthlyPay), 0)
+  const selectedPayrollBonusTotal = selectedPayrollEmployees.reduce((sum, employee) => sum + Number(payrollBonuses[employee.id] || 0), 0)
   const metricCards = [
-    { title: 'Income this month', value: dashboard?.totals.monthIncome ?? '0', Icon: ArrowDownLeft, tone: 'purple-icon', destination: 'Accounting' },
-    { title: 'Expenses this month', value: dashboard?.totals.monthExpenses ?? '0', Icon: ArrowUpRight, tone: 'peach-icon', destination: 'Expenses' },
-    { title: 'Net movement', value: dashboard?.totals.monthNet ?? '0', Icon: Gauge, tone: 'blue-icon', destination: 'Accounting' },
+    { title: `Income · ${periodLabel}`, value: dashboard?.totals.income ?? '0', Icon: ArrowDownLeft, tone: 'purple-icon', destination: 'Accounting' },
+    { title: `Expenses · ${periodLabel}`, value: dashboard?.totals.expenses ?? '0', Icon: ArrowUpRight, tone: 'peach-icon', destination: 'Expenses' },
+    { title: `Net movement · ${periodLabel}`, value: dashboard?.totals.net ?? '0', Icon: Gauge, tone: 'blue-icon', destination: 'Accounting' },
     { title: 'Unpaid invoices', value: dashboard?.invoices.unpaid_amount ?? '0', Icon: Wallet, tone: 'mint-icon', destination: 'Sales' },
   ]
 
-  if (window.location.pathname.startsWith('/store/') || window.location.pathname.startsWith('/portal/')) {
+  if (window.location.pathname.startsWith('/store/') || window.location.pathname.startsWith('/portal/') || window.location.pathname.startsWith('/invoice/')) {
     return <OnlineStoreApp apiBase={API_BASE} pathname={window.location.pathname} />
   }
 
@@ -1742,14 +1968,28 @@ function App() {
         {page !== 'Overview' && <div className="page-navigation"><button className="button button-secondary" onClick={navigateBack}><ArrowLeft size={15} /> Back</button></div>}
         {page === 'Overview' ? <>
           <section className="welcome-row"><div><div className="eyebrow"><span className="live-dot" /> PRIVATE WORKSPACE</div>
-            <h1>{dashboard?.workspaceName}</h1><p className="welcome-subtitle">Your saved records for this month.</p>
+            <h1>{dashboard?.workspaceName}</h1><p className="welcome-subtitle">Review income and expense totals for the period you choose.</p>
           </div><div className="welcome-actions">
             <button className="button button-secondary" onClick={() => { setError(''); setModal('transaction') }}><Plus size={16} /> {t('Add transaction')}</button>
             <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}><Plus size={17} /> {t('Create invoice')}</button>
             <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={16} /> {t('Invite member')}</button>
           </div></section>
 
-          <section className="metric-grid" aria-label="Saved business totals">
+          <section className="overview-period-toolbar" aria-label="Overview date range">
+            <label className="field-label">Overview period
+              <select value={overviewRange} disabled={overviewLoading} onChange={(event) => {
+                const range = event.target.value as OverviewRange
+                if (range === 'custom') setOverviewRange(range)
+                else void loadOverviewPeriod(range)
+              }}>
+                {(Object.entries(overviewRangeNames) as Array<[OverviewRange, string]>).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+              </select>
+            </label>
+            {overviewRange === 'custom' && <><label className="field-label">From<input type="date" max={overviewTo || today} value={overviewFrom} onChange={(event) => setOverviewFrom(event.target.value)} /></label><label className="field-label">To<input type="date" min={overviewFrom} max={today} value={overviewTo} onChange={(event) => setOverviewTo(event.target.value)} /></label><button className="button button-primary overview-apply" disabled={overviewLoading || !overviewFrom || !overviewTo || overviewFrom > overviewTo} onClick={() => void loadOverviewPeriod('custom')}>{overviewLoading ? 'Updating…' : 'Apply dates'}</button></>}
+            <span className="overview-period-caption">{dashboard?.period ? `${dashboard.period.from} – ${dashboard.period.to}` : 'Loading selected period…'}</span>
+          </section>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <section className="metric-grid" aria-label="Saved business totals for selected period">
             {metricCards.map(({ title, value, Icon, tone, destination }) =>             <button type="button" className="metric-card metric-card-link" key={title} onClick={() => navigateTo(destination)} aria-label={`${t('Open')} ${t(title)} ${t('details')}`}>
                 <div className="metric-top"><span>{t(title)}</span><span className={`metric-icon ${tone}`}><Icon size={17} /></span></div>
                 <div className="metric-value">{money(value)}</div><div className="metric-foot"><span>{t('View related records')} <ArrowRight size={12} /></span></div>
@@ -1852,12 +2092,13 @@ function App() {
             <form onSubmit={addEmployee}>
               <div className="field-row"><label className="field-label">Employee number<input required value={employeeInput.employeeNumber} onChange={(event) => setEmployeeInput({ ...employeeInput, employeeNumber: event.target.value })} /></label><label className="field-label">Full name<input required value={employeeInput.fullName} onChange={(event) => setEmployeeInput({ ...employeeInput, fullName: event.target.value })} /></label></div>
               <div className="field-row"><label className="field-label">Email<input type="email" value={employeeInput.email} onChange={(event) => setEmployeeInput({ ...employeeInput, email: event.target.value })} /></label><label className="field-label">Phone<input type="tel" value={employeeInput.phone} onChange={(event) => setEmployeeInput({ ...employeeInput, phone: event.target.value })} /></label></div>
+              <div className="field-row"><label className="field-label">Bank name<input maxLength={100} value={employeeInput.bankName} onChange={(event) => setEmployeeInput({ ...employeeInput, bankName: event.target.value })} placeholder="Optional" /></label><label className="field-label">Account holder name<input maxLength={160} value={employeeInput.bankAccountName} onChange={(event) => setEmployeeInput({ ...employeeInput, bankAccountName: event.target.value })} placeholder="Optional" /></label><label className="field-label">Bank account number<input maxLength={34} autoComplete="off" value={employeeInput.bankAccountNumber} onChange={(event) => setEmployeeInput({ ...employeeInput, bankAccountNumber: event.target.value })} placeholder="Optional" /></label></div>
               <div className="field-row"><label className="field-label">Gross monthly pay (KSh)<input required type="number" min="0.01" step="0.01" value={employeeInput.grossMonthlyPay} onChange={(event) => setEmployeeInput({ ...employeeInput, grossMonthlyPay: event.target.value })} /></label><label className="field-label">Other allowable deductions<input type="number" min="0" step="0.01" value={employeeInput.otherTaxableDeductions} onChange={(event) => setEmployeeInput({ ...employeeInput, otherTaxableDeductions: event.target.value })} /></label></div>
               <div className="deduction-editor"><div className="panel-header"><div><h3>Named employee deductions</h3><p>Choose how each amount is treated in the estimate; confirm tax treatment with a qualified payroll adviser.</p></div><button type="button" className="button button-small" onClick={() => setEmployeeInput({ ...employeeInput, deductions: [...employeeInput.deductions, { name: '', kind: 'post_tax', amount: '' }] })}><Plus size={14} /> Add deduction</button></div>
                 {employeeInput.deductions.map((deduction, index) => <div className="field-row deduction-row" key={index}><label className="field-label">Deduction name<input required value={deduction.name} placeholder="e.g. Sacco contribution" onChange={(event) => setEmployeeInput({ ...employeeInput, deductions: employeeInput.deductions.map((item, row) => row === index ? { ...item, name: event.target.value } : item) })} /></label><label className="field-label">Treatment<select value={deduction.kind} onChange={(event) => setEmployeeInput({ ...employeeInput, deductions: employeeInput.deductions.map((item, row) => row === index ? { ...item, kind: event.target.value as typeof item.kind } : item) })}><option value="taxable_base">Taxable-pay adjustment</option><option value="tax_relief">Tax relief adjustment</option><option value="post_tax">Post-tax net deduction</option></select></label><label className="field-label">Amount (KSh)<input required type="number" min="0.01" step="0.01" value={deduction.amount} onChange={(event) => setEmployeeInput({ ...employeeInput, deductions: employeeInput.deductions.map((item, row) => row === index ? { ...item, amount: event.target.value } : item) })} /></label><button type="button" className="button button-small" aria-label={`Remove deduction ${index + 1}`} onClick={() => setEmployeeInput({ ...employeeInput, deductions: employeeInput.deductions.filter((_, row) => row !== index) })}>Remove</button></div>)}
               </div>
               <label className="field-label">Other tax reliefs (KSh)<input type="number" min="0" step="0.01" value={employeeInput.otherTaxReliefs} onChange={(event) => setEmployeeInput({ ...employeeInput, otherTaxReliefs: event.target.value })} /></label>
-              <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : editingEmployeeId ? 'Save employee changes' : 'Save encrypted employee'}</button>{editingEmployeeId && <button type="button" className="button button-secondary" disabled={busy} onClick={() => { setEditingEmployeeId(''); setEmployeeInput({ employeeNumber: '', fullName: '', email: '', phone: '', grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0', deductions: [] }) }}>Cancel edit</button>}</div>
+              <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : editingEmployeeId ? 'Save employee changes' : 'Save encrypted employee'}</button>{editingEmployeeId && <button type="button" className="button button-secondary" disabled={busy} onClick={() => { setEditingEmployeeId(''); setEmployeeInput({ employeeNumber: '', fullName: '', email: '', phone: '', bankName: '', bankAccountName: '', bankAccountNumber: '', grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0', deductions: [] }) }}>Cancel edit</button>}</div>
             </form>
             {employees.map((employee) => <div className="transaction-row employee-record-row" key={employee.id}>
               <span><strong>{employee.fullName} {!employee.active && <span className="status-pill amber">Archived</span>}</strong><small>{employee.employeeNumber} · {payrollMoney(employee.grossMonthlyPay)}/month · {employee.email || 'No email'}{employee.phone ? ` · ${employee.phone}` : ''}</small></span>
@@ -1866,8 +2107,29 @@ function App() {
           </article>
           <article className="module-card">
             <h2>Payroll runs</h2>
-            <form className="field-row" onSubmit={createPayrollRun}><label className="field-label">Period<input required type="month" value={payrollPeriod} onChange={(event) => setPayrollPeriod(event.target.value)} /></label><button className="button button-primary" disabled={busy}>Create draft run</button></form>
-            <p className="dialog-note">Bank connections provide read-only feeds; they do not send or verify payroll transfers. After paying employees externally, record the confirmed amount and reference below. Any unpaid balance remains in payroll payable and is not marked paid.</p>
+            <form onSubmit={createPayrollRun}>
+              <div className="field-row"><label className="field-label">Period<input required type="month" value={payrollPeriod} onChange={(event) => setPayrollPeriod(event.target.value)} /></label></div>
+              <h3>Choose employees and add bonuses</h3>
+              <p className="dialog-note">Active employees are included by default. Remove someone by unchecking Include. Bonuses are added to gross pay before the saved tax estimate is calculated.</p>
+              <div className="payroll-table-scroll"><table className="payroll-line-table"><thead><tr><th>Include</th><th>Employee</th><th>Bank account</th><th>Gross salary</th><th>Bonus (KSh)</th><th>Gross total</th></tr></thead><tbody>
+                {activePayrollEmployees.map((employee) => {
+                  const included = payrollIncludedEmployeeIds.includes(employee.id)
+                  const bonus = Number(payrollBonuses[employee.id] || 0)
+                  return <tr key={employee.id}>
+                    <td><label className="payroll-include"><input type="checkbox" checked={included} onChange={(event) => setPayrollIncludedEmployeeIds((current) => event.target.checked ? [...new Set([...current, employee.id])] : current.filter((id) => id !== employee.id))} /><span>Include</span></label></td>
+                    <td><strong>{employee.fullName}</strong><small>{employee.employeeNumber}</small></td>
+                    <td>{employee.bankAccountNumber ? <span>{employee.bankName || 'Bank'} · ****{employee.bankAccountNumber.slice(-4)}</span> : <span className="dialog-note">Not added</span>}</td>
+                    <td>{payrollMoney(employee.grossMonthlyPay)}</td>
+                    <td><input aria-label={`Bonus for ${employee.fullName}`} className="payroll-bonus-input" type="number" min="0" max="100000000" step="0.01" value={payrollBonuses[employee.id] ?? '0'} disabled={!included} onChange={(event) => setPayrollBonuses((current) => ({ ...current, [employee.id]: event.target.value }))} /></td>
+                    <td>{payrollMoney(Number(employee.grossMonthlyPay) + (included ? bonus : 0))}</td>
+                  </tr>
+                })}
+                {!activePayrollEmployees.length && <tr><td colSpan={6}>Add an active employee above to prepare payroll.</td></tr>}
+              </tbody></table></div>
+              <div className="payroll-draft-summary"><span>{selectedPayrollEmployees.length} employee(s)</span><span>Salary {payrollMoney(selectedPayrollSalaryTotal)}</span><span>Bonuses {payrollMoney(selectedPayrollBonusTotal)}</span><strong>Estimated gross {payrollMoney(selectedPayrollSalaryTotal + selectedPayrollBonusTotal)}</strong></div>
+              <button className="button button-primary" disabled={busy || !selectedPayrollEmployees.length}>{busy ? 'Preparing…' : 'Create draft payroll'}</button>
+            </form>
+            <p className="dialog-note">Bank details are encrypted and shown here only as a masked destination; expand an employee's saved payroll details below when preparing the payment. Bank feeds are read-only and do not send payments. Record a payment only after paying employees externally and confirming it. Confirmed payroll payments appear separately in Expenses under Payroll.</p>
             {payrollRuns.map((run) => {
               const outstanding = Number(run.outstanding_total ?? Math.max(0, Number(run.net_total) - Number(run.paid_total ?? (run.status === 'paid' ? run.net_total : 0))))
               const paid = Number(run.paid_total ?? (run.status === 'paid' ? run.net_total : 0))
@@ -1881,7 +2143,17 @@ function App() {
                 </div>}
               </div>
             })}
-            {payslips.map((slip) => <div className="invoice-summary" key={slip.id}><strong>Payslip · {slip.employee.fullName} · {slip.period}</strong><p>Gross {payrollMoney(slip.estimate.grossMonthlyPay)} · PAYE {payrollMoney(slip.estimate.payeEstimate)} · Net {payrollMoney(slip.estimate.netPayEstimate)}</p></div>)}
+            {payslips.length > 0 && <div className="payroll-table-scroll"><h3>Employee payroll details · {payslips[0].period}</h3><table className="payroll-line-table payroll-payslip-table"><thead><tr><th>Employee / bank</th><th>Gross salary</th><th>Bonus</th><th>PAYE</th><th>NSSF</th><th>SHIF</th><th>AHL</th><th>Other deductions</th><th>Net pay</th></tr></thead><tbody>
+              {payslips.map((slip) => {
+                const postTaxDeductions = slip.employee.deductions?.filter((item) => item.kind === 'post_tax').reduce((sum, item) => sum + Number(item.amount), 0) ?? 0
+                return <tr key={slip.id}>
+                  <td><strong>{slip.employee.fullName}</strong><small>{slip.employee.employeeNumber}</small>{slip.employee.bankAccountNumber && <details className="payroll-bank-details"><summary>{slip.employee.bankName || 'Bank'} · ****{slip.employee.bankAccountNumber.slice(-4)}</summary><small>{slip.employee.bankAccountName || slip.employee.fullName}<br />{slip.employee.bankAccountNumber}</small></details>}</td>
+                  <td>{payrollMoney(Number(slip.employee.grossMonthlyPay))}</td><td>{payrollMoney(slip.bonusAmount ?? 0)}</td>
+                  <td>{payrollMoney(slip.estimate.payeEstimate)}</td><td>{payrollMoney(slip.estimate.nssfEmployee)}</td><td>{payrollMoney(slip.estimate.shifEmployee)}</td><td>{payrollMoney(slip.estimate.housingLevyEmployee)}</td>
+                  <td>{payrollMoney(postTaxDeductions)}</td><td><strong>{payrollMoney(slip.estimate.netPayEstimate)}</strong></td>
+                </tr>
+              })}
+            </tbody></table></div>}
           </article>
           <article className="module-card"><h2>Statutory remittances (reference tracking only)</h2><p>Record a payment reference after paying the authority through its official channel. KashFlow does not submit returns or transfer remittances.</p>{remittances.map((item) => <div className="transaction-row" key={item.id}><span><strong>{item.remittance_type.toUpperCase()} · {item.status}</strong><small>{money(item.amount)}</small></span>{item.status === 'due' && <button className="button button-small" onClick={() => void recordRemittance(item.id)}>Record external payment</button>}</div>)}</article>
           <article className="module-card"><h2>Ad-hoc payroll estimate (not saved)</h2><form onSubmit={calculatePayroll}>
@@ -1950,10 +2222,36 @@ function App() {
             inventory: [{ name: 'name', label: 'Item or service name' }, { name: 'sku', label: 'SKU' }, { name: 'barcode', label: 'Barcode (scanner input)' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'reorderPoint', label: 'Low-stock alert at', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
             projects: [{ name: 'name', label: 'Project name' }, { name: 'customer', label: 'Customer' }, { name: 'status', label: 'Status', kind: 'status' }, { name: 'startDate', label: 'Start date', kind: 'date' }, { name: 'endDate', label: 'End date', kind: 'date' }, { name: 'budget', label: 'Budget (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
           }
+          const inventoryHealth = type === 'inventory' ? records.inventory.map((record) => {
+            const locationQuantities = inventoryLocationStock.filter((stock) => stock.item_id === record.id && inventoryLocations.some((location) => location.id === stock.location_id && location.active))
+            const quantity = locationQuantities.length
+              ? locationQuantities.reduce((sum, stock) => sum + Number(stock.quantity), 0)
+              : Number(record.data.quantity ?? 0)
+            const reorderPoint = Number(record.data.reorderPoint ?? 0)
+            const status: 'low' | 'medium' | 'high' = quantity <= 0 || (reorderPoint > 0 && quantity <= reorderPoint) ? 'low'
+              : reorderPoint > 0 && quantity <= reorderPoint * 2 ? 'medium' : 'high'
+            return { id: record.id, name: String(record.data.name ?? 'Inventory item'), quantity, unit: String(record.data.unit ?? 'unit'), reorderPoint, status }
+          }).sort((left, right) => ({ low: 0, medium: 1, high: 2 }[left.status] - { low: 0, medium: 1, high: 2 }[right.status]) || left.name.localeCompare(right.name)) : []
+          const healthGroups = [
+            { status: 'low', title: 'Low stock · reorder now', description: 'At or below your reorder point, or out of stock.', items: inventoryHealth.filter((item) => item.status === 'low') },
+            { status: 'medium', title: 'Medium stock · watch', description: 'Up to twice the reorder point.', items: inventoryHealth.filter((item) => item.status === 'medium') },
+            { status: 'high', title: 'Healthy stock', description: 'Above twice the reorder point.', items: inventoryHealth.filter((item) => item.status === 'high') },
+          ]
           return <section className="module-page"><div className="eyebrow"><span className="live-dot" /> {page.toUpperCase()} · WORKSPACE DATABASE</div><h1>{page}</h1><p className="welcome-subtitle">Create and maintain records for {dashboard?.workspaceName}. Data is private to this business.</p>
             {error && <p className="form-error" role="alert">{error}</p>}
             <form className="module-card" onSubmit={(event) => void saveWorkspaceRecord(event, type)}><h2>{editingRecordId ? 'Edit' : 'Add'} {page.slice(0, -1).toLowerCase()}</h2><div className="record-form-grid">{fields[type].map((field) => <label className="field-label" key={field.name}>{field.label}{field.kind === 'status' ? <select value={recordForm[field.name] ?? 'planned'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="planned">Planned</option><option value="active">Active</option><option value="on_hold">On hold</option><option value="completed">Completed</option></select> : <input required={field.name === 'name'} type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : field.kind ?? 'text'} min={field.kind === 'number' ? '0' : undefined} step={field.kind === 'number' ? '0.01' : undefined} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} />}</label>)}</div>{type === 'suppliers' && <fieldset className="module-card supplier-items-fieldset"><legend>Inventory items supplied (optional)</legend><p className="dialog-note">Link one or more items this supplier provides. These are reference links only; they do not change stock or purchase orders.</p>{supplierItemIds.map((itemId, index) => <div className="field-row" key={`supplier-item-${index}`}><label className="field-label">Inventory item<select aria-label={`Supplier inventory item ${index + 1}`} value={itemId} onChange={(event) => setSupplierItemIds((current) => current.map((value, row) => row === index ? event.target.value : value))}><option value="">Choose item (optional)</option>{records.inventory.filter((item) => !supplierItemIds.includes(item.id) || item.id === itemId).map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')}{item.data.sku ? ` · ${item.data.sku}` : ''}</option>)}</select></label>{supplierItemIds.length > 1 && <button type="button" className="button button-small" aria-label="Remove supplier item row" onClick={() => setSupplierItemIds((current) => current.filter((_, row) => row !== index))}>Remove</button>}</div>)}<button type="button" className="button button-secondary" onClick={() => setSupplierItemIds((current) => [...current, ''])}>Add another item</button></fieldset>}<div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : `${editingRecordId ? 'Update' : 'Save'} ${page.slice(0, -1).toLowerCase()}`}</button>{editingRecordId && <button type="button" className="button button-secondary" onClick={() => { setEditingRecordId(''); setRecordForm({}); setSupplierItemIds(['']) }}>Cancel edit</button>}</div></form>
-            <article className="module-card"><h2>Saved {page.toLowerCase()} ({records[type].length})</h2>{records[type].map((record) => <div className="transaction-row" key={record.id}><span><strong>{record.data.name}</strong><small>{type === 'inventory' ? `SKU ${record.data.sku || '—'} · Qty ${record.data.quantity} ${record.data.unit}` : type === 'projects' ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}` : type === 'suppliers' ? `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'} · ${(Array.isArray(record.data.supplyItemIds) ? record.data.supplyItemIds : []).map((itemId) => String(records.inventory.find((item) => item.id === itemId)?.data.name ?? '')).filter(Boolean).join(', ') || 'No linked inventory items'}` : `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'}`}</small></span><div className="button-row">{type === 'customers' && <button className="button button-small" onClick={() => beginInvoiceForCustomer(record)}>Create invoice</button>}<button className="button button-small" onClick={() => { setEditingRecordId(record.id); setRecordForm(Object.fromEntries(Object.entries(record.data).filter(([key]) => key !== 'supplyItemIds').map(([key, value]) => [key, String(value ?? '')]))); setSupplierItemIds(Array.isArray(record.data.supplyItemIds) && record.data.supplyItemIds.length ? record.data.supplyItemIds.map(String) : ['']) }}>Edit</button><button className="button button-small" onClick={() => void deleteWorkspaceRecord(type, record.id)}>Delete</button></div></div>)}{!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}</article>
+            {type === 'inventory' && <article className="module-card stock-health-panel">
+              <div className="panel-header"><div><h2>Stock health &amp; reorder reminders</h2><p>Health uses each item’s saved reorder point; location quantities are combined for the business total.</p></div><span className="task-count">{inventoryHealth.filter((item) => item.status === 'low').length} low</span></div>
+              <div className="stock-health-grid">{healthGroups.map((group) => <section className={`stock-health-card stock-health-${group.status}`} key={group.status}>
+                <div className="stock-health-heading"><span className={`stock-health-dot stock-health-dot-${group.status}`} /><h3>{group.title}</h3><strong>{group.items.length}</strong></div>
+                <p>{group.description}</p>
+                {group.items.slice(0, 8).map((item) => <div className="stock-health-item" key={item.id}><span><strong>{item.name}</strong><small>{item.quantity} {item.unit} on hand · reorder at {item.reorderPoint}</small></span><span className={`stock-status-pill stock-status-${group.status}`}>{group.status === 'low' ? 'Reorder' : group.status === 'medium' ? 'Watch' : 'Healthy'}</span></div>)}
+                {group.items.length > 8 && <small className="stock-health-more">+{group.items.length - 8} more items</small>}
+                {!group.items.length && <div className="empty-state stock-health-empty">No items in this level.</div>}
+              </section>)}</div>
+              <p className="dialog-note">Red = low stock; orange = watch; green = healthy. Items with a reorder point of 0 are marked low only when out of stock. These are in-app reminders; they do not create a purchase order.</p>
+            </article>}
+            <article className="module-card"><h2>Saved {page.toLowerCase()} ({records[type].length})</h2>{records[type].map((record) => <div className="transaction-row" key={record.id}><span><strong>{record.data.name}</strong><small>{type === 'inventory' ? `SKU ${record.data.sku || '—'} · Qty ${record.data.quantity} ${record.data.unit}` : type === 'projects' ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}` : type === 'suppliers' ? `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'} · ${(Array.isArray(record.data.supplyItemIds) ? record.data.supplyItemIds : []).map((itemId) => String(records.inventory.find((item) => item.id === itemId)?.data.name ?? '')).filter(Boolean).join(', ') || 'No linked inventory items'}` : `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'}`}</small>{type === 'inventory' && <span className={`stock-status-pill stock-status-${inventoryHealth.find((item) => item.id === record.id)?.status ?? 'high'}`}>{inventoryHealth.find((item) => item.id === record.id)?.status === 'low' ? 'Low stock' : inventoryHealth.find((item) => item.id === record.id)?.status === 'medium' ? 'Watch stock' : 'Healthy stock'}</span>}</span><div className="button-row">{type === 'customers' && <button className="button button-small" onClick={() => beginInvoiceForCustomer(record)}>Create invoice</button>}<button className="button button-small" onClick={() => { setEditingRecordId(record.id); setRecordForm(Object.fromEntries(Object.entries(record.data).filter(([key]) => key !== 'supplyItemIds').map(([key, value]) => [key, String(value ?? '')]))); setSupplierItemIds(Array.isArray(record.data.supplyItemIds) && record.data.supplyItemIds.length ? record.data.supplyItemIds.map(String) : ['']) }}>Edit</button><button className="button button-small" onClick={() => void deleteWorkspaceRecord(type, record.id)}>Delete</button></div></div>)}{!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}</article>
             {type === 'suppliers' && <article className="module-card"><h2>Vendor bills and payments</h2><p>Record itemized bills and tax amounts verified for your business. Tax entries are bookkeeping inputs, not statutory determinations.</p><form className="record-form-grid" onSubmit={saveBill}><label className="field-label">Supplier<input required value={billInput.supplier} onChange={(event) => setBillInput({ ...billInput, supplier: event.target.value })} /></label><DraftLineEditor lines={billLines} includeRecoverableTax onChange={(index, key, value) => setBillLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setBillLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0', recoverableTaxAmount: '0' }])} onRemove={(index) => setBillLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} /><p>Total: <strong>{money(draftDocumentTotal(billLines))}</strong></p><label className="field-label">Bill date<input required type="date" value={billInput.billDate} onChange={(event) => setBillInput({ ...billInput, billDate: event.target.value })} /></label><label className="field-label">Due date<input required type="date" min={billInput.billDate} value={billInput.dueDate} onChange={(event) => setBillInput({ ...billInput, dueDate: event.target.value })} /></label><label className="field-label"><input type="checkbox" checked={billInput.requiresApproval} onChange={(event) => setBillInput({ ...billInput, requiresApproval: event.target.checked })} /> Require admin approval before posting</label><button className="button button-primary" disabled={busy}>Record bill</button></form>
               {bills.map((bill) => <div className="transaction-row" key={bill.id}><span><strong>{bill.supplier} · {bill.description}</strong><small>Due {bill.due_date} · {bill.approval_status === 'pending' ? 'awaiting approval' : bill.approval_status === 'rejected' ? 'rejected' : bill.status} · Remaining {money(bill.amount_due ?? bill.amount)}</small></span><strong>{money(bill.amount)}</strong>{bill.approval_status === 'pending' && <button className="button button-small" disabled={busy} onClick={() => void approveBill(bill)}>Approve and post</button>}{bill.status === 'unpaid' && bill.approval_status === 'approved' && <><label className="field-label">Payment (KSh)<input min="0.01" max={bill.amount_due ?? bill.amount} step="0.01" type="number" value={paymentAmounts[bill.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [bill.id]: event.target.value }))} /></label><button className="button button-small" disabled={busy || !paymentAmounts[bill.id]} onClick={() => void payBill(bill)}>Record payment</button></>}</div>)}
               {!bills.length && <div className="empty-state">No bills yet.</div>}
@@ -2076,7 +2374,7 @@ function App() {
         </section> : page === 'Sales' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> SALES · {dashboard?.workspaceName}</div><h1>Invoices</h1><p className="welcome-subtitle">Internal invoices support itemized lines and recorded payments. They are not KRA/eTIMS fiscal tax invoices.</p>
           <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice</button>
-          <div className="module-card">{error && <p className="form-error" role="alert">{error}</p>}{invoicesList.map((invoiceRow) => <div className="transaction-row" key={invoiceRow.id}><span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · {invoiceRow.status} · paid {money(invoiceRow.amount_paid ?? 0)} · due {money(invoiceRow.amount_due ?? invoiceRow.amount)}</small></span><strong>{money(invoiceRow.amount)}</strong><button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button>{invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}{invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <><label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label><button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button></>}</div>)}{!invoicesList.length && <div className="empty-state">No invoices yet. Create one to review and preview it here.</div>}</div>
+          <div className="module-card">{error && <p className="form-error" role="alert">{error}</p>}{invoicesList.map((invoiceRow) => <div className="transaction-row" key={invoiceRow.id}><span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · {invoiceRow.status} · paid {money(invoiceRow.amount_paid ?? 0)} · due {money(invoiceRow.amount_due ?? invoiceRow.amount)}</small></span><strong>{money(invoiceRow.amount)}</strong><button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button>{invoiceRow.status !== 'void' && <button className="button button-small" disabled={busy} onClick={() => void shareInvoice(invoiceRow)}>Share invoice</button>}{invoiceRow.status === 'unpaid' && <button className="button button-small" disabled={busy || !invoiceRow.customer_email} title={!invoiceRow.customer_email ? 'Add a customer email to this invoice first.' : undefined} onClick={() => void sendInvoiceReminder(invoiceRow)}>Send reminder</button>}{invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}{invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <><label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label><button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button></>}</div>)}{!invoicesList.length && <div className="empty-state">No invoices yet. Create one to review and preview it here.</div>}</div>
           <article className="module-card"><h2>Estimates and quotes</h2><p>Estimates do not post to the ledger. Tax amounts are entered by you after qualified review; these documents are not tax invoices.</p><form className="record-form-grid" onSubmit={saveEstimate}><label className="field-label">Customer<input required value={estimateInput.customer} onChange={(event) => setEstimateInput({ ...estimateInput, customer: event.target.value })} /></label><label className="field-label">Customer email<input type="email" value={estimateInput.customerEmail} onChange={(event) => setEstimateInput({ ...estimateInput, customerEmail: event.target.value })} /></label><DraftLineEditor lines={estimateLines} inventoryItems={records.inventory} onChange={(index, key, value) => setEstimateLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setEstimateLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])} onRemove={(index) => setEstimateLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} /><p>Estimate total: <strong>{money(draftDocumentTotal(estimateLines))}</strong></p><label className="field-label">Valid until<input required type="date" value={estimateInput.validUntil} onChange={(event) => setEstimateInput({ ...estimateInput, validUntil: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Save estimate</button></form>
             {estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'sent')}>Mark sent</button>}{['draft', 'sent'].includes(estimate.status) && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'accepted')}>Accept</button>}{estimate.status === 'accepted' && !salesOrders.some((order) => order.estimate_id === estimate.id) && <button className="button button-primary" disabled={busy} onClick={() => void createSalesOrder(estimate)}>Create sales order</button>}</div></div>)}
             <h3>Sales order lifecycle</h3>{salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>)}{!salesOrders.length && <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
@@ -2099,6 +2397,24 @@ function App() {
             {error && <p className="form-error" role="alert">{error}</p>}
             <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
           </form>
+            <section className="module-card">
+              <h2>Export workspace data</h2>
+              <p>Download business-scoped CSV files for reporting, migration, or accountant review. Exports are limited to 50,000 rows and require administrator access.</p>
+              {error && <p className="form-error" role="alert">{error}</p>}
+              <div className="button-row">{['customers', 'suppliers', 'inventory', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit'].map((type) => <button key={type} className="button button-secondary" disabled={exportBusy} onClick={() => void exportWorkspaceData(type)}>{exportBusy ? 'Preparing…' : `Export ${type}`}</button>)}</div>
+            </section>
+            <section className="module-card">
+              <h2>Import records from CSV</h2>
+              <p>Preview and check up to 500 customers, suppliers, inventory items, or projects before importing. Existing names and repeated rows are skipped. Inventory opening quantity and cost create stock movements and a balanced opening journal. This does not import invoices, payroll, bank transactions, attachments, or supplier item links.</p>
+              <div className="field-row"><label className="field-label">Record type<select value={recordImportType} disabled={busy} onChange={(event) => { setRecordImportType(event.target.value as ImportType); setRecordImportPreview(null); setRecordImportRows([]) }}><option value="customers">Customers</option><option value="suppliers">Suppliers</option><option value="inventory">Inventory</option><option value="projects">Projects</option></select></label><label className="field-label">CSV file<input type="file" accept=".csv,text/csv" disabled={busy} onChange={(event) => { const file = event.target.files?.[0]; if (file) void previewRecordImport(file); event.target.value = '' }} /></label></div>
+              <p className="dialog-note">Use a <code>name</code> header, followed by supported fields for the selected type (for example <code>email,phone,address,taxPin,notes</code> or inventory <code>sku,barcode,quantity,unit,cost,price,reorderPoint</code>). Exported KashFlow CSVs include system IDs and timestamps; imports create new records and do not restore IDs.</p>
+              {recordImportPreview && <div className="transaction-row"><span><strong>Preview: {recordImportPreview.wouldImport} new records</strong><small>{recordImportPreview.totalRows} valid rows · {recordImportPreview.duplicateRows.length} duplicate rows will be skipped{recordImportPreview.duplicateRows.length ? ` (CSV row ${recordImportPreview.duplicateRows.join(', ')})` : ''}</small></span><div className="button-row"><button className="button button-secondary" disabled={busy} onClick={() => { setRecordImportPreview(null); setRecordImportRows([]) }}>Discard preview</button><button className="button button-primary" disabled={busy || !recordImportPreview.wouldImport} onClick={() => void commitRecordImport()}>{busy ? 'Importing…' : `Import ${recordImportPreview.wouldImport} records`}</button></div></div>}
+            </section>
+            <section className="module-card">
+              <div className="panel-header"><div><h2>Audit activity</h2><p>Recent supported accounting events are retained for internal review. This is an application log, not an independently certified audit.</p></div><button className="button button-secondary" disabled={busy} onClick={() => void loadAuditEvents()}>{busy ? 'Loading…' : 'Load audit log'}</button></div>
+              {auditEvents.map((event) => <div className="transaction-row" key={event.id}><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><small>{event.entity_type}{event.entity_id ? ` · ${event.entity_id.slice(0, 8)}` : ''} · {new Date(event.created_at).toLocaleString('en-KE')}</small></span><small>{JSON.stringify(event.event_data)}</small></div>)}
+              {!auditEvents.length && <p className="dialog-note">Load recent supported events. Not all record reads or edits are currently audited.</p>}
+            </section>
             <section className="module-card">
               <h2>{t('Online store and customer orders')}</h2>
               <p>Publish a simple product catalog and accept order requests. Customers do not pay online here; verify stock, shipping, tax, and payment before fulfillment.</p>
@@ -2127,7 +2443,7 @@ function App() {
             </section>
             <section className="module-card">
               <h2>Team &amp; Permissions</h2>
-              <p>Invite your team and control access with granular role-based permissions. Create custom roles and select exactly which business areas they can use. Administrators retain full access.</p>
+              <p>Invite team members, assign built-in or custom roles, and edit each person’s effective access. Administrators retain full access and are protected from accidental privilege changes here.</p>
               <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={15} /> Invite your team</button>
               <form className="module-card record-form-grid" onSubmit={(event) => void saveCustomRole(event)}>
                 <h3>{editingCustomRoleKey ? `Edit role: ${customRoleDraft.name}` : 'Add a custom role'}</h3>
@@ -2147,9 +2463,23 @@ function App() {
                 <div className="button-row"><button className="button button-primary" disabled={busy || !customRoleDraft.name.trim()}>{editingCustomRoleKey ? 'Save role permissions' : 'Create custom role'}</button>{editingCustomRoleKey && <button type="button" className="button button-secondary" onClick={cancelCustomRoleEdit}>Cancel</button>}</div>
               </form>
               {customRoles.map((role) => <div className="transaction-row" key={role.id}><span><strong>{role.roleName}</strong><small>{role.permissions.length ? role.permissions.join(' · ') : 'Read-only access'}</small></span><button className="button button-small" onClick={() => editCustomRole(role)}>Edit permissions</button></div>)}
-              {teamMembers.filter((member) => member.role !== 'admin').map((member) => <div className="team-permission-card" key={member.userId}>
-                <h3>{member.email || member.phone} · {member.role}</h3>
-                <div className="field-row">{([
+              {teamMembers.filter((member) => member.role !== 'admin').map((member) => {
+                const role = memberRoleDrafts[member.userId] ?? member.role
+                const permissionDraft = memberPermissionDrafts[member.userId] ?? member.defaultPermissions
+                const isOverridden = memberPermissionOverrides[member.userId] ?? (member.permissions !== null)
+                return <div className="team-permission-card" key={member.userId}>
+                <div className="team-member-heading"><div><h3>{member.email || member.phone}</h3><p>Current role: {member.role}</p></div><span className="status-pill green">Active member</span></div>
+                <label className="field-label">Assigned role<select value={role} disabled={busy} onChange={(event) => assignMemberRole(member.userId, event.target.value)}>
+                  <option value="accountant">Accountant</option><option value="staff">Staff</option><option value="viewer">Viewer</option>
+                  {customRoles.map((customRole) => <option key={customRole.roleKey} value={customRole.roleKey}>{customRole.roleName}</option>)}
+                </select></label>
+                <label className="field-label checkbox-row"><input type="checkbox" checked={isOverridden} disabled={busy} onChange={(event) => {
+                  setMemberPermissionOverrides((current) => ({ ...current, [member.userId]: event.target.checked }))
+                  if (event.target.checked && !(memberPermissionDrafts[member.userId]?.length)) {
+                    setMemberPermissionDrafts((current) => ({ ...current, [member.userId]: permissionsForRole(role) }))
+                  }
+                }} /> Customize individual privileges instead of using this role’s defaults</label>
+                <div className={`field-row team-permission-grid ${isOverridden ? '' : 'permissions-inherited'}`}>{([
                   ['operations.write', 'Operations'],
                   ['sales.write', 'Sales'],
                   ['inventory.write', 'Inventory'],
@@ -2160,9 +2490,9 @@ function App() {
                   ['workspace.manage', 'Business settings'],
                   ['team.manage', 'Team management'],
                   ['store.manage', 'Online store'],
-                ] as Array<[MemberPermission, string]>).map(([permission, label]) => <label className="field-label checkbox-row" key={permission}><input type="checkbox" checked={(memberPermissionDrafts[member.userId] ?? member.permissions ?? member.defaultPermissions).includes(permission)} onChange={(event) => toggleMemberPermission(member.userId, permission, event.target.checked)} /> {label}</label>)}</div>
-                <button className="button button-small" disabled={busy} onClick={() => void saveMemberPermissions(member)}>{t('Save permissions')}</button>
-              </div>)}
+                ] as Array<[MemberPermission, string]>).map(([permission, label]) => <label className="field-label checkbox-row" key={permission}><input type="checkbox" disabled={!isOverridden || busy} checked={permissionDraft.includes(permission)} onChange={(event) => toggleMemberPermission(member.userId, permission, event.target.checked)} /> {label}</label>)}</div>
+                <div className="button-row"><button className="button button-primary" disabled={busy} onClick={() => void saveMemberPermissions(member)}>{busy ? 'Saving…' : 'Save role & privileges'}</button><span className="dialog-note">{isOverridden ? 'Custom privileges will override role defaults.' : 'Using the selected role’s saved privileges.'}</span></div>
+              </div>})}
               {!teamMembers.some((member) => member.role !== 'admin') && <div className="empty-state">Invite a team member to manage their access here.</div>}
             </section>
         </section> : page === 'Help' ? <section className="module-page">

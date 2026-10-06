@@ -142,10 +142,44 @@ function CustomerOrderPortal({ apiBase, token }: { apiBase: string; token: strin
   </main>
 }
 
+function CustomerInvoicePortal({ apiBase, token }: { apiBase: string; token: string }) {
+  const { t } = useTranslation()
+  const [invoice, setInvoice] = useState<{
+    id: string; customer: string; description: string; amount: string; amountPaid: string; amountDue: string;
+    dueDate: string; status: string; businessName: string; expiresAt: string
+  } | null>(null)
+  const [lines, setLines] = useState<Array<{ description: string; quantity: string; unit_price: string; total_amount: string }>>([])
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    void publicRequest<{ invoice: NonNullable<typeof invoice>; lines: typeof lines }>(apiBase, `/v1/public/invoices/${encodeURIComponent(token)}`)
+      .then((result) => { setInvoice(result.invoice); setLines(result.lines) })
+      .catch((reason: unknown) => setError(reason instanceof Error ? t(reason.message) : t('Invoice link is invalid or has expired.')))
+  }, [apiBase, token, t])
+
+  if (!invoice && !error) return <main className="public-store-shell"><p role="status">{t('Loading invoice…')}</p></main>
+  if (!invoice) return <main className="public-store-shell"><h1>{t('Invoice unavailable')}</h1><p className="form-error" role="alert">{error}</p></main>
+
+  return <main className="public-store-shell">
+    <header className="public-store-header"><div className="brand-row"><div className="brand-mark">K</div><div className="brand-name">Kash<span>Flow</span><small>{t('BUSINESS SUITE')}</small></div></div><p>{invoice.businessName}</p><LanguageControl /></header>
+    <section className="public-store-intro"><div className="eyebrow">{t('CUSTOMER INVOICE')}</div><h1>{t('Invoice')} {invoice.id.slice(0, 8).toUpperCase()}</h1><p>{t('For')} {invoice.customer} · {t('Due')} {invoice.dueDate}</p></section>
+    <section className="module-card public-checkout">
+      <span className={`status-pill ${invoice.status === 'paid' ? 'green' : 'amber'}`}>{t(invoice.status)}</span>
+      <h2>{invoice.description}</h2>
+      {lines.map((line, index) => <div className="transaction-row" key={`${line.description}-${index}`}><span>{line.description} × {line.quantity}</span><strong>{formatMoney(line.total_amount)}</strong></div>)}
+      <div className="transaction-row"><strong>{t('Invoice total')}</strong><strong>{formatMoney(invoice.amount)}</strong></div>
+      <div className="transaction-row"><span>{t('Recorded payments')}</span><strong>{formatMoney(invoice.amountPaid)}</strong></div>
+      <div className="transaction-row"><strong>{t('Balance due')}</strong><strong>{formatMoney(invoice.amountDue)}</strong></div>
+      <p className="dialog-note">{t('This is an internal invoice view, not a KRA/eTIMS tax invoice. It does not accept or confirm payments. Contact the seller to arrange payment and confirm the status.')}</p>
+    </section>
+  </main>
+}
+
 export function OnlineStoreApp({ apiBase, pathname }: { apiBase: string; pathname: string }) {
   const { t } = useTranslation()
   const parts = pathname.split('/').filter(Boolean)
   if (parts[0] === 'store' && parts[1]) return <Storefront apiBase={apiBase} slug={parts[1]} />
   if (parts[0] === 'portal' && parts[1]) return <CustomerOrderPortal apiBase={apiBase} token={parts[1]} />
+  if (parts[0] === 'invoice' && parts[1]) return <CustomerInvoicePortal apiBase={apiBase} token={parts[1]} />
   return <main className="public-store-shell"><h1>{t('Page not found')}</h1><a href="/">{t('Return to KashFlow')}</a></main>
 }
