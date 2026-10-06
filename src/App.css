@@ -54,3 +54,11 @@
 .reconciliation-item input[type=checkbox]{width:auto;flex:0 0 auto}
 .reconciliation-item>span{flex:1;min-width:0}
 .reconciliation-item small{display:block;color:#858497;margin-top:4px}
+.draft-lines{display:grid;gap:12px;grid-column:1/-1}
+.draft-line{border:1px solid #e7e8ef;border-radius:12px;padding:14px;min-width:0;display:grid;gap:10px}
+.draft-line legend{font-weight:700;color:#39334c;padding:0 6px}
+.draft-line .field-row{margin:0}
+.draft-line .field-label{min-width:0}
+.transaction-row .field-label{max-width:180px}
+.transaction-row .field-label input{min-width:0}
+@media(max-width:680px){.draft-line .field-row,.transaction-row{align-items:stretch;flex-wrap:wrap}.transaction-row .field-label{max-width:none;width:100%}.draft-line{padding:10px}}

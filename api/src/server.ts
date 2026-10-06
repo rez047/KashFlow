@@ -238,16 +238,20 @@ function decryptKraCredentials<T>(encoded: string): T {
 const defaultChartOfAccounts = [
   { code: '1000', name: 'Cash and bank', type: 'asset' },
   { code: '1100', name: 'Accounts receivable', type: 'asset' },
+  { code: '1200', name: 'Inventory on hand', type: 'asset' },
+  { code: '1300', name: 'Recoverable purchase tax', type: 'asset' },
   { code: '2000', name: 'Net salaries payable', type: 'liability' },
   { code: '2100', name: 'PAYE payable', type: 'liability' },
   { code: '2110', name: 'SHIF payable', type: 'liability' },
   { code: '2120', name: 'NSSF payable', type: 'liability' },
   { code: '2130', name: 'Affordable Housing Levy payable', type: 'liability' },
   { code: '2140', name: 'Other employee deductions payable', type: 'liability' },
+  { code: '2150', name: 'Sales tax payable', type: 'liability' },
   { code: '2200', name: 'Accounts payable', type: 'liability' },
   { code: '3000', name: 'Retained earnings', type: 'equity' },
   { code: '4000', name: 'Sales income', type: 'income' },
   { code: '5000', name: 'Salaries expense', type: 'expense' },
+  { code: '5100', name: 'Cost of goods sold', type: 'expense' },
   { code: '5010', name: 'Employer NSSF expense', type: 'expense' },
   { code: '5020', name: 'Employer Housing Levy expense', type: 'expense' },
   { code: '6000', name: 'Operating expenses', type: 'expense' },
@@ -301,6 +305,21 @@ async function requireWorkspaceAdmin(request: AuthedRequest, response: express.R
     next()
   } catch (error) { next(error) }
 }
+function requireWorkspaceRole(allowedRoles: Array<'admin' | 'accountant' | 'staff'>) {
+  return async (request: AuthedRequest, response: express.Response, next: express.NextFunction) => {
+    try {
+      const result = await pool!.query('SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2', [request.session!.userId, request.session!.workspaceId])
+      const role = String(result.rows[0]?.role ?? '')
+      if (!allowedRoles.some((allowedRole) => allowedRole === role)) {
+        response.status(403).json({ error: 'Your workspace role does not have permission to make this change.' })
+        return
+      }
+      next()
+    } catch (error) { next(error) }
+  }
+}
+const requireWorkspaceWriter = requireWorkspaceRole(['admin', 'accountant', 'staff'])
+const requireAccountingRole = requireWorkspaceRole(['admin', 'accountant'])
 function requireWorkspaceProviderPreference(preference: 'monoEnabled' | 'darajaEnabled' | 'kraEtimsLiveEnabled', productionOnly = false) {
   return async (request: AuthedRequest, response: express.Response, next: express.NextFunction) => {
     if (productionOnly && env.KRA_ETIMS_ENV !== 'production') { next(); return }
@@ -515,17 +534,32 @@ app.get('/v1/records/:type', requirePool, requireSession, async (request: Authed
     response.json({ records: result.rows })
   } catch (error) { next(error) }
 })
-app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const type = parseRecordType(String(request.params.type ?? ''))
   if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
   const input = workspaceRecordSchemas[type].safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Check the required name and field values.' }); return }
+  const inventoryInput = type === 'inventory' ? workspaceRecordSchemas.inventory.parse(request.body) : null
+  const client = await pool!.connect()
   try {
-    const result = await pool!.query('INSERT INTO workspace_records (workspace_id, record_type, data) VALUES ($1, $2, $3::jsonb) RETURNING id, data, created_at, updated_at', [request.session!.workspaceId, workspaceRecordDatabaseTypes[type], JSON.stringify(input.data)])
+    await client.query('BEGIN')
+    const result = await client.query('INSERT INTO workspace_records (id, workspace_id, record_type, data) VALUES ($1, $2, $3, $4::jsonb) RETURNING id, data, created_at, updated_at', [randomUUID(), request.session!.workspaceId, workspaceRecordDatabaseTypes[type], JSON.stringify(input.data)])
+    if (inventoryInput && inventoryInput.quantity > 0 && inventoryInput.cost > 0) {
+      const movementId = randomUUID()
+      const value = Number((inventoryInput.quantity * inventoryInput.cost).toFixed(2))
+      await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, 'opening', $4, $5, 'Opening stock', $6, $7)", [movementId, request.session!.workspaceId, result.rows[0].id, inventoryInput.quantity.toFixed(3), inventoryInput.cost.toFixed(2), nairobiToday(), request.session!.userId])
+      await ensureDefaultAccounts(request.session!.workspaceId)
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Opening inventory: ${input.data.name}`, sourceType: 'inventory_opening', sourceId: movementId, lines: [{ accountCode: '1200', debit: value, credit: 0 }, { accountCode: '3000', debit: 0, credit: value }] })
+    }
+    await client.query('COMMIT')
     response.status(201).json({ record: result.rows[0] })
-  } catch (error) { next(error) }
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
 })
-app.post('/v1/bank-imports', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.post('/v1/bank-imports', requirePool, verifyOrigin, requireSession, requireAccountingRole, async (request: AuthedRequest, response, next) => {
   const input = z.object({ rows: z.array(z.object({ date: z.string().date(), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), direction: z.enum(['income', 'expense']) })).min(1).max(500) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Provide 1 to 500 reviewed rows with valid dates, descriptions, amounts, and directions.' }); return }
   await ensureDefaultAccounts(request.session!.workspaceId)
@@ -697,24 +731,358 @@ app.post('/v1/integrations/mono/webhook', requirePool, async (request, response,
   }
   response.status(200).json({ received: true })
 })
-app.put('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.put('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const type = parseRecordType(String(request.params.type ?? ''))
   if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
   const input = workspaceRecordSchemas[type].safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Check the required name and field values.' }); return }
+  const inventoryInput = type === 'inventory' ? workspaceRecordSchemas.inventory.parse(request.body) : null
+  const client = await pool!.connect()
   try {
-    const result = await pool!.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3 AND record_type = $4 RETURNING id, data, created_at, updated_at', [JSON.stringify(input.data), request.params.recordId, request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
+    await client.query('BEGIN')
+    if (type === 'inventory') {
+      const current = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [request.params.recordId, request.session!.workspaceId])
+      if (!current.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Record not found in this workspace.' }); return }
+      const prior = current.rows[0].data as Record<string, unknown>
+      const movementCount = await client.query('SELECT count(*)::int AS count FROM inventory_movements WHERE item_id = $1 AND workspace_id = $2', [request.params.recordId, request.session!.workspaceId])
+      if (inventoryInput && Number(movementCount.rows[0].count) > 0 && (Number(prior.quantity) !== inventoryInput.quantity || Number(prior.cost) !== inventoryInput.cost)) {
+        await client.query('ROLLBACK')
+        response.status(409).json({ error: 'Stock quantity and cost are controlled by the inventory movement ledger. Record a movement instead of editing these values.' })
+        return
+      }
+    }
+    const result = await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3 AND record_type = $4 RETURNING id, data, created_at, updated_at', [JSON.stringify(input.data), request.params.recordId, request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
     if (!result.rowCount) { response.status(404).json({ error: 'Record not found in this workspace.' }); return }
+    await client.query('COMMIT')
     response.json({ record: result.rows[0] })
-  } catch (error) { next(error) }
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
 })
-app.delete('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.delete('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const type = parseRecordType(String(request.params.type ?? ''))
   if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
   try {
     const result = await pool!.query('DELETE FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = $3 RETURNING id', [request.params.recordId, request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
     if (!result.rowCount) { response.status(404).json({ error: 'Record not found in this workspace.' }); return }
     response.status(204).end()
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/inventory/:itemId/movements', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT id, movement_type, quantity_delta::text, unit_cost::text, reference, moved_at, created_at
+      FROM inventory_movements WHERE workspace_id = $1 AND item_id = $2 ORDER BY moved_at DESC, created_at DESC LIMIT 200`, [request.session!.workspaceId, request.params.itemId])
+    response.json({ movements: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/inventory/:itemId/movements', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    movementType: z.enum(['purchase', 'sale', 'adjustment']),
+    quantity: z.coerce.number().finite().positive().max(1_000_000),
+    adjustmentDirection: z.enum(['increase', 'decrease']).default('increase'),
+    unitCost: z.coerce.number().finite().min(0).max(999999999999),
+    reference: z.string().trim().max(200).default(''),
+    date: z.string().date(),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a valid stock movement, quantity, unit cost, reference, and date.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [request.params.itemId, request.session!.workspaceId])
+    const data = result.rows[0]?.data as Record<string, unknown> | undefined
+    if (!data) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Inventory item not found in this business.' }); return }
+    const oldQuantity = Number(data.quantity ?? 0)
+    const oldCost = Number(data.cost ?? 0)
+    const quantityDelta = input.data.movementType === 'sale' || (input.data.movementType === 'adjustment' && input.data.adjustmentDirection === 'decrease')
+      ? -input.data.quantity
+      : input.data.quantity
+    const newQuantity = oldQuantity + quantityDelta
+    if (newQuantity < 0) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This movement would make on-hand stock negative.' }); return }
+    const movementCost = input.data.movementType === 'sale' ? oldCost : input.data.unitCost || oldCost
+    const averageCost = newQuantity > 0 && quantityDelta > 0
+      ? ((oldQuantity * oldCost) + (quantityDelta * movementCost)) / newQuantity
+      : oldCost
+    await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...data, quantity: Number(newQuantity.toFixed(3)), cost: Number(averageCost.toFixed(2)) }), request.params.itemId, request.session!.workspaceId])
+    const movementId = randomUUID()
+    await client.query(`INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, [movementId, request.session!.workspaceId, request.params.itemId, input.data.movementType, quantityDelta.toFixed(3), movementCost.toFixed(2), input.data.reference, input.data.date, request.session!.userId])
+    await ensureDefaultAccounts(request.session!.workspaceId)
+    const movementValue = Number((Math.abs(quantityDelta) * movementCost).toFixed(2))
+    if (movementValue > 0) {
+      const lines: JournalLineInput[] = quantityDelta > 0
+        ? [{ accountCode: '1200', debit: movementValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: movementValue }]
+        : [{ accountCode: '5100', debit: movementValue, credit: 0 }, { accountCode: '1200', debit: 0, credit: movementValue }]
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: `Inventory ${input.data.movementType}: ${String(data.name ?? 'item')}`, sourceType: 'inventory_movement', sourceId: movementId, lines })
+    }
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'inventory.movement_recorded', entityType: 'inventory_item', entityId: String(request.params.itemId), eventData: { movementId, movementType: input.data.movementType, quantityDelta, newQuantity } })
+    await client.query('COMMIT')
+    response.status(201).json({ movement: { id: movementId, movementType: input.data.movementType, quantityDelta, quantityOnHand: Number(newQuantity.toFixed(3)), unitCost: movementCost } })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+
+app.get('/v1/purchase-orders', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, supplier, status, order_date, due_date, expected_date, notes FROM purchase_orders WHERE workspace_id = $1 ORDER BY order_date DESC LIMIT 100', [request.session!.workspaceId])
+    const lineResult = await pool!.query(`SELECT l.purchase_order_id, l.id, l.item_id, r.data->>'name' AS item_name,
+      l.quantity::text, l.received_quantity::text, l.unit_cost::text
+      FROM purchase_order_lines l JOIN purchase_orders p ON p.id = l.purchase_order_id AND p.workspace_id = $1
+      JOIN workspace_records r ON r.id = l.item_id AND r.workspace_id = $1 ORDER BY l.id`, [request.session!.workspaceId])
+    const purchaseOrders = result.rows.map((order: Record<string, unknown>) => ({ ...order, lines: lineResult.rows.filter((line: Record<string, unknown>) => line.purchase_order_id === order.id) }))
+    response.json({ purchaseOrders })
+  } catch (error) { next(error) }
+})
+app.post('/v1/purchase-orders', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    supplier: z.string().trim().min(1).max(160),
+    orderDate: z.string().date(),
+    dueDate: z.string().date().optional(),
+    expectedDate: z.string().date().optional(),
+    notes: z.string().trim().max(2000).default(''),
+    lines: z.array(z.object({ itemId: z.string().uuid(), quantity: z.coerce.number().finite().positive().max(1_000_000), unitCost: z.coerce.number().finite().min(0).max(999999999999) })).min(1).max(100),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a supplier, valid dates, and at least one inventory line.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const id = randomUUID()
+    await client.query('INSERT INTO purchase_orders (id, workspace_id, supplier, order_date, due_date, expected_date, notes, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [id, request.session!.workspaceId, input.data.supplier, input.data.orderDate, input.data.dueDate ?? input.data.orderDate, input.data.expectedDate ?? null, input.data.notes, request.session!.userId])
+    for (const line of input.data.lines) {
+      const item = await client.query("SELECT id FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory'", [line.itemId, request.session!.workspaceId])
+      if (!item.rowCount) { await client.query('ROLLBACK'); response.status(400).json({ error: 'Every purchase order line must reference an inventory item in this business.' }); return }
+      await client.query('INSERT INTO purchase_order_lines (id, purchase_order_id, item_id, quantity, unit_cost) VALUES ($1, $2, $3, $4, $5)', [randomUUID(), id, line.itemId, line.quantity.toFixed(3), line.unitCost.toFixed(2)])
+    }
+    await client.query('COMMIT')
+    response.status(201).json({ purchaseOrder: { id, status: 'open' } })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+app.post('/v1/purchase-orders/:orderId/receive', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ lines: z.array(z.object({ lineId: z.string().uuid(), quantity: z.coerce.number().finite().positive().max(1_000_000) })).min(1).max(100), date: z.string().date() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide received quantities and a valid receiving date.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const orderResult = await client.query("SELECT id, supplier, status, due_date FROM purchase_orders WHERE id = $1 AND workspace_id = $2 AND status IN ('open', 'partially_received') FOR UPDATE", [request.params.orderId, request.session!.workspaceId])
+    const order = orderResult.rows[0]
+    if (!order) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Open purchase order not found.' }); return }
+    let receivedValue = 0
+    const receivedLines: Array<{ itemId: string; description: string; quantity: number; unitCost: number; total: number }> = []
+    for (const received of input.data.lines) {
+      const lineResult = await client.query(`SELECT l.id, l.item_id, l.quantity::text, l.received_quantity::text, l.unit_cost::text, r.data
+        FROM purchase_order_lines l JOIN workspace_records r ON r.id = l.item_id AND r.workspace_id = $2 AND r.record_type = 'inventory'
+        WHERE l.id = $1 AND l.purchase_order_id = $3 FOR UPDATE`, [received.lineId, request.session!.workspaceId, order.id])
+      const line = lineResult.rows[0]
+      if (!line || Number(line.received_quantity) + received.quantity > Number(line.quantity)) { await client.query('ROLLBACK'); response.status(409).json({ error: 'A received quantity exceeds its remaining purchase order quantity.' }); return }
+      const data = line.data as Record<string, unknown>
+      const priorQuantity = Number(data.quantity ?? 0)
+      const cost = Number(line.unit_cost)
+      const nextQuantity = priorQuantity + received.quantity
+      const nextCost = nextQuantity > 0 ? (priorQuantity * Number(data.cost ?? cost) + received.quantity * cost) / nextQuantity : cost
+      await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...data, quantity: Number(nextQuantity.toFixed(3)), cost: Number(nextCost.toFixed(2)) }), line.item_id, request.session!.workspaceId])
+      await client.query('UPDATE purchase_order_lines SET received_quantity = received_quantity + $1 WHERE id = $2', [received.quantity.toFixed(3), line.id])
+      const movementId = randomUUID()
+      await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, 'purchase', $4, $5, $6, $7, $8)", [movementId, request.session!.workspaceId, line.item_id, received.quantity.toFixed(3), cost.toFixed(2), `PO ${String(order.id).slice(0, 8)}`, input.data.date, request.session!.userId])
+      receivedValue += received.quantity * cost
+      receivedLines.push({ itemId: String(line.item_id), description: String(data.name ?? 'Inventory item'), quantity: received.quantity, unitCost: cost, total: received.quantity * cost })
+    }
+    await ensureDefaultAccounts(request.session!.workspaceId)
+    if (receivedValue > 0) {
+      const billId = randomUUID()
+      const description = `Purchase order receipt ${String(order.id).slice(0, 8)}`
+      const dueDate = order.due_date ? String(order.due_date).slice(0, 10) : input.data.date
+      await client.query(`INSERT INTO vendor_bills (id, workspace_id, supplier, description, amount, bill_date, due_date, approval_status, approved_by, approved_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved', $8, now())`,
+      [billId, request.session!.workspaceId, order.supplier, description, receivedValue.toFixed(2), input.data.date, dueDate, request.session!.userId])
+      for (const [index, line] of receivedLines.entries()) {
+        await client.query(`INSERT INTO vendor_bill_lines (id, bill_id, line_number, description, quantity, unit_price, total_amount)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)`, [randomUUID(), billId, index + 1, line.description, line.quantity.toFixed(3), line.unitCost.toFixed(2), line.total.toFixed(2)])
+      }
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: `Goods received from ${order.supplier}`, sourceType: 'vendor_bill', sourceId: billId, lines: [{ accountCode: '1200', debit: receivedValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: receivedValue }] })
+    }
+    const remaining = await client.query('SELECT count(*)::int AS count FROM purchase_order_lines WHERE purchase_order_id = $1 AND received_quantity < quantity', [order.id])
+    const status = Number(remaining.rows[0].count) === 0 ? 'received' : 'partially_received'
+    await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2', [status, order.id])
+    await client.query('COMMIT')
+    response.json({ status, receivedValue: Number(receivedValue.toFixed(2)) })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+
+app.get('/v1/projects/:projectId/time', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const project = await pool!.query("SELECT id FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'project'", [request.params.projectId, request.session!.workspaceId])
+    if (!project.rowCount) { response.status(404).json({ error: 'Project not found in this business.' }); return }
+    const result = await pool!.query('SELECT id, description, work_date, hours::text, hourly_cost::text, billable, status, created_at FROM project_time_entries WHERE workspace_id = $1 AND project_id = $2 ORDER BY work_date DESC, created_at DESC', [request.session!.workspaceId, request.params.projectId])
+    response.json({ entries: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/projects/:projectId/time', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ description: z.string().trim().min(1).max(240), workDate: z.string().date(), hours: z.coerce.number().finite().positive().max(24), hourlyCost: z.coerce.number().finite().min(0).max(999999999999), billable: z.boolean().default(false) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a description, work date, hours (up to 24), and valid hourly cost.' }); return }
+  try {
+    const project = await pool!.query("SELECT id FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'project'", [request.params.projectId, request.session!.workspaceId])
+    if (!project.rowCount) { response.status(404).json({ error: 'Project not found in this business.' }); return }
+    const result = await pool!.query(`INSERT INTO project_time_entries (id, workspace_id, project_id, description, work_date, hours, hourly_cost, billable, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, description, work_date, hours::text, hourly_cost::text, billable, status`,
+    [randomUUID(), request.session!.workspaceId, request.params.projectId, input.data.description, input.data.workDate, input.data.hours.toFixed(2), input.data.hourlyCost.toFixed(2), input.data.billable, request.session!.userId])
+    response.status(201).json({ entry: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.patch('/v1/projects/:projectId/time/:entryId', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ status: z.enum(['approved', 'rejected']) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Choose approved or rejected for time review.' }); return }
+  try {
+    const result = await pool!.query(`UPDATE project_time_entries SET status = $1, reviewed_by = $2
+      WHERE id = $3 AND project_id = $4 AND workspace_id = $5 AND status = 'submitted' RETURNING id, status`,
+    [input.data.status, request.session!.userId, request.params.entryId, request.params.projectId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Submitted time entry not found.' }); return }
+    response.json({ entry: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.get('/v1/projects/:projectId/summary', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const project = await pool!.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'project'", [request.params.projectId, request.session!.workspaceId])
+    if (!project.rowCount) { response.status(404).json({ error: 'Project not found in this business.' }); return }
+    const result = await pool!.query(`SELECT COALESCE(SUM(hours * hourly_cost) FILTER (WHERE status = 'approved'), 0)::text AS approved_cost,
+      COALESCE(SUM(hours) FILTER (WHERE status = 'approved'), 0)::text AS approved_hours,
+      COALESCE(SUM(hours * hourly_cost) FILTER (WHERE status = 'approved' AND billable), 0)::text AS billable_value,
+      COALESCE(SUM(hours * hourly_cost) FILTER (WHERE status = 'submitted'), 0)::text AS pending_cost
+      FROM project_time_entries WHERE workspace_id = $1 AND project_id = $2`, [request.session!.workspaceId, request.params.projectId])
+    response.json({ project: project.rows[0].data, ...result.rows[0] })
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/reports/budgets', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ from: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/), to: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/) }).safeParse(request.query)
+  if (!input.success || input.data.from > input.data.to) { response.status(400).json({ error: 'Choose a valid YYYY-MM budget period range.' }); return }
+  try {
+    const result = await pool!.query(`SELECT b.id, b.account_code, a.name AS account_name, b.period, b.amount::text AS budget,
+      COALESCE(SUM(CASE WHEN e.id IS NOT NULL AND a.account_type = 'income' THEN l.credit - l.debit
+        WHEN e.id IS NOT NULL THEN l.debit - l.credit ELSE 0 END), 0)::text AS actual
+      FROM workspace_budgets b JOIN workspace_accounts a ON a.workspace_id = b.workspace_id AND a.code = b.account_code
+      LEFT JOIN journal_lines l ON l.account_id = a.id
+      LEFT JOIN journal_entries e ON e.id = l.journal_entry_id AND e.entry_date >= (b.period || '-01')::date AND e.entry_date < ((b.period || '-01')::date + interval '1 month')
+      WHERE b.workspace_id = $1 AND b.period BETWEEN $2 AND $3
+      GROUP BY b.id, b.account_code, a.name, b.period ORDER BY b.period, b.account_code`, [request.session!.workspaceId, input.data.from, input.data.to])
+    response.json({ budgets: result.rows.map((row: Record<string, unknown>) => ({ ...row, variance: (Number(row.actual) - Number(row.budget)).toFixed(2) })) })
+  } catch (error) { next(error) }
+})
+app.put('/v1/reports/budgets', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ accountCode: z.string().trim().regex(/^\d{4}$/), period: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/), amount: z.coerce.number().finite().min(0).max(999999999999) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a valid account code, YYYY-MM period, and non-negative KSh budget.' }); return }
+  try {
+    const account = await pool!.query('SELECT 1 FROM workspace_accounts WHERE workspace_id = $1 AND code = $2 AND active = true', [request.session!.workspaceId, input.data.accountCode])
+    if (!account.rowCount) { response.status(404).json({ error: 'Active account not found in this business chart.' }); return }
+    const result = await pool!.query(`INSERT INTO workspace_budgets (id, workspace_id, account_code, period, amount, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (workspace_id, account_code, period)
+      DO UPDATE SET amount = EXCLUDED.amount RETURNING id, account_code, period, amount::text`,
+    [randomUUID(), request.session!.workspaceId, input.data.accountCode, input.data.period, input.data.amount.toFixed(2), request.session!.userId])
+    response.status(201).json({ budget: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.get('/v1/reports/cash-flow-forecast', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT to_char(date_trunc('month', e.entry_date), 'YYYY-MM') AS period,
+      COALESCE(SUM(l.debit), 0)::text AS inflows,
+      COALESCE(SUM(l.credit), 0)::text AS outflows
+      FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
+      JOIN workspace_accounts a ON a.id = l.account_id
+      WHERE e.workspace_id = $1 AND a.code = '1000' AND e.entry_date >= (current_date - interval '6 months')
+      GROUP BY date_trunc('month', e.entry_date) ORDER BY period`, [request.session!.workspaceId])
+    const history = result.rows.map((row: Record<string, unknown>) => ({ period: String(row.period), inflows: Number(row.inflows), outflows: Number(row.outflows), source: 'actual' }))
+    const monthlyIncome = history.length ? history.reduce((sum: number, row: { inflows: number }) => sum + row.inflows, 0) / history.length : 0
+    const monthlyExpenses = history.length ? history.reduce((sum: number, row: { outflows: number }) => sum + row.outflows, 0) / history.length : 0
+    const now = new Date()
+    const forecast = Array.from({ length: 3 }, (_, index) => {
+      const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + index + 1, 1))
+      return { period: date.toISOString().slice(0, 7), income: Number(monthlyIncome.toFixed(2)), expenses: Number(monthlyExpenses.toFixed(2)), source: 'historical-average-estimate' }
+    })
+    response.json({ history, forecast, assumptions: 'Forecast repeats the average monthly cash inflows and outflows from the available prior six months; it is not a guarantee or a projected cash balance.' })
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/recurring', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT id, template_type, description, counterparty, amount::text, account, frequency, next_date, active FROM recurring_templates WHERE workspace_id = $1 ORDER BY next_date', [request.session!.workspaceId])
+    response.json({ templates: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/recurring', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ type: z.enum(['invoice', 'expense']), description: z.string().trim().min(1).max(240), counterparty: z.string().trim().max(160).default(''), amount: z.coerce.number().finite().positive().max(999999999999), account: z.string().trim().max(80).default('Operating expenses'), frequency: z.enum(['monthly', 'quarterly', 'annually']), nextDate: z.string().date() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a valid recurring invoice or expense schedule.' }); return }
+  try {
+    const result = await pool!.query(`INSERT INTO recurring_templates (id, workspace_id, template_type, description, counterparty, amount, account, frequency, next_date, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, template_type, next_date, active`,
+    [randomUUID(), request.session!.workspaceId, input.data.type, input.data.description, input.data.counterparty, input.data.amount.toFixed(2), input.data.account, input.data.frequency, input.data.nextDate, request.session!.userId])
+    response.status(201).json({ template: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.post('/v1/recurring/:templateId/run', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query('SELECT * FROM recurring_templates WHERE id = $1 AND workspace_id = $2 AND active = true FOR UPDATE', [request.params.templateId, request.session!.workspaceId])
+    const template = result.rows[0]
+    const currentDate = nairobiToday()
+    if (!template) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active recurring schedule not found.' }); return }
+    const nextDate = template.next_date instanceof Date ? template.next_date.toISOString().slice(0, 10) : String(template.next_date).slice(0, 10)
+    if (nextDate > currentDate) { await client.query('ROLLBACK'); response.status(409).json({ error: `This schedule is next due on ${nextDate}.` }); return }
+    const entryDate = nextDate
+    const amount = Number(template.amount)
+    const generatedId = randomUUID()
+    if (template.template_type === 'invoice') {
+      const invoice = await client.query('INSERT INTO invoices (id, workspace_id, customer, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id', [generatedId, request.session!.workspaceId, template.counterparty || 'Recurring customer', template.description, amount.toFixed(2), entryDate])
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: entryDate, description: `Recurring invoice: ${template.description}`, sourceType: 'recurring_invoice', sourceId: String(invoice.rows[0].id), lines: [{ accountCode: '1100', debit: amount, credit: 0 }, { accountCode: '4000', debit: 0, credit: amount }] })
+    } else {
+      await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [generatedId, request.session!.workspaceId, template.description, amount.toFixed(2), 'expense', template.account, entryDate])
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: entryDate, description: `Recurring expense: ${template.description}`, sourceType: 'recurring_expense', sourceId: generatedId, lines: [{ accountCode: '6000', debit: amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: amount }] })
+    }
+    const dueDate = new Date(`${entryDate}T00:00:00Z`)
+    dueDate.setUTCMonth(dueDate.getUTCMonth() + (template.frequency === 'monthly' ? 1 : template.frequency === 'quarterly' ? 3 : 12))
+    await client.query('UPDATE recurring_templates SET next_date = $1 WHERE id = $2', [dueDate.toISOString().slice(0, 10), template.id])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'recurring.generated', entityType: 'recurring_template', entityId: String(template.id), eventData: { generatedId, type: template.template_type, date: entryDate, amount } })
+    await client.query('COMMIT')
+    response.status(201).json({ generatedId, date: entryDate, nextDate: dueDate.toISOString().slice(0, 10) })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+
+app.get('/v1/reports/aging', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ asOf: z.string().date().default(nairobiToday()) }).safeParse(request.query)
+  if (!input.success) { response.status(400).json({ error: 'Use a valid YYYY-MM-DD as-of date.' }); return }
+  try {
+    const [receivables, payables] = await Promise.all([
+      pool!.query(`SELECT id, customer AS counterparty, amount::text, amount_paid::text, due_date,
+        GREATEST(($2::date - due_date), 0) AS days_overdue FROM invoices
+        WHERE workspace_id = $1 AND status <> 'void' AND approval_status = 'approved' AND amount > amount_paid ORDER BY due_date`, [request.session!.workspaceId, input.data.asOf]),
+      pool!.query(`SELECT id, supplier AS counterparty, amount::text, amount_paid::text, due_date,
+        GREATEST(($2::date - due_date), 0) AS days_overdue FROM vendor_bills
+        WHERE workspace_id = $1 AND status <> 'void' AND amount > amount_paid ORDER BY due_date`, [request.session!.workspaceId, input.data.asOf]),
+    ])
+    const buckets = (rows: Array<Record<string, unknown>>) => {
+      const totals = { current: 0, days1to30: 0, days31to60: 0, days61to90: 0, over90: 0 }
+      for (const row of rows) {
+        const due = Number(row.amount) - Number(row.amount_paid)
+        const days = Number(row.days_overdue)
+        if (days <= 0) totals.current += due
+        else if (days <= 30) totals.days1to30 += due
+        else if (days <= 60) totals.days31to60 += due
+        else if (days <= 90) totals.days61to90 += due
+        else totals.over90 += due
+      }
+      return Object.fromEntries(Object.entries(totals).map(([key, value]) => [key, value.toFixed(2)]))
+    }
+    response.json({ asOf: input.data.asOf, receivables: { items: receivables.rows, buckets: buckets(receivables.rows) }, payables: { items: payables.rows, buckets: buckets(payables.rows) } })
   } catch (error) { next(error) }
 })
 
@@ -811,10 +1179,10 @@ app.post('/v1/workspaces', requirePool, verifyOrigin, requireSession, async (req
 app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
   const input = z.object({
     email: z.string().trim().email().max(254).transform((value) => value.toLowerCase()),
-    role: z.string().trim().min(1).max(50).regex(/^[\p{L}\p{N} _-]+$/u),
+    role: z.enum(['accountant', 'staff', 'viewer']),
     scope: z.enum(['single', 'all_owned']).default('single'),
   }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Provide a valid email address and a role name (up to 50 letters, numbers, spaces, hyphens, or underscores).' }); return }
+  if (!input.success) { response.status(400).json({ error: 'Choose a valid email, accountant, staff, or viewer role.' }); return }
   if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Invitations can only be created for the active business.' }); return }
 
   const client = await pool!.connect()
@@ -833,19 +1201,142 @@ app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, r
     }
     if (!targets.length) { await client.query('ROLLBACK'); response.status(403).json({ error: 'No businesses are available for this invitation.' }); return }
 
-    const invite = await client.query('INSERT INTO workspace_invitations (workspace_id, email, role, scope, invited_by) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, role, scope, status', [request.session!.workspaceId, input.data.email, input.data.role, input.data.scope, request.session!.userId])
+    const inviteToken = randomBytes(32).toString('base64url')
+    const tokenHash = createHash('sha256').update(inviteToken).digest('hex')
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+    const invite = await client.query(`INSERT INTO workspace_invitations (workspace_id, email, role, scope, invited_by, token_hash, expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, email, role, scope, status, expires_at`,
+    [request.session!.workspaceId, input.data.email, input.data.role, input.data.scope, request.session!.userId, tokenHash, expiresAt])
     for (const target of targets) {
       await client.query('INSERT INTO invitation_workspaces (id, invitation_id, workspace_id) VALUES ($1, $2, $3)', [randomUUID(), invite.rows[0].id, target.workspace_id])
     }
     await client.query('COMMIT')
-    response.status(201).json({ invitation: { ...invite.rows[0], businesses: targets.map((target) => target.name) }, delivery: 'not_configured' })
+    const invitationUrl = new URL('/', env.FRONTEND_ORIGIN)
+    invitationUrl.searchParams.set('invite', inviteToken)
+    if (!emailConfigured) {
+      response.status(201).json({ invitation: { ...invite.rows[0], businesses: targets.map((target) => target.name) }, delivery: 'manual_link', invitationUrl: invitationUrl.toString() })
+      return
+    }
+    const emailResponse = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: env.EMAIL_FROM,
+        to: [input.data.email],
+        subject: `You are invited to ${targets.map((target) => target.name).join(', ')}`,
+        html: `<main style="font-family:Arial,sans-serif;color:#242537"><h1>KashFlow workspace invitation</h1><p>You have been invited as ${escapeHtml(input.data.role)} to ${escapeHtml(targets.map((target) => target.name).join(', '))}.</p><p>This invitation expires in seven days. Sign in or create an account using this email, then accept the invitation:</p><p><a href="${escapeHtml(invitationUrl.toString())}">Review invitation</a></p></main>`,
+        text: `You have been invited as ${input.data.role} to ${targets.map((target) => target.name).join(', ')}. Sign in or create an account using this email, then accept within seven days: ${invitationUrl.toString()}`,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    const emailPayload = await emailResponse.json().catch(() => ({})) as { id?: string; message?: string }
+    if (!emailResponse.ok || !emailPayload.id) {
+      await pool!.query("UPDATE workspace_invitations SET status = 'declined' WHERE id = $1 AND status = 'pending'", [invite.rows[0].id])
+      response.status(502).json({ error: `Invitation email was not accepted by the provider: ${String(emailPayload.message ?? `HTTP ${emailResponse.status}`).slice(0, 300)}` })
+      return
+    }
+    response.status(201).json({ invitation: { ...invite.rows[0], businesses: targets.map((target) => target.name) }, delivery: 'accepted_by_provider' })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
+app.get('/v1/workspaces/:workspaceId/invitations', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Invitations can only be viewed for the active business.' }); return }
+  try {
+    const result = await pool!.query('SELECT id, email, role, scope, status, expires_at, accepted_at, created_at FROM workspace_invitations WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
+    response.json({ invitations: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/invitations/accept', requirePool, verifyOrigin, async (request, response, next) => {
+  const input = z.object({ token: z.string().min(32).max(200), email: emailSchema.optional(), password: passwordSchema.optional() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a valid invitation token.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const tokenHash = createHash('sha256').update(input.data.token).digest('hex')
+    const inviteResult = await client.query(`SELECT i.id, i.email, i.role FROM workspace_invitations i
+      WHERE i.token_hash = $1 AND i.status = 'pending' AND i.expires_at > now() FOR UPDATE`, [tokenHash])
+    const invite = inviteResult.rows[0]
+    if (!invite) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invitation is invalid, expired, or already used.' }); return }
+    const targets = await client.query('SELECT workspace_id FROM invitation_workspaces WHERE invitation_id = $1 ORDER BY workspace_id', [invite.id])
+    if (!targets.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Invitation has no associated businesses.' }); return }
+    const session = readSession(cookies(request.headers.cookie)[cookieName])
+    let userId = session?.userId
+    if (session) {
+      const user = await client.query('SELECT email FROM users WHERE id = $1', [session.userId])
+      if (String(user.rows[0]?.email ?? '').toLowerCase() !== String(invite.email).toLowerCase()) {
+        await client.query('ROLLBACK')
+        response.status(403).json({ error: 'Sign in using the email address that received this invitation.' })
+        return
+      }
+    } else {
+      const existing = await client.query('SELECT id FROM users WHERE email = $1', [invite.email])
+      if (existing.rowCount) {
+        await client.query('ROLLBACK')
+        response.status(401).json({ error: 'This email already has an account. Sign in with it, then accept the invitation.' })
+        return
+      }
+      if (!input.data.password || !input.data.email || input.data.email.toLowerCase() !== String(invite.email).toLowerCase()) {
+        await client.query('ROLLBACK')
+        response.status(400).json({ error: 'For a new account, use the invited email address and choose a password of at least 12 characters.' })
+        return
+      }
+      userId = randomUUID()
+      await client.query('INSERT INTO users (id, workspace_id, email, password_hash) VALUES ($1, $2, $3, $4)', [userId, targets.rows[0].workspace_id, invite.email, await hashPassword(input.data.password)])
+    }
+    for (const target of targets.rows) {
+      await client.query('INSERT INTO workspace_members (user_id, workspace_id, role) VALUES ($1, $2, $3) ON CONFLICT (user_id, workspace_id) DO NOTHING', [userId, target.workspace_id, invite.role])
+    }
+    await client.query("UPDATE workspace_invitations SET status = 'accepted', accepted_at = now(), token_hash = NULL WHERE id = $1", [invite.id])
+    await client.query('COMMIT')
+    const workspaceId = String(targets.rows[0].workspace_id)
+    setSessionCookie(response, { userId: userId!, workspaceId, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
+    response.json({ accepted: true, workspaceId, role: invite.role })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+app.post('/v1/workspaces/:workspaceId/activate', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id
+      WHERE wm.user_id = $1 AND wm.workspace_id = $2`, [request.session!.userId, request.params.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'You are not a member of that business.' }); return }
+    setSessionCookie(response, { ...request.session!, workspaceId: String(request.params.workspaceId) })
+    response.json({ workspace: { id: String(request.params.workspaceId), name: result.rows[0].name, role: result.rows[0].role } })
+  } catch (error) { next(error) }
+})
+
+const commercialLineSchema = z.object({
+  itemId: z.string().uuid().optional(),
+  description: z.string().trim().min(1).max(240),
+  quantity: z.coerce.number().finite().positive().max(1_000_000),
+  unitPrice: z.coerce.number().finite().min(0).max(999999999999),
+  discountAmount: z.coerce.number().finite().min(0).max(999999999999).default(0),
+  taxAmount: z.coerce.number().finite().min(0).max(999999999999).default(0),
+  recoverableTaxAmount: z.coerce.number().finite().min(0).max(999999999999).default(0),
+})
+type CommercialLine = z.infer<typeof commercialLineSchema>
+function calculateCommercialLines(lines: CommercialLine[]) {
+  let subtotalCents = 0
+  let taxCents = 0
+  let recoverableTaxCents = 0
+  const normalized = lines.map((line) => {
+    const baseCents = Math.round(line.quantity * Math.round(line.unitPrice * 100))
+    const discountCents = Math.round(line.discountAmount * 100)
+    const lineTaxCents = Math.round(line.taxAmount * 100)
+    const recoverableCents = Math.round(line.recoverableTaxAmount * 100)
+    if (discountCents > baseCents || recoverableCents > lineTaxCents) throw new Error('Discount cannot exceed its line subtotal and recoverable tax cannot exceed tax charged.')
+    const lineSubtotal = baseCents - discountCents
+    const totalCents = lineSubtotal + lineTaxCents
+    subtotalCents += lineSubtotal
+    taxCents += lineTaxCents
+    recoverableTaxCents += recoverableCents
+    return { ...line, discountAmount: (discountCents / 100).toFixed(2), taxAmount: (lineTaxCents / 100).toFixed(2), recoverableTaxAmount: (recoverableCents / 100).toFixed(2), totalAmount: (totalCents / 100).toFixed(2) }
+  })
+  return { lines: normalized, subtotal: subtotalCents / 100, tax: taxCents / 100, recoverableTax: recoverableTaxCents / 100, total: (subtotalCents + taxCents) / 100 }
+}
 
 app.get('/v1/invoices', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT id, customer, customer_email, description, amount::text, due_date, status, created_at FROM invoices WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
+    const result = await pool!.query('SELECT id, customer, customer_email, description, amount::text, amount_paid::text, GREATEST(amount - amount_paid, 0)::text AS amount_due, due_date, status, created_at FROM invoices WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
     response.json({ invoices: result.rows })
   } catch (error) { next(error) }
 })
@@ -853,7 +1344,7 @@ app.get('/v1/invoices', requirePool, requireSession, async (request: AuthedReque
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character] ?? character)
 }
-app.post('/v1/invoices/:invoiceId/email', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.post('/v1/invoices/:invoiceId/email', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.' }); return }
   try {
     const result = await pool!.query('SELECT id, customer, customer_email, description, amount::text, due_date, status FROM invoices WHERE id = $1 AND workspace_id = $2', [request.params.invoiceId, request.session!.workspaceId])
@@ -895,7 +1386,7 @@ app.get('/v1/invoices/:invoiceId/email-history', requirePool, requireSession, as
   } catch (error) { next(error) }
 })
 
-app.patch('/v1/invoices/:invoiceId/status', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.patch('/v1/invoices/:invoiceId/status', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const input = z.object({ status: z.enum(['unpaid', 'paid', 'void']) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Status must be unpaid, paid, or void.' }); return }
   if (input.data.status === 'paid') { response.status(409).json({ error: 'Invoices can only be marked paid after a recorded payment or verified M-Pesa callback.' }); return }
@@ -906,7 +1397,32 @@ app.patch('/v1/invoices/:invoiceId/status', requirePool, verifyOrigin, requireSe
   } catch (error) { next(error) }
 })
 
-app.post('/v1/transactions', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.post('/v1/invoices/:invoiceId/payments', requirePool, verifyOrigin, requireSession, requireAccountingRole, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ amount: z.coerce.number().finite().positive().max(999999999999), paymentDate: z.string().date() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a positive payment amount and valid payment date.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query("SELECT id, customer, description, amount::text, amount_paid::text FROM invoices WHERE id = $1 AND workspace_id = $2 AND status = 'unpaid' FOR UPDATE", [request.params.invoiceId, request.session!.workspaceId])
+    const invoice = found.rows[0]
+    if (!invoice) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Open invoice not found.' }); return }
+    const due = Number(invoice.amount) - Number(invoice.amount_paid)
+    if (Math.round(input.data.amount * 100) > Math.round(due * 100)) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Payment cannot exceed the outstanding invoice balance.' }); return }
+    const paymentId = randomUUID()
+    await client.query('INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, created_by) VALUES ($1, $2, $3, $4, $5, $6)', [paymentId, request.session!.workspaceId, invoice.id, input.data.amount.toFixed(2), input.data.paymentDate, request.session!.userId])
+    const updated = await client.query("UPDATE invoices SET amount_paid = amount_paid + $1, status = CASE WHEN amount_paid + $1 >= amount THEN 'paid' ELSE 'unpaid' END WHERE id = $2 AND workspace_id = $3 RETURNING amount::text, amount_paid::text, status", [input.data.amount.toFixed(2), invoice.id, request.session!.workspaceId])
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.paymentDate, description: `Invoice payment: ${invoice.customer} — ${invoice.description}`, sourceType: 'invoice_payment', sourceId: paymentId, lines: [{ accountCode: '1000', debit: input.data.amount, credit: 0 }, { accountCode: '1100', debit: 0, credit: input.data.amount }] })
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'invoice.payment_recorded', entityType: 'invoice', entityId: String(invoice.id), eventData: { paymentId, amount: input.data.amount, paymentDate: input.data.paymentDate } })
+    await client.query('COMMIT')
+    response.status(201).json({ payment: { id: paymentId, amount: input.data.amount.toFixed(2), ...updated.rows[0] } })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+
+app.post('/v1/transactions', requirePool, verifyOrigin, requireSession, requireAccountingRole, async (request: AuthedRequest, response, next) => {
   const input = z.object({ description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), direction: z.enum(['income', 'expense']), account: z.string().trim().min(1).max(80), date: z.string().date() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a description, positive amount, transaction type, account, and valid date.' }); return }
   const client = await pool!.connect()
@@ -929,15 +1445,52 @@ app.post('/v1/transactions', requirePool, verifyOrigin, requireSession, async (r
   finally { client.release() }
 })
 
-app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ customer: z.string().trim().min(1).max(160), customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), dueDate: z.string().date() }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Enter a customer, description, positive amount, and valid due date.' }); return }
+app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    customer: z.string().trim().min(1).max(160),
+    customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''),
+    description: z.string().trim().min(1).max(240).optional(),
+    amount: z.coerce.number().finite().positive().max(999999999999).optional(),
+    lines: z.array(commercialLineSchema.omit({ recoverableTaxAmount: true })).min(1).max(100).optional(),
+    dueDate: z.string().date(),
+  }).superRefine((value, context) => {
+    if (!value.lines && (!value.description || !value.amount)) context.addIssue({ code: 'custom', message: 'Provide invoice lines or a description and amount.' })
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a customer, invoice lines (or description and amount), and a valid due date.' }); return }
+  let financials: ReturnType<typeof calculateCommercialLines>
+  try {
+    const lines = input.data.lines ?? [{ description: input.data.description!, quantity: 1, unitPrice: input.data.amount!, discountAmount: 0, taxAmount: 0, recoverableTaxAmount: 0 }]
+    financials = calculateCommercialLines(lines.map((line) => ({ ...line, recoverableTaxAmount: 0 })))
+  } catch (error) { response.status(400).json({ error: error instanceof Error ? error.message : 'Invoice line amounts are invalid.' }); return }
+  if (financials.total <= 0) { response.status(400).json({ error: 'Invoice total must be greater than zero.' }); return }
+  const description = input.data.description ?? financials.lines.map((line) => line.description).join('; ').slice(0, 240)
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
     const id = randomUUID()
-    const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, customer_email, description, amount::text, due_date, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.customerEmail, input.data.description, input.data.amount.toFixed(2), input.data.dueDate])
-    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${input.data.customer} — ${input.data.description}`, sourceType: 'invoice', sourceId: id, lines: [{ accountCode: '1100', debit: input.data.amount, credit: 0 }, { accountCode: '4000', debit: 0, credit: input.data.amount }] })
+    const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, customer_email, description, amount::text, due_date, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.customerEmail, description, financials.total.toFixed(2), input.data.dueDate])
+    let costOfGoodsSold = 0
+    for (const [index, line] of financials.lines.entries()) {
+      if (line.itemId) {
+        const item = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [line.itemId, request.session!.workspaceId])
+        const itemData = item.rows[0]?.data as Record<string, unknown> | undefined
+        if (!itemData) { await client.query('ROLLBACK'); response.status(400).json({ error: 'A sales line references an inventory item that is not in this business.' }); return }
+        const onHand = Number(itemData.quantity ?? 0)
+        if (line.quantity > onHand) { await client.query('ROLLBACK'); response.status(409).json({ error: `Not enough stock for ${String(itemData.name ?? 'this item')}. Available: ${onHand}.` }); return }
+        const itemCost = Number(itemData.cost ?? 0)
+        const nextQuantity = Number((onHand - line.quantity).toFixed(3))
+        await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...itemData, quantity: nextQuantity }), line.itemId, request.session!.workspaceId])
+        const movementId = randomUUID()
+        await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, 'sale', $4, $5, $6, $7, $8)", [movementId, request.session!.workspaceId, line.itemId, (-line.quantity).toFixed(3), itemCost.toFixed(2), `Invoice ${id.slice(0, 8)}`, nairobiToday(), request.session!.userId])
+        costOfGoodsSold += line.quantity * itemCost
+      }
+      await client.query('INSERT INTO invoice_lines (id, invoice_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [randomUUID(), id, index + 1, line.itemId ?? null, line.description, line.quantity.toFixed(3), line.unitPrice.toFixed(2), line.discountAmount, line.taxAmount, line.totalAmount])
+    }
+    const journalLines: JournalLineInput[] = [{ accountCode: '1100', debit: financials.total, credit: 0 }]
+    if (financials.subtotal > 0) journalLines.push({ accountCode: '4000', debit: 0, credit: financials.subtotal })
+    if (financials.tax > 0) journalLines.push({ accountCode: '2150', debit: 0, credit: financials.tax })
+    if (costOfGoodsSold > 0) journalLines.push({ accountCode: '5100', debit: Number(costOfGoodsSold.toFixed(2)), credit: 0 }, { accountCode: '1200', debit: 0, credit: Number(costOfGoodsSold.toFixed(2)) })
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${input.data.customer} — ${description}`, sourceType: 'invoice', sourceId: id, lines: journalLines })
     await client.query('COMMIT')
     response.status(201).json({ invoice: result.rows[0] })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
@@ -950,15 +1503,39 @@ app.get('/v1/estimates', requirePool, requireSession, async (request: AuthedRequ
     response.json({ estimates: result.rows })
   } catch (error) { next(error) }
 })
-app.post('/v1/estimates', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ customer: z.string().trim().min(1).max(160), customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), validUntil: z.string().date() }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Enter a customer, description, positive amount, and valid expiry date.' }); return }
+app.post('/v1/estimates', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    customer: z.string().trim().min(1).max(160),
+    customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''),
+    description: z.string().trim().min(1).max(240).optional(),
+    amount: z.coerce.number().finite().positive().max(999999999999).optional(),
+    lines: z.array(commercialLineSchema.omit({ recoverableTaxAmount: true })).min(1).max(100).optional(),
+    validUntil: z.string().date(),
+  }).superRefine((value, context) => {
+    if (!value.lines && (!value.description || !value.amount)) context.addIssue({ code: 'custom', message: 'Provide estimate lines or a description and amount.' })
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a customer, estimate lines (or description and amount), and a valid expiry date.' }); return }
+  let financials: ReturnType<typeof calculateCommercialLines>
   try {
-    const result = await pool!.query('INSERT INTO estimates (id, workspace_id, customer, customer_email, description, amount, valid_until) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, customer_email, description, amount::text, valid_until, status, created_at', [randomUUID(), request.session!.workspaceId, input.data.customer, input.data.customerEmail, input.data.description, input.data.amount.toFixed(2), input.data.validUntil])
+    const lines = input.data.lines ?? [{ description: input.data.description!, quantity: 1, unitPrice: input.data.amount!, discountAmount: 0, taxAmount: 0 }]
+    financials = calculateCommercialLines(lines.map((line) => ({ ...line, recoverableTaxAmount: 0 })))
+  } catch (error) { response.status(400).json({ error: error instanceof Error ? error.message : 'Estimate line amounts are invalid.' }); return }
+  if (financials.total <= 0) { response.status(400).json({ error: 'Estimate total must be greater than zero.' }); return }
+  const description = input.data.description ?? financials.lines.map((line) => line.description).join('; ').slice(0, 240)
+  const client = await pool!.connect()
+  try {
+    const id = randomUUID()
+    await client.query('BEGIN')
+    const result = await client.query('INSERT INTO estimates (id, workspace_id, customer, customer_email, description, amount, valid_until) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, customer_email, description, amount::text, valid_until, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.customerEmail, description, financials.total.toFixed(2), input.data.validUntil])
+    for (const [index, line] of financials.lines.entries()) {
+      await client.query('INSERT INTO estimate_lines (id, estimate_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [randomUUID(), id, index + 1, line.itemId ?? null, line.description, line.quantity.toFixed(3), line.unitPrice.toFixed(2), line.discountAmount, line.taxAmount, line.totalAmount])
+    }
+    await client.query('COMMIT')
     response.status(201).json({ estimate: result.rows[0] })
-  } catch (error) { next(error) }
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
 })
-app.patch('/v1/estimates/:estimateId/status', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.patch('/v1/estimates/:estimateId/status', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const input = z.object({ status: z.enum(['sent', 'accepted', 'declined', 'void']) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Choose a valid estimate status.' }); return }
   try {
@@ -967,7 +1544,7 @@ app.patch('/v1/estimates/:estimateId/status', requirePool, verifyOrigin, require
     response.json({ estimate: result.rows[0] })
   } catch (error) { next(error) }
 })
-app.post('/v1/estimates/:estimateId/convert', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.post('/v1/estimates/:estimateId/convert', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
@@ -978,7 +1555,34 @@ app.post('/v1/estimates/:estimateId/convert', requirePool, verifyOrigin, require
     const dueDate = z.string().date().safeParse(request.body?.dueDate)
     if (!dueDate.success) { await client.query('ROLLBACK'); response.status(400).json({ error: 'Provide a valid invoice due date.' }); return }
     const invoice = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, amount::text, due_date, status', [invoiceId, request.session!.workspaceId, estimate.customer, estimate.customer_email, estimate.description, estimate.amount, dueDate.data])
-    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${estimate.customer} — ${estimate.description}`, sourceType: 'invoice', sourceId: invoiceId, lines: [{ accountCode: '1100', debit: Number(estimate.amount), credit: 0 }, { accountCode: '4000', debit: 0, credit: Number(estimate.amount) }] })
+    const estimateLines = await client.query('SELECT line_number, item_id, description, quantity::text, unit_price::text, discount_amount::text, tax_amount::text, total_amount::text FROM estimate_lines WHERE estimate_id = $1 ORDER BY line_number', [estimate.id])
+    let invoiceSubtotalCents = 0
+    let invoiceTaxCents = 0
+    let costOfGoodsSold = 0
+    for (const line of estimateLines.rows) {
+      const lineBaseCents = Math.round(Number(line.quantity) * Math.round(Number(line.unit_price) * 100))
+      invoiceSubtotalCents += lineBaseCents - Math.round(Number(line.discount_amount) * 100)
+      invoiceTaxCents += Math.round(Number(line.tax_amount) * 100)
+      if (line.item_id) {
+        const item = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [line.item_id, request.session!.workspaceId])
+        const itemData = item.rows[0]?.data as Record<string, unknown> | undefined
+        if (!itemData) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This estimate refers to an inventory item that no longer exists.' }); return }
+        const onHand = Number(itemData.quantity ?? 0)
+        const quantity = Number(line.quantity)
+        if (quantity > onHand) { await client.query('ROLLBACK'); response.status(409).json({ error: `Not enough stock for ${String(itemData.name ?? 'this item')}. Available: ${onHand}.` }); return }
+        const itemCost = Number(itemData.cost ?? 0)
+        await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...itemData, quantity: Number((onHand - quantity).toFixed(3)) }), line.item_id, request.session!.workspaceId])
+        const movementId = randomUUID()
+        await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, 'sale', $4, $5, $6, $7, $8)", [movementId, request.session!.workspaceId, line.item_id, (-quantity).toFixed(3), itemCost.toFixed(2), `Invoice ${invoiceId.slice(0, 8)}`, nairobiToday(), request.session!.userId])
+        costOfGoodsSold += quantity * itemCost
+      }
+      await client.query('INSERT INTO invoice_lines (id, invoice_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [randomUUID(), invoiceId, line.line_number, line.item_id, line.description, line.quantity, line.unit_price, line.discount_amount, line.tax_amount, line.total_amount])
+    }
+    const journalLines: JournalLineInput[] = [{ accountCode: '1100', debit: Number(estimate.amount), credit: 0 }]
+    if (invoiceSubtotalCents > 0) journalLines.push({ accountCode: '4000', debit: 0, credit: invoiceSubtotalCents / 100 })
+    if (invoiceTaxCents > 0) journalLines.push({ accountCode: '2150', debit: 0, credit: invoiceTaxCents / 100 })
+    if (costOfGoodsSold > 0) journalLines.push({ accountCode: '5100', debit: Number(costOfGoodsSold.toFixed(2)), credit: 0 }, { accountCode: '1200', debit: 0, credit: Number(costOfGoodsSold.toFixed(2)) })
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${estimate.customer} — ${estimate.description}`, sourceType: 'invoice', sourceId: invoiceId, lines: journalLines })
     await client.query("UPDATE estimates SET status = 'converted', invoice_id = $1, updated_at = now() WHERE id = $2", [invoiceId, estimate.id])
     await client.query('COMMIT')
     response.status(201).json({ invoice: invoice.rows[0] })
@@ -991,22 +1595,79 @@ app.post('/v1/estimates/:estimateId/convert', requirePool, verifyOrigin, require
 
 app.get('/v1/bills', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT id, supplier, description, amount::text, bill_date, due_date, status, created_at FROM vendor_bills WHERE workspace_id = $1 ORDER BY due_date, created_at DESC LIMIT 200', [request.session!.workspaceId])
+    const result = await pool!.query('SELECT id, supplier, description, amount::text, amount_paid::text, GREATEST(amount - amount_paid, 0)::text AS amount_due, bill_date, due_date, status, approval_status, created_at FROM vendor_bills WHERE workspace_id = $1 ORDER BY due_date, created_at DESC LIMIT 200', [request.session!.workspaceId])
     response.json({ bills: result.rows })
   } catch (error) { next(error) }
 })
 app.post('/v1/bills', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ supplier: z.string().trim().min(1).max(160), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), billDate: z.string().date(), dueDate: z.string().date() }).safeParse(request.body)
+  const input = z.object({
+    supplier: z.string().trim().min(1).max(160),
+    description: z.string().trim().min(1).max(240).optional(),
+    amount: z.coerce.number().finite().positive().max(999999999999).optional(),
+    lines: z.array(commercialLineSchema).min(1).max(100).optional(),
+    billDate: z.string().date(),
+    dueDate: z.string().date(),
+    requiresApproval: z.boolean().default(false),
+  }).superRefine((value, context) => {
+    if (!value.lines && (!value.description || !value.amount)) context.addIssue({ code: 'custom', message: 'Provide bill lines or a description and amount.' })
+  }).safeParse(request.body)
   if (!input.success || input.data.billDate > input.data.dueDate) { response.status(400).json({ error: 'Enter a supplier, description, positive amount, and valid bill/due dates.' }); return }
+  let financials: ReturnType<typeof calculateCommercialLines>
+  try {
+    const lines = input.data.lines ?? [{ description: input.data.description!, quantity: 1, unitPrice: input.data.amount!, discountAmount: 0, taxAmount: 0, recoverableTaxAmount: 0 }]
+    financials = calculateCommercialLines(lines)
+  } catch (error) { response.status(400).json({ error: error instanceof Error ? error.message : 'Bill line amounts are invalid.' }); return }
+  if (financials.total <= 0) { response.status(400).json({ error: 'Bill total must be greater than zero.' }); return }
+  const description = input.data.description ?? financials.lines.map((line) => line.description).join('; ').slice(0, 240)
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
     await ensureDefaultAccounts(request.session!.workspaceId)
     const id = randomUUID()
-    const bill = await client.query('INSERT INTO vendor_bills (id, workspace_id, supplier, description, amount, bill_date, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, supplier, description, amount::text, bill_date, due_date, status', [id, request.session!.workspaceId, input.data.supplier, input.data.description, input.data.amount.toFixed(2), input.data.billDate, input.data.dueDate])
-    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.billDate, description: `Bill: ${input.data.supplier} — ${input.data.description}`, sourceType: 'vendor_bill', sourceId: id, lines: [{ accountCode: '6000', debit: input.data.amount, credit: 0 }, { accountCode: '2200', debit: 0, credit: input.data.amount }] })
+    const approvalStatus = input.data.requiresApproval ? 'pending' : 'approved'
+    const bill = await client.query(`INSERT INTO vendor_bills (id, workspace_id, supplier, description, amount, bill_date, due_date, approval_status, approved_by, approved_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $8 = 'approved' THEN $9::uuid ELSE NULL END, CASE WHEN $8 = 'approved' THEN now() ELSE NULL END)
+      RETURNING id, supplier, description, amount::text, bill_date, due_date, status, approval_status`, [id, request.session!.workspaceId, input.data.supplier, description, financials.total.toFixed(2), input.data.billDate, input.data.dueDate, approvalStatus, request.session!.userId])
+    for (const [index, line] of financials.lines.entries()) {
+      await client.query('INSERT INTO vendor_bill_lines (id, bill_id, line_number, description, quantity, unit_price, discount_amount, tax_amount, recoverable_tax_amount, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [randomUUID(), id, index + 1, line.description, line.quantity.toFixed(3), line.unitPrice.toFixed(2), line.discountAmount, line.taxAmount, line.recoverableTaxAmount, line.totalAmount])
+    }
+    if (approvalStatus === 'approved') {
+      const expenseAmount = financials.total - financials.recoverableTax
+      const journalLines: JournalLineInput[] = [{ accountCode: '6000', debit: expenseAmount, credit: 0 }]
+      if (financials.recoverableTax > 0) journalLines.push({ accountCode: '1300', debit: financials.recoverableTax, credit: 0 })
+      journalLines.push({ accountCode: '2200', debit: 0, credit: financials.total })
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.billDate, description: `Bill: ${input.data.supplier} — ${description}`, sourceType: 'vendor_bill', sourceId: id, lines: journalLines })
+    }
     await client.query('COMMIT')
     response.status(201).json({ bill: bill.rows[0] })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+app.post('/v1/bills/:billId/approval', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ decision: z.enum(['approved', 'rejected']) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Choose approve or reject for this bill.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query("SELECT id, supplier, description, amount::text, bill_date FROM vendor_bills WHERE id = $1 AND workspace_id = $2 AND approval_status = 'pending' FOR UPDATE", [request.params.billId, request.session!.workspaceId])
+    const bill = found.rows[0]
+    if (!bill) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Pending bill approval not found.' }); return }
+    if (input.data.decision === 'approved') {
+      const amount = Number(bill.amount)
+      const lines = await client.query('SELECT COALESCE(SUM(recoverable_tax_amount), 0)::text AS recoverable_tax FROM vendor_bill_lines WHERE bill_id = $1', [bill.id])
+      const recoverableTax = Number(lines.rows[0].recoverable_tax)
+      const journalLines: JournalLineInput[] = [{ accountCode: '6000', debit: amount - recoverableTax, credit: 0 }]
+      if (recoverableTax > 0) journalLines.push({ accountCode: '1300', debit: recoverableTax, credit: 0 })
+      journalLines.push({ accountCode: '2200', debit: 0, credit: amount })
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: String(bill.bill_date).slice(0, 10), description: `Bill: ${bill.supplier} — ${bill.description}`, sourceType: 'vendor_bill', sourceId: String(bill.id), lines: journalLines })
+    }
+    await client.query('UPDATE vendor_bills SET approval_status = $1, approved_by = $2, approved_at = now() WHERE id = $3 AND workspace_id = $4', [input.data.decision, request.session!.userId, bill.id, request.session!.workspaceId])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: `bill.${input.data.decision}`, entityType: 'vendor_bill', entityId: String(bill.id) })
+    await client.query('COMMIT')
+    response.json({ billId: bill.id, approvalStatus: input.data.decision })
   } catch (error) {
     await client.query('ROLLBACK')
     if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
@@ -1019,15 +1680,18 @@ app.post('/v1/bills/:billId/payments', requirePool, verifyOrigin, requireSession
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const found = await client.query("SELECT id, supplier, description, amount::text FROM vendor_bills WHERE id = $1 AND workspace_id = $2 AND status = 'unpaid' FOR UPDATE", [request.params.billId, request.session!.workspaceId])
+    const found = await client.query("SELECT id, supplier, description, amount::text, amount_paid::text FROM vendor_bills WHERE id = $1 AND workspace_id = $2 AND status = 'unpaid' AND approval_status = 'approved' FOR UPDATE", [request.params.billId, request.session!.workspaceId])
     const bill = found.rows[0]
     if (!bill) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Unpaid bill not found.' }); return }
-    const amount = Number(bill.amount)
-    if (Math.round(input.data.amount * 100) !== Math.round(amount * 100)) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Partial payments are not supported yet; pay the full bill amount.' }); return }
-    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.paymentDate, description: `Bill payment: ${bill.supplier} — ${bill.description}`, sourceType: 'vendor_bill_payment', sourceId: String(bill.id), lines: [{ accountCode: '2200', debit: amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: amount }] })
-    await client.query("UPDATE vendor_bills SET status = 'paid', updated_at = now() WHERE id = $1 AND workspace_id = $2", [bill.id, request.session!.workspaceId])
+    const amountDue = Number(bill.amount) - Number(bill.amount_paid)
+    if (Math.round(input.data.amount * 100) > Math.round(amountDue * 100)) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Payment cannot exceed the outstanding bill balance.' }); return }
+    const paymentId = randomUUID()
+    await client.query('INSERT INTO bill_payments (id, workspace_id, bill_id, amount, payment_date, created_by) VALUES ($1, $2, $3, $4, $5, $6)', [paymentId, request.session!.workspaceId, bill.id, input.data.amount.toFixed(2), input.data.paymentDate, request.session!.userId])
+    const updated = await client.query("UPDATE vendor_bills SET amount_paid = amount_paid + $1, status = CASE WHEN amount_paid + $1 >= amount THEN 'paid' ELSE 'unpaid' END, updated_at = now() WHERE id = $2 AND workspace_id = $3 RETURNING amount::text, amount_paid::text, status", [input.data.amount.toFixed(2), bill.id, request.session!.workspaceId])
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.paymentDate, description: `Bill payment: ${bill.supplier} — ${bill.description}`, sourceType: 'vendor_bill_payment', sourceId: paymentId, lines: [{ accountCode: '2200', debit: input.data.amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: input.data.amount }] })
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'bill.payment_recorded', entityType: 'vendor_bill', entityId: String(bill.id), eventData: { paymentId, amount: input.data.amount, paymentDate: input.data.paymentDate } })
     await client.query('COMMIT')
-    response.json({ status: 'paid' })
+    response.json({ payment: { id: paymentId, amount: input.data.amount.toFixed(2), ...updated.rows[0] } })
   } catch (error) {
     await client.query('ROLLBACK')
     if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
@@ -1489,9 +2153,9 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
     const paymentId = randomUUID()
     try {
       await client.query('BEGIN')
-      const invoiceResult = await client.query('SELECT id, amount, status FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.invoiceId, request.session!.workspaceId])
+      const invoiceResult = await client.query('SELECT id, amount, amount_paid, status FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.invoiceId, request.session!.workspaceId])
       if (!invoiceResult.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invoice not found in this business.' }); return }
-      invoiceAmount = Number(invoiceResult.rows[0].amount)
+      invoiceAmount = Number(invoiceResult.rows[0].amount) - Number(invoiceResult.rows[0].amount_paid)
       if (invoiceResult.rows[0].status !== 'unpaid') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only unpaid invoices can be sent for M-Pesa payment.' }); return }
       if (!Number.isSafeInteger(invoiceAmount) || invoiceAmount < 1) { await client.query('ROLLBACK'); response.status(400).json({ error: 'M-Pesa STK Push requires a whole-number KSh invoice amount.' }); return }
       const activeRequest = await client.query("SELECT 1 FROM mpesa_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 AND status IN ('initiating', 'pending', 'verification_required') LIMIT 1", [request.params.invoiceId, request.session!.workspaceId])
@@ -1576,8 +2240,9 @@ app.post('/v1/integrations/mpesa/callback', requirePool, rateLimit({ windowMs: 6
     try {
       await client.query('BEGIN')
       await client.query('UPDATE mpesa_payment_requests SET status = $1, result_code = $2, result_description = $3, mpesa_receipt_number = $4, callback_received_at = now() WHERE id = $5', ['paid', '0', resultDescription, String(metadata.MpesaReceiptNumber), payment.id])
-      const invoice = await client.query('UPDATE invoices SET status = $1 WHERE id = $2 AND workspace_id = $3 AND status = $4 RETURNING customer, description', ['paid', payment.invoice_id, payment.workspace_id, 'unpaid'])
+      const invoice = await client.query("UPDATE invoices SET amount_paid = amount_paid + $1, status = CASE WHEN amount_paid + $1 >= amount THEN 'paid' ELSE 'unpaid' END WHERE id = $2 AND workspace_id = $3 AND status = 'unpaid' AND amount_paid + $1 <= amount RETURNING customer, description", [payment.amount, payment.invoice_id, payment.workspace_id])
       if (!invoice.rowCount) throw new Error('Invoice was already paid or changed before this payment callback; review this payment against the bank statement.')
+      await client.query('INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date) VALUES ($1, $2, $3, $4, $5)', [randomUUID(), payment.workspace_id, payment.invoice_id, payment.amount, nairobiToday()])
       await insertJournal(client, { workspaceId: String(payment.workspace_id), userId: null, date: nairobiToday(), description: `M-Pesa receipt ${String(metadata.MpesaReceiptNumber)}`, sourceType: 'mpesa_payment', sourceId: String(payment.invoice_id), lines: [{ accountCode: '1000', debit: Number(payment.amount), credit: 0 }, { accountCode: '1100', debit: 0, credit: Number(payment.amount) }] })
       await recordAudit(client, { workspaceId: String(payment.workspace_id), actorUserId: null, eventType: 'mpesa.payment_verified', entityType: 'mpesa_payment', entityId: String(payment.id), eventData: { invoiceId: String(payment.invoice_id), receiptNumber: String(metadata.MpesaReceiptNumber), amount: String(payment.amount) } })
       await client.query('COMMIT')
