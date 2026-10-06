@@ -127,6 +127,8 @@ const defaultWorkspaceSettings = {
   auditTrail: true,
   twoFactor: false,
   backupSchedule: 'Daily automatic',
+  inventoryLowStockThreshold: 5,
+  inventoryMediumStockThreshold: 10,
   monoEnabled: false,
   darajaEnabled: false,
   kraEtimsLiveEnabled: false,
@@ -1538,9 +1540,10 @@ app.post('/v1/inventory/:itemId/movements', requirePool, verifyOrigin, requireSe
       const lines: JournalLineInput[] = quantityDelta > 0
         ? [{ accountCode: '1200', debit: movementValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: movementValue }]
         : [{ accountCode: '5100', debit: movementValue, credit: 0 }, { accountCode: '1200', debit: 0, credit: movementValue }]
-      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: `Inventory ${input.data.movementType}: ${String(data.name ?? 'item')}`, sourceType: 'inventory_movement', sourceId: movementId, lines })
+      const movementDescription = `Inventory ${input.data.movementType}: ${String(data.name ?? 'item')}${input.data.reference ? ` · ${input.data.reference}` : ''}`.slice(0, 240)
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: movementDescription, sourceType: 'inventory_movement', sourceId: movementId, lines })
     }
-    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'inventory.movement_recorded', entityType: 'inventory_item', entityId: String(request.params.itemId), eventData: { movementId, movementType: input.data.movementType, quantityDelta, newQuantity } })
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'inventory.movement_recorded', entityType: 'inventory_item', entityId: String(request.params.itemId), eventData: { movementId, movementType: input.data.movementType, quantityDelta, newQuantity, reference: input.data.reference } })
     await client.query('COMMIT')
     response.status(201).json({ movement: { id: movementId, movementType: input.data.movementType, quantityDelta, quantityOnHand: Number(newQuantity.toFixed(3)), unitCost: movementCost } })
   } catch (error) {
@@ -1914,6 +1917,8 @@ app.put('/v1/settings', requirePool, verifyOrigin, requireSession, requireWorksp
     auditTrail: z.boolean(),
     twoFactor: z.boolean(),
     backupSchedule: z.enum(['Daily automatic', 'Weekly automatic', 'Manual only']),
+    inventoryLowStockThreshold: z.coerce.number().int().min(0).max(1_000_000),
+    inventoryMediumStockThreshold: z.coerce.number().int().min(1).max(1_000_000),
     monoEnabled: z.boolean().default(false),
     darajaEnabled: z.boolean().default(false),
     kraEtimsLiveEnabled: z.boolean().default(false),
@@ -1922,7 +1927,7 @@ app.put('/v1/settings', requirePool, verifyOrigin, requireSession, requireWorksp
     nssfEnabled: z.boolean().default(false),
     ahlEnabled: z.boolean().default(false),
   }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'One or more settings are invalid.' }); return }
+  if (!input.success || input.data.inventoryMediumStockThreshold <= input.data.inventoryLowStockThreshold) { response.status(400).json({ error: 'Settings are invalid. Medium stock threshold must be higher than the low stock threshold.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')

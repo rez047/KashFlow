@@ -275,6 +275,7 @@ function App() {
   const [locationInput, setLocationInput] = useState({ name: '', code: '' })
   const [transferInput, setTransferInput] = useState({ itemId: '', fromLocationId: '', toLocationId: '', quantity: '1' })
   const [countInput, setCountInput] = useState({ itemId: '', locationId: '', countedQuantity: '0' })
+  const [inventoryWriteOffInput, setInventoryWriteOffInput] = useState({ itemId: '', locationId: '', reason: 'damaged' as 'damaged' | 'expired' | 'custom', customReason: '', quantity: '1', date: today, notes: '' })
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
   const [storeConfig, setStoreConfig] = useState<OnlineStoreConfig>({ slug: '', title: '', description: '', enabled: false })
@@ -370,6 +371,8 @@ function App() {
     auditTrail: true,
     twoFactor: false,
     backupSchedule: 'Daily automatic',
+    inventoryLowStockThreshold: 5,
+    inventoryMediumStockThreshold: 10,
     monoEnabled: false,
     darajaEnabled: false,
     kraEtimsLiveEnabled: false,
@@ -566,7 +569,7 @@ function App() {
     if (page === 'Inventory') void Promise.all([
       request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
       request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders').then((result) => setPurchaseOrders(result.purchaseOrders)),
-      request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setStockMovementInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })); setPurchaseOrderInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })) }),
+      request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setStockMovementInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })); setInventoryWriteOffInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })); setPurchaseOrderInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })) }),
       request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock').then((result) => setInventoryLocationStock(result.stock)),
     ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load inventory and location records.'))
     if (page === 'Reports') {
@@ -1310,6 +1313,56 @@ function App() {
       setInventoryLocationStock(stock.stock); setRecords((current) => ({ ...current, inventory: inventory.records })); await refresh(); notify('Stock count adjustment recorded.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not post stock count.') }
     finally { setBusy(false) }
+  }
+
+  async function writeOffInventory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const item = records.inventory.find((record) => record.id === inventoryWriteOffInput.itemId)
+    if (!item) { setError('Choose an inventory item to write off.'); return }
+    const customReason = inventoryWriteOffInput.customReason.trim()
+    if (inventoryWriteOffInput.reason === 'custom' && !customReason) { setError('Enter a reason for this stock write-off.'); return }
+    setBusy(true); setError('')
+    try {
+      const reason = inventoryWriteOffInput.reason === 'custom'
+        ? `Other: ${customReason}`
+        : inventoryWriteOffInput.reason === 'expired' ? 'Expired stock' : 'Damaged stock'
+      const reference = `${reason}${inventoryWriteOffInput.notes.trim() ? `: ${inventoryWriteOffInput.notes.trim()}` : ''}`.slice(0, 200)
+      await request(`/v1/inventory/${item.id}/movements`, { method: 'POST', body: JSON.stringify({
+        movementType: 'adjustment',
+        adjustmentDirection: 'decrease',
+        locationId: inventoryWriteOffInput.locationId,
+        quantity: Number(inventoryWriteOffInput.quantity),
+        unitCost: Number(item.data.cost ?? 0),
+        reference,
+        date: inventoryWriteOffInput.date,
+      }) })
+      const [stock, inventory] = await Promise.all([
+        request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock'),
+        request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
+      ])
+      setInventoryLocationStock(stock.stock)
+      setRecords((current) => ({ ...current, inventory: inventory.records }))
+      setInventoryWriteOffInput((current) => ({ ...current, quantity: '1', customReason: '', notes: '' }))
+      await refresh()
+      notify(`${reason} quantity deducted and its cost posted as an inventory expense.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not record the inventory write-off.')
+    } finally { setBusy(false) }
+  }
+
+  async function saveInventoryThresholds(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (settings.inventoryMediumStockThreshold <= settings.inventoryLowStockThreshold) {
+      setError('The medium stock threshold must be higher than the low stock threshold.')
+      return
+    }
+    setBusy(true); setError('')
+    try {
+      await request('/v1/settings', { method: 'PUT', body: JSON.stringify({ ...settings, businessName: settings.businessName || dashboard?.workspaceName }) })
+      notify('Stock health thresholds saved for this business.')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not save stock thresholds.')
+    } finally { setBusy(false) }
   }
 
   async function createPurchaseOrder(event: FormEvent<HTMLFormElement>) {
@@ -2443,14 +2496,16 @@ function App() {
               ? locationQuantities.reduce((sum, stock) => sum + Number(stock.quantity), 0)
               : Number(record.data.quantity ?? 0)
             const reorderPoint = Number(record.data.reorderPoint ?? 0)
-            const status: 'low' | 'medium' | 'high' = quantity <= 0 || (reorderPoint > 0 && quantity <= reorderPoint) ? 'low'
-              : reorderPoint > 0 && quantity <= reorderPoint * 2 ? 'medium' : 'high'
-            return { id: record.id, name: String(record.data.name ?? 'Inventory item'), quantity, unit: String(record.data.unit ?? 'unit'), reorderPoint, status }
+            const lowThreshold = Math.max(Number(settings.inventoryLowStockThreshold ?? 5), reorderPoint)
+            const mediumThreshold = Math.max(Number(settings.inventoryMediumStockThreshold ?? 10), lowThreshold + 1, reorderPoint * 2)
+            const status: 'low' | 'medium' | 'high' = quantity <= lowThreshold ? 'low'
+              : quantity <= mediumThreshold ? 'medium' : 'high'
+            return { id: record.id, name: String(record.data.name ?? 'Inventory item'), quantity, unit: String(record.data.unit ?? 'unit'), reorderPoint, lowThreshold, mediumThreshold, status }
           }).sort((left, right) => ({ low: 0, medium: 1, high: 2 }[left.status] - { low: 0, medium: 1, high: 2 }[right.status]) || left.name.localeCompare(right.name)) : []
           const healthGroups = [
-            { status: 'low', title: 'Low stock · reorder now', description: 'At or below your reorder point, or out of stock.', items: inventoryHealth.filter((item) => item.status === 'low') },
-            { status: 'medium', title: 'Medium stock · watch', description: 'Up to twice the reorder point.', items: inventoryHealth.filter((item) => item.status === 'medium') },
-            { status: 'high', title: 'Healthy stock', description: 'Above twice the reorder point.', items: inventoryHealth.filter((item) => item.status === 'high') },
+            { status: 'low', title: 'Low stock · reorder now', description: 'At or below the configured low-stock limit or item reorder point.', items: inventoryHealth.filter((item) => item.status === 'low') },
+            { status: 'medium', title: 'Medium stock · watch', description: 'Above the low limit and at or below the configured medium limit.', items: inventoryHealth.filter((item) => item.status === 'medium') },
+            { status: 'high', title: 'Healthy stock', description: 'Above the configured medium-stock limit.', items: inventoryHealth.filter((item) => item.status === 'high') },
           ]
           return <section className="module-page"><div className="eyebrow"><span className="live-dot" /> {page.toUpperCase()} · WORKSPACE DATABASE</div><h1>{page}</h1><p className="welcome-subtitle">Create and maintain records for {dashboard?.workspaceName}. Data is private to this business.</p>
             {error && <p className="form-error" role="alert">{error}</p>}
@@ -2464,7 +2519,17 @@ function App() {
                 {group.items.length > 8 && <small className="stock-health-more">+{group.items.length - 8} more items</small>}
                 {!group.items.length && <div className="empty-state stock-health-empty">No items in this level.</div>}
               </section>)}</div>
-              <p className="dialog-note">Red = low stock; orange = watch; green = healthy. Items with a reorder point of 0 are marked low only when out of stock. These are in-app reminders; they do not create a purchase order.</p>
+              <p className="dialog-note">Red = low stock; orange = medium/watch; green = healthy. Item-specific reorder points can raise the low and medium cutoffs above the business thresholds.</p>
+            </article>}
+            {type === 'inventory' && account?.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin' && <article className="module-card">
+              <h2>Set stock health thresholds</h2>
+              <p>Choose the maximum quantity for low and medium stock. High stock is anything above the medium limit. Saved thresholds apply to this business; an item’s reorder point can raise its alert limits.</p>
+              <form className="record-form-grid" onSubmit={(event) => void saveInventoryThresholds(event)}>
+                <label className="field-label">Low stock up to (items)<input required type="number" min="0" max="1000000" step="1" value={settings.inventoryLowStockThreshold} onChange={(event) => setSettings({ ...settings, inventoryLowStockThreshold: Number(event.target.value) })} /></label>
+                <label className="field-label">Medium stock up to (items)<input required type="number" min="1" max="1000000" step="1" value={settings.inventoryMediumStockThreshold} onChange={(event) => setSettings({ ...settings, inventoryMediumStockThreshold: Number(event.target.value) })} /></label>
+                <p className="dialog-note">High stock starts above {settings.inventoryMediumStockThreshold} items. Medium must be higher than low.</p>
+                <button className="button button-primary" disabled={busy || settings.inventoryMediumStockThreshold <= settings.inventoryLowStockThreshold}>{busy ? 'Saving…' : 'Save stock thresholds'}</button>
+              </form>
             </article>}
             <article className="module-card"><h2>Saved {page.toLowerCase()} ({records[type].length})</h2>{records[type].map((record) => <div className="transaction-row" key={record.id}><span><strong>{record.data.name}</strong><small>{type === 'inventory' ? `SKU ${record.data.sku || '—'} · Qty ${record.data.quantity} ${record.data.unit}` : type === 'projects' ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}` : type === 'suppliers' ? `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'} · ${(Array.isArray(record.data.supplyItemIds) ? record.data.supplyItemIds : []).map((itemId) => String(records.inventory.find((item) => item.id === itemId)?.data.name ?? '')).filter(Boolean).join(', ') || 'No linked inventory items'}` : `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'}`}</small>{type === 'inventory' && <span className={`stock-status-pill stock-status-${inventoryHealth.find((item) => item.id === record.id)?.status ?? 'high'}`}>{inventoryHealth.find((item) => item.id === record.id)?.status === 'low' ? 'Low stock' : inventoryHealth.find((item) => item.id === record.id)?.status === 'medium' ? 'Watch stock' : 'Healthy stock'}</span>}</span><div className="button-row">{type === 'customers' && <button className="button button-small" onClick={() => beginInvoiceForCustomer(record)}>Create invoice</button>}<button className="button button-small" onClick={() => { setEditingRecordId(record.id); setRecordForm(Object.fromEntries(Object.entries(record.data).filter(([key]) => key !== 'supplyItemIds').map(([key, value]) => [key, String(value ?? '')]))); setSupplierItemIds(Array.isArray(record.data.supplyItemIds) && record.data.supplyItemIds.length ? record.data.supplyItemIds.map(String) : ['']) }}>Edit</button><button className="button button-small" onClick={() => void deleteWorkspaceRecord(type, record.id)}>Delete</button></div></div>)}{!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}</article>
             {type === 'suppliers' && <article className="module-card"><h2>Vendor bills and payments</h2><p>Record itemized bills and tax amounts verified for your business. Tax entries are bookkeeping inputs, not statutory determinations.</p><form className="record-form-grid" onSubmit={saveBill}><label className="field-label">Supplier<input required value={billInput.supplier} onChange={(event) => setBillInput({ ...billInput, supplier: event.target.value })} /></label><DraftLineEditor lines={billLines} includeRecoverableTax onChange={(index, key, value) => setBillLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setBillLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0', recoverableTaxAmount: '0' }])} onRemove={(index) => setBillLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} /><p>Total: <strong>{money(draftDocumentTotal(billLines))}</strong></p><label className="field-label">Bill date<input required type="date" value={billInput.billDate} onChange={(event) => setBillInput({ ...billInput, billDate: event.target.value })} /></label><label className="field-label">Due date<input required type="date" min={billInput.billDate} value={billInput.dueDate} onChange={(event) => setBillInput({ ...billInput, dueDate: event.target.value })} /></label><label className="field-label"><input type="checkbox" checked={billInput.requiresApproval} onChange={(event) => setBillInput({ ...billInput, requiresApproval: event.target.checked })} /> Require admin approval before posting</label><button className="button button-primary" disabled={busy}>Record bill</button></form>
@@ -2476,6 +2541,18 @@ function App() {
               <div className="transaction-row"><span><strong>Active locations</strong><small>{inventoryLocations.map((location) => `${location.name}${location.is_default ? ' (default)' : ''}`).join(' · ')}</small></span><span>{inventoryLocations.length} locations</span></div>
               <form className="record-form-grid" onSubmit={transferInventory}><h3>Transfer stock</h3><label className="field-label">Item<select required value={transferInput.itemId} onChange={(event) => setTransferInput({ ...transferInput, itemId: event.target.value })}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)}</option>)}</select></label><label className="field-label">From<select required value={transferInput.fromLocationId} onChange={(event) => setTransferInput({ ...transferInput, fromLocationId: event.target.value })}><option value="">Select source</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">To<select required value={transferInput.toLocationId} onChange={(event) => setTransferInput({ ...transferInput, toLocationId: event.target.value })}><option value="">Select destination</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Quantity<input required type="number" min="0.001" step="0.001" value={transferInput.quantity} onChange={(event) => setTransferInput({ ...transferInput, quantity: event.target.value })} /></label><button className="button button-secondary" disabled={busy || inventoryLocations.length < 2}>Transfer</button></form>
               <form className="record-form-grid" onSubmit={countInventory}><h3>Stock count</h3><label className="field-label">Item<select required value={countInput.itemId} onChange={(event) => setCountInput({ ...countInput, itemId: event.target.value })}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)}</option>)}</select></label><label className="field-label">Location<select required value={countInput.locationId} onChange={(event) => setCountInput({ ...countInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Counted quantity<input required type="number" min="0" step="0.001" value={countInput.countedQuantity} onChange={(event) => setCountInput({ ...countInput, countedQuantity: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Post count</button></form>
+              {account?.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin' && <form className="record-form-grid inventory-writeoff-form" onSubmit={(event) => void writeOffInventory(event)}>
+                <h3>Damaged or expired inventory write-off</h3>
+                <p className="dialog-note">Record stock that can no longer be sold. The quantity is deducted from the selected location and business total, and its recorded unit cost is posted as an inventory expense. Negative stock is blocked.</p>
+                <label className="field-label">Inventory item<select required value={inventoryWriteOffInput.itemId} onChange={(event) => setInventoryWriteOffInput({ ...inventoryWriteOffInput, itemId: event.target.value })}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)} · total {item.data.quantity}</option>)}</select></label>
+                <label className="field-label">Location<select required value={inventoryWriteOffInput.locationId} onChange={(event) => setInventoryWriteOffInput({ ...inventoryWriteOffInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
+                <label className="field-label">Reason<select value={inventoryWriteOffInput.reason} onChange={(event) => setInventoryWriteOffInput({ ...inventoryWriteOffInput, reason: event.target.value as typeof inventoryWriteOffInput.reason })}><option value="damaged">Damaged</option><option value="expired">Expired</option><option value="custom">Custom reason</option></select></label>
+                {inventoryWriteOffInput.reason === 'custom' && <label className="field-label">Custom reason<input required maxLength={100} value={inventoryWriteOffInput.customReason} onChange={(event) => setInventoryWriteOffInput({ ...inventoryWriteOffInput, customReason: event.target.value })} placeholder="e.g. lost in transit" /></label>}
+                <label className="field-label">Quantity<input required type="number" min="0.001" step="0.001" value={inventoryWriteOffInput.quantity} onChange={(event) => setInventoryWriteOffInput({ ...inventoryWriteOffInput, quantity: event.target.value })} /></label>
+                <label className="field-label">Write-off date<input required type="date" value={inventoryWriteOffInput.date} onChange={(event) => setInventoryWriteOffInput({ ...inventoryWriteOffInput, date: event.target.value })} /></label>
+                <label className="field-label">Notes (optional)<input maxLength={160} value={inventoryWriteOffInput.notes} onChange={(event) => setInventoryWriteOffInput({ ...inventoryWriteOffInput, notes: event.target.value })} placeholder="e.g. damaged in storage" /></label>
+                <button className="button button-primary" disabled={busy || !inventoryWriteOffInput.itemId || !inventoryWriteOffInput.locationId}>{busy ? 'Posting…' : 'Deduct damaged / expired stock'}</button>
+              </form>}
               <div className="transaction-row"><span><strong>Stock by location</strong><small>{inventoryLocationStock.map((stock) => `${records.inventory.find((item) => item.id === stock.item_id)?.data.name ?? 'Item'} · ${stock.location_name}: ${stock.quantity}`).join(' | ') || 'No location stock saved yet'}</small></span></div>
               <form className="record-form-grid" onSubmit={recordStockMovement}><label className="field-label">Inventory item<select required value={stockMovementInput.itemId} onChange={(event) => { const item = records.inventory.find((record) => record.id === event.target.value); setStockMovementInput({ ...stockMovementInput, itemId: event.target.value, unitCost: String(item?.data.cost ?? stockMovementInput.unitCost) }) }}><option value="">Select item</option>{records.inventory.map((item) => <option value={item.id} key={item.id}>{String(item.data.name)} · total {item.data.quantity}</option>)}</select></label><label className="field-label">Location<select required value={stockMovementInput.locationId} onChange={(event) => setStockMovementInput({ ...stockMovementInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Movement<select value={stockMovementInput.movementType} onChange={(event) => setStockMovementInput({ ...stockMovementInput, movementType: event.target.value as typeof stockMovementInput.movementType })}><option value="purchase">Receive stock</option><option value="sale">Issue stock (COGS only)</option><option value="adjustment">Stock count adjustment</option></select></label>{stockMovementInput.movementType === 'adjustment' && <label className="field-label">Adjustment direction<select value={stockMovementInput.adjustmentDirection} onChange={(event) => setStockMovementInput({ ...stockMovementInput, adjustmentDirection: event.target.value as typeof stockMovementInput.adjustmentDirection })}><option value="increase">Increase stock</option><option value="decrease">Decrease stock</option></select></label>}<label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={stockMovementInput.quantity} onChange={(event) => setStockMovementInput({ ...stockMovementInput, quantity: event.target.value })} /></label><label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" disabled={stockMovementInput.movementType === 'sale'} value={stockMovementInput.unitCost} onChange={(event) => setStockMovementInput({ ...stockMovementInput, unitCost: event.target.value })} /></label><label className="field-label">Reference<input maxLength={200} value={stockMovementInput.reference} onChange={(event) => setStockMovementInput({ ...stockMovementInput, reference: event.target.value })} /></label><label className="field-label">Date<input required type="date" value={stockMovementInput.date} onChange={(event) => setStockMovementInput({ ...stockMovementInput, date: event.target.value })} /></label><button className="button button-primary" disabled={busy || !records.inventory.length}>Post movement</button></form>
               <h3>Purchase orders</h3><form className="record-form-grid" onSubmit={createPurchaseOrder}><label className="field-label">Supplier<input required value={purchaseOrderInput.supplier} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, supplier: event.target.value })} /></label><label className="field-label">Receive into<select required value={purchaseOrderInput.locationId} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Item<select required value={purchaseOrderInput.itemId} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, itemId: event.target.value })}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)}</option>)}</select></label><label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={purchaseOrderInput.quantity} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, quantity: event.target.value })} /></label><label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" value={purchaseOrderInput.unitCost} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, unitCost: event.target.value })} /></label><label className="field-label">Order date<input required type="date" value={purchaseOrderInput.orderDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, orderDate: event.target.value })} /></label><label className="field-label">Payment due date<input type="date" min={purchaseOrderInput.orderDate} value={purchaseOrderInput.dueDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, dueDate: event.target.value })} /></label><label className="field-label">Expected date<input type="date" value={purchaseOrderInput.expectedDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, expectedDate: event.target.value })} /></label><button className="button button-secondary" disabled={busy || !records.inventory.length}>Create purchase order</button></form>
