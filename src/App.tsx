@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
 import {
-  Activity, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Bell, BookOpen,
+  Activity, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
   BriefcaseBusiness, Building2, CalendarDays, Check, ChevronRight, CircleHelp,
   FileText, Filter, Gauge, Landmark, LayoutDashboard,
-  LifeBuoy, LogOut, Menu, MoreHorizontal, Package, Plus, Search, Settings2,
-  ShieldCheck, ShoppingBag, Users, Wallet, X,
+  LifeBuoy, LogOut, Menu, Minus, MoreHorizontal, Package, Plus, Printer,
+  Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Trash2, Users, Wallet, X,
 } from 'lucide-react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import './App.css'
@@ -18,7 +18,7 @@ function nairobiDate() {
 const today = nairobiDate()
 const yearStart = `${today.slice(0, 4)}-01-01`
 const groups = [
-  { title: 'WORKSPACE', items: [['Overview', LayoutDashboard], ['Banking', Landmark], ['Sales', ArrowUpRight], ['Expenses', ArrowDownLeft], ['Payroll', Users]] },
+  { title: 'WORKSPACE', items: [['Overview', LayoutDashboard], ['Point of sale', ShoppingBag], ['Banking', Landmark], ['Sales', ArrowUpRight], ['Expenses', ArrowDownLeft], ['Payroll', Users]] },
   { title: 'MANAGE', items: [['Customers', Users], ['Suppliers', ShoppingBag], ['Inventory', Package], ['Projects', BriefcaseBusiness], ['Accounting', BookOpen]] },
   { title: 'INSIGHTS & COMPLIANCE', items: [['Reports', Activity], ['Kenya compliance', ShieldCheck], ['Documents', FileText]] },
 ] as const
@@ -59,6 +59,8 @@ type Employee = { id: string; employeeNumber: string; fullName: string; email?: 
 type PayrollRun = { id: string; period: string; status: 'draft' | 'posted' | 'partially_paid' | 'paid'; rule_set: string; employee_count: number; gross_total: string; net_total: string; paid_total?: string; outstanding_total?: string; paye_total: string; shif_total: string }
 type Remittance = { id: string; remittance_type: string; amount: string; status: string; payment_reference?: string; payroll_run_id: string }
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
+type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number }
+type PosReceipt = { invoiceId: string; customer: string; amount: number; paymentMethod: 'cash' | 'mpesa'; status: string; lines: PosCartLine[] }
 type EstimateRecord = { id: string; customer: string; customer_email: string; description: string; amount: string; valid_until: string; status: string; invoice_id?: string | null }
 type VendorBill = { id: string; supplier: string; description: string; amount: string; amount_paid?: string; amount_due?: string; bill_date: string; due_date: string; status: string; approval_status?: string }
 type DraftLine = { itemId?: string; description: string; quantity: string; unitPrice: string; discountAmount: string; taxAmount: string; recoverableTaxAmount?: string }
@@ -193,6 +195,12 @@ function App() {
   const [estimateLines, setEstimateLines] = useState<DraftLine[]>([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])
   const [billLines, setBillLines] = useState<DraftLine[]>([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0', recoverableTaxAmount: '0' }])
   const [paymentAmounts, setPaymentAmounts] = useState<Record<string, string>>({})
+  const [posSearch, setPosSearch] = useState('')
+  const [posCart, setPosCart] = useState<PosCartLine[]>([])
+  const [posCustomer, setPosCustomer] = useState('')
+  const [posPaymentMethod, setPosPaymentMethod] = useState<'cash' | 'mpesa'>('cash')
+  const [posPaymentPhone, setPosPaymentPhone] = useState('')
+  const [posReceipt, setPosReceipt] = useState<PosReceipt | null>(null)
   const [estimateInput, setEstimateInput] = useState({ customer: '', customerEmail: '', description: '', amount: '', validUntil: today })
   const [billInput, setBillInput] = useState({ supplier: '', description: '', amount: '', billDate: today, dueDate: today, requiresApproval: false })
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([])
@@ -350,6 +358,12 @@ function App() {
         request<{ templates: RecurringTemplate[] }>('/v1/recurring').then((result) => setRecurringTemplates(result.templates)),
         request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load sales records.'))
+    }
+    if (page === 'Point of sale') {
+      void Promise.all([
+        request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
+        request<{ records: WorkspaceRecord[] }>('/v1/records/customers').then((result) => setRecords((current) => ({ ...current, customers: result.records }))),
+      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load point-of-sale items.'))
     }
     if (page === 'Inventory') void request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders').then((result) => setPurchaseOrders(result.purchaseOrders)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load purchase orders.'))
     if (page === 'Reports') {
@@ -510,6 +524,121 @@ function App() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not save transaction.')
     } finally { setBusy(false) }
+  }
+
+  function addPosItem(item: WorkspaceRecord) {
+    const onHand = Number(item.data.quantity ?? 0)
+    const existing = posCart.find((line) => line.itemId === item.id)
+    if (onHand <= 0 || (existing && existing.quantity >= onHand)) return
+    const itemName = String(item.data.name ?? 'Inventory item')
+    const unitPrice = Number(item.data.price ?? 0)
+    setError('')
+    setPosReceipt(null)
+    setPosCart((cart) => {
+      const line = cart.find((entry) => entry.itemId === item.id)
+      if (line) return cart.map((entry) => entry.itemId === item.id ? { ...entry, quantity: entry.quantity + 1 } : entry)
+      return [...cart, { itemId: item.id, description: itemName, quantity: 1, unitPrice, onHand }]
+    })
+  }
+
+  function changePosQuantity(itemId: string, quantity: number) {
+    setPosCart((cart) => quantity <= 0
+      ? cart.filter((line) => line.itemId !== itemId)
+      : cart.map((line) => line.itemId === itemId ? { ...line, quantity: Math.min(quantity, line.onHand) } : line))
+  }
+
+  async function checkoutPos() {
+    if (!posCart.length || posCart.some((line) => line.quantity <= 0 || line.quantity > line.onHand)) {
+      setError('Add available stock items to the cart before checkout.')
+      return
+    }
+    if (posPaymentMethod === 'mpesa' && !posPaymentPhone.trim()) {
+      setError('Enter the customer’s M-Pesa phone number before requesting payment.')
+      return
+    }
+    const customer = posCustomer.trim() || 'Walk-in customer'
+    const saleLines = posCart.map((line) => ({ ...line }))
+    const total = saleLines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
+    if (total <= 0) {
+      setError('The sale total must be greater than zero. Check the item selling prices in Inventory.')
+      return
+    }
+    if (posPaymentMethod === 'mpesa' && (!Number.isSafeInteger(total) || total < 1)) {
+      setError('M-Pesa STK Push requires a whole-KSh total. Adjust item prices or quantities before checkout.')
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      const created = await request<{ invoice: { id: string } }>('/v1/invoices', {
+        method: 'POST',
+        body: JSON.stringify({
+          customer,
+          customerEmail: '',
+          dueDate: today,
+          lines: saleLines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: 0 })),
+        }),
+      })
+      const receipt: PosReceipt = { invoiceId: created.invoice.id, customer, amount: total, paymentMethod: posPaymentMethod, status: 'Payment not yet recorded', lines: saleLines }
+      setPosReceipt(receipt)
+      setPosCart([])
+      setPosCustomer('')
+      setPosPaymentPhone('')
+
+      if (posPaymentMethod === 'cash') {
+        try {
+          await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: total, paymentDate: today }) })
+          receipt.status = 'Paid · cash recorded'
+          notify('Sale completed. Stock and cash payment recorded.')
+        } catch (reason) {
+          receipt.status = 'Unpaid · payment recording failed'
+          setError(`Sale and stock were saved as invoice ${created.invoice.id.slice(0, 8)}, but cash payment was not recorded: ${reason instanceof Error ? reason.message : 'try recording the payment from Sales.'}`)
+        }
+      } else {
+        try {
+          const result = await request<{ customerMessage: string }>(`/v1/invoices/${created.invoice.id}/payments/mpesa`, { method: 'POST', body: JSON.stringify({ phone: posPaymentPhone.trim() }) })
+          receipt.status = 'M-Pesa request started · confirm payment status before releasing goods'
+          notify(result.customerMessage)
+        } catch (reason) {
+          receipt.status = 'Unpaid · M-Pesa request did not start'
+          setError(`Sale and stock were saved as invoice ${created.invoice.id.slice(0, 8)}, but the M-Pesa request did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try from Sales.'}`)
+        }
+      }
+      setPosReceipt({ ...receipt })
+      try {
+        const [inventory, listedInvoices] = await Promise.all([
+          request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
+          request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
+        ])
+        setRecords((current) => ({ ...current, inventory: inventory.records }))
+        setInvoicesList(listedInvoices.invoices)
+        await refresh()
+      } catch (reason) {
+        setError((message) => [message, `Sale was saved, but the workspace view could not refresh: ${reason instanceof Error ? reason.message : 'reload the page.'}`].filter(Boolean).join(' '))
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not save the sale.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function retryPosCashPayment() {
+    if (!posReceipt || !posReceipt.status.startsWith('Unpaid · payment recording failed')) return
+    setBusy(true)
+    setError('')
+    try {
+      await request(`/v1/invoices/${posReceipt.invoiceId}/payments`, { method: 'POST', body: JSON.stringify({ amount: posReceipt.amount, paymentDate: today }) })
+      setPosReceipt({ ...posReceipt, status: 'Paid · cash recorded' })
+      notify('Cash payment recorded against the saved POS invoice.')
+      const listedInvoices = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+      setInvoicesList(listedInvoices.invoices)
+      await refresh()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not record the cash payment.')
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function saveInvoice(event: FormEvent<HTMLFormElement>) {
@@ -1173,6 +1302,11 @@ function App() {
 
   const filtered = useMemo(() => (dashboard?.transactions ?? []).filter((row) =>
     `${row.description} ${row.account} ${row.direction}`.toLowerCase().includes(search.toLowerCase())), [dashboard, search])
+  const posItems = useMemo(() => records.inventory.filter((item) => {
+    const query = posSearch.trim().toLowerCase()
+    return !query || `${item.data.name ?? ''} ${item.data.sku ?? ''} ${item.data.notes ?? ''}`.toLowerCase().includes(query)
+  }), [records.inventory, posSearch])
+  const posTotal = posCart.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
   const chart = useMemo(() => (dashboard?.cashflow ?? []).map((row) => ({
     date: new Date(`${row.date}T00:00:00`).toLocaleDateString('en-KE', { day: 'numeric', month: 'short' }),
     income: Number(row.income), expense: Number(row.expense),
@@ -1545,6 +1679,53 @@ function App() {
             {budgets.map((budget) => <div className="transaction-row" key={budget.id}><span><strong>{budget.period} · {budget.account_code} {budget.account_name}</strong><small>Budget {money(budget.budget)} · actual {money(budget.actual)}</small></span><strong>Variance {money(budget.variance)}</strong></div>)}
           </article>
           {agingReport && <article className="module-card"><h2>Receivables and payables aging as at {agingReport.asOf}</h2><div className="dashboard-grid"><div><h3>Customer invoices</h3>{Object.entries(agingReport.receivables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ar-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div><div><h3>Supplier bills</h3>{Object.entries(agingReport.payables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ap-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div></div></article>}
+        </section> : page === 'Point of sale' ? <section className="module-page pos-page">
+          <div className="eyebrow"><span className="live-dot" /> POINT OF SALE · {dashboard?.workspaceName}</div>
+          <h1>Counter checkout</h1>
+          <p className="welcome-subtitle">Sell from saved inventory. Checkout creates an internal invoice, deducts stock, and records cash payments in your workspace.</p>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="pos-layout">
+            <section className="module-card pos-catalog" aria-label="Sellable inventory">
+              <div className="pos-catalog-head"><div><h2>Items</h2><p>{records.inventory.length} inventory items · {records.inventory.filter((item) => Number(item.data.quantity ?? 0) > 0).length} in stock</p></div>
+                <label className="pos-search"><Search size={16} /><input aria-label="Search inventory by name or SKU" placeholder="Search items or SKU…" value={posSearch} onChange={(event) => setPosSearch(event.target.value)} /></label>
+              </div>
+              {!records.inventory.length ? <div className="empty-state">No inventory items yet. Add items with a selling price in Inventory to start a sale.<button className="button button-secondary" onClick={() => navigateTo('Inventory')}>Open inventory</button></div> :
+                <div className="pos-item-grid">{posItems.map((item) => {
+                  const onHand = Number(item.data.quantity ?? 0)
+                  const itemName = String(item.data.name ?? 'Inventory item')
+                  const sku = String(item.data.sku ?? '')
+                  const line = posCart.find((entry) => entry.itemId === item.id)
+                  const disabled = onHand <= 0 || Boolean(line && line.quantity >= onHand)
+                  return <button type="button" className="pos-item" key={item.id} disabled={disabled} onClick={() => addPosItem(item)}>
+                    <span className="pos-item-icon"><Package size={19} /></span><strong>{itemName}</strong>{sku && <small>{sku}</small>}
+                    <span className={`pos-stock ${onHand <= 5 ? 'low' : ''}`}>{onHand > 0 ? `${onHand} in stock` : 'Out of stock'}</span><b>{money(Number(item.data.price ?? 0))}</b>
+                  </button>
+                })}{!posItems.length && <div className="empty-state">No items match “{posSearch}”.</div>}</div>
+              }
+            </section>
+            <aside className="module-card pos-checkout" aria-label="Current sale">
+              <div className="pos-cart-title"><div><h2>Current sale</h2><p>{posCart.reduce((count, line) => count + line.quantity, 0)} items</p></div><button type="button" className="button button-small" disabled={!posCart.length} onClick={() => setPosCart([])}>Clear</button></div>
+              <label className="field-label">Customer (optional)<input maxLength={160} list="pos-customer-records" placeholder="Walk-in customer" value={posCustomer} onChange={(event) => setPosCustomer(event.target.value)} /><datalist id="pos-customer-records">{records.customers.map((customer) => <option key={customer.id} value={String(customer.data.name ?? '')} />)}</datalist></label>
+              <div className="pos-cart-lines">{posCart.map((line) => <div className="pos-cart-line" key={line.itemId}>
+                <div className="pos-line-main"><strong>{line.description}</strong><small>{money(line.unitPrice)} each · {line.onHand} available</small></div>
+                <div className="pos-quantity"><button type="button" aria-label={`Remove one ${line.description}`} onClick={() => changePosQuantity(line.itemId, line.quantity - 1)}><Minus size={14} /></button><span>{line.quantity}</span><button type="button" aria-label={`Add one ${line.description}`} disabled={line.quantity >= line.onHand} onClick={() => changePosQuantity(line.itemId, line.quantity + 1)}><Plus size={14} /></button></div>
+                <strong className="pos-line-total">{money(line.quantity * line.unitPrice)}</strong>
+                <button type="button" className="icon-button pos-remove" aria-label={`Remove ${line.description} from sale`} onClick={() => changePosQuantity(line.itemId, 0)}><Trash2 size={15} /></button>
+              </div>)}{!posCart.length && <div className="pos-cart-empty"><ShoppingBag size={22} /><strong>Your sale is empty</strong><span>Select an item to add it to the cart.</span></div>}</div>
+              <div className="pos-total-row"><span>Total due</span><strong>{money(posTotal)}</strong></div>
+              <fieldset className="pos-payment-choice"><legend>Payment method</legend>
+                <button type="button" className={posPaymentMethod === 'cash' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'cash'} onClick={() => setPosPaymentMethod('cash')}><Banknote size={17} />Cash / manual</button>
+                <button type="button" className={posPaymentMethod === 'mpesa' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'mpesa'} disabled={!mpesaConfigured} title={mpesaConfigured ? 'Request an M-Pesa STK push' : 'Configure Daraja before requesting M-Pesa'} onClick={() => setPosPaymentMethod('mpesa')}><Smartphone size={17} />M-Pesa{!mpesaConfigured && <small>Setup needed</small>}</button>
+              </fieldset>
+              {posPaymentMethod === 'mpesa' && <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="07XX XXX XXX" value={posPaymentPhone} onChange={(event) => setPosPaymentPhone(event.target.value)} /></label>}
+              <button type="button" className="button button-primary pos-complete" disabled={busy || !posCart.length || posTotal <= 0} onClick={() => void checkoutPos()}>{busy ? 'Processing sale…' : posPaymentMethod === 'mpesa' ? 'Request M-Pesa payment' : 'Complete cash sale'}</button>
+              <p className="pos-disclaimer"><ShieldCheck size={14} />Internal invoice only—not a KRA/eTIMS fiscal receipt. M-Pesa requests require configured Daraja; verify payment before releasing goods.</p>
+            </aside>
+          </div>
+          {posReceipt && <div className="module-card pos-last-sale"><div><div className="eyebrow">LAST SALE · {posReceipt.invoiceId.slice(0, 8).toUpperCase()}</div><h2>{money(posReceipt.amount)}</h2><p>{posReceipt.customer} · {posReceipt.status}</p></div>
+            <div className="button-row"><button className="button button-secondary" onClick={() => window.print()}><Printer size={15} />Print receipt</button><button className="button button-secondary" onClick={() => navigateTo('Sales')}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
+          </div>}
+          {posReceipt && <article className="pos-receipt-print"><div className="pos-receipt-brand"><strong>KashFlow</strong><span>{dashboard?.workspaceName}</span></div><h2>SALE RECEIPT</h2><p>Invoice {posReceipt.invoiceId.slice(0, 8).toUpperCase()} · {today}</p><p>Customer: {posReceipt.customer}</p><hr />{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.quantity} × {line.description}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><strong>Total</strong><strong>{money(posReceipt.amount)}</strong></div><p>{posReceipt.status}</p><small>Internal sales receipt—not a KRA/eTIMS fiscal invoice.</small></article>}
         </section> : page === 'Sales' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> SALES · {dashboard?.workspaceName}</div><h1>Invoices</h1><p className="welcome-subtitle">Internal invoices support itemized lines and recorded payments. They are not KRA/eTIMS fiscal tax invoices.</p>
           <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice</button>
