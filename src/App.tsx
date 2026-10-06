@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import './App.css'
+import './Sidebar.css'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001').replace(/\/$/, '')
 function nairobiDate() {
@@ -215,6 +216,7 @@ function App() {
   const { language, setLanguage, t } = useTranslation()
   const [page, setPage] = useState('Overview')
   const [pageHistory, setPageHistory] = useState<string[]>([])
+  const teamPermissionsScrollPending = useRef(false)
   const [overviewRange, setOverviewRange] = useState<OverviewRange>('mtd')
   const [overviewFrom, setOverviewFrom] = useState(`${today.slice(0, 7)}-01`)
   const [overviewTo, setOverviewTo] = useState(today)
@@ -384,6 +386,12 @@ function App() {
     setPageHistory((history) => history.slice(0, -1))
     setPage(previous)
   }
+
+  useEffect(() => {
+    if (page !== 'Settings' || !teamPermissionsScrollPending.current) return
+    teamPermissionsScrollPending.current = false
+    document.getElementById('team-permissions')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [page])
 
   const refresh = useCallback(async () => {
     const period = overviewPeriod(overviewRange, overviewFrom, overviewTo)
@@ -2133,8 +2141,11 @@ function App() {
       </nav>
       <div className="sidebar-bottom">
         <div className="help-card"><div className="help-icon"><ShieldCheck size={16} /></div><strong>{t('Private workspace')}</strong><p>{t('Records you enter are saved to your account database.')}</p></div>
-        <button className="nav-link bottom-link" onClick={() => navigateTo('Settings')}><Settings2 size={18} /> {t('Settings')}</button>
-        <button className="nav-link bottom-link" onClick={() => navigateTo('Help')}><LifeBuoy size={18} /> {t('Help & support')}</button>
+        <div className="sidebar-utility-links" aria-label="Account and support">
+          <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { teamPermissionsScrollPending.current = false; navigateTo('Settings'); setSidebarOpen(false) }}><Settings2 size={18} /> {t('Settings')}</button>
+          <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { setSidebarOpen(false); if (page === 'Settings') document.getElementById('team-permissions')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); else { teamPermissionsScrollPending.current = true; navigateTo('Settings') } }}><Users size={18} /> Team &amp; Permissions</button>
+          <button className={`nav-link bottom-link ${page === 'Help' ? 'active' : ''}`} onClick={() => { navigateTo('Help'); setSidebarOpen(false) }}><LifeBuoy size={18} /> {t('Help & support')}</button>
+        </div>
         <div className="profile-row"><div className="profile-avatar">{account.user.email.slice(0, 1).toUpperCase()}</div>
           <div className="profile-copy"><strong>{account.user.email}</strong><small>{account.workspaces?.length ? `Business admin • ${account.workspaces.length} businesses` : 'Workspace admin'}</small></div>
           <button className="icon-button" onClick={() => void logout()} aria-label="Sign out"><LogOut size={16} /></button>
@@ -2637,10 +2648,10 @@ function App() {
                 <div className="button-row"><button className="button button-primary" disabled={busy || !wooEncryptionReady}>{t('Save encrypted connection')}</button><button type="button" className="button button-secondary" disabled={busy || !wooConnection?.enabled} onClick={() => void syncWooCommerce('products')}>{t('Sync products')}</button><button type="button" className="button button-secondary" disabled={busy || !wooConnection?.enabled} onClick={() => void syncWooCommerce('orders')}>{t('Import new orders')}</button></div>
               </form>
             </section>
-            <section className="module-card">
+            <section className="module-card" id="team-permissions">
               <h2>Team &amp; Permissions</h2>
-              <p>Invite team members, assign built-in or custom roles, and edit each person’s effective access. Administrators retain full access and are protected from accidental privilege changes here.</p>
-              <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={15} /> Invite your team</button>
+              <p>Add workspace users even when they are not employees. Invitations create business access only; they do not create payroll or employee records. Assign built-in or custom roles and edit each person’s effective access here.</p>
+              <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={15} /> Add user (not an employee)</button>
               <form className="module-card record-form-grid" onSubmit={(event) => void saveCustomRole(event)}>
                 <h3>{editingCustomRoleKey ? `Edit role: ${customRoleDraft.name}` : 'Add a custom role'}</h3>
                 <label className="field-label">Custom role name<input required minLength={2} maxLength={60} disabled={Boolean(editingCustomRoleKey)} value={customRoleDraft.name} onChange={(event) => setCustomRoleDraft({ ...customRoleDraft, name: event.target.value })} placeholder="e.g. Sales assistant" /></label>
@@ -2746,7 +2757,7 @@ function App() {
 
     {modal && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget && !busy) setModal(null) }}>
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
-        <div className="dialog-head"><div><div className="eyebrow">{dashboard?.workspaceName}</div><h2 id="dialog-title">{modal === 'invoice' ? invoicePreview ? 'Invoice preview' : 'Create an invoice' : modal === 'business' ? 'Add a business' : modal === 'invite' ? 'Invite team member' : modal === 'return' ? 'Record a return or credit' : 'Add a transaction'}</h2></div>
+        <div className="dialog-head"><div><div className="eyebrow">{dashboard?.workspaceName}</div><h2 id="dialog-title">{modal === 'invoice' ? invoicePreview ? 'Invoice preview' : 'Create an invoice' : modal === 'business' ? 'Add a business' : modal === 'invite' ? 'Invite workspace user' : modal === 'return' ? 'Record a return or credit' : 'Add a transaction'}</h2></div>
           <button className="icon-button" aria-label="Close dialog" onClick={() => setModal(null)}><X size={19} /></button>
         </div>
         {modal === 'business' ? <form onSubmit={createBusiness}>
@@ -2755,6 +2766,7 @@ function App() {
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? 'Creating…' : 'Create business'}</button></div>
         </form> : null}
         {modal === 'invite' ? <form onSubmit={inviteUser}>
+          <p className="dialog-note">This invitation adds a user to this business workspace. It does not create an employee or payroll record.</p>
           <label className="field-label">Email<input type="email" required value={invite.email} onChange={(event) => setInvite({ ...invite, email: event.target.value })} /></label>
           <label className="field-label">Role<select value={invite.role} onChange={(event) => { const role = event.target.value; setInvite({ ...invite, role }); if (customRoles.some((item) => item.roleKey === role)) setInviteScope('single') }}>
             <option value="accountant">Accountant</option>

@@ -1,0 +1,60 @@
+.sidebar-bottom {
+  margin-top: auto;
+  padding-top: 4px;
+}
+
+.help-card {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 5px;
+  text-align: left;
+}
+
+.help-icon {
+  grid-row: span 2;
+}
+
+.help-card strong {
+  font-size: 11px;
+}
+
+.help-card p {
+  grid-column: 2;
+  margin: 1px 0 0;
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.sidebar-utility-links {
+  display: grid;
+  gap: 1px;
+}
+
+.sidebar-utility-links .nav-link {
+  margin: 0;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.profile-row {
+  gap: 7px;
+  margin-top: 5px;
+  padding: 7px 4px 0;
+  min-width: 0;
+}
+
+.profile-copy {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.profile-copy strong,
+.profile-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
