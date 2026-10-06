@@ -17,10 +17,22 @@ The API provides first-admin workspace setup, password sign-in, signed HttpOnly 
 - `MPESA_PASSKEY`: Daraja STK Push passkey; server-side only.
 - `MPESA_CALLBACK_URL`: publicly reachable URL ending in `/v1/integrations/mpesa/callback`; HTTPS is required in production.
 - `MPESA_TRANSACTION_TYPE`: `CustomerPayBillOnline` by default or `CustomerBuyGoodsOnline` when supported by the merchant setup.
+- `ONLINE_COMMERCE_ENCRYPTION_KEY`: optional stable 32+ character API-side secret for encrypting WooCommerce REST credentials. Use an independent random key and back it up securely; losing or changing it makes saved WooCommerce credentials unreadable.
 
 There is no fixed admin email required. The homepage self-serve flow lets the first user create their own workspace admin account using a business name, email or phone number, and a password of at least 12 characters.
 
-Invitations can be scoped to the current business or all businesses the inviter administers. They expire after seven days and are single-use. Resend email delivery is optional; otherwise the API returns a secure manual link to the administrator. Invitees may accept using a matching signed-in account or create an account for the invited email. Basic admin/accountant/staff/viewer checks protect selected writes; authorization is not comprehensive across every endpoint and requires security review.
+Invitations can be scoped to the current business or all businesses the inviter administers. They expire after seven days and are single-use. Resend email delivery is optional; otherwise the API returns a secure manual link to the administrator. Invitees may accept using a matching signed-in account or create an account for the invited email. Business-area member permissions are configurable, but authorization is not comprehensive across every endpoint and requires security review.
+
+## Store, WooCommerce, and member permissions
+
+- Admin-only `GET/PUT /v1/store/settings` configure the public product store. Authenticated `GET /v1/store/orders` and `GET /v1/store/orders/:orderId/lines` support order review. Public `GET /v1/public/stores/:slug`, order submission, and token-based tracking create order requests only; they do not take payment.
+- `PATCH /v1/store/orders/:orderId/status` accepts/rejects pending requests and marks invoiced orders fulfilled. `POST /v1/store/orders/:orderId/convert` requires an accepted request, validates available stock, creates an internal invoice, adjusts inventory and posts the journal in one transaction. The invoice is not a tax invoice.
+- Admin-only `GET/PUT /v1/integrations/woocommerce` manage an HTTPS WooCommerce URL and encrypted REST credentials. `POST /v1/integrations/woocommerce/products/sync` pushes mapped inventory products; `POST /v1/integrations/woocommerce/orders/sync` imports new orders as pending review. Confirm stock, tax, shipping, and payment separately; imported payment status is not trusted as a KashFlow receipt.
+- `GET /v1/workspaces/:workspaceId/members` lists business member permissions. Admin-only `PUT /v1/workspaces/:workspaceId/members/:userId/permissions` sets allowed business-area scopes for a non-admin member. Admins retain full access.
+
+## Local POS bridge
+
+The optional Windows launcher in `../pos-bridge/start.cmd` runs a separate local service for compatible network ESC/POS printers and attached cash drawers. Configure its local `.env` from `../pos-bridge/.env.example`; allow only the exact frontend origin. The bridge binds to loopback, is not hosted by the API, and does not create eTIMS receipts.
 
 ## M-Pesa Daraja STK Push
 
@@ -42,6 +54,12 @@ Accounting exposes the chart/trial balance, date-ranged income statement and as-
 - `GET/POST /v1/estimates`, `PATCH /v1/estimates/:estimateId/status`, and `POST /v1/estimates/:estimateId/convert` manage itemized estimates. Conversion is only allowed for an accepted, not-yet-converted estimate and posts linked stock movements and the invoice atomically.
 - `/v1/bills`, bill payment/approval routes, `/v1/inventory/:itemId/movements`, `/v1/purchase-orders`, and purchase-order receiving manage payables and inventory. Receipts create supplier bills; inventory issues use the recorded weighted-average cost.
 - `/v1/projects/:projectId/time`, project review/summary routes, `/v1/recurring`, `/v1/reports/budgets`, `/v1/reports/aging`, and `/v1/reports/cash-flow-forecast` provide management tracking. Recurring entries require deliberate user execution; the forecast uses available historical cash movements and is not a guarantee.
+- `/v1/inventory/locations`, `/v1/inventory/location-stock`, `/v1/inventory/transfers`, and `/v1/inventory/counts` manage per-location balances, transfers, and count adjustments. Existing aggregate item quantities remain synchronized with sales, purchase receipts, and count adjustments.
+- Accepted estimates can become sales orders with `POST /v1/estimates/:estimateId/order`; fulfillment/cancellation is tracked through `PATCH /v1/sales-orders/:orderId/status`. An ordered estimate must have a fulfilled order before conversion to an invoice.
+- `GET /v1/invoices/:invoiceId/lines` and `POST /v1/invoices/:invoiceId/returns` record partial line returns, credit notes, optional cash-refund ledger records, and optional restocking. KashFlow records but does not transfer refund money; invoice balances and receivables aging reflect these credits.
+- `GET /v1/reports/retail` returns per-location stock value, reorder-point alerts, and best-seller/gross-profit estimates. Unit-cost values are operational estimates, not audited valuation.
+
+The POS accepts exact SKU/barcode matches from a keyboard-wedge scanner. Compatible network ESC/POS printers and attached cash drawers can be used through the optional Windows local bridge; USB/Bluetooth devices are not supported by that bridge, and receipts remain internal rather than fiscal. Online store/order tracking and WooCommerce product/order sync are implemented with explicit payment-review limits. The language catalogs are partial, and role permissions are configurable but still do not cover every endpoint or replace a full security review.
 
 Line prices, tax amounts, recoverable tax, hours, costs, and statutory/payroll assumptions require user input and appropriate qualified review. KashFlow does not calculate Kenyan tax determinations; an internal invoice is not an eTIMS fiscal tax invoice.
 

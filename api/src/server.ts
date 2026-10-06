@@ -1,4 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
+import { lookup } from 'node:dns/promises'
+import { isIP } from 'node:net'
 import { promisify } from 'node:util'
 import cors from 'cors'
 import express from 'express'
@@ -33,6 +35,7 @@ const envSchema = z.object({
   KRA_ETIMS_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
   KRA_ETIMS_LIVE_ENABLED: z.enum(['true', 'false']).default('false'),
   KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY: z.string().min(32).optional(),
+  ONLINE_COMMERCE_ENCRYPTION_KEY: z.string().min(32).optional(),
 })
 const parsed = envSchema.safeParse(process.env)
 if (!parsed.success) {
@@ -131,7 +134,15 @@ const emailSchema = z.string().email().max(254).transform((value) => value.toLow
 const phoneSchema = z.string().trim().min(7).max(30).transform((value) => value.replace(/[\s().-]/g, ''))
 
 type Session = { userId: string; workspaceId: string; expiresAt: number }
-type AuthedRequest = express.Request & { session?: Session }
+type WorkspacePermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
+type AuthedRequest = express.Request & { session?: Session; workspaceRole?: string; workspacePermissions?: WorkspacePermission[] }
+const workspacePermissionNames: WorkspacePermission[] = ['operations.write', 'sales.write', 'inventory.write', 'accounting.write', 'banking.write', 'payroll.manage', 'integrations.manage', 'workspace.manage', 'team.manage', 'store.manage']
+const rolePermissionDefaults: Record<string, WorkspacePermission[]> = {
+  admin: workspacePermissionNames,
+  accountant: ['operations.write', 'sales.write', 'inventory.write', 'accounting.write', 'banking.write'],
+  staff: ['operations.write', 'sales.write', 'inventory.write'],
+  viewer: [],
+}
 
 function normalizeIdentifier(value: string): { email: string | null; phone: string | null } {
   const trimmed = value.trim()
@@ -217,6 +228,43 @@ function decryptPayrollData<T>(encoded: string): T {
   const plaintext = Buffer.concat([decipher.update(Buffer.from(dataText, 'base64')), decipher.final()]).toString('utf8')
   return JSON.parse(plaintext) as T
 }
+function commerceEncryptionKey() {
+  if (!env.ONLINE_COMMERCE_ENCRYPTION_KEY) throw new Error('Set ONLINE_COMMERCE_ENCRYPTION_KEY on the API service before storing WooCommerce credentials.')
+  return createHash('sha256').update(env.ONLINE_COMMERCE_ENCRYPTION_KEY).digest()
+}
+function encryptCommerceSecret(value: string) {
+  const nonce = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', commerceEncryptionKey(), nonce)
+  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()])
+  return `${nonce.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ciphertext.toString('base64')}`
+}
+function decryptCommerceSecret(encoded: string) {
+  const [nonceText, tagText, dataText] = encoded.split(':')
+  if (!nonceText || !tagText || !dataText) throw new Error('Encrypted WooCommerce credential has an invalid format.')
+  const decipher = createDecipheriv('aes-256-gcm', commerceEncryptionKey(), Buffer.from(nonceText, 'base64'))
+  decipher.setAuthTag(Buffer.from(tagText, 'base64'))
+  return Buffer.concat([decipher.update(Buffer.from(dataText, 'base64')), decipher.final()]).toString('utf8')
+}
+async function validatedWooStoreUrl(value: string) {
+  const parsedUrl = new URL(value)
+  if (parsedUrl.protocol !== 'https:' || parsedUrl.username || parsedUrl.password || isIP(parsedUrl.hostname) || parsedUrl.hostname === 'localhost' || !parsedUrl.hostname.includes('.')) {
+    throw new Error('WooCommerce store address must be a public HTTPS hostname, without embedded credentials.')
+  }
+  const addresses = await lookup(parsedUrl.hostname, { all: true, verbatim: true })
+  const privateAddress = addresses.find(({ address }) => {
+    if (isIP(address) === 4) {
+      const [first = -1, second = -1] = address.split('.').map(Number)
+      return first === 0 || first === 10 || first === 127 || first >= 224
+        || (first === 169 && second === 254)
+        || (first === 172 && second >= 16 && second <= 31)
+        || (first === 192 && second === 168)
+    }
+    return address === '::' || address === '::1' || address.toLowerCase().startsWith('fc') || address.toLowerCase().startsWith('fd') || address.toLowerCase().startsWith('fe80:')
+  })
+  if (!addresses.length || privateAddress) throw new Error('WooCommerce hostname must resolve only to publicly routable addresses.')
+  parsedUrl.pathname = parsedUrl.pathname.replace(/\/+$/, '')
+  return parsedUrl.toString().replace(/\/$/, '')
+}
 function kraCredentialKey() {
   if (!env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY) throw new Error('Set KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY on the API service before storing KRA OSCU credentials.')
   return createHash('sha256').update(env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY).digest()
@@ -293,29 +341,64 @@ async function requireSession(request: AuthedRequest, response: express.Response
   request.session = readSession(cookies(request.headers.cookie)[cookieName]) ?? undefined
   if (!request.session) { response.status(401).json({ error: 'Authentication is required to access this workspace.' }); return }
   try {
-    const membership = await pool!.query('SELECT 1 FROM workspace_members WHERE user_id = $1 AND workspace_id = $2', [request.session.userId, request.session.workspaceId])
+    const membership = await pool!.query('SELECT role, permissions FROM workspace_members WHERE user_id = $1 AND workspace_id = $2', [request.session.userId, request.session.workspaceId])
     if (!membership.rowCount) { response.status(401).json({ error: 'Workspace membership has been revoked or is no longer valid.' }); return }
+    request.workspaceRole = String(membership.rows[0].role)
+    const overrides = membership.rows[0].permissions
+    request.workspacePermissions = request.workspaceRole === 'admin'
+      ? rolePermissionDefaults.admin
+      : Array.isArray(overrides)
+        ? overrides.filter((permission: unknown): permission is WorkspacePermission => workspacePermissionNames.includes(permission as WorkspacePermission))
+        : rolePermissionDefaults[request.workspaceRole] ?? []
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
+      const permission = permissionForRequest(request) ?? 'operations.write'
+      if (permission && !(request.workspacePermissions ?? []).includes(permission)) {
+        response.status(403).json({ error: `Your workspace role does not have the ${permission} permission.` })
+        return
+      }
+    }
     next()
   } catch (error) { next(error) }
 }
+function permissionForRequest(request: AuthedRequest): WorkspacePermission | null {
+  const routePath = String(request.route?.path ?? '')
+  if (routePath === '/v1/workspaces/:workspaceId/activate') return null
+  if (routePath.includes('/invitations') || routePath.includes('/members')) return 'team.manage'
+  if (routePath.startsWith('/v1/payroll') || routePath.startsWith('/v1/integrations/statutory')) return 'payroll.manage'
+  if (routePath.startsWith('/v1/integrations')) return 'integrations.manage'
+  if (routePath.startsWith('/v1/settings')) return 'workspace.manage'
+  if (routePath.startsWith('/v1/banking')) return 'banking.write'
+  if (routePath.startsWith('/v1/purchase-orders')) return 'inventory.write'
+  if (routePath.startsWith('/v1/accounting') || routePath.startsWith('/v1/bills')) return 'accounting.write'
+  if (routePath.startsWith('/v1/inventory')) return 'inventory.write'
+  if (routePath.startsWith('/v1/invoices')) {
+    if (routePath.includes('/payments/mpesa')) return 'integrations.manage'
+    return routePath.endsWith('/payments') || routePath.endsWith('/returns') ? 'accounting.write' : 'sales.write'
+  }
+  if (routePath.startsWith('/v1/estimates') || routePath.startsWith('/v1/sales-orders')) return 'sales.write'
+  if (routePath.startsWith('/v1/records')) return request.params.type === 'inventory' ? 'inventory.write' : 'operations.write'
+  if (routePath.startsWith('/v1/documents')) return 'operations.write'
+  if (routePath.startsWith('/v1/store')) return routePath.includes('settings') ? 'store.manage' : 'sales.write'
+  if (routePath.startsWith('/v1/workspaces')) return 'workspace.manage'
+  return null
+}
 async function requireWorkspaceAdmin(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
-  try {
-    const result = await pool!.query('SELECT 1 FROM workspace_members WHERE user_id = $1 AND workspace_id = $2 AND role = $3', [request.session!.userId, request.session!.workspaceId, 'admin'])
-    if (!result.rowCount) { response.status(403).json({ error: 'Workspace administrator access is required for this operation.' }); return }
-    next()
-  } catch (error) { next(error) }
+  const permission = permissionForRequest(request)
+  if (request.workspaceRole !== 'admin' && (!permission || !(request.workspacePermissions ?? []).includes(permission))) {
+    response.status(403).json({ error: permission ? `Your workspace role does not have the ${permission} permission.` : 'Workspace administrator access is required for this operation.' })
+    return
+  }
+  next()
 }
 function requireWorkspaceRole(allowedRoles: Array<'admin' | 'accountant' | 'staff'>) {
   return async (request: AuthedRequest, response: express.Response, next: express.NextFunction) => {
-    try {
-      const result = await pool!.query('SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2', [request.session!.userId, request.session!.workspaceId])
-      const role = String(result.rows[0]?.role ?? '')
-      if (!allowedRoles.some((allowedRole) => allowedRole === role)) {
-        response.status(403).json({ error: 'Your workspace role does not have permission to make this change.' })
-        return
-      }
-      next()
-    } catch (error) { next(error) }
+    const role = request.workspaceRole ?? ''
+    const required = allowedRoles.includes('accountant') && !allowedRoles.includes('staff') ? 'accounting.write' : 'operations.write'
+    if (role !== 'admin' && !request.workspacePermissions?.includes(required)) {
+      response.status(403).json({ error: `Your workspace role does not have the ${required} permission.` })
+      return
+    }
+    next()
   }
 }
 const requireWorkspaceWriter = requireWorkspaceRole(['admin', 'accountant', 'staff'])
@@ -513,7 +596,7 @@ const workspaceRecordTypes = ['customers', 'suppliers', 'inventory', 'projects']
 const workspaceRecordSchemas = {
   customers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default('') }),
   suppliers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default('') }),
-  inventory: z.object({ name: z.string().trim().min(1).max(160), sku: z.string().trim().max(80).default(''), quantity: z.coerce.number().finite().min(0).default(0), unit: z.string().trim().max(30).default('unit'), cost: z.coerce.number().finite().min(0).default(0), price: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
+  inventory: z.object({ name: z.string().trim().min(1).max(160), sku: z.string().trim().max(80).default(''), barcode: z.string().trim().max(80).default(''), reorderPoint: z.coerce.number().finite().min(0).default(0), quantity: z.coerce.number().finite().min(0).default(0), unit: z.string().trim().max(30).default('unit'), cost: z.coerce.number().finite().min(0).default(0), price: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
   projects: z.object({ name: z.string().trim().min(1).max(160), customer: z.string().trim().max(160).default(''), status: z.enum(['planned', 'active', 'on_hold', 'completed']).default('planned'), startDate: z.string().date().or(z.literal('')).default(''), endDate: z.string().date().or(z.literal('')).default(''), budget: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
 }
 type WorkspaceRecordType = typeof workspaceRecordTypes[number]
@@ -526,6 +609,32 @@ const workspaceRecordDatabaseTypes: Record<WorkspaceRecordType, string> = {
 function parseRecordType(value: string): WorkspaceRecordType | null {
   return workspaceRecordTypes.find((type) => type === value) ?? null
 }
+async function ensureDefaultInventoryLocation(client: PoolClient, workspaceId: string) {
+  const existing = await client.query('SELECT id FROM inventory_locations WHERE workspace_id = $1 AND is_default = true', [workspaceId])
+  let locationId = existing.rows[0]?.id as string | undefined
+  if (!locationId) {
+    locationId = randomUUID()
+    await client.query(`INSERT INTO inventory_locations (id, workspace_id, name, code, is_default)
+      VALUES ($1, $2, 'Main location', 'MAIN', true) ON CONFLICT (workspace_id, code) DO UPDATE SET is_default = true RETURNING id`, [locationId, workspaceId])
+    const ensured = await client.query('SELECT id FROM inventory_locations WHERE workspace_id = $1 AND code = $2', [workspaceId, 'MAIN'])
+    locationId = String(ensured.rows[0].id)
+  }
+  const items = await client.query("SELECT id, data FROM workspace_records WHERE workspace_id = $1 AND record_type = 'inventory'", [workspaceId])
+  for (const item of items.rows) {
+    const data = item.data as Record<string, unknown>
+    await client.query(`INSERT INTO inventory_location_stock (workspace_id, location_id, item_id, quantity)
+      VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, location_id, item_id) DO NOTHING`,
+    [workspaceId, locationId, item.id, Number(data.quantity ?? 0).toFixed(3)])
+  }
+  return locationId
+}
+async function ensureInventoryLocation(client: PoolClient, workspaceId: string, locationId: string | undefined) {
+  const defaultLocationId = await ensureDefaultInventoryLocation(client, workspaceId)
+  if (!locationId) return defaultLocationId
+  const location = await client.query('SELECT id, workspace_id, active FROM inventory_locations WHERE id = $1', [locationId])
+  const row = location.rows[0]
+  return row && String(row.workspace_id) === workspaceId && row.active === true ? String(row.id) : null
+}
 app.get('/v1/records/:type', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   const type = parseRecordType(String(request.params.type ?? ''))
   if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
@@ -533,6 +642,104 @@ app.get('/v1/records/:type', requirePool, requireSession, async (request: Authed
     const result = await pool!.query('SELECT id, data, created_at, updated_at FROM workspace_records WHERE workspace_id = $1 AND record_type = $2 ORDER BY updated_at DESC', [request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
     response.json({ records: result.rows })
   } catch (error) { next(error) }
+})
+app.get('/v1/inventory/locations', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const client = await pool!.connect()
+  try {
+    const defaultLocationId = await ensureDefaultInventoryLocation(client, request.session!.workspaceId)
+    const [defaultLocation, additionalLocations] = await Promise.all([
+      client.query('SELECT id, name, code, is_default, active FROM inventory_locations WHERE id = $1', [defaultLocationId]),
+      client.query('SELECT id, name, code, is_default, active FROM inventory_locations WHERE workspace_id = $1 AND is_default = false', [request.session!.workspaceId]),
+    ])
+    const locations = [...defaultLocation.rows, ...additionalLocations.rows]
+    locations.sort((left: Record<string, unknown>, right: Record<string, unknown>) => Number(right.is_default === true) - Number(left.is_default === true) || String(left.name).localeCompare(String(right.name)))
+    response.json({ locations, defaultLocationId })
+  } catch (error) { next(error) }
+  finally { client.release() }
+})
+app.post('/v1/inventory/locations', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ name: z.string().trim().min(1).max(120), code: z.string().trim().min(1).max(40).regex(/^[A-Za-z0-9_-]+$/) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a location name and a short code using letters, numbers, dashes, or underscores.' }); return }
+  try {
+    const result = await pool!.query('INSERT INTO inventory_locations (id, workspace_id, name, code) VALUES ($1, $2, $3, $4) RETURNING id, name, code, is_default, active', [randomUUID(), request.session!.workspaceId, input.data.name, input.data.code.toUpperCase()])
+    response.status(201).json({ location: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.get('/v1/inventory/location-stock', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const client = await pool!.connect()
+  try {
+    await ensureDefaultInventoryLocation(client, request.session!.workspaceId)
+    const result = await client.query(`SELECT s.location_id, s.item_id, s.quantity::text, l.name AS location_name
+      FROM inventory_location_stock s JOIN inventory_locations l ON l.id = s.location_id
+      WHERE s.workspace_id = $1 AND l.active = true ORDER BY l.name, s.item_id`, [request.session!.workspaceId])
+    response.json({ stock: result.rows })
+  } catch (error) { next(error) }
+  finally { client.release() }
+})
+app.post('/v1/inventory/transfers', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ itemId: z.string().uuid(), fromLocationId: z.string().uuid(), toLocationId: z.string().uuid(), quantity: z.coerce.number().finite().positive().max(1_000_000), date: z.string().date(), reference: z.string().trim().max(200).default('') }).safeParse(request.body)
+  if (!input.success || input.data.fromLocationId === input.data.toLocationId) { response.status(400).json({ error: 'Choose an item, two different active locations, a positive quantity, and a valid date.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const item = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [input.data.itemId, request.session!.workspaceId])
+    if (!item.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Inventory item not found.' }); return }
+    const sourceLocation = await client.query('SELECT id FROM inventory_locations WHERE workspace_id = $1 AND active = true AND id = $2 FOR UPDATE', [request.session!.workspaceId, input.data.fromLocationId])
+    const destinationLocation = await client.query('SELECT id FROM inventory_locations WHERE workspace_id = $1 AND active = true AND id = $2 FOR UPDATE', [request.session!.workspaceId, input.data.toLocationId])
+    if (!sourceLocation.rowCount || !destinationLocation.rowCount) { await client.query('ROLLBACK'); response.status(400).json({ error: 'Both locations must be active in this business.' }); return }
+    const source = await client.query('SELECT quantity::text FROM inventory_location_stock WHERE workspace_id = $1 AND location_id = $2 AND item_id = $3 FOR UPDATE', [request.session!.workspaceId, input.data.fromLocationId, input.data.itemId])
+    const available = Number(source.rows[0]?.quantity ?? 0)
+    if (input.data.quantity > available) { await client.query('ROLLBACK'); response.status(409).json({ error: `Only ${available} units are available at the source location.` }); return }
+    const itemData = item.rows[0].data as Record<string, unknown>
+    await client.query('UPDATE inventory_location_stock SET quantity = quantity - $1, updated_at = now() WHERE workspace_id = $2 AND location_id = $3 AND item_id = $4', [input.data.quantity.toFixed(3), request.session!.workspaceId, input.data.fromLocationId, input.data.itemId])
+    await client.query(`INSERT INTO inventory_location_stock (workspace_id, location_id, item_id, quantity)
+      VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, location_id, item_id)
+      DO UPDATE SET quantity = inventory_location_stock.quantity + EXCLUDED.quantity, updated_at = now()`,
+    [request.session!.workspaceId, input.data.toLocationId, input.data.itemId, input.data.quantity.toFixed(3)])
+    const movementLabel = input.data.reference || 'Location transfer'
+    for (const [locationId, direction, delta] of [[input.data.fromLocationId, 'outbound', -input.data.quantity], [input.data.toLocationId, 'inbound', input.data.quantity]] as const) {
+      await client.query(`INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by)
+        VALUES ($1, $2, $3, $4, 'adjustment', $5, $6, $7, $8, $9)`,
+      [randomUUID(), request.session!.workspaceId, input.data.itemId, locationId, delta.toFixed(3), Number(itemData.cost ?? 0).toFixed(2), `${movementLabel} (${direction})`, input.data.date, request.session!.userId])
+    }
+    await client.query('COMMIT')
+    response.status(201).json({ transferred: input.data.quantity })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+app.post('/v1/inventory/counts', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ itemId: z.string().uuid(), locationId: z.string().uuid(), countedQuantity: z.coerce.number().finite().min(0).max(1_000_000), date: z.string().date(), reference: z.string().trim().max(200).default('') }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter an item, location, non-negative count, and valid date.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const item = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [input.data.itemId, request.session!.workspaceId])
+    if (!item.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Inventory item not found.' }); return }
+    const locationId = await ensureInventoryLocation(client, request.session!.workspaceId, input.data.locationId)
+    if (!locationId) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active stock location not found.' }); return }
+    const row = await client.query('SELECT quantity::text FROM inventory_location_stock WHERE workspace_id = $1 AND location_id = $2 AND item_id = $3 FOR UPDATE', [request.session!.workspaceId, locationId, input.data.itemId])
+    const previous = Number(row.rows[0]?.quantity ?? 0)
+    const delta = Number((input.data.countedQuantity - previous).toFixed(3))
+    if (delta === 0) { await client.query('ROLLBACK'); response.status(409).json({ error: 'The counted quantity matches the saved quantity; no adjustment was posted.' }); return }
+    const itemData = item.rows[0].data as Record<string, unknown>
+    const aggregateQuantity = Number((Number(itemData.quantity ?? 0) + delta).toFixed(3))
+    if (aggregateQuantity < 0) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Count adjustment cannot reduce total business stock below zero.' }); return }
+    await client.query(`INSERT INTO inventory_location_stock (workspace_id, location_id, item_id, quantity)
+      VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, location_id, item_id)
+      DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = now()`,
+    [request.session!.workspaceId, locationId, input.data.itemId, input.data.countedQuantity.toFixed(3)])
+    await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...itemData, quantity: aggregateQuantity }), input.data.itemId, request.session!.workspaceId])
+    const unitCost = Number(itemData.cost ?? 0)
+    const movementId = randomUUID()
+    await client.query(`INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by)
+      VALUES ($1, $2, $3, $4, 'adjustment', $5, $6, $7, $8, $9)`,
+    [movementId, request.session!.workspaceId, input.data.itemId, locationId, delta.toFixed(3), unitCost.toFixed(2), input.data.reference || 'Stock count adjustment', input.data.date, request.session!.userId])
+    const value = Number((Math.abs(delta) * unitCost).toFixed(2))
+    if (value > 0) await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: `Stock count: ${String(itemData.name ?? 'item')}`, sourceType: 'inventory_count', sourceId: movementId, lines: delta > 0 ? [{ accountCode: '1200', debit: value, credit: 0 }, { accountCode: '5100', debit: 0, credit: value }] : [{ accountCode: '5100', debit: value, credit: 0 }, { accountCode: '1200', debit: 0, credit: value }] })
+    await client.query('COMMIT')
+    response.status(201).json({ delta, quantity: input.data.countedQuantity })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
 })
 app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const type = parseRecordType(String(request.params.type ?? ''))
@@ -547,7 +754,9 @@ app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, require
     if (inventoryInput && inventoryInput.quantity > 0 && inventoryInput.cost > 0) {
       const movementId = randomUUID()
       const value = Number((inventoryInput.quantity * inventoryInput.cost).toFixed(2))
-      await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, 'opening', $4, $5, 'Opening stock', $6, $7)", [movementId, request.session!.workspaceId, result.rows[0].id, inventoryInput.quantity.toFixed(3), inventoryInput.cost.toFixed(2), nairobiToday(), request.session!.userId])
+      const locationId = await ensureDefaultInventoryLocation(client, request.session!.workspaceId)
+      await client.query('INSERT INTO inventory_location_stock (workspace_id, location_id, item_id, quantity) VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, location_id, item_id) DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = now()', [request.session!.workspaceId, locationId, result.rows[0].id, inventoryInput.quantity.toFixed(3)])
+      await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, $4, 'opening', $5, $6, 'Opening stock', $7, $8)", [movementId, request.session!.workspaceId, result.rows[0].id, locationId, inventoryInput.quantity.toFixed(3), inventoryInput.cost.toFixed(2), nairobiToday(), request.session!.userId])
       await ensureDefaultAccounts(request.session!.workspaceId)
       await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Opening inventory: ${input.data.name}`, sourceType: 'inventory_opening', sourceId: movementId, lines: [{ accountCode: '1200', debit: value, credit: 0 }, { accountCode: '3000', debit: 0, credit: value }] })
     }
@@ -558,6 +767,352 @@ app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, require
     if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
     next(error)
   } finally { client.release() }
+})
+app.get('/v1/public/stores/:slug', requirePool, rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-8', legacyHeaders: false }), async (request, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT s.workspace_id, s.slug, s.title, s.description, w.name AS business_name
+      FROM online_stores s JOIN workspaces w ON w.id = s.workspace_id
+      WHERE s.slug = $1 AND s.enabled = true`, [request.params.slug])
+    const store = result.rows[0]
+    if (!store) { response.status(404).json({ error: 'This online store is not available.' }); return }
+    const records = await pool!.query("SELECT id, data FROM workspace_records WHERE workspace_id = $1 AND record_type = 'inventory'", [store.workspace_id])
+    const products = records.rows.map((row: { id: unknown; data: Record<string, unknown> }) => ({
+      id: String(row.id),
+      name: String(row.data.name ?? 'Product'),
+      sku: String(row.data.sku ?? ''),
+      price: Number(row.data.price ?? 0),
+      inStock: Number(row.data.quantity ?? 0) > 0,
+    })).filter((item: { price: number }) => Number.isFinite(item.price) && item.price > 0)
+    response.json({ store: { slug: store.slug, title: store.title, description: store.description, businessName: store.business_name }, products })
+  } catch (error) { next(error) }
+})
+app.post('/v1/public/stores/:slug/orders', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 12, standardHeaders: 'draft-8', legacyHeaders: false }), async (request, response, next) => {
+  const input = z.object({
+    customerName: z.string().trim().min(1).max(160),
+    customerEmail: z.string().trim().email().max(254),
+    customerPhone: z.string().trim().max(30).default(''),
+    lines: z.array(z.object({ itemId: z.string().uuid(), quantity: z.coerce.number().int().min(1).max(1000) })).min(1).max(50),
+  }).safeParse(request.body)
+  if (!input.success || new Set(input.data.lines.map((line) => line.itemId)).size !== input.data.lines.length) {
+    response.status(400).json({ error: 'Enter your contact details and one quantity per selected product.' }); return
+  }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const storeResult = await client.query('SELECT workspace_id, slug FROM online_stores WHERE slug = $1 AND enabled = true FOR SHARE', [request.params.slug])
+    const store = storeResult.rows[0]
+    if (!store) { await client.query('ROLLBACK'); response.status(404).json({ error: 'This online store is not available.' }); return }
+    const lines: Array<{ itemId: string; name: string; sku: string; quantity: number; priceCents: number; totalCents: number }> = []
+    for (const requestedLine of input.data.lines) {
+      const itemResult = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [requestedLine.itemId, store.workspace_id])
+      const data = itemResult.rows[0]?.data as Record<string, unknown> | undefined
+      if (!data || Number(data.quantity ?? 0) < requestedLine.quantity) {
+        await client.query('ROLLBACK'); response.status(409).json({ error: `${String(data?.name ?? 'A selected product')} is no longer available in that quantity.` }); return
+      }
+      const priceCents = Math.round(Number(data.price ?? 0) * 100)
+      if (priceCents <= 0) { await client.query('ROLLBACK'); response.status(409).json({ error: `${String(data.name ?? 'A selected product')} is not currently for sale online.` }); return }
+      lines.push({ itemId: requestedLine.itemId, name: String(data.name ?? 'Product'), sku: String(data.sku ?? ''), quantity: requestedLine.quantity, priceCents, totalCents: priceCents * requestedLine.quantity })
+    }
+    const totalCents = lines.reduce((sum, line) => sum + line.totalCents, 0)
+    const orderId = randomUUID()
+    const portalToken = randomBytes(32).toString('base64url')
+    const tokenHash = createHash('sha256').update(portalToken).digest('hex')
+    await client.query(`INSERT INTO online_store_orders (id, workspace_id, customer_name, customer_email, customer_phone, portal_token_hash, total)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [orderId, store.workspace_id, input.data.customerName, input.data.customerEmail, input.data.customerPhone, tokenHash, (totalCents / 100).toFixed(2)])
+    for (const line of lines) {
+      await client.query(`INSERT INTO online_store_order_lines (id, order_id, item_id, product_name, sku, quantity, unit_price, total)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [randomUUID(), orderId, line.itemId, line.name, line.sku, line.quantity.toFixed(3), (line.priceCents / 100).toFixed(2), (line.totalCents / 100).toFixed(2)])
+    }
+    await client.query('COMMIT')
+    const portalUrl = new URL(`/portal/${portalToken}`, env.FRONTEND_ORIGIN).toString()
+    response.status(201).json({ order: { id: orderId, status: 'pending_review', total: (totalCents / 100).toFixed(2), portalUrl }, message: 'Order request received. The store will confirm availability and payment arrangements.' })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+app.get('/v1/public/orders/:token', requirePool, rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-8', legacyHeaders: false }), async (request, response, next) => {
+  const tokenParam = request.params.token
+  const token = Array.isArray(tokenParam) ? tokenParam[0] : tokenParam
+  if (!token || !/^[A-Za-z0-9_-]{40,60}$/.test(token)) { response.status(404).json({ error: 'Order tracking link is invalid.' }); return }
+  try {
+    const tokenHash = createHash('sha256').update(token).digest('hex')
+    const result = await pool!.query(`SELECT id, status, total::text, created_at FROM online_store_orders WHERE portal_token_hash = $1`, [tokenHash])
+    const order = result.rows[0]
+    if (!order) { response.status(404).json({ error: 'Order tracking link is invalid.' }); return }
+    const lines = await pool!.query('SELECT product_name, sku, quantity::text, unit_price::text, total::text FROM online_store_order_lines WHERE order_id = $1', [order.id])
+    response.json({ order, lines: lines.rows })
+  } catch (error) { next(error) }
+})
+app.get('/v1/store/settings', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT slug, title, description, enabled FROM online_stores WHERE workspace_id = $1', [request.session!.workspaceId])
+    response.json({ store: result.rows[0] ?? null })
+  } catch (error) { next(error) }
+})
+app.put('/v1/store/settings', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ slug: z.string().trim().min(3).max(50).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/), title: z.string().trim().min(1).max(120), description: z.string().trim().max(1000).default(''), enabled: z.boolean() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Use a 3–50 character lowercase store address, title, description, and enabled setting.' }); return }
+  try {
+    const result = await pool!.query(`INSERT INTO online_stores (workspace_id, slug, title, description, enabled)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (workspace_id) DO UPDATE SET slug = EXCLUDED.slug, title = EXCLUDED.title, description = EXCLUDED.description, enabled = EXCLUDED.enabled, updated_at = now()
+      RETURNING slug, title, description, enabled`,
+    [request.session!.workspaceId, input.data.slug, input.data.title, input.data.description, input.data.enabled])
+    response.json({ store: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.get('/v1/store/orders', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const orders = await pool!.query(`SELECT id, status, source, external_order_id, customer_name, customer_email, customer_phone, total::text, invoice_id, created_at
+      FROM online_store_orders WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 200`, [request.session!.workspaceId])
+    response.json({ orders: orders.rows })
+  } catch (error) { next(error) }
+})
+app.get('/v1/store/orders/:orderId/lines', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const order = await pool!.query('SELECT id FROM online_store_orders WHERE id = $1 AND workspace_id = $2', [request.params.orderId, request.session!.workspaceId])
+    if (!order.rowCount) { response.status(404).json({ error: 'Store order not found.' }); return }
+    const lines = await pool!.query('SELECT item_id, product_name, sku, quantity::text, unit_price::text, total::text FROM online_store_order_lines WHERE order_id = $1', [request.params.orderId])
+    response.json({ lines: lines.rows })
+  } catch (error) { next(error) }
+})
+app.patch('/v1/store/orders/:orderId/status', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ status: z.enum(['accepted', 'rejected', 'fulfilled']) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Choose accepted, rejected, or fulfilled.' }); return }
+  try {
+    const result = input.data.status === 'fulfilled'
+      ? await pool!.query(`UPDATE online_store_orders SET status = 'fulfilled', updated_at = now()
+        WHERE id = $1 AND workspace_id = $2 AND status = 'invoiced' AND invoice_id IS NOT NULL RETURNING id, status`,
+      [request.params.orderId, request.session!.workspaceId])
+      : await pool!.query(`UPDATE online_store_orders SET status = $1, updated_at = now()
+        WHERE id = $2 AND workspace_id = $3 AND status = 'pending_review' RETURNING id, status`,
+      [input.data.status, request.params.orderId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(409).json({ error: input.data.status === 'fulfilled' ? 'Only invoiced store orders can be marked fulfilled.' : 'Only pending store orders can be accepted or rejected.' }); return }
+    response.json({ order: result.rows[0] })
+  } catch (error) { next(error) }
+})
+app.post('/v1/store/orders/:orderId/convert', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const locationInput = z.object({ locationId: z.string().uuid().optional() }).safeParse(request.body)
+  if (!locationInput.success) { response.status(400).json({ error: 'Choose a valid stock location.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query(`SELECT id, customer_name, customer_email, total::text
+      FROM online_store_orders WHERE id = $1 AND workspace_id = $2 AND status = 'accepted' FOR UPDATE`,
+    [request.params.orderId, request.session!.workspaceId])
+    const order = found.rows[0]
+    if (!order) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Accept the online order before invoicing it.' }); return }
+    const orderLines = await client.query(`SELECT id, item_id, product_name, quantity::text, unit_price::text, total::text
+      FROM online_store_order_lines WHERE order_id = $1 ORDER BY id`, [order.id])
+    const locationId = await ensureInventoryLocation(client, request.session!.workspaceId, locationInput.data.locationId)
+    if (!locationId) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active stock location not found.' }); return }
+    const dueDate = new Date(`${nairobiToday()}T00:00:00.000Z`)
+    dueDate.setUTCDate(dueDate.getUTCDate() + 14)
+    const dueDateText = dueDate.toISOString().slice(0, 10)
+    const invoiceId = randomUUID()
+    const description = orderLines.rows.map((line: Record<string, unknown>) => String(line.product_name)).join('; ').slice(0, 240) || 'Online store order'
+    const invoiceResult = await client.query(`INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date, location_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING id, customer, description, amount::text, due_date, status`,
+    [invoiceId, request.session!.workspaceId, order.customer_name, order.customer_email, description, order.total, dueDateText, locationId])
+    let costOfGoodsSold = 0
+    let invoiceSubtotalCents = 0
+    for (const [index, line] of orderLines.rows.entries()) {
+      const itemId = line.item_id ? String(line.item_id) : null
+      const quantity = Number(line.quantity)
+      const unitPriceCents = Math.round(Number(line.unit_price) * 100)
+      const lineTotalCents = Math.round(Number(line.total) * 100)
+      invoiceSubtotalCents += lineTotalCents
+      if (itemId) {
+        const itemResult = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [itemId, request.session!.workspaceId])
+        const data = itemResult.rows[0]?.data as Record<string, unknown> | undefined
+        if (!data || Number(data.quantity ?? 0) < quantity) { await client.query('ROLLBACK'); response.status(409).json({ error: `${String(line.product_name)} is no longer available in the required quantity.` }); return }
+        const locationStock = await client.query('SELECT quantity::text FROM inventory_location_stock WHERE workspace_id = $1 AND location_id = $2 AND item_id = $3 FOR UPDATE', [request.session!.workspaceId, locationId, itemId])
+        if (Number(locationStock.rows[0]?.quantity ?? 0) < quantity) { await client.query('ROLLBACK'); response.status(409).json({ error: `${String(line.product_name)} is not available at the selected stock location.` }); return }
+        const nextQuantity = Number((Number(data.quantity) - quantity).toFixed(3))
+        await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...data, quantity: nextQuantity }), itemId, request.session!.workspaceId])
+        await client.query('UPDATE inventory_location_stock SET quantity = quantity - $1, updated_at = now() WHERE workspace_id = $2 AND location_id = $3 AND item_id = $4', [quantity.toFixed(3), request.session!.workspaceId, locationId, itemId])
+        const itemCost = Number(data.cost ?? 0)
+        const movementId = randomUUID()
+        await client.query(`INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by)
+          VALUES ($1, $2, $3, $4, 'sale', $5, $6, $7, $8, $9)`,
+        [movementId, request.session!.workspaceId, itemId, locationId, (-quantity).toFixed(3), itemCost.toFixed(2), `Store order ${String(order.id).slice(0, 8)}`, nairobiToday(), request.session!.userId])
+        costOfGoodsSold += quantity * itemCost
+      }
+      await client.query(`INSERT INTO invoice_lines (id, invoice_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8)`,
+      [randomUUID(), invoiceId, index + 1, itemId, String(line.product_name), quantity.toFixed(3), (unitPriceCents / 100).toFixed(2), (lineTotalCents / 100).toFixed(2)])
+    }
+    const journalLines: JournalLineInput[] = [{ accountCode: '1100', debit: Number(order.total), credit: 0 }]
+    if (invoiceSubtotalCents > 0) journalLines.push({ accountCode: '4000', debit: 0, credit: invoiceSubtotalCents / 100 })
+    if (costOfGoodsSold > 0) journalLines.push({ accountCode: '5100', debit: Number(costOfGoodsSold.toFixed(2)), credit: 0 }, { accountCode: '1200', debit: 0, credit: Number(costOfGoodsSold.toFixed(2)) })
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Online order invoice: ${order.customer_name}`, sourceType: 'online_store_invoice', sourceId: invoiceId, lines: journalLines })
+    await client.query("UPDATE online_store_orders SET status = 'invoiced', invoice_id = $1, updated_at = now() WHERE id = $2", [invoiceId, order.id])
+    await client.query('COMMIT')
+    response.status(201).json({ invoice: invoiceResult.rows[0] })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+type WooConnection = { store_url: string; consumer_key_ciphertext: string; consumer_secret_ciphertext: string; last_order_id?: string | null; last_synced_at?: Date | string | null }
+async function woocommerceRequest<T>(connection: WooConnection, resource: string, method = 'GET', body?: unknown): Promise<T> {
+  const storeUrl = await validatedWooStoreUrl(connection.store_url)
+  const credentials = Buffer.from(`${decryptCommerceSecret(connection.consumer_key_ciphertext)}:${decryptCommerceSecret(connection.consumer_secret_ciphertext)}`).toString('base64')
+  const providerResponse = await fetch(`${storeUrl}/wp-json/wc/v3/${resource}`, {
+    method,
+    headers: { Authorization: `Basic ${credentials}`, Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+    redirect: 'error',
+    signal: AbortSignal.timeout(20_000),
+  })
+  const payload = await providerResponse.json().catch(() => null)
+  if (!providerResponse.ok) {
+    const providerMessage = typeof payload?.message === 'string' ? payload.message.slice(0, 250) : `HTTP ${providerResponse.status}`
+    throw new Error(`WooCommerce request failed: ${providerMessage}`)
+  }
+  return payload as T
+}
+app.get('/v1/integrations/woocommerce', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT store_url, enabled, last_order_id, last_synced_at FROM woocommerce_connections WHERE workspace_id = $1', [request.session!.workspaceId])
+    response.json({ connection: result.rows[0] ? { ...result.rows[0], credentialsConfigured: true } : null, encryptionReady: Boolean(env.ONLINE_COMMERCE_ENCRYPTION_KEY) })
+  } catch (error) { next(error) }
+})
+app.put('/v1/integrations/woocommerce', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ storeUrl: z.string().trim().url(), consumerKey: z.string().trim().min(1).max(300), consumerSecret: z.string().trim().min(1).max(300) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter the WooCommerce HTTPS store address and REST API consumer key and secret.' }); return }
+  if (!env.ONLINE_COMMERCE_ENCRYPTION_KEY) { response.status(503).json({ error: 'WooCommerce credential storage is disabled. Configure ONLINE_COMMERCE_ENCRYPTION_KEY on the API service.' }); return }
+  try {
+    const storeUrl = await validatedWooStoreUrl(input.data.storeUrl)
+    const encrypted = {
+      key: encryptCommerceSecret(input.data.consumerKey),
+      secret: encryptCommerceSecret(input.data.consumerSecret),
+    }
+    const saved = await pool!.query(`INSERT INTO woocommerce_connections (workspace_id, store_url, consumer_key_ciphertext, consumer_secret_ciphertext)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (workspace_id) DO UPDATE SET store_url = EXCLUDED.store_url, consumer_key_ciphertext = EXCLUDED.consumer_key_ciphertext,
+        consumer_secret_ciphertext = EXCLUDED.consumer_secret_ciphertext, enabled = true, updated_at = now()
+      RETURNING store_url, enabled, last_order_id, last_synced_at`,
+    [request.session!.workspaceId, storeUrl, encrypted.key, encrypted.secret])
+    response.json({ connection: { ...saved.rows[0], credentialsConfigured: true } })
+  } catch (error) {
+    if (error instanceof Error && (error.message.includes('WooCommerce store address') || error.message.includes('WooCommerce hostname'))) { response.status(400).json({ error: error.message }); return }
+    next(error)
+  }
+})
+app.post('/v1/integrations/woocommerce/products/sync', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const connectionResult = await pool!.query('SELECT store_url, consumer_key_ciphertext, consumer_secret_ciphertext FROM woocommerce_connections WHERE workspace_id = $1 AND enabled = true', [request.session!.workspaceId])
+    const connection = connectionResult.rows[0] as WooConnection | undefined
+    if (!connection) { response.status(409).json({ error: 'Configure a WooCommerce connection before synchronizing products.' }); return }
+    const inventory = await pool!.query("SELECT id, data FROM workspace_records WHERE workspace_id = $1 AND record_type = 'inventory' ORDER BY updated_at DESC LIMIT 250", [request.session!.workspaceId])
+    const mappings = await pool!.query('SELECT item_id, external_product_id FROM woocommerce_product_mappings WHERE workspace_id = $1', [request.session!.workspaceId])
+    const mappingByItem = new Map<string, string>(mappings.rows.map((mapping: { item_id: unknown; external_product_id: unknown }) => [String(mapping.item_id), String(mapping.external_product_id)]))
+    let synced = 0
+    const failures: Array<{ item: string; reason: string }> = []
+    for (const row of inventory.rows as Array<{ id: unknown; data: Record<string, unknown> }>) {
+      const itemId = String(row.id)
+      const name = String(row.data.name ?? 'Product')
+      const price = Number(row.data.price ?? 0)
+      if (!Number.isFinite(price) || price <= 0) { failures.push({ item: name, reason: 'Set a positive selling price before sync.' }); continue }
+      const productBody = {
+        name,
+        type: 'simple',
+        sku: String(row.data.sku ?? ''),
+        regular_price: price.toFixed(2),
+        manage_stock: true,
+        stock_quantity: Math.max(0, Math.floor(Number(row.data.quantity ?? 0))),
+        stock_status: Number(row.data.quantity ?? 0) > 0 ? 'instock' : 'outofstock',
+        description: String(row.data.onlineDescription ?? ''),
+        status: 'publish',
+      }
+      try {
+        const externalId = mappingByItem.get(itemId)
+        const product = await woocommerceRequest<{ id: number }>(connection, externalId ? `products/${encodeURIComponent(externalId)}` : 'products', externalId ? 'PUT' : 'POST', productBody)
+        await pool!.query(`INSERT INTO woocommerce_product_mappings (workspace_id, item_id, external_product_id)
+          VALUES ($1, $2, $3) ON CONFLICT (workspace_id, item_id) DO UPDATE SET external_product_id = EXCLUDED.external_product_id, updated_at = now()`,
+        [request.session!.workspaceId, itemId, String(product.id)])
+        synced += 1
+      } catch (error) { failures.push({ item: name, reason: error instanceof Error ? error.message : 'Provider request failed.' }) }
+    }
+    response.json({ synced, failed: failures.length, failures })
+  } catch (error) { next(error) }
+})
+app.post('/v1/integrations/woocommerce/orders/sync', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const connectionResult = await pool!.query('SELECT store_url, consumer_key_ciphertext, consumer_secret_ciphertext, last_order_id, last_synced_at FROM woocommerce_connections WHERE workspace_id = $1 AND enabled = true', [request.session!.workspaceId])
+    const connection = connectionResult.rows[0] as WooConnection | undefined
+    if (!connection) { response.status(409).json({ error: 'Configure a WooCommerce connection before importing orders.' }); return }
+    const updatedAfter = connection.last_synced_at ? new Date(new Date(connection.last_synced_at).getTime() - 5 * 60_000).toISOString() : undefined
+    const mappingRows = await pool!.query('SELECT item_id, external_product_id FROM woocommerce_product_mappings WHERE workspace_id = $1', [request.session!.workspaceId])
+    const mapping = new Map<string, string>(mappingRows.rows.map((row: { item_id: unknown; external_product_id: unknown }) => [String(row.external_product_id), String(row.item_id)]))
+    const inventory = await pool!.query("SELECT id, data FROM workspace_records WHERE workspace_id = $1 AND record_type = 'inventory'", [request.session!.workspaceId])
+    const itemBySku = new Map<string, string>()
+    for (const row of inventory.rows as Array<{ id: unknown; data: Record<string, unknown> }>) {
+      if (row.data.sku) itemBySku.set(String(row.data.sku).toLowerCase(), String(row.id))
+    }
+    let imported = 0
+    let skipped = 0
+    let lastOrderId = Number(connection.last_order_id ?? 0)
+    for (let pageNumber = 1; pageNumber <= 10; pageNumber += 1) {
+      const query = new URLSearchParams({ per_page: '100', page: String(pageNumber), status: 'processing,on-hold,pending' })
+      if (updatedAfter) query.set('after', updatedAfter)
+      const orders = await woocommerceRequest<Array<Record<string, unknown>>>(connection, `orders?${query.toString()}`)
+      if (!orders.length) break
+      for (const externalOrder of orders) {
+        const externalId = String(externalOrder.id ?? '')
+        if (!externalId) { skipped += 1; continue }
+        const existing = await pool!.query('SELECT id FROM online_store_orders WHERE workspace_id = $1 AND source = $2 AND external_order_id = $3', [request.session!.workspaceId, 'woocommerce', externalId])
+        if (existing.rowCount) continue
+        const externalLines = Array.isArray(externalOrder.line_items) ? externalOrder.line_items as Array<Record<string, unknown>> : []
+        const importedLines: Array<{ itemId: string; name: string; sku: string; quantity: number; unitPriceCents: number; totalCents: number }> = []
+        let missingMapping = false
+        for (const externalLine of externalLines) {
+          const externalProductId = String(externalLine.product_id ?? '')
+          const sku = String(externalLine.sku ?? '')
+          const itemId = mapping.get(externalProductId) ?? itemBySku.get(sku.toLowerCase())
+          const quantity = Math.floor(Number(externalLine.quantity))
+          const totalCents = Math.round(Number(externalLine.total ?? 0) * 100)
+          if (!itemId || quantity < 1 || totalCents < 0) { missingMapping = true; break }
+          if (!mapping.has(externalProductId) && externalProductId) {
+            await pool!.query(`INSERT INTO woocommerce_product_mappings (workspace_id, item_id, external_product_id)
+              VALUES ($1, $2, $3) ON CONFLICT (workspace_id, item_id) DO NOTHING`,
+            [request.session!.workspaceId, itemId, externalProductId])
+            mapping.set(externalProductId, itemId)
+          }
+          importedLines.push({
+            itemId,
+            name: String(externalLine.name ?? 'Product'),
+            sku,
+            quantity,
+            unitPriceCents: Math.round(totalCents / quantity),
+            totalCents,
+          })
+        }
+        if (missingMapping || !importedLines.length) { skipped += 1; continue }
+        const totalCents = importedLines.reduce((sum, line) => sum + line.totalCents, 0)
+        const customerName = [externalOrder.billing && (externalOrder.billing as Record<string, unknown>).first_name, externalOrder.billing && (externalOrder.billing as Record<string, unknown>).last_name].filter(Boolean).join(' ') || 'WooCommerce customer'
+        const billing = externalOrder.billing as Record<string, unknown> | undefined
+        const email = String(billing?.email ?? `order-${externalId}@woocommerce.invalid`)
+        const phone = String(billing?.phone ?? '')
+        const portalToken = randomBytes(32).toString('base64url')
+        const orderId = randomUUID()
+        await pool!.query(`INSERT INTO online_store_orders (id, workspace_id, status, source, external_order_id, customer_name, customer_email, customer_phone, portal_token_hash, total)
+          VALUES ($1, $2, 'pending_review', 'woocommerce', $3, $4, $5, $6, $7, $8)`,
+        [orderId, request.session!.workspaceId, externalId, customerName.slice(0, 160), email, phone.slice(0, 30), createHash('sha256').update(portalToken).digest('hex'), (totalCents / 100).toFixed(2)])
+        for (const line of importedLines) {
+          await pool!.query(`INSERT INTO online_store_order_lines (id, order_id, item_id, product_name, sku, quantity, unit_price, total)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [randomUUID(), orderId, line.itemId, line.name.slice(0, 160), line.sku.slice(0, 80), line.quantity.toFixed(3), (line.unitPriceCents / 100).toFixed(2), (line.totalCents / 100).toFixed(2)])
+        }
+        imported += 1
+        lastOrderId = Math.max(lastOrderId, Number(externalId) || 0)
+      }
+      if (orders.length < 100) break
+    }
+    await pool!.query('UPDATE woocommerce_connections SET last_order_id = $1, last_synced_at = now(), updated_at = now() WHERE workspace_id = $2', [String(lastOrderId), request.session!.workspaceId])
+    response.json({ imported, skipped, note: 'Imported WooCommerce orders remain pending review. Tax, shipping, WooCommerce payment status, and actual money movement must be verified separately.' })
+  } catch (error) { next(error) }
 })
 app.post('/v1/bank-imports', requirePool, verifyOrigin, requireSession, requireAccountingRole, async (request: AuthedRequest, response, next) => {
   const input = z.object({ rows: z.array(z.object({ date: z.string().date(), description: z.string().trim().min(1).max(240), amount: z.coerce.number().finite().positive().max(999999999999), direction: z.enum(['income', 'expense']) })).min(1).max(500) }).safeParse(request.body)
@@ -780,6 +1335,7 @@ app.post('/v1/inventory/:itemId/movements', requirePool, verifyOrigin, requireSe
     movementType: z.enum(['purchase', 'sale', 'adjustment']),
     quantity: z.coerce.number().finite().positive().max(1_000_000),
     adjustmentDirection: z.enum(['increase', 'decrease']).default('increase'),
+    locationId: z.string().uuid().optional(),
     unitCost: z.coerce.number().finite().min(0).max(999999999999),
     reference: z.string().trim().max(200).default(''),
     date: z.string().date(),
@@ -791,6 +1347,8 @@ app.post('/v1/inventory/:itemId/movements', requirePool, verifyOrigin, requireSe
     const result = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [request.params.itemId, request.session!.workspaceId])
     const data = result.rows[0]?.data as Record<string, unknown> | undefined
     if (!data) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Inventory item not found in this business.' }); return }
+    const locationId = await ensureInventoryLocation(client, request.session!.workspaceId, input.data.locationId)
+    if (!locationId) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active stock location not found.' }); return }
     const oldQuantity = Number(data.quantity ?? 0)
     const oldCost = Number(data.cost ?? 0)
     const quantityDelta = input.data.movementType === 'sale' || (input.data.movementType === 'adjustment' && input.data.adjustmentDirection === 'decrease')
@@ -798,14 +1356,21 @@ app.post('/v1/inventory/:itemId/movements', requirePool, verifyOrigin, requireSe
       : input.data.quantity
     const newQuantity = oldQuantity + quantityDelta
     if (newQuantity < 0) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This movement would make on-hand stock negative.' }); return }
+    const locationStock = await client.query('SELECT quantity::text FROM inventory_location_stock WHERE workspace_id = $1 AND location_id = $2 AND item_id = $3 FOR UPDATE', [request.session!.workspaceId, locationId, request.params.itemId])
+    const locationQuantity = Number(locationStock.rows[0]?.quantity ?? 0)
+    if (locationQuantity + quantityDelta < 0) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This movement would make stock at this location negative.' }); return }
     const movementCost = input.data.movementType === 'sale' ? oldCost : input.data.unitCost || oldCost
     const averageCost = newQuantity > 0 && quantityDelta > 0
       ? ((oldQuantity * oldCost) + (quantityDelta * movementCost)) / newQuantity
       : oldCost
     await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...data, quantity: Number(newQuantity.toFixed(3)), cost: Number(averageCost.toFixed(2)) }), request.params.itemId, request.session!.workspaceId])
+    await client.query(`INSERT INTO inventory_location_stock (workspace_id, location_id, item_id, quantity)
+      VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, location_id, item_id)
+      DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = now()`,
+    [request.session!.workspaceId, locationId, request.params.itemId, Number((locationQuantity + quantityDelta).toFixed(3)).toFixed(3)])
     const movementId = randomUUID()
-    await client.query(`INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, [movementId, request.session!.workspaceId, request.params.itemId, input.data.movementType, quantityDelta.toFixed(3), movementCost.toFixed(2), input.data.reference, input.data.date, request.session!.userId])
+    await client.query(`INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, [movementId, request.session!.workspaceId, request.params.itemId, locationId, input.data.movementType, quantityDelta.toFixed(3), movementCost.toFixed(2), input.data.reference, input.data.date, request.session!.userId])
     await ensureDefaultAccounts(request.session!.workspaceId)
     const movementValue = Number((Math.abs(quantityDelta) * movementCost).toFixed(2))
     if (movementValue > 0) {
@@ -838,6 +1403,7 @@ app.get('/v1/purchase-orders', requirePool, requireSession, async (request: Auth
 app.post('/v1/purchase-orders', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   const input = z.object({
     supplier: z.string().trim().min(1).max(160),
+    locationId: z.string().uuid().optional(),
     orderDate: z.string().date(),
     dueDate: z.string().date().optional(),
     expectedDate: z.string().date().optional(),
@@ -849,7 +1415,9 @@ app.post('/v1/purchase-orders', requirePool, verifyOrigin, requireSession, requi
   try {
     await client.query('BEGIN')
     const id = randomUUID()
-    await client.query('INSERT INTO purchase_orders (id, workspace_id, supplier, order_date, due_date, expected_date, notes, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [id, request.session!.workspaceId, input.data.supplier, input.data.orderDate, input.data.dueDate ?? input.data.orderDate, input.data.expectedDate ?? null, input.data.notes, request.session!.userId])
+    const locationId = await ensureInventoryLocation(client, request.session!.workspaceId, input.data.locationId)
+    if (!locationId) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active stock location not found.' }); return }
+    await client.query('INSERT INTO purchase_orders (id, workspace_id, supplier, location_id, order_date, due_date, expected_date, notes, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [id, request.session!.workspaceId, input.data.supplier, locationId, input.data.orderDate, input.data.dueDate ?? input.data.orderDate, input.data.expectedDate ?? null, input.data.notes, request.session!.userId])
     for (const line of input.data.lines) {
       const item = await client.query("SELECT id FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory'", [line.itemId, request.session!.workspaceId])
       if (!item.rowCount) { await client.query('ROLLBACK'); response.status(400).json({ error: 'Every purchase order line must reference an inventory item in this business.' }); return }
@@ -866,7 +1434,7 @@ app.post('/v1/purchase-orders/:orderId/receive', requirePool, verifyOrigin, requ
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const orderResult = await client.query("SELECT id, supplier, status, due_date FROM purchase_orders WHERE id = $1 AND workspace_id = $2 AND status IN ('open', 'partially_received') FOR UPDATE", [request.params.orderId, request.session!.workspaceId])
+    const orderResult = await client.query("SELECT id, supplier, status, due_date, location_id FROM purchase_orders WHERE id = $1 AND workspace_id = $2 AND status IN ('open', 'partially_received') FOR UPDATE", [request.params.orderId, request.session!.workspaceId])
     const order = orderResult.rows[0]
     if (!order) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Open purchase order not found.' }); return }
     let receivedValue = 0
@@ -883,9 +1451,15 @@ app.post('/v1/purchase-orders/:orderId/receive', requirePool, verifyOrigin, requ
       const nextQuantity = priorQuantity + received.quantity
       const nextCost = nextQuantity > 0 ? (priorQuantity * Number(data.cost ?? cost) + received.quantity * cost) / nextQuantity : cost
       await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...data, quantity: Number(nextQuantity.toFixed(3)), cost: Number(nextCost.toFixed(2)) }), line.item_id, request.session!.workspaceId])
+      const locationId = await ensureInventoryLocation(client, request.session!.workspaceId, order.location_id ? String(order.location_id) : undefined)
+      if (!locationId) { await client.query('ROLLBACK'); response.status(409).json({ error: 'The purchase order location is no longer active.' }); return }
+      await client.query(`INSERT INTO inventory_location_stock (workspace_id, location_id, item_id, quantity)
+        VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, location_id, item_id)
+        DO UPDATE SET quantity = inventory_location_stock.quantity + EXCLUDED.quantity, updated_at = now()`,
+      [request.session!.workspaceId, locationId, line.item_id, received.quantity.toFixed(3)])
       await client.query('UPDATE purchase_order_lines SET received_quantity = received_quantity + $1 WHERE id = $2', [received.quantity.toFixed(3), line.id])
       const movementId = randomUUID()
-      await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, 'purchase', $4, $5, $6, $7, $8)", [movementId, request.session!.workspaceId, line.item_id, received.quantity.toFixed(3), cost.toFixed(2), `PO ${String(order.id).slice(0, 8)}`, input.data.date, request.session!.userId])
+      await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, $4, 'purchase', $5, $6, $7, $8, $9)", [movementId, request.session!.workspaceId, line.item_id, locationId, received.quantity.toFixed(3), cost.toFixed(2), `PO ${String(order.id).slice(0, 8)}`, input.data.date, request.session!.userId])
       receivedValue += received.quantity * cost
       receivedLines.push({ itemId: String(line.item_id), description: String(data.name ?? 'Inventory item'), quantity: received.quantity, unitCost: cost, total: received.quantity * cost })
     }
@@ -1062,17 +1636,31 @@ app.get('/v1/reports/aging', requirePool, requireSession, async (request: Authed
   if (!input.success) { response.status(400).json({ error: 'Use a valid YYYY-MM-DD as-of date.' }); return }
   try {
     const [receivables, payables] = await Promise.all([
-      pool!.query(`SELECT id, customer AS counterparty, amount::text, amount_paid::text, due_date,
-        GREATEST(($2::date - due_date), 0) AS days_overdue FROM invoices
-        WHERE workspace_id = $1 AND status <> 'void' AND approval_status = 'approved' AND amount > amount_paid ORDER BY due_date`, [request.session!.workspaceId, input.data.asOf]),
-      pool!.query(`SELECT id, supplier AS counterparty, amount::text, amount_paid::text, due_date,
-        GREATEST(($2::date - due_date), 0) AS days_overdue FROM vendor_bills
-        WHERE workspace_id = $1 AND status <> 'void' AND amount > amount_paid ORDER BY due_date`, [request.session!.workspaceId, input.data.asOf]),
+      pool!.query(`SELECT i.id, i.customer AS counterparty,
+        GREATEST(i.amount - i.amount_paid - COALESCE(r.returned_amount, 0) + COALESCE(r.refunded_amount, 0), 0)::text AS amount_due,
+        i.due_date
+        FROM invoices i LEFT JOIN (
+          SELECT invoice_id, SUM(amount) AS returned_amount, SUM(refund_amount) AS refunded_amount
+          FROM sales_returns WHERE workspace_id = $1 GROUP BY invoice_id
+        ) r ON r.invoice_id = i.id
+        WHERE i.workspace_id = $1 AND i.status <> 'void'
+          AND i.amount - i.amount_paid - COALESCE(r.returned_amount, 0) + COALESCE(r.refunded_amount, 0) > 0
+        ORDER BY i.due_date`, [request.session!.workspaceId, input.data.asOf]),
+      pool!.query(`SELECT id, supplier AS counterparty, amount::text, amount_paid::text, due_date FROM vendor_bills
+        WHERE workspace_id = $1 AND status <> 'void' AND amount > amount_paid ORDER BY due_date`, [request.session!.workspaceId]),
     ])
+    const addDaysOverdue = (rows: Array<Record<string, unknown>>) => rows.map((row) => {
+      const dueDate = row.due_date instanceof Date ? row.due_date.toISOString().slice(0, 10) : String(row.due_date).slice(0, 10)
+      const asOf = new Date(`${input.data.asOf}T00:00:00.000Z`).getTime()
+      const due = new Date(`${dueDate}T00:00:00.000Z`).getTime()
+      return { ...row, due_date: dueDate, days_overdue: Math.max(0, Math.floor((asOf - due) / 86_400_000)) }
+    })
+    const receivableRows = addDaysOverdue(receivables.rows)
+    const payableRows = addDaysOverdue(payables.rows)
     const buckets = (rows: Array<Record<string, unknown>>) => {
       const totals = { current: 0, days1to30: 0, days31to60: 0, days61to90: 0, over90: 0 }
       for (const row of rows) {
-        const due = Number(row.amount) - Number(row.amount_paid)
+        const due = Number(row.amount_due ?? (Number(row.amount) - Number(row.amount_paid)))
         const days = Number(row.days_overdue)
         if (days <= 0) totals.current += due
         else if (days <= 30) totals.days1to30 += due
@@ -1082,8 +1670,56 @@ app.get('/v1/reports/aging', requirePool, requireSession, async (request: Authed
       }
       return Object.fromEntries(Object.entries(totals).map(([key, value]) => [key, value.toFixed(2)]))
     }
-    response.json({ asOf: input.data.asOf, receivables: { items: receivables.rows, buckets: buckets(receivables.rows) }, payables: { items: payables.rows, buckets: buckets(payables.rows) } })
+    response.json({ asOf: input.data.asOf, receivables: { items: receivableRows, buckets: buckets(receivableRows) }, payables: { items: payableRows, buckets: buckets(payableRows) } })
   } catch (error) { next(error) }
+})
+app.get('/v1/reports/retail', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const locationId = typeof request.query.locationId === 'string' ? request.query.locationId : undefined
+  if (locationId && !z.string().uuid().safeParse(locationId).success) { response.status(400).json({ error: 'Choose a valid stock location.' }); return }
+  const client = await pool!.connect()
+  try {
+    await ensureDefaultInventoryLocation(client, request.session!.workspaceId)
+    const locations = await client.query('SELECT id, name, code, is_default FROM inventory_locations WHERE workspace_id = $1 AND active = true ORDER BY is_default DESC, name', [request.session!.workspaceId])
+    const stock = await client.query(`SELECT s.location_id, s.item_id, s.quantity::text, l.name AS location_name, r.data
+      FROM inventory_location_stock s
+      JOIN inventory_locations l ON l.id = s.location_id
+      JOIN workspace_records r ON r.id = s.item_id AND r.workspace_id = s.workspace_id AND r.record_type = 'inventory'
+      WHERE s.workspace_id = $1 AND l.active = true AND ($2::uuid IS NULL OR s.location_id = $2)
+      ORDER BY r.data->>'name', l.name`, [request.session!.workspaceId, locationId ?? null])
+    const sales = await client.query(`SELECT il.item_id, il.quantity::text, il.returned_quantity::text, il.unit_price::text,
+      il.discount_amount::text, il.description, r.data
+      FROM invoice_lines il JOIN invoices i ON i.id = il.invoice_id
+      LEFT JOIN workspace_records r ON r.id = il.item_id AND r.workspace_id = i.workspace_id
+      WHERE i.workspace_id = $1 AND i.status <> 'void' AND il.item_id IS NOT NULL`, [request.session!.workspaceId])
+    const costs = await client.query(`SELECT item_id,
+      SUM(CASE WHEN movement_type = 'sale' THEN -quantity_delta * unit_cost
+        WHEN movement_type = 'purchase' AND reference LIKE 'Return %' THEN quantity_delta * unit_cost ELSE 0 END)::text AS net_cost
+      FROM inventory_movements WHERE workspace_id = $1 GROUP BY item_id`, [request.session!.workspaceId])
+    const costByItem = new Map<string, number>(costs.rows.map((row: { item_id: unknown; net_cost: unknown }) => [String(row.item_id), Number(row.net_cost ?? 0)]))
+    const productMap = new Map<string, { itemId: string; name: string; quantitySold: number; revenue: number; cost: number }>()
+    for (const row of sales.rows as Array<{ item_id: unknown; data: unknown; quantity: string; returned_quantity: string; discount_amount: string; unit_price: string; description: string }>) {
+      const id = String(row.item_id)
+      const data = row.data as Record<string, unknown> | null
+      const quantity = Math.max(0, Number(row.quantity) - Number(row.returned_quantity))
+      const discount = Number(row.discount_amount) * (Number(row.quantity) > 0 ? quantity / Number(row.quantity) : 0)
+      const revenue = Math.max(0, quantity * Number(row.unit_price) - discount)
+      const prior = productMap.get(id) ?? { itemId: id, name: String(data?.name ?? row.description), quantitySold: 0, revenue: 0, cost: costByItem.get(id) ?? 0 }
+      prior.quantitySold += quantity
+      prior.revenue += revenue
+      productMap.set(id, prior)
+    }
+    const stockLevels = stock.rows.map((row: { data: unknown; quantity: string; item_id: unknown; location_id: unknown; location_name: unknown }) => {
+      const data = row.data as Record<string, unknown>
+      const quantity = Number(row.quantity)
+      const cost = Number(data.cost ?? 0)
+      const reorderPoint = Number(data.reorderPoint ?? 0)
+      return { itemId: String(row.item_id), locationId: String(row.location_id), location: String(row.location_name), name: String(data.name ?? 'Inventory item'), quantity, unit: String(data.unit ?? 'unit'), unitCost: cost, valuation: Number((quantity * cost).toFixed(2)), reorderPoint, needsReorder: reorderPoint > 0 && quantity <= reorderPoint }
+    })
+    const bestSellers = [...productMap.values()].map((item) => ({ ...item, revenue: Number(item.revenue.toFixed(2)), cost: Number(item.cost.toFixed(2)), grossProfit: Number((item.revenue - item.cost).toFixed(2)) }))
+      .sort((left, right) => right.quantitySold - left.quantitySold).slice(0, 20)
+    response.json({ locations: locations.rows, stockLevels, reorderAlerts: stockLevels.filter((item: { needsReorder: boolean }) => item.needsReorder), totalValuation: Number(stockLevels.reduce((sum: number, item: { valuation: number }) => sum + item.valuation, 0).toFixed(2)), bestSellers })
+  } catch (error) { next(error) }
+  finally { client.release() }
 })
 
 app.get('/v1/settings', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
@@ -1246,6 +1882,36 @@ app.get('/v1/workspaces/:workspaceId/invitations', requirePool, requireSession, 
     response.json({ invitations: result.rows })
   } catch (error) { next(error) }
 })
+app.get('/v1/workspaces/:workspaceId/members', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Members can only be managed for the active business.' }); return }
+  try {
+    const result = await pool!.query(`SELECT wm.user_id, wm.role, wm.permissions, u.email, u.phone
+      FROM workspace_members wm JOIN users u ON u.id = wm.user_id
+      WHERE wm.workspace_id = $1 ORDER BY wm.role, u.email, u.phone`, [request.session!.workspaceId])
+    response.json({ members: result.rows.map((member: Record<string, unknown>) => ({
+      userId: String(member.user_id),
+      role: String(member.role),
+      email: member.email ?? '',
+      phone: member.phone ?? '',
+      permissions: Array.isArray(member.permissions) ? member.permissions : null,
+      defaultPermissions: rolePermissionDefaults[String(member.role)] ?? [],
+    })) })
+  } catch (error) { next(error) }
+})
+app.put('/v1/workspaces/:workspaceId/members/:userId/permissions', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Members can only be managed for the active business.' }); return }
+  const input = z.object({ permissions: z.array(z.enum(workspacePermissionNames)).max(workspacePermissionNames.length) }).safeParse(request.body)
+  if (!input.success || new Set(input.data.permissions).size !== input.data.permissions.length) {
+    response.status(400).json({ error: 'Choose a unique list of supported permissions.' }); return
+  }
+  try {
+    const result = await pool!.query(`UPDATE workspace_members SET permissions = $1::jsonb
+      WHERE workspace_id = $2 AND user_id = $3 AND role <> 'admin'
+      RETURNING user_id, role, permissions`, [JSON.stringify(input.data.permissions), request.session!.workspaceId, request.params.userId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Non-admin workspace member not found.' }); return }
+    response.json({ member: result.rows[0] })
+  } catch (error) { next(error) }
+})
 app.post('/v1/invitations/accept', requirePool, verifyOrigin, async (request, response, next) => {
   const input = z.object({ token: z.string().min(32).max(200), email: emailSchema.optional(), password: passwordSchema.optional() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Provide a valid invitation token.' }); return }
@@ -1336,8 +2002,25 @@ function calculateCommercialLines(lines: CommercialLine[]) {
 
 app.get('/v1/invoices', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT id, customer, customer_email, description, amount::text, amount_paid::text, GREATEST(amount - amount_paid, 0)::text AS amount_due, due_date, status, created_at FROM invoices WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
+    const result = await pool!.query(`SELECT i.id, i.customer, i.customer_email, i.description, i.amount::text, i.amount_paid::text,
+      COALESCE(r.returned_amount, 0)::text AS returned_amount, COALESCE(r.refunded_amount, 0)::text AS refunded_amount,
+      GREATEST(i.amount - i.amount_paid - COALESCE(r.returned_amount, 0) + COALESCE(r.refunded_amount, 0), 0)::text AS amount_due,
+      i.due_date, i.status, i.created_at
+      FROM invoices i LEFT JOIN (
+        SELECT invoice_id, SUM(amount) AS returned_amount, SUM(refund_amount) AS refunded_amount
+        FROM sales_returns WHERE workspace_id = $1 GROUP BY invoice_id
+      ) r ON r.invoice_id = i.id
+      WHERE i.workspace_id = $1 ORDER BY i.created_at DESC LIMIT 100`, [request.session!.workspaceId])
     response.json({ invoices: result.rows })
+  } catch (error) { next(error) }
+})
+app.get('/v1/invoices/:invoiceId/lines', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT il.id, il.item_id, il.description, il.quantity::text, il.returned_quantity::text,
+      il.unit_price::text, il.discount_amount::text, il.tax_amount::text, il.total_amount::text
+      FROM invoice_lines il JOIN invoices i ON i.id = il.invoice_id
+      WHERE i.workspace_id = $1 AND i.id = $2 ORDER BY il.line_number`, [request.session!.workspaceId, request.params.invoiceId])
+    response.json({ lines: result.rows })
   } catch (error) { next(error) }
 })
 
@@ -1403,18 +2086,123 @@ app.post('/v1/invoices/:invoiceId/payments', requirePool, verifyOrigin, requireS
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const found = await client.query("SELECT id, customer, description, amount::text, amount_paid::text FROM invoices WHERE id = $1 AND workspace_id = $2 AND status = 'unpaid' FOR UPDATE", [request.params.invoiceId, request.session!.workspaceId])
+    const found = await client.query(`SELECT id, customer, description, amount::text, amount_paid::text
+      FROM invoices WHERE id = $1 AND workspace_id = $2 AND status = 'unpaid' FOR UPDATE`, [request.params.invoiceId, request.session!.workspaceId])
     const invoice = found.rows[0]
     if (!invoice) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Open invoice not found.' }); return }
-    const due = Number(invoice.amount) - Number(invoice.amount_paid)
+    const returns = await client.query('SELECT COALESCE(SUM(amount), 0)::text AS returned, COALESCE(SUM(refund_amount), 0)::text AS refunded FROM sales_returns WHERE invoice_id = $1', [invoice.id])
+    const due = Number(invoice.amount) - Number(invoice.amount_paid) - Number(returns.rows[0].returned) + Number(returns.rows[0].refunded)
     if (Math.round(input.data.amount * 100) > Math.round(due * 100)) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Payment cannot exceed the outstanding invoice balance.' }); return }
     const paymentId = randomUUID()
     await client.query('INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, created_by) VALUES ($1, $2, $3, $4, $5, $6)', [paymentId, request.session!.workspaceId, invoice.id, input.data.amount.toFixed(2), input.data.paymentDate, request.session!.userId])
-    const updated = await client.query("UPDATE invoices SET amount_paid = amount_paid + $1, status = CASE WHEN amount_paid + $1 >= amount THEN 'paid' ELSE 'unpaid' END WHERE id = $2 AND workspace_id = $3 RETURNING amount::text, amount_paid::text, status", [input.data.amount.toFixed(2), invoice.id, request.session!.workspaceId])
+    const updated = await client.query(`UPDATE invoices SET amount_paid = amount_paid + $1,
+      status = CASE WHEN amount_paid + $1 >= amount
+        - COALESCE((SELECT SUM(amount) FROM sales_returns WHERE invoice_id = $2), 0)
+        + COALESCE((SELECT SUM(refund_amount) FROM sales_returns WHERE invoice_id = $2), 0)
+        THEN 'paid' ELSE 'unpaid' END
+      WHERE id = $2 AND workspace_id = $3 RETURNING amount::text, amount_paid::text, status`, [input.data.amount.toFixed(2), invoice.id, request.session!.workspaceId])
     await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.paymentDate, description: `Invoice payment: ${invoice.customer} — ${invoice.description}`, sourceType: 'invoice_payment', sourceId: paymentId, lines: [{ accountCode: '1000', debit: input.data.amount, credit: 0 }, { accountCode: '1100', debit: 0, credit: input.data.amount }] })
     await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'invoice.payment_recorded', entityType: 'invoice', entityId: String(invoice.id), eventData: { paymentId, amount: input.data.amount, paymentDate: input.data.paymentDate } })
     await client.query('COMMIT')
     response.status(201).json({ payment: { id: paymentId, amount: input.data.amount.toFixed(2), ...updated.rows[0] } })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+app.get('/v1/invoices/:invoiceId/returns', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT id, amount::text, refund_amount::text, reason, return_date, created_at
+      FROM sales_returns WHERE workspace_id = $1 AND invoice_id = $2 ORDER BY created_at DESC`, [request.session!.workspaceId, request.params.invoiceId])
+    response.json({ returns: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/invoices/:invoiceId/returns', requirePool, verifyOrigin, requireSession, requireAccountingRole, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    reason: z.string().trim().min(2).max(500),
+    returnDate: z.string().date(),
+    refundAmount: z.coerce.number().finite().min(0).max(999999999999).default(0),
+    restock: z.boolean().default(true),
+    lines: z.array(z.object({ invoiceLineId: z.string().uuid(), quantity: z.coerce.number().finite().positive().max(1_000_000) })).min(1).max(100),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a reason, date, and one or more returned invoice lines.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query(`SELECT id, customer, description, amount::text, amount_paid::text, location_id
+      FROM invoices WHERE id = $1 AND workspace_id = $2 AND status <> 'void' FOR UPDATE`, [request.params.invoiceId, request.session!.workspaceId])
+    const invoice = found.rows[0]
+    if (!invoice) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invoice not found or voided.' }); return }
+    const prior = await client.query('SELECT COALESCE(SUM(amount), 0)::text AS returned, COALESCE(SUM(refund_amount), 0)::text AS refunded FROM sales_returns WHERE invoice_id = $1', [invoice.id])
+    const availableRefund = Math.max(0, Number(invoice.amount_paid) - Number(prior.rows[0].refunded))
+    if (input.data.refundAmount > availableRefund) { await client.query('ROLLBACK'); response.status(409).json({ error: `Refund cannot exceed collected cash still available to refund (${availableRefund.toFixed(2)}).` }); return }
+    const processedLineIds = new Set<string>()
+    let returnedCents = 0
+    let returnedSubtotalCents = 0
+    let returnedTaxCents = 0
+    let costOfGoodsReturned = 0
+    const details: Array<{ lineId: string; itemId: string | null; quantity: number; amountCents: number }> = []
+    for (const returned of input.data.lines) {
+      if (processedLineIds.has(returned.invoiceLineId)) { await client.query('ROLLBACK'); response.status(400).json({ error: 'Each invoice line may appear only once in a return.' }); return }
+      processedLineIds.add(returned.invoiceLineId)
+      const lineResult = await client.query(`SELECT id, item_id, description, quantity::text, returned_quantity::text, unit_price::text,
+        discount_amount::text, tax_amount::text, total_amount::text
+        FROM invoice_lines WHERE id = $1 AND invoice_id = $2 FOR UPDATE`, [returned.invoiceLineId, invoice.id])
+      const line = lineResult.rows[0]
+      if (!line || returned.quantity > Number(line.quantity) - Number(line.returned_quantity)) { await client.query('ROLLBACK'); response.status(409).json({ error: 'A returned quantity exceeds the unreturned quantity on this invoice.' }); return }
+      const ratio = returned.quantity / Number(line.quantity)
+      const lineBaseCents = Math.round(Number(line.quantity) * Math.round(Number(line.unit_price) * 100))
+      const returnedBaseCents = Math.round(lineBaseCents * ratio)
+      const returnedDiscountCents = Math.round(Number(line.discount_amount) * 100 * ratio)
+      const returnedLineTaxCents = Math.round(Number(line.tax_amount) * 100 * ratio)
+      const subtotalCents = returnedBaseCents - returnedDiscountCents
+      const amountCents = subtotalCents + returnedLineTaxCents
+      if (amountCents <= 0) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Returned invoice line has no positive value to credit.' }); return }
+      returnedCents += amountCents
+      returnedSubtotalCents += subtotalCents
+      returnedTaxCents += returnedLineTaxCents
+      details.push({ lineId: String(line.id), itemId: line.item_id ? String(line.item_id) : null, quantity: returned.quantity, amountCents })
+      await client.query('UPDATE invoice_lines SET returned_quantity = returned_quantity + $1 WHERE id = $2', [returned.quantity.toFixed(3), line.id])
+      if (input.data.restock && line.item_id) {
+        const itemResult = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [line.item_id, request.session!.workspaceId])
+        const itemData = itemResult.rows[0]?.data as Record<string, unknown> | undefined
+        if (!itemData) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Inventory item for this return no longer exists.' }); return }
+        const nextQuantity = Number((Number(itemData.quantity ?? 0) + returned.quantity).toFixed(3))
+        await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...itemData, quantity: nextQuantity }), line.item_id, request.session!.workspaceId])
+        const locationId = await ensureInventoryLocation(client, request.session!.workspaceId, invoice.location_id ? String(invoice.location_id) : undefined)
+        if (!locationId) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Invoice stock location is no longer active.' }); return }
+        await client.query(`INSERT INTO inventory_location_stock (workspace_id, location_id, item_id, quantity)
+          VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, location_id, item_id)
+          DO UPDATE SET quantity = inventory_location_stock.quantity + EXCLUDED.quantity, updated_at = now()`,
+        [request.session!.workspaceId, locationId, line.item_id, returned.quantity.toFixed(3)])
+        const unitCost = Number(itemData.cost ?? 0)
+        costOfGoodsReturned += returned.quantity * unitCost
+        await client.query(`INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by)
+          VALUES ($1, $2, $3, $4, 'purchase', $5, $6, $7, $8, $9)`,
+        [randomUUID(), request.session!.workspaceId, line.item_id, locationId, returned.quantity.toFixed(3), unitCost.toFixed(2), `Return ${String(invoice.id).slice(0, 8)}`, input.data.returnDate, request.session!.userId])
+      }
+    }
+    const amount = returnedCents / 100
+    if (input.data.refundAmount > amount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Cash refund cannot exceed the return credit amount.' }); return }
+    const returnId = randomUUID()
+    await client.query('INSERT INTO sales_returns (id, workspace_id, invoice_id, amount, refund_amount, reason, return_date, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [returnId, request.session!.workspaceId, invoice.id, amount.toFixed(2), input.data.refundAmount.toFixed(2), input.data.reason, input.data.returnDate, request.session!.userId])
+    for (const line of details) await client.query('INSERT INTO sales_return_lines (id, return_id, invoice_line_id, item_id, quantity, amount) VALUES ($1, $2, $3, $4, $5, $6)', [randomUUID(), returnId, line.lineId, line.itemId, line.quantity.toFixed(3), (line.amountCents / 100).toFixed(2)])
+    const creditToReceivable = amount - input.data.refundAmount
+    const totalReturned = Number(prior.rows[0].returned) + amount
+    const totalRefunded = Number(prior.rows[0].refunded) + input.data.refundAmount
+    const remainingDueCents = Math.round((Number(invoice.amount) - Number(invoice.amount_paid) - totalReturned + totalRefunded) * 100)
+    await client.query("UPDATE invoices SET status = CASE WHEN $1 > 0 THEN 'unpaid' ELSE 'paid' END WHERE id = $2 AND workspace_id = $3", [remainingDueCents, invoice.id, request.session!.workspaceId])
+    const journalLines: JournalLineInput[] = []
+    if (returnedSubtotalCents > 0) journalLines.push({ accountCode: '4000', debit: returnedSubtotalCents / 100, credit: 0 })
+    if (returnedTaxCents > 0) journalLines.push({ accountCode: '2150', debit: returnedTaxCents / 100, credit: 0 })
+    if (input.data.refundAmount > 0) journalLines.push({ accountCode: '1000', debit: 0, credit: input.data.refundAmount })
+    if (creditToReceivable > 0) journalLines.push({ accountCode: '1100', debit: 0, credit: creditToReceivable })
+    if (costOfGoodsReturned > 0) journalLines.push({ accountCode: '1200', debit: Number(costOfGoodsReturned.toFixed(2)), credit: 0 }, { accountCode: '5100', debit: 0, credit: Number(costOfGoodsReturned.toFixed(2)) })
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.returnDate, description: `Sales return: ${invoice.customer} — ${input.data.reason}`, sourceType: 'sales_return', sourceId: returnId, lines: journalLines })
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'sales.return_recorded', entityType: 'invoice', entityId: String(invoice.id), eventData: { returnId, amount, refundAmount: input.data.refundAmount, restocked: input.data.restock } })
+    await client.query('COMMIT')
+    response.status(201).json({ return: { id: returnId, amount: amount.toFixed(2), refundAmount: input.data.refundAmount.toFixed(2), status: input.data.refundAmount > 0 ? 'refund_recorded' : 'credit_issued' } })
   } catch (error) {
     await client.query('ROLLBACK')
     if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
@@ -1449,6 +2237,7 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
   const input = z.object({
     customer: z.string().trim().min(1).max(160),
     customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''),
+    locationId: z.string().uuid().optional(),
     description: z.string().trim().min(1).max(240).optional(),
     amount: z.coerce.number().finite().positive().max(999999999999).optional(),
     lines: z.array(commercialLineSchema.omit({ recoverableTaxAmount: true })).min(1).max(100).optional(),
@@ -1468,7 +2257,9 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
   try {
     await client.query('BEGIN')
     const id = randomUUID()
-    const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, customer_email, description, amount::text, due_date, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.customerEmail, description, financials.total.toFixed(2), input.data.dueDate])
+    const locationId = financials.lines.some((line) => line.itemId) || input.data.locationId ? await ensureInventoryLocation(client, request.session!.workspaceId, input.data.locationId) : null
+    if (financials.lines.some((line) => line.itemId) && !locationId) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active stock location not found.' }); return }
+    const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date, location_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, customer, customer_email, description, amount::text, due_date, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.customerEmail, description, financials.total.toFixed(2), input.data.dueDate, locationId])
     let costOfGoodsSold = 0
     for (const [index, line] of financials.lines.entries()) {
       if (line.itemId) {
@@ -1476,12 +2267,15 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
         const itemData = item.rows[0]?.data as Record<string, unknown> | undefined
         if (!itemData) { await client.query('ROLLBACK'); response.status(400).json({ error: 'A sales line references an inventory item that is not in this business.' }); return }
         const onHand = Number(itemData.quantity ?? 0)
-        if (line.quantity > onHand) { await client.query('ROLLBACK'); response.status(409).json({ error: `Not enough stock for ${String(itemData.name ?? 'this item')}. Available: ${onHand}.` }); return }
+        const locationStock = await client.query('SELECT quantity::text FROM inventory_location_stock WHERE workspace_id = $1 AND location_id = $2 AND item_id = $3 FOR UPDATE', [request.session!.workspaceId, locationId, line.itemId])
+        const localOnHand = Number(locationStock.rows[0]?.quantity ?? 0)
+        if (line.quantity > localOnHand || line.quantity > onHand) { await client.query('ROLLBACK'); response.status(409).json({ error: `Not enough stock for ${String(itemData.name ?? 'this item')} at the selected location. Available: ${localOnHand}.` }); return }
         const itemCost = Number(itemData.cost ?? 0)
         const nextQuantity = Number((onHand - line.quantity).toFixed(3))
         await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...itemData, quantity: nextQuantity }), line.itemId, request.session!.workspaceId])
+        await client.query('UPDATE inventory_location_stock SET quantity = quantity - $1, updated_at = now() WHERE workspace_id = $2 AND location_id = $3 AND item_id = $4', [line.quantity.toFixed(3), request.session!.workspaceId, locationId, line.itemId])
         const movementId = randomUUID()
-        await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, 'sale', $4, $5, $6, $7, $8)", [movementId, request.session!.workspaceId, line.itemId, (-line.quantity).toFixed(3), itemCost.toFixed(2), `Invoice ${id.slice(0, 8)}`, nairobiToday(), request.session!.userId])
+        await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, $4, 'sale', $5, $6, $7, $8, $9)", [movementId, request.session!.workspaceId, line.itemId, locationId, (-line.quantity).toFixed(3), itemCost.toFixed(2), `Invoice ${id.slice(0, 8)}`, nairobiToday(), request.session!.userId])
         costOfGoodsSold += line.quantity * itemCost
       }
       await client.query('INSERT INTO invoice_lines (id, invoice_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [randomUUID(), id, index + 1, line.itemId ?? null, line.description, line.quantity.toFixed(3), line.unitPrice.toFixed(2), line.discountAmount, line.taxAmount, line.totalAmount])
@@ -1535,6 +2329,48 @@ app.post('/v1/estimates', requirePool, verifyOrigin, requireSession, requireWork
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
+app.get('/v1/sales-orders', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT o.id, o.estimate_id, o.invoice_id, o.status, o.created_at, e.customer, e.description, e.amount::text
+      FROM sales_orders o JOIN estimates e ON e.id = o.estimate_id
+      WHERE o.workspace_id = $1 ORDER BY o.created_at DESC LIMIT 200`, [request.session!.workspaceId])
+    response.json({ orders: result.rows })
+  } catch (error) { next(error) }
+})
+app.post('/v1/estimates/:estimateId/order', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const estimate = await client.query("SELECT id FROM estimates WHERE id = $1 AND workspace_id = $2 AND status = 'accepted' AND invoice_id IS NULL FOR UPDATE", [request.params.estimateId, request.session!.workspaceId])
+    if (!estimate.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only an accepted estimate can become an order.' }); return }
+    const existing = await client.query('SELECT id, status FROM sales_orders WHERE workspace_id = $1 AND estimate_id = $2 FOR UPDATE', [request.session!.workspaceId, request.params.estimateId])
+    if (existing.rows[0] && existing.rows[0].status !== 'cancelled') { await client.query('ROLLBACK'); response.status(409).json({ error: 'This estimate already has an active sales order.' }); return }
+    const id = existing.rows[0]?.id ?? randomUUID()
+    if (existing.rows[0]) {
+      await client.query("UPDATE sales_orders SET status = 'confirmed', invoice_id = NULL, fulfilled_at = NULL WHERE id = $1 AND workspace_id = $2", [id, request.session!.workspaceId])
+    } else {
+      await client.query('INSERT INTO sales_orders (id, workspace_id, estimate_id, created_by) VALUES ($1, $2, $3, $4)', [id, request.session!.workspaceId, request.params.estimateId, request.session!.userId])
+    }
+    await client.query('COMMIT')
+    response.status(201).json({ order: { id, estimateId: request.params.estimateId, status: 'confirmed' } })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+app.patch('/v1/sales-orders/:orderId/status', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ status: z.enum(['fulfilled', 'cancelled']) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Choose fulfilled or cancelled.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query(`UPDATE sales_orders SET status = $1, fulfilled_at = CASE WHEN $1 = 'fulfilled' THEN now() ELSE fulfilled_at END
+      WHERE id = $2 AND workspace_id = $3 AND status = 'confirmed' RETURNING id, estimate_id, status`,
+    [input.data.status, request.params.orderId, request.session!.workspaceId])
+    await client.query('COMMIT')
+    if (!result.rowCount) { response.status(409).json({ error: 'Only a confirmed order can be fulfilled or cancelled.' }); return }
+    response.json({ order: result.rows[0] })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
 app.patch('/v1/estimates/:estimateId/status', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const input = z.object({ status: z.enum(['sent', 'accepted', 'declined', 'void']) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Choose a valid estimate status.' }); return }
@@ -1548,14 +2384,21 @@ app.post('/v1/estimates/:estimateId/convert', requirePool, verifyOrigin, require
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const found = await client.query("SELECT id, customer, customer_email, description, amount::text FROM estimates WHERE id = $1 AND workspace_id = $2 AND status = 'accepted' AND invoice_id IS NULL FOR UPDATE", [request.params.estimateId, request.session!.workspaceId])
+    const found = await client.query("SELECT id, customer, customer_email, description, amount::text, status FROM estimates WHERE id = $1 AND workspace_id = $2 AND status = 'accepted' AND invoice_id IS NULL FOR UPDATE", [request.params.estimateId, request.session!.workspaceId])
     const estimate = found.rows[0]
     if (!estimate) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only an accepted estimate that has not been converted can become an invoice.' }); return }
+    const order = await client.query('SELECT id, status FROM sales_orders WHERE estimate_id = $1 AND workspace_id = $2 FOR UPDATE', [estimate.id, request.session!.workspaceId])
+    if (order.rowCount && order.rows[0].status !== 'fulfilled') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Fulfill the sales order before converting it to an invoice.' }); return }
     const invoiceId = randomUUID()
     const dueDate = z.string().date().safeParse(request.body?.dueDate)
     if (!dueDate.success) { await client.query('ROLLBACK'); response.status(400).json({ error: 'Provide a valid invoice due date.' }); return }
-    const invoice = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, customer, amount::text, due_date, status', [invoiceId, request.session!.workspaceId, estimate.customer, estimate.customer_email, estimate.description, estimate.amount, dueDate.data])
+    const requestedLocation = z.string().uuid().optional().safeParse(request.body?.locationId)
+    if (!requestedLocation.success) { await client.query('ROLLBACK'); response.status(400).json({ error: 'Choose a valid stock location.' }); return }
     const estimateLines = await client.query('SELECT line_number, item_id, description, quantity::text, unit_price::text, discount_amount::text, tax_amount::text, total_amount::text FROM estimate_lines WHERE estimate_id = $1 ORDER BY line_number', [estimate.id])
+    const hasInventory = estimateLines.rows.some((line: Record<string, unknown>) => Boolean(line.item_id))
+    const locationId = hasInventory || requestedLocation.data ? await ensureInventoryLocation(client, request.session!.workspaceId, requestedLocation.data) : null
+    if (hasInventory && !locationId) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active stock location not found.' }); return }
+    const invoice = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date, location_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, customer, amount::text, due_date, status', [invoiceId, request.session!.workspaceId, estimate.customer, estimate.customer_email, estimate.description, estimate.amount, dueDate.data, locationId])
     let invoiceSubtotalCents = 0
     let invoiceTaxCents = 0
     let costOfGoodsSold = 0
@@ -1569,11 +2412,14 @@ app.post('/v1/estimates/:estimateId/convert', requirePool, verifyOrigin, require
         if (!itemData) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This estimate refers to an inventory item that no longer exists.' }); return }
         const onHand = Number(itemData.quantity ?? 0)
         const quantity = Number(line.quantity)
-        if (quantity > onHand) { await client.query('ROLLBACK'); response.status(409).json({ error: `Not enough stock for ${String(itemData.name ?? 'this item')}. Available: ${onHand}.` }); return }
+        const locationStock = await client.query('SELECT quantity::text FROM inventory_location_stock WHERE workspace_id = $1 AND location_id = $2 AND item_id = $3 FOR UPDATE', [request.session!.workspaceId, locationId, line.item_id])
+        const localOnHand = Number(locationStock.rows[0]?.quantity ?? 0)
+        if (quantity > onHand || quantity > localOnHand) { await client.query('ROLLBACK'); response.status(409).json({ error: `Not enough stock for ${String(itemData.name ?? 'this item')} at the selected location. Available: ${localOnHand}.` }); return }
         const itemCost = Number(itemData.cost ?? 0)
         await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3', [JSON.stringify({ ...itemData, quantity: Number((onHand - quantity).toFixed(3)) }), line.item_id, request.session!.workspaceId])
+        await client.query('UPDATE inventory_location_stock SET quantity = quantity - $1, updated_at = now() WHERE workspace_id = $2 AND location_id = $3 AND item_id = $4', [quantity.toFixed(3), request.session!.workspaceId, locationId, line.item_id])
         const movementId = randomUUID()
-        await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, 'sale', $4, $5, $6, $7, $8)", [movementId, request.session!.workspaceId, line.item_id, (-quantity).toFixed(3), itemCost.toFixed(2), `Invoice ${invoiceId.slice(0, 8)}`, nairobiToday(), request.session!.userId])
+        await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, $4, 'sale', $5, $6, $7, $8, $9)", [movementId, request.session!.workspaceId, line.item_id, locationId, (-quantity).toFixed(3), itemCost.toFixed(2), `Invoice ${invoiceId.slice(0, 8)}`, nairobiToday(), request.session!.userId])
         costOfGoodsSold += quantity * itemCost
       }
       await client.query('INSERT INTO invoice_lines (id, invoice_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [randomUUID(), invoiceId, line.line_number, line.item_id, line.description, line.quantity, line.unit_price, line.discount_amount, line.tax_amount, line.total_amount])
@@ -1584,6 +2430,7 @@ app.post('/v1/estimates/:estimateId/convert', requirePool, verifyOrigin, require
     if (costOfGoodsSold > 0) journalLines.push({ accountCode: '5100', debit: Number(costOfGoodsSold.toFixed(2)), credit: 0 }, { accountCode: '1200', debit: 0, credit: Number(costOfGoodsSold.toFixed(2)) })
     await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${estimate.customer} — ${estimate.description}`, sourceType: 'invoice', sourceId: invoiceId, lines: journalLines })
     await client.query("UPDATE estimates SET status = 'converted', invoice_id = $1, updated_at = now() WHERE id = $2", [invoiceId, estimate.id])
+    await client.query("UPDATE sales_orders SET status = 'fulfilled', invoice_id = $1, fulfilled_at = COALESCE(fulfilled_at, now()) WHERE estimate_id = $2 AND workspace_id = $3", [invoiceId, estimate.id, request.session!.workspaceId])
     await client.query('COMMIT')
     response.status(201).json({ invoice: invoice.rows[0] })
   } catch (error) {

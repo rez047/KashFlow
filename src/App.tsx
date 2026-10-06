@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { OnlineStoreApp } from './OnlineStore'
+import { languages, useTranslation, type LanguageCode } from './i18n'
 import {
   Activity, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
   BriefcaseBusiness, Building2, CalendarDays, Check, ChevronRight, CircleHelp,
@@ -65,6 +67,15 @@ type EstimateRecord = { id: string; customer: string; customer_email: string; de
 type VendorBill = { id: string; supplier: string; description: string; amount: string; amount_paid?: string; amount_due?: string; bill_date: string; due_date: string; status: string; approval_status?: string }
 type DraftLine = { itemId?: string; description: string; quantity: string; unitPrice: string; discountAmount: string; taxAmount: string; recoverableTaxAmount?: string }
 type PurchaseOrder = { id: string; supplier: string; status: string; order_date: string; expected_date?: string; lines: Array<{ id: string; item_id: string; item_name: string; quantity: string; received_quantity: string; unit_cost: string }> }
+type InventoryLocation = { id: string; name: string; code: string; is_default: boolean; active: boolean }
+type InventoryLocationStock = { location_id: string; item_id: string; quantity: string; location_name: string }
+type SalesOrder = { id: string; estimate_id: string; invoice_id?: string | null; status: 'confirmed' | 'fulfilled' | 'cancelled'; customer: string; description: string; amount: string }
+type RetailReport = { locations: InventoryLocation[]; stockLevels: Array<{ itemId: string; locationId: string; location: string; name: string; quantity: number; unit: string; unitCost: number; valuation: number; reorderPoint: number; needsReorder: boolean }>; reorderAlerts: Array<{ itemId: string; locationId: string; location: string; name: string; quantity: number; unit: string; reorderPoint: number }>; totalValuation: number; bestSellers: Array<{ itemId: string; name: string; quantitySold: number; revenue: number; cost: number; grossProfit: number }> }
+type OnlineStoreConfig = { slug: string; title: string; description: string; enabled: boolean }
+type StoreOrder = { id: string; status: string; source: string; external_order_id?: string | null; customer_name: string; customer_email: string; customer_phone: string; total: string; invoice_id?: string | null; created_at: string }
+type WooConnection = { store_url: string; enabled: boolean; last_synced_at?: string | null; credentialsConfigured: boolean }
+type MemberPermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
+type WorkspaceMember = { userId: string; role: string; email: string; phone: string; permissions: MemberPermission[] | null; defaultPermissions: MemberPermission[] }
 type TimeEntry = { id: string; description: string; work_date: string; hours: string; hourly_cost: string; billable: boolean; status: string }
 type AgingReport = { asOf: string; receivables: { items: Array<{ id: string; counterparty: string; amount: string; amount_paid: string; due_date: string; days_overdue: number }>; buckets: Record<string, string> }; payables: { items: Array<{ id: string; counterparty: string; amount: string; amount_paid: string; due_date: string; days_overdue: number }>; buckets: Record<string, string> } }
 type BudgetLine = { id: string; account_code: string; account_name: string; period: string; budget: string; actual: string; variance: string }
@@ -87,7 +98,8 @@ type FinancialStatements = {
   incomeStatement: { income: StatementLine[]; expenses: StatementLine[]; totalIncome: number; totalExpenses: number; netIncome: number }
   balanceSheet: { asOf: string; assets: StatementLine[]; liabilities: StatementLine[]; equity: StatementLine[]; accumulatedEarnings: number; totalAssets: number; totalLiabilities: number; totalEquity: number; liabilitiesAndEquity: number; difference: number }
 }
-type Modal = 'invoice' | 'transaction' | 'business' | 'invite' | null
+type Modal = 'invoice' | 'transaction' | 'business' | 'invite' | 'return' | null
+type ReturnLine = { id: string; item_id?: string | null; description: string; quantity: string; returned_quantity: string; unit_price: string; discount_amount: string; tax_amount: string }
 type AccountingPeriod = { period: string; status: 'open' | 'closed'; closed_at?: string }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -169,6 +181,7 @@ function draftDocumentTotal(lines: DraftLine[]) {
 }
 
 function App() {
+  const { language, setLanguage, t } = useTranslation()
   const [page, setPage] = useState('Overview')
   const [pageHistory, setPageHistory] = useState<string[]>([])
   const [search, setSearch] = useState('')
@@ -191,11 +204,13 @@ function App() {
   const [credentials, setCredentials] = useState({ identifier: '', password: '', businessName: '' })
   const [transaction, setTransaction] = useState({ description: '', amount: '', direction: 'expense', account: '', date: today })
   const [invoice, setInvoice] = useState({ customer: '', customerEmail: '', description: '', amount: '', dueDate: '' })
+  const [invoiceLocationId, setInvoiceLocationId] = useState('')
   const [invoiceLines, setInvoiceLines] = useState<DraftLine[]>([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])
   const [estimateLines, setEstimateLines] = useState<DraftLine[]>([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])
   const [billLines, setBillLines] = useState<DraftLine[]>([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0', recoverableTaxAmount: '0' }])
   const [paymentAmounts, setPaymentAmounts] = useState<Record<string, string>>({})
   const [posSearch, setPosSearch] = useState('')
+  const [posLocationId, setPosLocationId] = useState('')
   const [posCart, setPosCart] = useState<PosCartLine[]>([])
   const [posCustomer, setPosCustomer] = useState('')
   const [posPaymentMethod, setPosPaymentMethod] = useState<'cash' | 'mpesa'>('cash')
@@ -204,8 +219,25 @@ function App() {
   const [estimateInput, setEstimateInput] = useState({ customer: '', customerEmail: '', description: '', amount: '', validUntil: today })
   const [billInput, setBillInput] = useState({ supplier: '', description: '', amount: '', billDate: today, dueDate: today, requiresApproval: false })
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([])
-  const [purchaseOrderInput, setPurchaseOrderInput] = useState({ supplier: '', orderDate: today, dueDate: today, expectedDate: today, itemId: '', quantity: '1', unitCost: '0' })
-  const [stockMovementInput, setStockMovementInput] = useState({ itemId: '', movementType: 'purchase' as 'purchase' | 'sale' | 'adjustment', adjustmentDirection: 'increase' as 'increase' | 'decrease', quantity: '1', unitCost: '0', reference: '', date: today })
+  const [purchaseOrderInput, setPurchaseOrderInput] = useState({ supplier: '', orderDate: today, dueDate: today, expectedDate: today, locationId: '', itemId: '', quantity: '1', unitCost: '0' })
+  const [stockMovementInput, setStockMovementInput] = useState({ itemId: '', locationId: '', movementType: 'purchase' as 'purchase' | 'sale' | 'adjustment', adjustmentDirection: 'increase' as 'increase' | 'decrease', quantity: '1', unitCost: '0', reference: '', date: today })
+  const [inventoryLocations, setInventoryLocations] = useState<InventoryLocation[]>([])
+  const [inventoryLocationStock, setInventoryLocationStock] = useState<InventoryLocationStock[]>([])
+  const [locationInput, setLocationInput] = useState({ name: '', code: '' })
+  const [transferInput, setTransferInput] = useState({ itemId: '', fromLocationId: '', toLocationId: '', quantity: '1' })
+  const [countInput, setCountInput] = useState({ itemId: '', locationId: '', countedQuantity: '0' })
+  const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
+  const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
+  const [storeConfig, setStoreConfig] = useState<OnlineStoreConfig>({ slug: '', title: '', description: '', enabled: false })
+  const [storeOrders, setStoreOrders] = useState<StoreOrder[]>([])
+  const [wooConnection, setWooConnection] = useState<WooConnection | null>(null)
+  const [wooEncryptionReady, setWooEncryptionReady] = useState(false)
+  const [wooCredentials, setWooCredentials] = useState({ storeUrl: '', consumerKey: '', consumerSecret: '' })
+  const [teamMembers, setTeamMembers] = useState<WorkspaceMember[]>([])
+  const [memberPermissionDrafts, setMemberPermissionDrafts] = useState<Record<string, MemberPermission[]>>({})
+  const [posBridgeStatus, setPosBridgeStatus] = useState('')
+  const [posBridgeBusy, setPosBridgeBusy] = useState(false)
+  const [posBridgeAddress, setPosBridgeAddress] = useState(() => localStorage.getItem('kashflow-pos-bridge') || 'http://127.0.0.1:17371')
   const [timeInput, setTimeInput] = useState({ projectId: '', description: '', workDate: today, hours: '', hourlyCost: '', billable: false })
   const [timeEntries, setTimeEntries] = useState<TimeEntry[]>([])
   const [projectSummary, setProjectSummary] = useState<Record<string, string> | null>(null)
@@ -245,6 +277,10 @@ function App() {
   const [storedDocuments, setStoredDocuments] = useState<StoredDocument[]>([])
   const [bankImportRows, setBankImportRows] = useState<Array<{ date: string; description: string; amount: string; direction: 'income' | 'expense' }>>([])
   const [invoicePreview, setInvoicePreview] = useState<InvoiceRecord | null>(null)
+  const [returnInvoice, setReturnInvoice] = useState<InvoiceRecord | null>(null)
+  const [returnLines, setReturnLines] = useState<ReturnLine[]>([])
+  const [returnQuantities, setReturnQuantities] = useState<Record<string, string>>({})
+  const [returnInput, setReturnInput] = useState({ reason: '', refundAmount: '0', restock: true })
   const [complianceDrafts, setComplianceDrafts] = useState<ComplianceDraft[]>([])
   const [onboarding, setOnboarding] = useState<Record<string, { milestone: string; note: string; details: Record<string, string | boolean> }>>({})
   const [reviewerDetails] = useState({ name: '', qualification: '', registration: '', reference: '' })
@@ -356,16 +392,25 @@ function App() {
         request<{ invoices: InvoiceRecord[] }>('/v1/invoices').then((result) => setInvoicesList(result.invoices)),
         request<{ estimates: EstimateRecord[] }>('/v1/estimates').then((result) => setEstimates(result.estimates)),
         request<{ templates: RecurringTemplate[] }>('/v1/recurring').then((result) => setRecurringTemplates(result.templates)),
+        request<{ orders: SalesOrder[] }>('/v1/sales-orders').then((result) => setSalesOrders(result.orders)),
         request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
+        request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setInvoiceLocationId((current) => current || result.defaultLocationId) }),
+        request<{ orders: StoreOrder[] }>('/v1/store/orders').then((result) => setStoreOrders(result.orders)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load sales records.'))
     }
     if (page === 'Point of sale') {
       void Promise.all([
         request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
         request<{ records: WorkspaceRecord[] }>('/v1/records/customers').then((result) => setRecords((current) => ({ ...current, customers: result.records }))),
+        request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setPosLocationId((current) => current || result.defaultLocationId) }),
+        request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock').then((result) => setInventoryLocationStock(result.stock)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load point-of-sale items.'))
     }
-    if (page === 'Inventory') void request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders').then((result) => setPurchaseOrders(result.purchaseOrders)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load purchase orders.'))
+    if (page === 'Inventory') void Promise.all([
+      request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders').then((result) => setPurchaseOrders(result.purchaseOrders)),
+      request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setStockMovementInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })); setPurchaseOrderInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })) }),
+      request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock').then((result) => setInventoryLocationStock(result.stock)),
+    ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load inventory and location records.'))
     if (page === 'Reports') {
       const period = today.slice(0, 7)
       void Promise.all([
@@ -373,6 +418,7 @@ function App() {
         request<{ forecast: Array<{ period: string; income: number; expenses: number; source: string }> }>('/v1/reports/cash-flow-forecast').then((result) => setForecast(result.forecast)),
         request<AgingReport>(`/v1/reports/aging?asOf=${today}`).then(setAgingReport),
         request<{ accounts: AccountSummary[] }>('/v1/accounting/chart').then((result) => setAccounts(result.accounts)),
+        request<RetailReport>('/v1/reports/retail').then(setRetailReport),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load management reports.'))
     }
     if (page === 'Banking') {
@@ -395,9 +441,147 @@ function App() {
     if (recordType) void request<{ records: WorkspaceRecord[] }>(`/v1/records/${recordType}`).then((result) => setRecords((current) => ({ ...current, [recordType]: result.records }))).catch((reason) => setError(reason instanceof Error ? reason.message : `Could not load ${page.toLowerCase()}.`))
     if (page === 'Suppliers') void request<{ bills: VendorBill[] }>('/v1/bills').then((result) => setBills(result.bills)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load supplier bills.'))
     if (page === 'Documents' || page === 'Overview') void request<{ documents: StoredDocument[] }>('/v1/documents').then((result) => setStoredDocuments(result.documents)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load stored documents.'))
-    if (page === 'Settings') void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
+    if (page === 'Settings') {
+      void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
+      void Promise.all([
+        request<{ store: OnlineStoreConfig | null }>('/v1/store/settings').then(({ store }) => {
+          const slug = dashboard?.workspaceName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'my-store'
+          setStoreConfig(store ?? { slug, title: dashboard?.workspaceName ?? '', description: '', enabled: false })
+        }),
+        request<{ orders: StoreOrder[] }>('/v1/store/orders').then((result) => setStoreOrders(result.orders)),
+        request<{ connection: WooConnection | null; encryptionReady: boolean }>('/v1/integrations/woocommerce').then((result) => {
+          setWooConnection(result.connection); setWooEncryptionReady(result.encryptionReady)
+          if (result.connection) setWooCredentials((current) => ({ ...current, storeUrl: result.connection!.store_url }))
+        }),
+        request<{ members: WorkspaceMember[] }>(`/v1/workspaces/${account.workspace.id}/members`).then((result) => {
+          setTeamMembers(result.members)
+          setMemberPermissionDrafts(Object.fromEntries(result.members.map((member) => [member.userId, member.permissions ?? member.defaultPermissions])))
+        }),
+      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load store, WooCommerce, or team settings.'))
+    }
     else if (account) void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
   }, [account, dashboard?.workspaceName, page])
+
+  async function saveStoreSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      const result = await request<{ store: OnlineStoreConfig }>('/v1/store/settings', { method: 'PUT', body: JSON.stringify(storeConfig) })
+      setStoreConfig(result.store); notify('Online store settings saved.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save online store settings.') }
+    finally { setBusy(false) }
+  }
+
+  async function updateStoreOrder(order: StoreOrder, status: 'accepted' | 'rejected' | 'fulfilled') {
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/store/orders/${order.id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) })
+      const result = await request<{ orders: StoreOrder[] }>('/v1/store/orders')
+      setStoreOrders(result.orders); notify(`Online order marked ${status}.`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not update online order.') }
+    finally { setBusy(false) }
+  }
+
+  async function convertStoreOrder(order: StoreOrder) {
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ invoice: InvoiceRecord }>(`/v1/store/orders/${order.id}/convert`, { method: 'POST', body: JSON.stringify({}) })
+      const [orders, invoices, inventory, stock] = await Promise.all([
+        request<{ orders: StoreOrder[] }>('/v1/store/orders'),
+        request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
+        request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
+        request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock'),
+      ])
+      setStoreOrders(orders.orders); setInvoicesList(invoices.invoices); setRecords((current) => ({ ...current, inventory: inventory.records })); setInventoryLocationStock(stock.stock)
+      await refresh(); notify(`Order converted to invoice ${result.invoice.id.slice(0, 8)}; check payment and delivery separately.`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not convert online order to invoice.') }
+    finally { setBusy(false) }
+  }
+
+  async function saveWooCommerce(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      const result = await request<{ connection: WooConnection }>('/v1/integrations/woocommerce', { method: 'PUT', body: JSON.stringify(wooCredentials) })
+      setWooConnection(result.connection); setWooCredentials((current) => ({ ...current, consumerKey: '', consumerSecret: '' })); notify('WooCommerce credentials encrypted and saved for this business.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save WooCommerce credentials.') }
+    finally { setBusy(false) }
+  }
+
+  async function syncWooCommerce(kind: 'products' | 'orders') {
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ synced?: number; failed?: number; failures?: Array<{ item: string; reason: string }>; imported?: number; skipped?: number; note?: string }>(`/v1/integrations/woocommerce/${kind}/sync`, { method: 'POST', body: '{}' })
+      if (kind === 'orders') {
+        const orders = await request<{ orders: StoreOrder[] }>('/v1/store/orders')
+        setStoreOrders(orders.orders)
+        notify(`${result.imported ?? 0} order(s) imported; ${result.skipped ?? 0} skipped for review. ${result.note ?? ''}`)
+      } else {
+        notify(`${result.synced ?? 0} products synced; ${result.failed ?? 0} failed.${result.failures?.length ? ` ${result.failures.map((failure) => `${failure.item}: ${failure.reason}`).join('; ')}` : ''}`)
+      }
+      const status = await request<{ connection: WooConnection | null; encryptionReady: boolean }>('/v1/integrations/woocommerce')
+      setWooConnection(status.connection); setWooEncryptionReady(status.encryptionReady)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : `Could not synchronize WooCommerce ${kind}.`) }
+    finally { setBusy(false) }
+  }
+
+  async function saveMemberPermissions(member: WorkspaceMember) {
+    setBusy(true); setError('')
+    try {
+      const permissions = memberPermissionDrafts[member.userId] ?? []
+      await request(`/v1/workspaces/${account?.workspace.id}/members/${member.userId}/permissions`, { method: 'PUT', body: JSON.stringify({ permissions }) })
+      setTeamMembers((current) => current.map((item) => item.userId === member.userId ? { ...item, permissions } : item))
+      notify(`Permissions saved for ${member.email || member.phone}.`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save member permissions.') }
+    finally { setBusy(false) }
+  }
+
+  function toggleMemberPermission(userId: string, permission: MemberPermission, enabled: boolean) {
+    setMemberPermissionDrafts((current) => {
+      const active = current[userId] ?? []
+      const next = enabled ? [...new Set([...active, permission])] : active.filter((value) => value !== permission)
+      return { ...current, [userId]: next }
+    })
+  }
+
+  function changePosBridgeAddress(value: string) {
+    setPosBridgeAddress(value)
+    localStorage.setItem('kashflow-pos-bridge', value)
+    setPosBridgeStatus('')
+  }
+
+  function validatePosBridgeAddress() {
+    const parsed = new URL(posBridgeAddress)
+    if (parsed.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(parsed.hostname) || parsed.username || parsed.password) throw new Error('The POS bridge must use http://127.0.0.1 or http://localhost on this register.')
+    return parsed.origin
+  }
+
+  async function testPosBridge() {
+    setPosBridgeBusy(true); setPosBridgeStatus('')
+    try {
+      const origin = validatePosBridgeAddress()
+      const response = await fetch(`${origin}/health`, { signal: AbortSignal.timeout(3000) })
+      if (!response.ok) throw new Error(`Local bridge returned HTTP ${response.status}.`)
+      setPosBridgeStatus('Local printer bridge is reachable. Receipt printing requires the configured ESC/POS network printer.')
+    } catch (reason) { setPosBridgeStatus(reason instanceof Error ? reason.message : 'Could not reach the local printer bridge.') }
+    finally { setPosBridgeBusy(false) }
+  }
+
+  async function sendPosHardwareCommand(path: '/receipt' | '/cash-drawer') {
+    if (!posReceipt) return
+    setPosBridgeBusy(true); setPosBridgeStatus('')
+    try {
+      const origin = validatePosBridgeAddress()
+      const response = await fetch(`${origin}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(posReceipt),
+        signal: AbortSignal.timeout(10_000),
+      })
+      const result = await response.json().catch(() => ({})) as { error?: string; status?: string }
+      if (!response.ok) throw new Error(result.error || `Local bridge returned HTTP ${response.status}.`)
+      setPosBridgeStatus(path === '/receipt' ? 'Receipt sent to the thermal printer.' : 'Cash-drawer pulse sent through the printer.')
+    } catch (reason) { setPosBridgeStatus(reason instanceof Error ? reason.message : 'Local POS hardware command failed.') }
+    finally { setPosBridgeBusy(false) }
+  }
 
   function notify(message: string) {
     setToast(message)
@@ -527,7 +711,7 @@ function App() {
   }
 
   function addPosItem(item: WorkspaceRecord) {
-    const onHand = Number(item.data.quantity ?? 0)
+    const onHand = Number(inventoryLocationStock.find((stock) => stock.location_id === posLocationId && stock.item_id === item.id)?.quantity ?? 0)
     const existing = posCart.find((line) => line.itemId === item.id)
     if (onHand <= 0 || (existing && existing.quantity >= onHand)) return
     const itemName = String(item.data.name ?? 'Inventory item')
@@ -539,6 +723,18 @@ function App() {
       if (line) return cart.map((entry) => entry.itemId === item.id ? { ...entry, quantity: entry.quantity + 1 } : entry)
       return [...cart, { itemId: item.id, description: itemName, quantity: 1, unitPrice, onHand }]
     })
+  }
+
+  function scanPosBarcode(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key !== 'Enter') return
+    const code = event.currentTarget.value.trim().toLowerCase()
+    if (!code) return
+    const item = records.inventory.find((record) => [record.data.barcode, record.data.sku].some((value) => String(value ?? '').trim().toLowerCase() === code))
+    if (item) {
+      event.preventDefault()
+      addPosItem(item)
+      setPosSearch('')
+    }
   }
 
   function changePosQuantity(itemId: string, quantity: number) {
@@ -575,6 +771,7 @@ function App() {
         body: JSON.stringify({
           customer,
           customerEmail: '',
+          locationId: posLocationId || undefined,
           dueDate: today,
           lines: saleLines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: 0 })),
         }),
@@ -610,7 +807,9 @@ function App() {
           request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
           request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
         ])
+        const locationStock = await request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock')
         setRecords((current) => ({ ...current, inventory: inventory.records }))
+        setInventoryLocationStock(locationStock.stock)
         setInvoicesList(listedInvoices.invoices)
         await refresh()
       } catch (reason) {
@@ -633,6 +832,8 @@ function App() {
       notify('Cash payment recorded against the saved POS invoice.')
       const listedInvoices = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
       setInvoicesList(listedInvoices.invoices)
+      const locationStock = await request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock')
+      setInventoryLocationStock(locationStock.stock)
       await refresh()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not record the cash payment.')
@@ -647,10 +848,12 @@ function App() {
       const created = await request<{ invoice: { id: string } }>('/v1/invoices', { method: 'POST', body: JSON.stringify({
         customer: invoice.customer,
         customerEmail: invoice.customerEmail,
+        locationId: invoiceLocationId || undefined,
         dueDate: invoice.dueDate,
         lines: invoiceLines.map((line) => ({ itemId: line.itemId || undefined, description: line.description, quantity: Number(line.quantity), unitPrice: Number(line.unitPrice), discountAmount: Number(line.discountAmount || 0), taxAmount: Number(line.taxAmount || 0) })),
       }) })
       setModal(null); setInvoice({ customer: '', customerEmail: '', description: '', amount: '', dueDate: '' })
+      setInvoiceLocationId('')
       setInvoiceLines([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])
       void request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))).catch((reason) => setError(reason instanceof Error ? `Invoice saved, but stock could not be refreshed: ${reason.message}` : 'Invoice saved, but stock could not be refreshed.'))
       if (page === 'Sales') {
@@ -748,11 +951,42 @@ function App() {
     finally { setBusy(false) }
   }
 
+  async function createInventoryLocation(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      await request('/v1/inventory/locations', { method: 'POST', body: JSON.stringify(locationInput) })
+      const [locationResult, stockResult] = await Promise.all([request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations'), request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock')])
+      setInventoryLocations(locationResult.locations); setInventoryLocationStock(stockResult.stock); setLocationInput({ name: '', code: '' }); notify('Stock location created.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create stock location.') }
+    finally { setBusy(false) }
+  }
+
+  async function transferInventory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      await request('/v1/inventory/transfers', { method: 'POST', body: JSON.stringify({ ...transferInput, quantity: Number(transferInput.quantity), date: today }) })
+      const result = await request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock')
+      setInventoryLocationStock(result.stock); setTransferInput((current) => ({ ...current, quantity: '1' })); notify('Stock transfer recorded between locations.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not transfer stock.') }
+    finally { setBusy(false) }
+  }
+
+  async function countInventory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      await request('/v1/inventory/counts', { method: 'POST', body: JSON.stringify({ ...countInput, countedQuantity: Number(countInput.countedQuantity), date: today }) })
+      const [stock, inventory] = await Promise.all([request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock'), request<{ records: WorkspaceRecord[] }>('/v1/records/inventory')])
+      setInventoryLocationStock(stock.stock); setRecords((current) => ({ ...current, inventory: inventory.records })); await refresh(); notify('Stock count adjustment recorded.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not post stock count.') }
+    finally { setBusy(false) }
+  }
+
   async function createPurchaseOrder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
       await request('/v1/purchase-orders', { method: 'POST', body: JSON.stringify({
         supplier: purchaseOrderInput.supplier,
+        locationId: purchaseOrderInput.locationId,
         orderDate: purchaseOrderInput.orderDate,
         dueDate: purchaseOrderInput.dueDate,
         expectedDate: purchaseOrderInput.expectedDate,
@@ -853,6 +1087,52 @@ function App() {
       const [updatedEstimates, updatedInvoices, updatedInventory] = await Promise.all([request<{ estimates: EstimateRecord[] }>('/v1/estimates'), request<{ invoices: InvoiceRecord[] }>('/v1/invoices'), request<{ records: WorkspaceRecord[] }>('/v1/records/inventory')])
       setEstimates(updatedEstimates.estimates); setInvoicesList(updatedInvoices.invoices); setRecords((current) => ({ ...current, inventory: updatedInventory.records })); await refresh(); notify('Accepted estimate converted to an invoice.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not convert estimate.') }
+    finally { setBusy(false) }
+  }
+
+  async function createSalesOrder(estimate: EstimateRecord) {
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/estimates/${estimate.id}/order`, { method: 'POST', body: JSON.stringify({}) })
+      const [orders, updatedEstimates] = await Promise.all([request<{ orders: SalesOrder[] }>('/v1/sales-orders'), request<{ estimates: EstimateRecord[] }>('/v1/estimates')])
+      setSalesOrders(orders.orders); setEstimates(updatedEstimates.estimates); notify('Accepted quote converted into a confirmed sales order.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create sales order.') }
+    finally { setBusy(false) }
+  }
+
+  async function updateSalesOrder(order: SalesOrder, status: 'fulfilled' | 'cancelled') {
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/sales-orders/${order.id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) })
+      const [result, updatedEstimates] = await Promise.all([request<{ orders: SalesOrder[] }>('/v1/sales-orders'), status === 'cancelled' ? request<{ estimates: EstimateRecord[] }>('/v1/estimates') : Promise.resolve(null)])
+      setSalesOrders(result.orders)
+      if (updatedEstimates) setEstimates(updatedEstimates.estimates)
+      notify(status === 'fulfilled' ? 'Sales order marked fulfilled; convert it to an invoice to post the sale.' : 'Sales order cancelled.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not update sales order.') }
+    finally { setBusy(false) }
+  }
+
+  async function openSalesReturn(invoiceRow: InvoiceRecord) {
+    setError(''); setReturnInvoice(invoiceRow); setReturnQuantities({}); setReturnInput({ reason: '', refundAmount: '0', restock: true }); setBusy(true)
+    try {
+      const result = await request<{ lines: ReturnLine[] }>(`/v1/invoices/${invoiceRow.id}/lines`)
+      setReturnLines(result.lines)
+      setModal('return')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not load invoice lines for return.') }
+    finally { setBusy(false) }
+  }
+
+  async function saveSalesReturn(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!returnInvoice) return
+    const lines = Object.entries(returnQuantities).filter(([, quantity]) => Number(quantity) > 0).map(([invoiceLineId, quantity]) => ({ invoiceLineId, quantity: Number(quantity) }))
+    if (!lines.length) { setError('Enter a return quantity for at least one invoice line.'); return }
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/invoices/${returnInvoice.id}/returns`, { method: 'POST', body: JSON.stringify({ ...returnInput, refundAmount: Number(returnInput.refundAmount), returnDate: today, lines }) })
+      const [invoices, inventory, stock] = await Promise.all([request<{ invoices: InvoiceRecord[] }>('/v1/invoices'), request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'), request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock')])
+      setInvoicesList(invoices.invoices); setRecords((current) => ({ ...current, inventory: inventory.records })); setInventoryLocationStock(stock.stock); setModal(null); setReturnInvoice(null); await refresh(); notify('Return credit and any stock/refund entries were recorded. Make any external cash refund separately.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not record sales return.') }
     finally { setBusy(false) }
   }
 
@@ -1014,7 +1294,7 @@ function App() {
   async function saveWorkspaceRecord(event: FormEvent<HTMLFormElement>, type: 'customers' | 'suppliers' | 'inventory' | 'projects') {
     event.preventDefault(); setBusy(true); setError('')
     const body: Record<string, unknown> = { ...recordForm }
-    if (type === 'inventory' || type === 'projects') for (const key of type === 'inventory' ? ['quantity', 'cost', 'price'] : ['budget']) body[key] = Number(body[key] || 0)
+    if (type === 'inventory' || type === 'projects') for (const key of type === 'inventory' ? ['quantity', 'cost', 'price', 'reorderPoint'] : ['budget']) body[key] = Number(body[key] || 0)
     try {
       await request(editingRecordId ? `/v1/records/${type}/${editingRecordId}` : `/v1/records/${type}`, { method: editingRecordId ? 'PUT' : 'POST', body: JSON.stringify(body) })
       const result = await request<{ records: WorkspaceRecord[] }>(`/v1/records/${type}`)
@@ -1304,8 +1584,9 @@ function App() {
     `${row.description} ${row.account} ${row.direction}`.toLowerCase().includes(search.toLowerCase())), [dashboard, search])
   const posItems = useMemo(() => records.inventory.filter((item) => {
     const query = posSearch.trim().toLowerCase()
-    return !query || `${item.data.name ?? ''} ${item.data.sku ?? ''} ${item.data.notes ?? ''}`.toLowerCase().includes(query)
-  }), [records.inventory, posSearch])
+    const stock = Number(inventoryLocationStock.find((row) => row.location_id === posLocationId && row.item_id === item.id)?.quantity ?? 0)
+    return stock > 0 && (!query || `${item.data.name ?? ''} ${item.data.sku ?? ''} ${item.data.barcode ?? ''} ${item.data.notes ?? ''}`.toLowerCase().includes(query))
+  }), [records.inventory, inventoryLocationStock, posLocationId, posSearch])
   const posTotal = posCart.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
   const chart = useMemo(() => (dashboard?.cashflow ?? []).map((row) => ({
     date: new Date(`${row.date}T00:00:00`).toLocaleDateString('en-KE', { day: 'numeric', month: 'short' }),
@@ -1361,26 +1642,30 @@ function App() {
     { title: 'Unpaid invoices', value: dashboard?.invoices.unpaid_amount ?? '0', Icon: Wallet, tone: 'mint-icon', destination: 'Sales' },
   ]
 
+  if (window.location.pathname.startsWith('/store/') || window.location.pathname.startsWith('/portal/')) {
+    return <OnlineStoreApp apiBase={API_BASE} pathname={window.location.pathname} />
+  }
+
   return <div className="app-shell">
     <aside className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
-      <div className="brand-row"><div className="brand-mark">K</div><div className="brand-name">Kash<span>Flow</span><small>BUSINESS SUITE</small></div>
+      <div className="brand-row"><div className="brand-mark">K</div><div className="brand-name">Kash<span>Flow</span><small>{t('BUSINESS SUITE')}</small></div>
         <button className="icon-button sidebar-close" onClick={() => setSidebarOpen(false)} aria-label="Close menu"><X size={18} /></button>
       </div>
       <div className="company-switcher"><span className="company-avatar">{dashboard?.workspaceName.slice(0, 1).toUpperCase()}</span>
         <span className="company-copy"><strong>{dashboard?.workspaceName}</strong><small>{account?.workspaces?.length ? `${account.workspaces.length} businesses` : 'Private workspace'}</small></span>
       </div>
-      <button className="nav-link bottom-link" onClick={() => { setModal('business'); setSidebarOpen(false) }}><Plus size={18} /> Add business</button>
+      <button className="nav-link bottom-link" onClick={() => { setModal('business'); setSidebarOpen(false) }}><Plus size={18} /> {t('Add business')}</button>
       <nav className="side-nav" aria-label="Main navigation">
-        {groups.map((group) => <div className="nav-group" key={group.title}><p className="nav-heading">{group.title}</p>
+        {groups.map((group) => <div className="nav-group" key={group.title}><p className="nav-heading">{t(group.title)}</p>
           {group.items.map(([name, Icon]) => <button key={name} className={`nav-link ${page === name ? 'active' : ''}`} onClick={() => { navigateTo(name); setSidebarOpen(false) }}>
-            <Icon size={18} strokeWidth={1.8} /><span>{name}</span>
+            <Icon size={18} strokeWidth={1.8} /><span>{t(name)}</span>
           </button>)}
         </div>)}
       </nav>
       <div className="sidebar-bottom">
-        <div className="help-card"><div className="help-icon"><ShieldCheck size={16} /></div><strong>Private workspace</strong><p>Records you enter are saved to your account database.</p></div>
-        <button className="nav-link bottom-link" onClick={() => navigateTo('Settings')}><Settings2 size={18} /> Settings</button>
-        <button className="nav-link bottom-link" onClick={() => navigateTo('Help')}><LifeBuoy size={18} /> Help & support</button>
+        <div className="help-card"><div className="help-icon"><ShieldCheck size={16} /></div><strong>{t('Private workspace')}</strong><p>{t('Records you enter are saved to your account database.')}</p></div>
+        <button className="nav-link bottom-link" onClick={() => navigateTo('Settings')}><Settings2 size={18} /> {t('Settings')}</button>
+        <button className="nav-link bottom-link" onClick={() => navigateTo('Help')}><LifeBuoy size={18} /> {t('Help & support')}</button>
         <div className="profile-row"><div className="profile-avatar">{account.user.email.slice(0, 1).toUpperCase()}</div>
           <div className="profile-copy"><strong>{account.user.email}</strong><small>{account.workspaces?.length ? `Business admin • ${account.workspaces.length} businesses` : 'Workspace admin'}</small></div>
           <button className="icon-button" onClick={() => void logout()} aria-label="Sign out"><LogOut size={16} /></button>
@@ -1391,8 +1676,9 @@ function App() {
     <main className="main-area">
       <header className="topbar">
         <button className="icon-button mobile-menu" aria-label="Open menu" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button>
-        <div className="breadcrumbs"><span>{dashboard?.workspaceName}</span><ChevronRight size={14} /><strong>{page}</strong><span className="demo-tag">SAVED WORKSPACE DATA</span></div>
+        <div className="breadcrumbs"><span>{dashboard?.workspaceName}</span><ChevronRight size={14} /><strong>{t(page)}</strong><span className="demo-tag">{t('SAVED WORKSPACE DATA')}</span></div>
         <div className="topbar-actions">
+          <label className="language-picker"><span>{t('Language')}</span><select aria-label={t('Language')} value={language} onChange={(event) => setLanguage(event.target.value as LanguageCode)}>{languages.map((item) => <option key={item.code} value={item.code}>{item.name}</option>)}</select></label>
           <label className="search-box"><Search size={16} /><input aria-label="Search saved transactions" placeholder="Search records, settings, or help..." value={search} onChange={(event) => setSearch(event.target.value)} /><kbd>⌘ K</kbd></label>
           <button className="icon-button notification-button" aria-label="Workspace status" onClick={() => setStatusOpen((open) => !open)}><Bell size={18} /></button>
           <button className="top-help" onClick={() => navigateTo('Help')}><CircleHelp size={17} /><span>Help</span></button>
@@ -1406,15 +1692,15 @@ function App() {
           <section className="welcome-row"><div><div className="eyebrow"><span className="live-dot" /> PRIVATE WORKSPACE</div>
             <h1>{dashboard?.workspaceName}</h1><p className="welcome-subtitle">Your saved records for this month.</p>
           </div><div className="welcome-actions">
-            <button className="button button-secondary" onClick={() => { setError(''); setModal('transaction') }}><Plus size={16} /> Add transaction</button>
-            <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}><Plus size={17} /> Create invoice</button>
-            <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={16} /> Invite member</button>
+            <button className="button button-secondary" onClick={() => { setError(''); setModal('transaction') }}><Plus size={16} /> {t('Add transaction')}</button>
+            <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}><Plus size={17} /> {t('Create invoice')}</button>
+            <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={16} /> {t('Invite member')}</button>
           </div></section>
 
           <section className="metric-grid" aria-label="Saved business totals">
-            {metricCards.map(({ title, value, Icon, tone, destination }) => <button type="button" className="metric-card metric-card-link" key={title} onClick={() => navigateTo(destination)} aria-label={`Open ${title} details`}>
-              <div className="metric-top"><span>{title}</span><span className={`metric-icon ${tone}`}><Icon size={17} /></span></div>
-              <div className="metric-value">{money(value)}</div><div className="metric-foot"><span>View related records <ArrowRight size={12} /></span></div>
+            {metricCards.map(({ title, value, Icon, tone, destination }) =>             <button type="button" className="metric-card metric-card-link" key={title} onClick={() => navigateTo(destination)} aria-label={`${t('Open')} ${t(title)} ${t('details')}`}>
+                <div className="metric-top"><span>{t(title)}</span><span className={`metric-icon ${tone}`}><Icon size={17} /></span></div>
+                <div className="metric-value">{money(value)}</div><div className="metric-foot"><span>{t('View related records')} <ArrowRight size={12} /></span></div>
             </button>)}
           </section>
 
@@ -1609,7 +1895,7 @@ function App() {
           const fields: Record<string, Array<{ name: string; label: string; kind?: string }>> = {
             customers: [{ name: 'name', label: 'Customer name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
             suppliers: [{ name: 'name', label: 'Supplier name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
-            inventory: [{ name: 'name', label: 'Item or service name' }, { name: 'sku', label: 'SKU' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
+            inventory: [{ name: 'name', label: 'Item or service name' }, { name: 'sku', label: 'SKU' }, { name: 'barcode', label: 'Barcode (scanner input)' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'reorderPoint', label: 'Low-stock alert at', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
             projects: [{ name: 'name', label: 'Project name' }, { name: 'customer', label: 'Customer' }, { name: 'status', label: 'Status', kind: 'status' }, { name: 'startDate', label: 'Start date', kind: 'date' }, { name: 'endDate', label: 'End date', kind: 'date' }, { name: 'budget', label: 'Budget (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
           }
           return <section className="module-page"><div className="eyebrow"><span className="live-dot" /> {page.toUpperCase()} · WORKSPACE DATABASE</div><h1>{page}</h1><p className="welcome-subtitle">Create and maintain records for {dashboard?.workspaceName}. Data is private to this business.</p>
@@ -1620,9 +1906,14 @@ function App() {
               {bills.map((bill) => <div className="transaction-row" key={bill.id}><span><strong>{bill.supplier} · {bill.description}</strong><small>Due {bill.due_date} · {bill.approval_status === 'pending' ? 'awaiting approval' : bill.approval_status === 'rejected' ? 'rejected' : bill.status} · Remaining {money(bill.amount_due ?? bill.amount)}</small></span><strong>{money(bill.amount)}</strong>{bill.approval_status === 'pending' && <button className="button button-small" disabled={busy} onClick={() => void approveBill(bill)}>Approve and post</button>}{bill.status === 'unpaid' && bill.approval_status === 'approved' && <><label className="field-label">Payment (KSh)<input min="0.01" max={bill.amount_due ?? bill.amount} step="0.01" type="number" value={paymentAmounts[bill.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [bill.id]: event.target.value }))} /></label><button className="button button-small" disabled={busy || !paymentAmounts[bill.id]} onClick={() => void payBill(bill)}>Record payment</button></>}</div>)}
               {!bills.length && <div className="empty-state">No bills yet.</div>}
             </article>}
-            {type === 'inventory' && <article className="module-card"><h2>Stock control</h2><p>Receipts and issues update on-hand quantities and post inventory/COGS journals. Use an adjustment to correct a count; negative stock is blocked.</p>
-              <form className="record-form-grid" onSubmit={recordStockMovement}><label className="field-label">Inventory item<select required value={stockMovementInput.itemId} onChange={(event) => { const item = records.inventory.find((record) => record.id === event.target.value); setStockMovementInput({ ...stockMovementInput, itemId: event.target.value, unitCost: String(item?.data.cost ?? stockMovementInput.unitCost) }) }}><option value="">Select item</option>{records.inventory.map((item) => <option value={item.id} key={item.id}>{String(item.data.name)} · on hand {item.data.quantity}</option>)}</select></label><label className="field-label">Movement<select value={stockMovementInput.movementType} onChange={(event) => setStockMovementInput({ ...stockMovementInput, movementType: event.target.value as typeof stockMovementInput.movementType })}><option value="purchase">Receive stock</option><option value="sale">Issue stock (COGS only)</option><option value="adjustment">Stock count adjustment</option></select></label>{stockMovementInput.movementType === 'adjustment' && <label className="field-label">Adjustment direction<select value={stockMovementInput.adjustmentDirection} onChange={(event) => setStockMovementInput({ ...stockMovementInput, adjustmentDirection: event.target.value as typeof stockMovementInput.adjustmentDirection })}><option value="increase">Increase stock</option><option value="decrease">Decrease stock</option></select></label>}<label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={stockMovementInput.quantity} onChange={(event) => setStockMovementInput({ ...stockMovementInput, quantity: event.target.value })} /></label><label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" disabled={stockMovementInput.movementType === 'sale'} value={stockMovementInput.unitCost} onChange={(event) => setStockMovementInput({ ...stockMovementInput, unitCost: event.target.value })} /></label><label className="field-label">Reference<input maxLength={200} value={stockMovementInput.reference} onChange={(event) => setStockMovementInput({ ...stockMovementInput, reference: event.target.value })} /></label><label className="field-label">Date<input required type="date" value={stockMovementInput.date} onChange={(event) => setStockMovementInput({ ...stockMovementInput, date: event.target.value })} /></label><button className="button button-primary" disabled={busy || !records.inventory.length}>Post movement</button></form>
-              <h3>Purchase orders</h3><form className="record-form-grid" onSubmit={createPurchaseOrder}><label className="field-label">Supplier<input required value={purchaseOrderInput.supplier} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, supplier: event.target.value })} /></label><label className="field-label">Item<select required value={purchaseOrderInput.itemId} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, itemId: event.target.value })}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)}</option>)}</select></label><label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={purchaseOrderInput.quantity} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, quantity: event.target.value })} /></label><label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" value={purchaseOrderInput.unitCost} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, unitCost: event.target.value })} /></label><label className="field-label">Order date<input required type="date" value={purchaseOrderInput.orderDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, orderDate: event.target.value })} /></label><label className="field-label">Payment due date<input type="date" min={purchaseOrderInput.orderDate} value={purchaseOrderInput.dueDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, dueDate: event.target.value })} /></label><label className="field-label">Expected date<input type="date" value={purchaseOrderInput.expectedDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, expectedDate: event.target.value })} /></label><button className="button button-secondary" disabled={busy || !records.inventory.length}>Create purchase order</button></form>
+            {type === 'inventory' && <article className="module-card"><h2>Stock control and locations</h2><p>Receipts and issues update on-hand quantities and post inventory/COGS journals. Location transfers and counts are tracked separately; negative stock is blocked.</p>
+              <form className="record-form-grid" onSubmit={createInventoryLocation}><label className="field-label">New shop or warehouse<input required maxLength={120} value={locationInput.name} onChange={(event) => setLocationInput({ ...locationInput, name: event.target.value })} /></label><label className="field-label">Location code<input required maxLength={40} value={locationInput.code} onChange={(event) => setLocationInput({ ...locationInput, code: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Add location</button></form>
+              <div className="transaction-row"><span><strong>Active locations</strong><small>{inventoryLocations.map((location) => `${location.name}${location.is_default ? ' (default)' : ''}`).join(' · ')}</small></span><span>{inventoryLocations.length} locations</span></div>
+              <form className="record-form-grid" onSubmit={transferInventory}><h3>Transfer stock</h3><label className="field-label">Item<select required value={transferInput.itemId} onChange={(event) => setTransferInput({ ...transferInput, itemId: event.target.value })}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)}</option>)}</select></label><label className="field-label">From<select required value={transferInput.fromLocationId} onChange={(event) => setTransferInput({ ...transferInput, fromLocationId: event.target.value })}><option value="">Select source</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">To<select required value={transferInput.toLocationId} onChange={(event) => setTransferInput({ ...transferInput, toLocationId: event.target.value })}><option value="">Select destination</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Quantity<input required type="number" min="0.001" step="0.001" value={transferInput.quantity} onChange={(event) => setTransferInput({ ...transferInput, quantity: event.target.value })} /></label><button className="button button-secondary" disabled={busy || inventoryLocations.length < 2}>Transfer</button></form>
+              <form className="record-form-grid" onSubmit={countInventory}><h3>Stock count</h3><label className="field-label">Item<select required value={countInput.itemId} onChange={(event) => setCountInput({ ...countInput, itemId: event.target.value })}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)}</option>)}</select></label><label className="field-label">Location<select required value={countInput.locationId} onChange={(event) => setCountInput({ ...countInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Counted quantity<input required type="number" min="0" step="0.001" value={countInput.countedQuantity} onChange={(event) => setCountInput({ ...countInput, countedQuantity: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Post count</button></form>
+              <div className="transaction-row"><span><strong>Stock by location</strong><small>{inventoryLocationStock.map((stock) => `${records.inventory.find((item) => item.id === stock.item_id)?.data.name ?? 'Item'} · ${stock.location_name}: ${stock.quantity}`).join(' | ') || 'No location stock saved yet'}</small></span></div>
+              <form className="record-form-grid" onSubmit={recordStockMovement}><label className="field-label">Inventory item<select required value={stockMovementInput.itemId} onChange={(event) => { const item = records.inventory.find((record) => record.id === event.target.value); setStockMovementInput({ ...stockMovementInput, itemId: event.target.value, unitCost: String(item?.data.cost ?? stockMovementInput.unitCost) }) }}><option value="">Select item</option>{records.inventory.map((item) => <option value={item.id} key={item.id}>{String(item.data.name)} · total {item.data.quantity}</option>)}</select></label><label className="field-label">Location<select required value={stockMovementInput.locationId} onChange={(event) => setStockMovementInput({ ...stockMovementInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Movement<select value={stockMovementInput.movementType} onChange={(event) => setStockMovementInput({ ...stockMovementInput, movementType: event.target.value as typeof stockMovementInput.movementType })}><option value="purchase">Receive stock</option><option value="sale">Issue stock (COGS only)</option><option value="adjustment">Stock count adjustment</option></select></label>{stockMovementInput.movementType === 'adjustment' && <label className="field-label">Adjustment direction<select value={stockMovementInput.adjustmentDirection} onChange={(event) => setStockMovementInput({ ...stockMovementInput, adjustmentDirection: event.target.value as typeof stockMovementInput.adjustmentDirection })}><option value="increase">Increase stock</option><option value="decrease">Decrease stock</option></select></label>}<label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={stockMovementInput.quantity} onChange={(event) => setStockMovementInput({ ...stockMovementInput, quantity: event.target.value })} /></label><label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" disabled={stockMovementInput.movementType === 'sale'} value={stockMovementInput.unitCost} onChange={(event) => setStockMovementInput({ ...stockMovementInput, unitCost: event.target.value })} /></label><label className="field-label">Reference<input maxLength={200} value={stockMovementInput.reference} onChange={(event) => setStockMovementInput({ ...stockMovementInput, reference: event.target.value })} /></label><label className="field-label">Date<input required type="date" value={stockMovementInput.date} onChange={(event) => setStockMovementInput({ ...stockMovementInput, date: event.target.value })} /></label><button className="button button-primary" disabled={busy || !records.inventory.length}>Post movement</button></form>
+              <h3>Purchase orders</h3><form className="record-form-grid" onSubmit={createPurchaseOrder}><label className="field-label">Supplier<input required value={purchaseOrderInput.supplier} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, supplier: event.target.value })} /></label><label className="field-label">Receive into<select required value={purchaseOrderInput.locationId} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Item<select required value={purchaseOrderInput.itemId} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, itemId: event.target.value })}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)}</option>)}</select></label><label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={purchaseOrderInput.quantity} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, quantity: event.target.value })} /></label><label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" value={purchaseOrderInput.unitCost} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, unitCost: event.target.value })} /></label><label className="field-label">Order date<input required type="date" value={purchaseOrderInput.orderDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, orderDate: event.target.value })} /></label><label className="field-label">Payment due date<input type="date" min={purchaseOrderInput.orderDate} value={purchaseOrderInput.dueDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, dueDate: event.target.value })} /></label><label className="field-label">Expected date<input type="date" value={purchaseOrderInput.expectedDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, expectedDate: event.target.value })} /></label><button className="button button-secondary" disabled={busy || !records.inventory.length}>Create purchase order</button></form>
               {purchaseOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.supplier} · PO {order.id.slice(0, 8)}</strong><small>{order.status} · {order.lines.map((line) => `${line.item_name}: ${line.received_quantity}/${line.quantity}`).join(' · ')}</small></span>{order.status !== 'received' && order.status !== 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => void receivePurchaseOrder(order)}>Receive remaining</button>}</div>)}
             </article>}
             {type === 'projects' && <article className="module-card"><h2>Time and project costing</h2><p>Approved time is a management cost estimate and billable value, not a payroll posting or invoice.</p><label className="field-label">Project<select value={timeInput.projectId} onChange={(event) => void loadProjectTime(event.target.value)}><option value="">Select project</option>{records.projects.map((project) => <option key={project.id} value={project.id}>{String(project.data.name)}</option>)}</select></label>
@@ -1674,6 +1965,7 @@ function App() {
           <div className="dashboard-grid"><article className="module-card report-chart"><h2>Income vs expenses this month</h2><ResponsiveContainer width="100%" height={260}><BarChart data={chart}><CartesianGrid vertical={false} stroke="#eff0f4" /><XAxis dataKey="date" /><YAxis /><Tooltip formatter={(value) => money(Number(value))} /><Legend /><Bar dataKey="income" fill="#7256df" radius={[5, 5, 0, 0]} /><Bar dataKey="expense" fill="#48b99e" radius={[5, 5, 0, 0]} /></BarChart></ResponsiveContainer></article>
             <article className="module-card report-chart"><h2>Recorded cash flow mix</h2><ResponsiveContainer width="100%" height={260}><PieChart><Pie data={[{ name: 'Income', value: Number(dashboard?.totals.monthIncome ?? 0) }, { name: 'Expenses', value: Number(dashboard?.totals.monthExpenses ?? 0) }].filter((item) => item.value > 0)} dataKey="value" nameKey="name" outerRadius={85} label>{['#7256df', '#48b99e'].map((color) => <Cell key={color} fill={color} />)}</Pie><Tooltip formatter={(value) => money(Number(value))} /><Legend /></PieChart></ResponsiveContainer>{Number(dashboard?.totals.monthIncome ?? 0) + Number(dashboard?.totals.monthExpenses ?? 0) === 0 && <div className="empty-state">Add transactions to populate this chart.</div>}</article></div>
           <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income this month</span><strong>{money(dashboard?.totals.monthIncome ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses this month</span><strong>{money(dashboard?.totals.monthExpenses ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
+          {retailReport && <article className="module-card"><h2>Retail and inventory insights</h2><div className="transaction-row"><span>Inventory valuation at recorded unit cost</span><strong>{money(retailReport.totalValuation)}</strong></div><h3>Reorder alerts</h3>{retailReport.reorderAlerts.map((item) => <div className="transaction-row" key={`${item.itemId}-${item.locationId}`}><span><strong>{item.name} · {item.location}</strong><small>{item.quantity} {item.unit} on hand · alert at {item.reorderPoint}</small></span><span className="status-pill amber">Reorder</span></div>)}{!retailReport.reorderAlerts.length && <p>No items are at or below their configured reorder points.</p>}<h3>Best sellers</h3>{retailReport.bestSellers.map((item) => <div className="transaction-row" key={item.itemId}><span><strong>{item.name}</strong><small>{item.quantitySold.toLocaleString('en-KE')} sold · revenue {money(item.revenue)} · cost estimate {money(item.cost)}</small></span><strong>Gross profit est. {money(item.grossProfit)}</strong></div>)}{!retailReport.bestSellers.length && <div className="empty-state">Post product sales to see best sellers and gross profit estimates.</div>}<p className="dialog-note">Inventory value uses current average item cost; product margins are management estimates and do not replace reviewed accounting valuation.</p></article>}
           <article className="module-card"><h2>Cash-flow outlook</h2><p>Three-month estimate based on the average monthly posted ledger activity available over the last six months; not a cash guarantee.</p>{forecast.map((row) => <div className="transaction-row" key={row.period}><span><strong>{row.period}</strong><small>Historical-average estimate</small></span><span>Income {money(row.income)} · Expenses {money(row.expenses)}</span><strong>Net {money(row.income - row.expenses)}</strong></div>)}</article>
           <article className="module-card"><h2>Budget by account</h2><form className="record-form-grid" onSubmit={saveBudget}><label className="field-label">Account<select required value={budgetInput.accountCode} onChange={(event) => setBudgetInput({ ...budgetInput, accountCode: event.target.value })}><option value="">Choose account</option>{accounts.map((accountRow) => <option value={accountRow.code} key={accountRow.code}>{accountRow.code} · {accountRow.name}</option>)}</select></label><label className="field-label">Period<input required type="month" value={budgetInput.period} onChange={(event) => setBudgetInput({ ...budgetInput, period: event.target.value })} /></label><label className="field-label">Budget (KSh)<input required min="0" step="0.01" type="number" value={budgetInput.amount} onChange={(event) => setBudgetInput({ ...budgetInput, amount: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Save budget</button></form>
             {budgets.map((budget) => <div className="transaction-row" key={budget.id}><span><strong>{budget.period} · {budget.account_code} {budget.account_name}</strong><small>Budget {money(budget.budget)} · actual {money(budget.actual)}</small></span><strong>Variance {money(budget.variance)}</strong></div>)}
@@ -1681,23 +1973,24 @@ function App() {
           {agingReport && <article className="module-card"><h2>Receivables and payables aging as at {agingReport.asOf}</h2><div className="dashboard-grid"><div><h3>Customer invoices</h3>{Object.entries(agingReport.receivables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ar-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div><div><h3>Supplier bills</h3>{Object.entries(agingReport.payables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ap-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div></div></article>}
         </section> : page === 'Point of sale' ? <section className="module-page pos-page">
           <div className="eyebrow"><span className="live-dot" /> POINT OF SALE · {dashboard?.workspaceName}</div>
-          <h1>Counter checkout</h1>
+          <h1>{t('Counter checkout')}</h1>
           <p className="welcome-subtitle">Sell from saved inventory. Checkout creates an internal invoice, deducts stock, and records cash payments in your workspace.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="pos-layout">
             <section className="module-card pos-catalog" aria-label="Sellable inventory">
               <div className="pos-catalog-head"><div><h2>Items</h2><p>{records.inventory.length} inventory items · {records.inventory.filter((item) => Number(item.data.quantity ?? 0) > 0).length} in stock</p></div>
-                <label className="pos-search"><Search size={16} /><input aria-label="Search inventory by name or SKU" placeholder="Search items or SKU…" value={posSearch} onChange={(event) => setPosSearch(event.target.value)} /></label>
+                <label className="field-label">Selling location<select aria-label="POS selling location" value={posLocationId} onChange={(event) => setPosLocationId(event.target.value)}>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
+                <label className="pos-search"><Search size={16} /><input aria-label="Search or scan barcode/SKU" placeholder="Search or scan barcode…" value={posSearch} onKeyDown={scanPosBarcode} onChange={(event) => setPosSearch(event.target.value)} /></label>
               </div>
               {!records.inventory.length ? <div className="empty-state">No inventory items yet. Add items with a selling price in Inventory to start a sale.<button className="button button-secondary" onClick={() => navigateTo('Inventory')}>Open inventory</button></div> :
                 <div className="pos-item-grid">{posItems.map((item) => {
-                  const onHand = Number(item.data.quantity ?? 0)
+                  const onHand = Number(inventoryLocationStock.find((stock) => stock.location_id === posLocationId && stock.item_id === item.id)?.quantity ?? 0)
                   const itemName = String(item.data.name ?? 'Inventory item')
                   const sku = String(item.data.sku ?? '')
                   const line = posCart.find((entry) => entry.itemId === item.id)
                   const disabled = onHand <= 0 || Boolean(line && line.quantity >= onHand)
                   return <button type="button" className="pos-item" key={item.id} disabled={disabled} onClick={() => addPosItem(item)}>
-                    <span className="pos-item-icon"><Package size={19} /></span><strong>{itemName}</strong>{sku && <small>{sku}</small>}
+                    <span className="pos-item-icon"><Package size={19} /></span><strong>{itemName}</strong>{(sku || item.data.barcode) && <small>{sku}{item.data.barcode ? ` · ${item.data.barcode}` : ''}</small>}
                     <span className={`pos-stock ${onHand <= 5 ? 'low' : ''}`}>{onHand > 0 ? `${onHand} in stock` : 'Out of stock'}</span><b>{money(Number(item.data.price ?? 0))}</b>
                   </button>
                 })}{!posItems.length && <div className="empty-state">No items match “{posSearch}”.</div>}</div>
@@ -1723,15 +2016,17 @@ function App() {
             </aside>
           </div>
           {posReceipt && <div className="module-card pos-last-sale"><div><div className="eyebrow">LAST SALE · {posReceipt.invoiceId.slice(0, 8).toUpperCase()}</div><h2>{money(posReceipt.amount)}</h2><p>{posReceipt.customer} · {posReceipt.status}</p></div>
-            <div className="button-row"><button className="button button-secondary" onClick={() => window.print()}><Printer size={15} />Print receipt</button><button className="button button-secondary" onClick={() => navigateTo('Sales')}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
+            <div className="button-row"><button className="button button-secondary" onClick={() => window.print()}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod === 'cash' && posReceipt.status.startsWith('Paid') && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}<button className="button button-secondary" onClick={() => navigateTo('Sales')}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
+            <details className="module-footnote"><summary>Receipt printer setup · Windows local bridge</summary><p>Install and run the local bridge on this checkout computer, configured for an ESC/POS network printer. It is separate from the browser print option; compatible printer, network access, and drawer cable are required.</p><div className="field-row"><label className="field-label">Local bridge URL<input value={posBridgeAddress} onChange={(event) => changePosBridgeAddress(event.target.value)} placeholder="http://127.0.0.1:17371" /></label><button className="button button-small" disabled={posBridgeBusy} onClick={() => void testPosBridge()}>{posBridgeBusy ? 'Checking…' : t('Test connection')}</button></div>{posBridgeStatus && <p role="status">{t(posBridgeStatus)}</p>}<small>{t('Internal receipt only; not an eTIMS tax invoice.')} Cash drawer is enabled only after a cash payment is recorded.</small></details>
           </div>}
-          {posReceipt && <article className="pos-receipt-print"><div className="pos-receipt-brand"><strong>KashFlow</strong><span>{dashboard?.workspaceName}</span></div><h2>SALE RECEIPT</h2><p>Invoice {posReceipt.invoiceId.slice(0, 8).toUpperCase()} · {today}</p><p>Customer: {posReceipt.customer}</p><hr />{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.quantity} × {line.description}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><strong>Total</strong><strong>{money(posReceipt.amount)}</strong></div><p>{posReceipt.status}</p><small>Internal sales receipt—not a KRA/eTIMS fiscal invoice.</small></article>}
+          {posReceipt && <article className="pos-receipt-print"><div className="pos-receipt-brand"><strong>KashFlow</strong><span>{dashboard?.workspaceName}</span></div><h2>{t('SALE RECEIPT')}</h2><p>{t('Invoice')} {posReceipt.invoiceId.slice(0, 8).toUpperCase()} · {today}</p><p>{t('Customer')}: {posReceipt.customer}</p><hr />{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.quantity} × {line.description}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><strong>{t('Total')}</strong><strong>{money(posReceipt.amount)}</strong></div><p>{posReceipt.status}</p><small>{t('Internal receipt only; not an eTIMS tax invoice.')}</small></article>}
         </section> : page === 'Sales' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> SALES · {dashboard?.workspaceName}</div><h1>Invoices</h1><p className="welcome-subtitle">Internal invoices support itemized lines and recorded payments. They are not KRA/eTIMS fiscal tax invoices.</p>
           <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice</button>
-          <div className="module-card">{error && <p className="form-error" role="alert">{error}</p>}{invoicesList.map((invoiceRow) => <div className="transaction-row" key={invoiceRow.id}><span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · {invoiceRow.status} · paid {money(invoiceRow.amount_paid ?? 0)} · due {money(invoiceRow.amount_due ?? invoiceRow.amount)}</small></span><strong>{money(invoiceRow.amount)}</strong><button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button>{invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <><label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label><button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button></>}</div>)}{!invoicesList.length && <div className="empty-state">No invoices yet. Create one to review and preview it here.</div>}</div>
+          <div className="module-card">{error && <p className="form-error" role="alert">{error}</p>}{invoicesList.map((invoiceRow) => <div className="transaction-row" key={invoiceRow.id}><span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · {invoiceRow.status} · paid {money(invoiceRow.amount_paid ?? 0)} · due {money(invoiceRow.amount_due ?? invoiceRow.amount)}</small></span><strong>{money(invoiceRow.amount)}</strong><button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button>{invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}{invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <><label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label><button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button></>}</div>)}{!invoicesList.length && <div className="empty-state">No invoices yet. Create one to review and preview it here.</div>}</div>
           <article className="module-card"><h2>Estimates and quotes</h2><p>Estimates do not post to the ledger. Tax amounts are entered by you after qualified review; these documents are not tax invoices.</p><form className="record-form-grid" onSubmit={saveEstimate}><label className="field-label">Customer<input required value={estimateInput.customer} onChange={(event) => setEstimateInput({ ...estimateInput, customer: event.target.value })} /></label><label className="field-label">Customer email<input type="email" value={estimateInput.customerEmail} onChange={(event) => setEstimateInput({ ...estimateInput, customerEmail: event.target.value })} /></label><DraftLineEditor lines={estimateLines} inventoryItems={records.inventory} onChange={(index, key, value) => setEstimateLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setEstimateLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])} onRemove={(index) => setEstimateLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} /><p>Estimate total: <strong>{money(draftDocumentTotal(estimateLines))}</strong></p><label className="field-label">Valid until<input required type="date" value={estimateInput.validUntil} onChange={(event) => setEstimateInput({ ...estimateInput, validUntil: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Save estimate</button></form>
-            {estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'sent')}>Mark sent</button>}{['draft', 'sent'].includes(estimate.status) && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'accepted')}>Accept</button>}{estimate.status === 'accepted' && <button className="button button-primary" disabled={busy} onClick={() => void convertEstimate(estimate)}>Convert to invoice</button>}</div></div>)}
+            {estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'sent')}>Mark sent</button>}{['draft', 'sent'].includes(estimate.status) && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'accepted')}>Accept</button>}{estimate.status === 'accepted' && !salesOrders.some((order) => order.estimate_id === estimate.id) && <button className="button button-primary" disabled={busy} onClick={() => void createSalesOrder(estimate)}>Create sales order</button>}</div></div>)}
+            <h3>Sales order lifecycle</h3>{salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>)}{!salesOrders.length && <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
           </article>
           <article className="module-card"><h2>Recurring transactions</h2><p>Create an invoice or expense schedule. KashFlow never posts a recurring transaction automatically; an admin must run each due item.</p><form className="record-form-grid" onSubmit={saveRecurring}><label className="field-label">Type<select value={recurringInput.type} onChange={(event) => setRecurringInput({ ...recurringInput, type: event.target.value as 'invoice' | 'expense' })}><option value="invoice">Invoice</option><option value="expense">Expense</option></select></label><label className="field-label">Description<input required value={recurringInput.description} onChange={(event) => setRecurringInput({ ...recurringInput, description: event.target.value })} /></label>{recurringInput.type === 'invoice' && <label className="field-label">Customer<input required value={recurringInput.counterparty} onChange={(event) => setRecurringInput({ ...recurringInput, counterparty: event.target.value })} /></label>}<label className="field-label">Amount (KSh)<input required min="0.01" step="0.01" type="number" value={recurringInput.amount} onChange={(event) => setRecurringInput({ ...recurringInput, amount: event.target.value })} /></label><label className="field-label">Frequency<select value={recurringInput.frequency} onChange={(event) => setRecurringInput({ ...recurringInput, frequency: event.target.value as typeof recurringInput.frequency })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option></select></label><label className="field-label">First due date<input required type="date" value={recurringInput.nextDate} onChange={(event) => setRecurringInput({ ...recurringInput, nextDate: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Save schedule</button></form>
             {recurringTemplates.map((template) => <div className="transaction-row" key={template.id}><span><strong>{template.template_type} · {template.description}</strong><small>{template.frequency} · next {template.next_date} · {template.active ? 'active' : 'paused'}</small></span><strong>{money(template.amount)}</strong><button className="button button-small" disabled={busy || !template.active || template.next_date > today} onClick={() => void runRecurring(template)}>Run due entry</button></div>)}
@@ -1751,6 +2046,53 @@ function App() {
             {error && <p className="form-error" role="alert">{error}</p>}
             <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
           </form>
+            <section className="module-card">
+              <h2>{t('Online store and customer orders')}</h2>
+              <p>Publish a simple product catalog and accept order requests. Customers do not pay online here; verify stock, shipping, tax, and payment before fulfillment.</p>
+              <form className="record-form-grid" onSubmit={saveStoreSettings}>
+                <label className="field-label checkbox-row"><input type="checkbox" checked={storeConfig.enabled} onChange={(event) => setStoreConfig({ ...storeConfig, enabled: event.target.checked })} /> {t('Store is open to customers')}</label>
+                <label className="field-label">{t('Store address slug')}<input required minLength={3} maxLength={50} pattern="[a-z0-9]+(-[a-z0-9]+)*" value={storeConfig.slug} onChange={(event) => setStoreConfig({ ...storeConfig, slug: event.target.value })} /></label>
+                <label className="field-label">{t('Store name')}<input required maxLength={120} value={storeConfig.title} onChange={(event) => setStoreConfig({ ...storeConfig, title: event.target.value })} /></label>
+                <label className="field-label">Description<textarea maxLength={1000} value={storeConfig.description} onChange={(event) => setStoreConfig({ ...storeConfig, description: event.target.value })} /></label>
+                <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : t('Save store')}</button>{storeConfig.enabled && storeConfig.slug && <a className="button button-secondary" href={`/store/${encodeURIComponent(storeConfig.slug)}`} target="_blank" rel="noreferrer">{t('Preview customer store')}</a>}</div>
+              </form>
+              <h3>{t('Customer order requests')} ({storeOrders.filter((order) => order.source !== 'woocommerce').length})</h3>
+              {storeOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer_name} · {money(order.total)}</strong><small>{order.source === 'woocommerce' ? `WooCommerce #${order.external_order_id ?? ''} · ` : ''}{order.customer_email}{order.customer_phone ? ` · ${order.customer_phone}` : ''} · {t(order.status)} · {new Date(order.created_at).toLocaleDateString('en-KE')}</small></span><div className="button-row">{order.status === 'pending_review' && <><button className="button button-small" disabled={busy} onClick={() => void updateStoreOrder(order, 'accepted')}>{t('Accept')}</button><button className="button button-small" disabled={busy} onClick={() => void updateStoreOrder(order, 'rejected')}>{t('Reject')}</button></>}{order.status === 'accepted' && !order.invoice_id && <button className="button button-small" disabled={busy} onClick={() => void convertStoreOrder(order)}>{t('Convert to invoice')}</button>}{order.status === 'invoiced' && order.invoice_id && <button className="button button-small" disabled={busy} onClick={() => void updateStoreOrder(order, 'fulfilled')}>{t('Mark fulfilled')}</button>}{order.invoice_id && <small>Invoice {order.invoice_id.slice(0, 8)}</small>}</div></div>)}
+              {!storeOrders.length && <div className="empty-state">No online order requests yet.</div>}
+            </section>
+            <section className="module-card">
+              <h2>{t('WooCommerce')}</h2>
+              <p>Connect a WooCommerce REST API key to synchronize products and import orders as pending review. Configure <code>ONLINE_COMMERCE_ENCRYPTION_KEY</code> on the API server. Connection is not a payment integration.</p>
+              {wooConnection && <p role="status">Connected to {wooConnection.store_url} · {wooConnection.enabled ? 'enabled' : 'disabled'}{wooConnection.last_synced_at ? ` · last sync ${new Date(wooConnection.last_synced_at).toLocaleString()}` : ''}</p>}
+              {!wooEncryptionReady && <p className="form-error" role="alert">Secure credential storage is not configured on the API server.</p>}
+              <form className="record-form-grid" onSubmit={saveWooCommerce}>
+                <label className="field-label">WooCommerce store URL<input required type="url" placeholder="https://shop.example.com" value={wooCredentials.storeUrl} onChange={(event) => setWooCredentials({ ...wooCredentials, storeUrl: event.target.value })} /></label>
+                <label className="field-label">REST API consumer key<input required autoComplete="off" value={wooCredentials.consumerKey} onChange={(event) => setWooCredentials({ ...wooCredentials, consumerKey: event.target.value })} /></label>
+                <label className="field-label">REST API consumer secret<input required type="password" autoComplete="new-password" value={wooCredentials.consumerSecret} onChange={(event) => setWooCredentials({ ...wooCredentials, consumerSecret: event.target.value })} /></label>
+                <div className="button-row"><button className="button button-primary" disabled={busy || !wooEncryptionReady}>{t('Save encrypted connection')}</button><button type="button" className="button button-secondary" disabled={busy || !wooConnection?.enabled} onClick={() => void syncWooCommerce('products')}>{t('Sync products')}</button><button type="button" className="button button-secondary" disabled={busy || !wooConnection?.enabled} onClick={() => void syncWooCommerce('orders')}>{t('Import new orders')}</button></div>
+              </form>
+            </section>
+            <section className="module-card">
+              <h2>{t('Team permissions')}</h2>
+              <p>Set business access by work area. Workspace administrators retain full access; changes apply when saved.</p>
+              {teamMembers.filter((member) => member.role !== 'admin').map((member) => <div className="team-permission-card" key={member.userId}>
+                <h3>{member.email || member.phone} · {member.role}</h3>
+                <div className="field-row">{([
+                  ['operations.write', 'Operations'],
+                  ['sales.write', 'Sales'],
+                  ['inventory.write', 'Inventory'],
+                  ['accounting.write', 'Accounting'],
+                  ['banking.write', 'Banking'],
+                  ['payroll.manage', 'Payroll'],
+                  ['integrations.manage', 'Integrations'],
+                  ['workspace.manage', 'Business settings'],
+                  ['team.manage', 'Team management'],
+                  ['store.manage', 'Online store'],
+                ] as Array<[MemberPermission, string]>).map(([permission, label]) => <label className="field-label checkbox-row" key={permission}><input type="checkbox" checked={(memberPermissionDrafts[member.userId] ?? member.permissions ?? member.defaultPermissions).includes(permission)} onChange={(event) => toggleMemberPermission(member.userId, permission, event.target.checked)} /> {label}</label>)}</div>
+                <button className="button button-small" disabled={busy} onClick={() => void saveMemberPermissions(member)}>{t('Save permissions')}</button>
+              </div>)}
+              {!teamMembers.some((member) => member.role !== 'admin') && <div className="empty-state">Invite a team member to manage their access here.</div>}
+            </section>
         </section> : page === 'Help' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> HELP & SUPPORT · {dashboard?.workspaceName}</div>
           <h1>Customer help centre</h1>
@@ -1806,7 +2148,7 @@ function App() {
 
     {modal && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget && !busy) setModal(null) }}>
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
-        <div className="dialog-head"><div><div className="eyebrow">{dashboard?.workspaceName}</div><h2 id="dialog-title">{modal === 'invoice' ? invoicePreview ? 'Invoice preview' : 'Create an invoice' : modal === 'business' ? 'Add a business' : modal === 'invite' ? 'Invite team member' : 'Add a transaction'}</h2></div>
+        <div className="dialog-head"><div><div className="eyebrow">{dashboard?.workspaceName}</div><h2 id="dialog-title">{modal === 'invoice' ? invoicePreview ? 'Invoice preview' : 'Create an invoice' : modal === 'business' ? 'Add a business' : modal === 'invite' ? 'Invite team member' : modal === 'return' ? 'Record a return or credit' : 'Add a transaction'}</h2></div>
           <button className="icon-button" aria-label="Close dialog" onClick={() => setModal(null)}><X size={19} /></button>
         </div>
         {modal === 'business' ? <form onSubmit={createBusiness}>
@@ -1832,6 +2174,15 @@ function App() {
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? 'Sending…' : 'Send invite'}</button></div>
         </form> : null}
+        {modal === 'return' && returnInvoice ? <form onSubmit={saveSalesReturn}>
+          <p className="dialog-note">Return against invoice {returnInvoice.id.slice(0, 8)} for {returnInvoice.customer}. This creates an internal credit note and ledger posting; any cash refund must be made separately through your normal payment method.</p>
+          <label className="field-label">Reason<input required maxLength={500} value={returnInput.reason} onChange={(event) => setReturnInput({ ...returnInput, reason: event.target.value })} /></label>
+          <label className="field-label">Cash refund to record (KSh)<input required type="number" min="0" step="0.01" value={returnInput.refundAmount} onChange={(event) => setReturnInput({ ...returnInput, refundAmount: event.target.value })} /><small>Must be no greater than the return value or cash previously collected and not already refunded.</small></label>
+          <label className="checkbox-row"><input type="checkbox" checked={returnInput.restock} onChange={(event) => setReturnInput({ ...returnInput, restock: event.target.checked })} /> Restock returned inventory items at the original invoice location</label>
+          <fieldset className="draft-line"><legend>Returned lines</legend>{returnLines.map((line) => <label className="field-label" key={line.id}>{line.description} · remaining {Number(line.quantity) - Number(line.returned_quantity)}{line.item_id ? ' · inventory item' : ''}<input type="number" min="0" max={Number(line.quantity) - Number(line.returned_quantity)} step="0.001" value={returnQuantities[line.id] ?? ''} onChange={(event) => setReturnQuantities((current) => ({ ...current, [line.id]: event.target.value }))} /></label>)}</fieldset>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? 'Recording…' : 'Record return'}</button></div>
+        </form> : null}
         {modal === 'invoice' && invoicePreview ? <article className="invoice-preview-card">
           <div className="invoice-preview-brand"><div><strong>KashFlow</strong><small>{dashboard?.workspaceName}</small></div><span>{invoicePreview.id ? `Invoice ${invoicePreview.id.slice(0, 8).toUpperCase()}` : 'INVOICE PREVIEW'}</span></div>
           <h2>Invoice</h2><div className="invoice-preview-grid"><span>Bill to<strong>{invoicePreview.customer}</strong><small>{invoicePreview.customer_email || 'No email address added'}</small></span><span>Due date<strong>{invoicePreview.due_date}</strong><small>Status: {invoicePreview.status || 'Draft'}</small></span></div>
@@ -1842,6 +2193,7 @@ function App() {
         {modal === 'invoice' && !invoicePreview ? <form onSubmit={saveInvoice}>
           <label className="field-label">Customer<input required maxLength={160} list="customer-records" value={invoice.customer} onChange={(event) => setInvoice({ ...invoice, customer: event.target.value })} /><datalist id="customer-records">{records.customers.map((customer) => <option key={customer.id} value={String(customer.data.name)} />)}</datalist></label>
           <label className="field-label">Customer email (for email draft)<input type="email" value={invoice.customerEmail} onChange={(event) => setInvoice({ ...invoice, customerEmail: event.target.value })} /></label>
+          {invoiceLines.some((line) => line.itemId) && <label className="field-label">Stock location<select value={invoiceLocationId} onChange={(event) => setInvoiceLocationId(event.target.value)}>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>}
           <DraftLineEditor lines={invoiceLines} inventoryItems={records.inventory} onChange={(index, key, value) => setInvoiceLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setInvoiceLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])} onRemove={(index) => setInvoiceLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} />
           <p className="dialog-note">Invoice total: <strong>{money(draftDocumentTotal(invoiceLines))}</strong></p>
           <label className="field-label">Due date<input required type="date" value={invoice.dueDate} onChange={(event) => setInvoice({ ...invoice, dueDate: event.target.value })} /></label>
