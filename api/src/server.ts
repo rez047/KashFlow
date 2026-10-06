@@ -129,6 +129,7 @@ const defaultWorkspaceSettings = {
   backupSchedule: 'Daily automatic',
   inventoryLowStockThreshold: 5,
   inventoryMediumStockThreshold: 10,
+  inventoryHealthyStockThreshold: 10000,
   monoEnabled: false,
   darajaEnabled: false,
   kraEtimsLiveEnabled: false,
@@ -1903,6 +1904,10 @@ app.get('/v1/settings', requirePool, requireSession, requireWorkspaceAdmin, asyn
     const result = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId])
     const workspaceResult = await pool!.query('SELECT name FROM workspaces WHERE id = $1', [request.session!.workspaceId])
     const preferences = { ...defaultWorkspaceSettings, ...(result.rows[0]?.preferences ?? {}) }
+    preferences.inventoryHealthyStockThreshold = Math.max(
+      Number(preferences.inventoryHealthyStockThreshold),
+      Number(preferences.inventoryMediumStockThreshold) + 1,
+    )
     const businessName = workspaceResult.rows[0]?.name ?? preferences.businessName ?? ''
     response.json({ settings: { ...preferences, businessName } })
   } catch (error) { next(error) }
@@ -1919,6 +1924,7 @@ app.put('/v1/settings', requirePool, verifyOrigin, requireSession, requireWorksp
     backupSchedule: z.enum(['Daily automatic', 'Weekly automatic', 'Manual only']),
     inventoryLowStockThreshold: z.coerce.number().int().min(0).max(1_000_000),
     inventoryMediumStockThreshold: z.coerce.number().int().min(1).max(1_000_000),
+    inventoryHealthyStockThreshold: z.coerce.number().int().min(2).max(2_000_000),
     monoEnabled: z.boolean().default(false),
     darajaEnabled: z.boolean().default(false),
     kraEtimsLiveEnabled: z.boolean().default(false),
@@ -1927,7 +1933,7 @@ app.put('/v1/settings', requirePool, verifyOrigin, requireSession, requireWorksp
     nssfEnabled: z.boolean().default(false),
     ahlEnabled: z.boolean().default(false),
   }).safeParse(request.body)
-  if (!input.success || input.data.inventoryMediumStockThreshold <= input.data.inventoryLowStockThreshold) { response.status(400).json({ error: 'Settings are invalid. Medium stock threshold must be higher than the low stock threshold.' }); return }
+  if (!input.success || input.data.inventoryMediumStockThreshold <= input.data.inventoryLowStockThreshold || input.data.inventoryHealthyStockThreshold <= input.data.inventoryMediumStockThreshold) { response.status(400).json({ error: 'Settings are invalid. Medium must be higher than low, and the healthy-stock threshold must be higher than medium.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
