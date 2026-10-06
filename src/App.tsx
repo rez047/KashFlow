@@ -3,9 +3,9 @@ import { OnlineStoreApp } from './OnlineStore'
 import { languages, useTranslation, type LanguageCode } from './i18n'
 import {
   Activity, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
-  BriefcaseBusiness, Building2, CalendarDays, Check, ChevronRight, CircleHelp,
+  BriefcaseBusiness, CalendarDays, Check, ChevronRight, CircleHelp,
   FileText, Filter, Gauge, Landmark, LayoutDashboard,
-  LifeBuoy, LogOut, Menu, Minus, MoreHorizontal, Package, Plus, Printer,
+  LifeBuoy, LogOut, Menu, Minus, Package, Plus, Printer,
   Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Trash2, Users, Wallet, X,
 } from 'lucide-react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
@@ -2231,23 +2231,6 @@ function App() {
               <div className="chart-footer"><span><span className="status-dot" /> Database-backed records</span><button onClick={() => navigateTo('Reports')}>View reports <ArrowRight size={14} /></button></div>
             </article>
 
-            <article className="panel compliance-panel">
-              <div className="panel-header"><div><h2>Integrations</h2><p>{mpesaConfigured ? 'Daraja M-Pesa is configured; other integrations remain inactive' : 'External services are not connected'}</p></div>
-                <button className="icon-button more-button" aria-label="Integration status" onClick={() => setStatusOpen(true)}><MoreHorizontal size={19} /></button>
-              </div>
-              <div className="integration-notice"><ShieldCheck size={19} /><div><strong>{mpesaConfigured ? 'M-Pesa STK Push configured' : 'Setup required'}</strong><p>KRA/eTIMS, bank feeds, and statutory filing still require approved providers. M-Pesa status reflects server configuration only; confirm live transactions against Daraja and your merchant statement.</p></div></div>
-              <div className="compliance-list">
-                {[
-                  { name: 'KRA eTIMS', detail: 'Adapter, certification, and credentials not configured', status: 'Inactive', configured: false },
-                  { name: 'Safaricom Daraja / M-Pesa', detail: mpesaConfigured ? `STK Push configured (${mpesaStatus.replace('configured_', '')})` : 'Credentials and public callback not configured', status: mpesaConfigured ? mpesaStatus.replace('configured_', '') : 'Inactive', configured: mpesaConfigured },
-                  { name: 'Bank feeds', detail: monoConfigured ? 'Mono adapter configured; customer consent required' : 'Mono business approval and API keys are required', status: monoConfigured ? 'Ready for consent' : 'Setup required', configured: monoConfigured },
-                  { name: 'Invoice email', detail: emailConfigured ? 'Resend API configured; acceptance is not delivery confirmation' : 'Resend API key and verified sender are required', status: emailConfigured ? 'Configured' : 'Inactive', configured: emailConfigured },
-                  { name: 'PAYE · SHIF · NSSF · AHL', detail: 'Versioned estimates available; filing not implemented', status: 'Estimate only', configured: false },
-                ].map(({ name, detail, status, configured }) => <div className="integration-row" key={name}>
-                  <span className="compliance-icon blue"><Building2 size={16} /></span><span className="compliance-copy"><strong>{name}</strong><small>{detail}</small></span><span className={`status-pill ${configured ? 'green' : 'amber'}`}>{status}</span>
-                </div>)}
-              </div>
-            </article>
           </section>
 
           <section className="bottom-grid">
