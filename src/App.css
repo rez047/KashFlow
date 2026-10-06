@@ -62,3 +62,4 @@
 .transaction-row .field-label{max-width:180px}
 .transaction-row .field-label input{min-width:0}
 @media(max-width:680px){.draft-line .field-row,.transaction-row{align-items:stretch;flex-wrap:wrap}.transaction-row .field-label{max-width:none;width:100%}.draft-line{padding:10px}}
+.employee-record-row>span{min-width:0}.employee-record-row>span strong,.employee-record-row>span small{display:block}.employee-record-row .button-row{flex-wrap:wrap;justify-content:flex-end}.payroll-run-row{border-bottom:1px solid #eeeef3;padding:4px 0 12px;margin-bottom:10px}.payroll-run-row:last-child{border-bottom:0}.payroll-payment-entry{display:grid;grid-template-columns:minmax(150px,1fr) minmax(180px,1.5fr) auto;gap:10px;align-items:end;padding:0 12px 4px}.payroll-payment-entry .field-label{margin:0}.payroll-payment-entry input{min-width:0}@media(max-width:680px){.payroll-payment-entry{grid-template-columns:1fr}.employee-record-row .button-row{width:100%;justify-content:flex-start}}

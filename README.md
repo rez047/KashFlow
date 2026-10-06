@@ -18,7 +18,7 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 - Shows saved transactions, monthly totals, a daily cash-flow chart, and unpaid invoice totals.
 - Can initiate a Safaricom Daraja M-Pesa STK Push for a whole-KSh unpaid invoice when merchant credentials and a public callback URL are configured; it verifies the callback with Daraja's STK Query API before marking the invoice paid.
 - Provides a versioned Kenya payroll estimator for PAYE, employee/employer NSSF, SHIF, and Affordable Housing Levy, with explicit assumptions and review warnings.
-- Provides encrypted employee records and payslips, monthly payroll drafts, double-entry payroll posting, payroll payment recording, and manual statutory remittance-reference tracking for admins.
+- Provides editable, encrypted employee records and payslips, monthly payroll drafts, double-entry payroll posting, partial or full external payroll-payment recording with references, and manual statutory remittance-reference tracking for admins. Any unpaid net-pay balance remains in payroll payable; confirmed payment outflows appear in cash-flow transactions.
 - Seeds a per-business chart of accounts; posts balanced journal entries for manual transactions, invoices, and posted payroll; exposes a trial balance and journal history.
 - Provides date-ranged income statement and as-of balance sheet management reports calculated from posted journals. These are operational reports only, depend on correct opening balances/account mappings, and are not audited or tax-certified financial statements.
 - Supports multi-line invoices and estimates, optional inventory-item links, partial invoice payments, accepted estimate-to-invoice conversion, supplier bills with partial payments and optional approval, and manual bank reconciliation against posted ledger transactions.
@@ -32,7 +32,7 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 
 Do not treat UI labels, environment variables, or saved invitation records as working third-party integrations. The current repository does **not** include:
 
-- Automatic employee payments, statutory remittance transfers, or filing/submission to KRA, SHIF/SHA, NSSF, or AHL. Remittances are only tracked after an external payment is made; payroll formula rules require professional review.
+- Automatic employee payments, bank-feed payment verification, statutory remittance transfers, or filing/submission to KRA, SHIF/SHA, NSSF, or AHL. Connected bank feeds are read-only and require review; payroll payments are recorded only after an external payment is confirmed and entered with its reference. Remittances are only tracked after an external payment is made; payroll formula rules require professional review.
 - Production-grade journal edits/reversals, audit certification, automated reminders, robust statement-line matching/exceptions, and period-end review controls. Reconciliation currently matches existing posted ledger transactions; it does not reconcile unposted provider-feed entries in a review queue.
 - Automatic recurring posting (each due schedule is run manually), inventory reorder automation, payroll-to-project costing, and production-grade security/permission administration. Inventory valuation and project time/cost tracking are operational bookkeeping tools and require review.
 - Statutory filing/remittance integrations for PAYE, AHL, SHIF, and NSSF. Saved payroll summaries and review attestations do not submit authority returns.

@@ -55,8 +55,8 @@ type PayrollEstimate = {
   payeEstimate: number; netPayEstimate: number; nssfEmployer: number; housingLevyEmployer: number
   employerPayrollCostEstimate: number; assumptions: string[]
 }
-type Employee = { id: string; employeeNumber: string; fullName: string; email?: string; phone?: string; grossMonthlyPay: number; deductions?: Array<{ name: string; kind: string; amount: number }>; active: boolean }
-type PayrollRun = { id: string; period: string; status: 'draft' | 'posted' | 'paid'; rule_set: string; employee_count: number; gross_total: string; net_total: string; paye_total: string; shif_total: string }
+type Employee = { id: string; employeeNumber: string; fullName: string; email?: string; phone?: string; grossMonthlyPay: number; otherTaxableDeductions?: number; otherTaxReliefs?: number; deductions?: Array<{ name: string; kind: 'taxable_base' | 'tax_relief' | 'post_tax'; amount: number }>; active: boolean }
+type PayrollRun = { id: string; period: string; status: 'draft' | 'posted' | 'partially_paid' | 'paid'; rule_set: string; employee_count: number; gross_total: string; net_total: string; paid_total?: string; outstanding_total?: string; paye_total: string; shif_total: string }
 type Remittance = { id: string; remittance_type: string; amount: string; status: string; payment_reference?: string; payroll_run_id: string }
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
 type EstimateRecord = { id: string; customer: string; customer_email: string; description: string; amount: string; valid_until: string; status: string; invoice_id?: string | null }
@@ -227,7 +227,9 @@ function App() {
   const [trialTotals, setTrialTotals] = useState({ debit: '0', credit: '0' })
   const [accountingPeriods, setAccountingPeriods] = useState<AccountingPeriod[]>([])
   const [employeeInput, setEmployeeInput] = useState({ employeeNumber: '', fullName: '', email: '', phone: '', grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0', deductions: [] as Array<{ name: string; kind: 'taxable_base' | 'tax_relief' | 'post_tax'; amount: string }> })
+  const [editingEmployeeId, setEditingEmployeeId] = useState('')
   const [payrollPeriod, setPayrollPeriod] = useState(today.slice(0, 7))
+  const [payrollPaymentInputs, setPayrollPaymentInputs] = useState<Record<string, { amount: string; paymentReference: string }>>({})
   const [payslips, setPayslips] = useState<Array<{ id: string; period: string; employee: { fullName: string; employeeNumber: string }; estimate: PayrollEstimate }>>([])
   const [records, setRecords] = useState<Record<string, WorkspaceRecord[]>>({ customers: [], suppliers: [], inventory: [], projects: [] })
   const [recordForm, setRecordForm] = useState<Record<string, string>>({})
@@ -843,10 +845,40 @@ function App() {
   async function addEmployee(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
-      await request('/v1/payroll/employees', { method: 'POST', body: JSON.stringify({ ...employeeInput, grossMonthlyPay: Number(employeeInput.grossMonthlyPay), otherTaxableDeductions: Number(employeeInput.otherTaxableDeductions), otherTaxReliefs: Number(employeeInput.otherTaxReliefs) }) })
+      const body = { ...employeeInput, grossMonthlyPay: Number(employeeInput.grossMonthlyPay), otherTaxableDeductions: Number(employeeInput.otherTaxableDeductions), otherTaxReliefs: Number(employeeInput.otherTaxReliefs), deductions: employeeInput.deductions.map((item) => ({ ...item, amount: Number(item.amount) })) }
+      await request(editingEmployeeId ? `/v1/payroll/employees/${editingEmployeeId}` : '/v1/payroll/employees', { method: editingEmployeeId ? 'PUT' : 'POST', body: JSON.stringify(body) })
       setEmployeeInput({ employeeNumber: '', fullName: '', email: '', phone: '', grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0', deductions: [] })
+      setEditingEmployeeId('')
       const result = await request<{ employees: Employee[] }>('/v1/payroll/employees'); setEmployees(result.employees); notify('Encrypted employee record saved')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save employee record.') }
+    finally { setBusy(false) }
+  }
+
+  function editEmployee(employee: Employee) {
+    const deductions = employee.deductions ?? []
+    const namedTaxableDeductions = deductions.filter((item) => item.kind === 'taxable_base').reduce((sum, item) => sum + item.amount, 0)
+    const namedTaxReliefs = deductions.filter((item) => item.kind === 'tax_relief').reduce((sum, item) => sum + item.amount, 0)
+    setEmployeeInput({
+      employeeNumber: employee.employeeNumber,
+      fullName: employee.fullName,
+      email: employee.email ?? '',
+      phone: employee.phone ?? '',
+      grossMonthlyPay: String(employee.grossMonthlyPay),
+      otherTaxableDeductions: String(Math.max(0, Number(employee.otherTaxableDeductions ?? 0) - namedTaxableDeductions)),
+      otherTaxReliefs: String(Math.max(0, Number(employee.otherTaxReliefs ?? 0) - namedTaxReliefs)),
+      deductions: deductions.map((item) => ({ ...item, amount: String(item.amount) })),
+    })
+    setEditingEmployeeId(employee.id)
+    setError('')
+  }
+
+  async function setEmployeeActive(employee: Employee, active: boolean) {
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/payroll/employees/${employee.id}/status`, { method: 'PATCH', body: JSON.stringify({ active }) })
+      setEmployees((current) => current.map((item) => item.id === employee.id ? { ...item, active } : item))
+      notify(active ? 'Employee restored to active payroll' : 'Employee archived')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not update employee.') }
     finally { setBusy(false) }
   }
 
@@ -1046,8 +1078,14 @@ function App() {
   async function markPayrollPaid(runId: string) {
     setBusy(true); setError('')
     try {
-      await request(`/v1/payroll/runs/${runId}/pay`, { method: 'POST', body: '{}' })
-      const result = await request<{ runs: PayrollRun[] }>('/v1/payroll/runs'); setPayrollRuns(result.runs); notify('Payroll payment recorded in the ledger')
+      const payment = payrollPaymentInputs[runId]
+      if (!payment?.paymentReference.trim()) throw new Error('Enter the reference from the external payment confirmation.')
+      const run = payrollRuns.find((item) => item.id === runId)
+      if (!run) throw new Error('Payroll run could not be found. Refresh the page and try again.')
+      await request(`/v1/payroll/runs/${runId}/pay`, { method: 'POST', body: JSON.stringify({ amount: Number(payment.amount || run.outstanding_total || run.net_total), paymentReference: payment.paymentReference, paymentDate: today }) })
+      const runs = await request<{ runs: PayrollRun[] }>('/v1/payroll/runs'); setPayrollRuns(runs.runs); await refresh()
+      setPayrollPaymentInputs((current) => ({ ...current, [runId]: { amount: '', paymentReference: '' } }))
+      notify('Externally confirmed payroll payment recorded; any unpaid balance remains a payroll payable.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not record payroll payment.') }
     finally { setBusy(false) }
   }
@@ -1270,7 +1308,7 @@ function App() {
 
           <section className="dashboard-grid">
             <article className="panel cashflow-panel">
-              <div className="panel-header"><div><h2>Recorded cash flow</h2><p>Daily income and expenses entered in this workspace</p></div>
+              <div className="panel-header"><div><h2>Recorded cash flow</h2><p>Daily saved income and expenses, including recorded payroll payments</p></div>
                 <span className="period-select"><CalendarDays size={14} /> This month</span>
               </div>
               <div className="chart-legend"><span><i className="legend-income" /> Income</span><span><i className="legend-expense" /> Expenses</span></div>
@@ -1335,7 +1373,7 @@ function App() {
         </> : page === 'Payroll' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> PAYROLL · {dashboard?.workspaceName}</div>
           <h1>Payroll & statutory estimates</h1>
-          <p className="welcome-subtitle">Manage encrypted employee records, prepare monthly drafts, review payslips, post the payroll journal, and track remittance references.</p>
+          <p className="welcome-subtitle">Manage employee and tax details, review monthly drafts, record confirmed external payments, and track any remaining payroll payable.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <article className="module-card">
             <h2>Employee records ({employees.length})</h2>
@@ -1347,14 +1385,30 @@ function App() {
                 {employeeInput.deductions.map((deduction, index) => <div className="field-row deduction-row" key={index}><label className="field-label">Deduction name<input required value={deduction.name} placeholder="e.g. Sacco contribution" onChange={(event) => setEmployeeInput({ ...employeeInput, deductions: employeeInput.deductions.map((item, row) => row === index ? { ...item, name: event.target.value } : item) })} /></label><label className="field-label">Treatment<select value={deduction.kind} onChange={(event) => setEmployeeInput({ ...employeeInput, deductions: employeeInput.deductions.map((item, row) => row === index ? { ...item, kind: event.target.value as typeof item.kind } : item) })}><option value="taxable_base">Taxable-pay adjustment</option><option value="tax_relief">Tax relief adjustment</option><option value="post_tax">Post-tax net deduction</option></select></label><label className="field-label">Amount (KSh)<input required type="number" min="0.01" step="0.01" value={deduction.amount} onChange={(event) => setEmployeeInput({ ...employeeInput, deductions: employeeInput.deductions.map((item, row) => row === index ? { ...item, amount: event.target.value } : item) })} /></label><button type="button" className="button button-small" aria-label={`Remove deduction ${index + 1}`} onClick={() => setEmployeeInput({ ...employeeInput, deductions: employeeInput.deductions.filter((_, row) => row !== index) })}>Remove</button></div>)}
               </div>
               <label className="field-label">Other tax reliefs (KSh)<input type="number" min="0" step="0.01" value={employeeInput.otherTaxReliefs} onChange={(event) => setEmployeeInput({ ...employeeInput, otherTaxReliefs: event.target.value })} /></label>
-              <button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save encrypted employee'}</button>
+              <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : editingEmployeeId ? 'Save employee changes' : 'Save encrypted employee'}</button>{editingEmployeeId && <button type="button" className="button button-secondary" disabled={busy} onClick={() => { setEditingEmployeeId(''); setEmployeeInput({ employeeNumber: '', fullName: '', email: '', phone: '', grossMonthlyPay: '', otherTaxableDeductions: '0', otherTaxReliefs: '0', deductions: [] }) }}>Cancel edit</button>}</div>
             </form>
-            {employees.map((employee) => <div className="transaction-row" key={employee.id}><span><strong>{employee.fullName}</strong><small>{employee.employeeNumber} · {payrollMoney(employee.grossMonthlyPay)}/month</small></span><button className="button button-small" disabled={busy || !employee.active} onClick={async () => { try { await request(`/v1/payroll/employees/${employee.id}/status`, { method: 'PATCH', body: JSON.stringify({ active: false }) }); setEmployees(employees.map((item) => item.id === employee.id ? { ...item, active: false } : item)) } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not update employee.') } }}>Archive</button></div>)}
+            {employees.map((employee) => <div className="transaction-row employee-record-row" key={employee.id}>
+              <span><strong>{employee.fullName} {!employee.active && <span className="status-pill amber">Archived</span>}</strong><small>{employee.employeeNumber} · {payrollMoney(employee.grossMonthlyPay)}/month · {employee.email || 'No email'}{employee.phone ? ` · ${employee.phone}` : ''}</small></span>
+              <div className="button-row"><button className="button button-small" disabled={busy} onClick={() => editEmployee(employee)}>Edit details</button><button className="button button-small" disabled={busy} onClick={() => void setEmployeeActive(employee, !employee.active)}>{employee.active ? 'Archive' : 'Restore'}</button></div>
+            </div>)}
           </article>
           <article className="module-card">
             <h2>Payroll runs</h2>
             <form className="field-row" onSubmit={createPayrollRun}><label className="field-label">Period<input required type="month" value={payrollPeriod} onChange={(event) => setPayrollPeriod(event.target.value)} /></label><button className="button button-primary" disabled={busy}>Create draft run</button></form>
-            {payrollRuns.map((run) => <div className="transaction-row" key={run.id}><span><strong>{run.period} · {run.status}</strong><small>{run.employee_count} employees · gross {money(run.gross_total)} · net {money(run.net_total)} · PAYE {money(run.paye_total)}</small></span><div className="button-row"><button className="button button-small" onClick={() => void loadPayslips(run.id)}>Payslips</button>{run.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void postPayroll(run.id)}>Review & post</button>}{run.status === 'posted' && <button className="button button-small" disabled={busy} onClick={() => void markPayrollPaid(run.id)}>Record net pay</button>}{run.status !== 'draft' && <button className="button button-small" disabled={busy || complianceDrafts.some((draft) => draft.integration_type === 'statutory_filing' && draft.source_id === run.id)} onClick={() => void createComplianceDraft('statutory_filing', run.id)}>Prepare filing draft</button>}</div></div>)}
+            <p className="dialog-note">Bank connections provide read-only feeds; they do not send or verify payroll transfers. After paying employees externally, record the confirmed amount and reference below. Any unpaid balance remains in payroll payable and is not marked paid.</p>
+            {payrollRuns.map((run) => {
+              const outstanding = Number(run.outstanding_total ?? Math.max(0, Number(run.net_total) - Number(run.paid_total ?? (run.status === 'paid' ? run.net_total : 0))))
+              const paid = Number(run.paid_total ?? (run.status === 'paid' ? run.net_total : 0))
+              const paymentInput = payrollPaymentInputs[run.id]
+              return <div className="payroll-run-row" key={run.id}>
+                <div className="transaction-row"><span><strong>{run.period} · {run.status.replace('_', ' ')}</strong><small>{run.employee_count} employees · gross {money(run.gross_total)} · net {money(run.net_total)} · PAYE {money(run.paye_total)}</small><small>Paid {money(paid)} · outstanding payroll payable {money(outstanding)}</small></span><div className="button-row"><button className="button button-small" onClick={() => void loadPayslips(run.id)}>Payslips</button>{run.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void postPayroll(run.id)}>Review & post</button>}{run.status !== 'draft' && <button className="button button-small" disabled={busy || complianceDrafts.some((draft) => draft.integration_type === 'statutory_filing' && draft.source_id === run.id)} onClick={() => void createComplianceDraft('statutory_filing', run.id)}>Prepare filing draft</button>}</div></div>
+                {(run.status === 'posted' || run.status === 'partially_paid') && <div className="payroll-payment-entry">
+                  <label className="field-label">Confirmed payment (KSh)<input aria-label={`Confirmed payment amount for ${run.period}`} required type="number" min="0.01" max={outstanding.toFixed(2)} step="0.01" value={paymentInput?.amount ?? outstanding.toFixed(2)} onChange={(event) => setPayrollPaymentInputs((current) => ({ ...current, [run.id]: { amount: event.target.value, paymentReference: current[run.id]?.paymentReference ?? '' } }))} /></label>
+                  <label className="field-label">External bank/cash reference<input aria-label={`External payment reference for ${run.period}`} required maxLength={120} value={paymentInput?.paymentReference ?? ''} onChange={(event) => setPayrollPaymentInputs((current) => ({ ...current, [run.id]: { amount: current[run.id]?.amount ?? outstanding.toFixed(2), paymentReference: event.target.value } }))} /></label>
+                  <button className="button button-primary" disabled={busy || outstanding <= 0} onClick={() => void markPayrollPaid(run.id)}>Record confirmed payment</button>
+                </div>}
+              </div>
+            })}
             {payslips.map((slip) => <div className="invoice-summary" key={slip.id}><strong>Payslip · {slip.employee.fullName} · {slip.period}</strong><p>Gross {payrollMoney(slip.estimate.grossMonthlyPay)} · PAYE {payrollMoney(slip.estimate.payeEstimate)} · Net {payrollMoney(slip.estimate.netPayEstimate)}</p></div>)}
           </article>
           <article className="module-card"><h2>Statutory remittances (reference tracking only)</h2><p>Record a payment reference after paying the authority through its official channel. KashFlow does not submit returns or transfer remittances.</p>{remittances.map((item) => <div className="transaction-row" key={item.id}><span><strong>{item.remittance_type.toUpperCase()} · {item.status}</strong><small>{money(item.amount)}</small></span>{item.status === 'due' && <button className="button button-small" onClick={() => void recordRemittance(item.id)}>Record external payment</button>}</div>)}</article>
@@ -1485,7 +1539,7 @@ function App() {
           <div className="eyebrow"><span className="live-dot" /> REPORTS · WORKSPACE RECORDS</div><h1>Business reports</h1><p className="welcome-subtitle">Visual summaries from saved transactions and invoices. These are management views, not audited financial statements.</p>
           <div className="dashboard-grid"><article className="module-card report-chart"><h2>Income vs expenses this month</h2><ResponsiveContainer width="100%" height={260}><BarChart data={chart}><CartesianGrid vertical={false} stroke="#eff0f4" /><XAxis dataKey="date" /><YAxis /><Tooltip formatter={(value) => money(Number(value))} /><Legend /><Bar dataKey="income" fill="#7256df" radius={[5, 5, 0, 0]} /><Bar dataKey="expense" fill="#48b99e" radius={[5, 5, 0, 0]} /></BarChart></ResponsiveContainer></article>
             <article className="module-card report-chart"><h2>Recorded cash flow mix</h2><ResponsiveContainer width="100%" height={260}><PieChart><Pie data={[{ name: 'Income', value: Number(dashboard?.totals.monthIncome ?? 0) }, { name: 'Expenses', value: Number(dashboard?.totals.monthExpenses ?? 0) }].filter((item) => item.value > 0)} dataKey="value" nameKey="name" outerRadius={85} label>{['#7256df', '#48b99e'].map((color) => <Cell key={color} fill={color} />)}</Pie><Tooltip formatter={(value) => money(Number(value))} /><Legend /></PieChart></ResponsiveContainer>{Number(dashboard?.totals.monthIncome ?? 0) + Number(dashboard?.totals.monthExpenses ?? 0) === 0 && <div className="empty-state">Add transactions to populate this chart.</div>}</article></div>
-          <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income this month</span><strong>{money(dashboard?.totals.monthIncome ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses this month</span><strong>{money(dashboard?.totals.monthExpenses ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: posted manual transactions and saved invoice records. Payroll journals and bank-feed statement data are not included until posted to the ledger.</p></div>
+          <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income this month</span><strong>{money(dashboard?.totals.monthIncome ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses this month</span><strong>{money(dashboard?.totals.monthExpenses ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
           <article className="module-card"><h2>Cash-flow outlook</h2><p>Three-month estimate based on the average monthly posted ledger activity available over the last six months; not a cash guarantee.</p>{forecast.map((row) => <div className="transaction-row" key={row.period}><span><strong>{row.period}</strong><small>Historical-average estimate</small></span><span>Income {money(row.income)} · Expenses {money(row.expenses)}</span><strong>Net {money(row.income - row.expenses)}</strong></div>)}</article>
           <article className="module-card"><h2>Budget by account</h2><form className="record-form-grid" onSubmit={saveBudget}><label className="field-label">Account<select required value={budgetInput.accountCode} onChange={(event) => setBudgetInput({ ...budgetInput, accountCode: event.target.value })}><option value="">Choose account</option>{accounts.map((accountRow) => <option value={accountRow.code} key={accountRow.code}>{accountRow.code} · {accountRow.name}</option>)}</select></label><label className="field-label">Period<input required type="month" value={budgetInput.period} onChange={(event) => setBudgetInput({ ...budgetInput, period: event.target.value })} /></label><label className="field-label">Budget (KSh)<input required min="0" step="0.01" type="number" value={budgetInput.amount} onChange={(event) => setBudgetInput({ ...budgetInput, amount: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Save budget</button></form>
             {budgets.map((budget) => <div className="transaction-row" key={budget.id}><span><strong>{budget.period} · {budget.account_code} {budget.account_name}</strong><small>Budget {money(budget.budget)} · actual {money(budget.actual)}</small></span><strong>Variance {money(budget.variance)}</strong></div>)}

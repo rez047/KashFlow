@@ -1968,12 +1968,36 @@ app.get('/v1/payroll/employees', requirePool, requireSession, requireWorkspaceAd
   } catch (error) { next(error) }
 })
 
+const employeeRecordSchema = z.object({
+  employeeNumber: z.string().trim().min(1).max(40),
+  fullName: z.string().trim().min(1).max(160),
+  email: z.string().trim().email().max(254).optional().or(z.literal('')),
+  phone: z.string().trim().max(30).optional(),
+  grossMonthlyPay: z.coerce.number().finite().positive().max(100_000_000),
+  otherTaxableDeductions: z.coerce.number().finite().min(0).default(0),
+  otherTaxReliefs: z.coerce.number().finite().min(0).default(0),
+  deductions: z.array(z.object({
+    name: z.string().trim().min(1).max(100),
+    kind: z.enum(['taxable_base', 'tax_relief', 'post_tax']),
+    amount: z.coerce.number().finite().positive().max(100_000_000),
+  })).max(30).default([]),
+})
+
+function normalizeEmployeeRecord(data: z.infer<typeof employeeRecordSchema>) {
+  return {
+    ...data,
+    email: data.email?.toLowerCase() || '',
+    otherTaxableDeductions: data.deductions.filter((item) => item.kind === 'taxable_base').reduce((sum, item) => sum + item.amount, data.otherTaxableDeductions),
+    otherTaxReliefs: data.deductions.filter((item) => item.kind === 'tax_relief').reduce((sum, item) => sum + item.amount, data.otherTaxReliefs),
+  }
+}
+
 app.post('/v1/payroll/employees', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ employeeNumber: z.string().trim().min(1).max(40), fullName: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).optional().or(z.literal('')), phone: z.string().trim().max(30).optional(), grossMonthlyPay: z.coerce.number().finite().positive().max(100_000_000), otherTaxableDeductions: z.coerce.number().finite().min(0).default(0), otherTaxReliefs: z.coerce.number().finite().min(0).default(0), deductions: z.array(z.object({ name: z.string().trim().min(1).max(100), kind: z.enum(['taxable_base', 'tax_relief', 'post_tax']), amount: z.coerce.number().finite().positive().max(100_000_000) })).max(30).default([]) }).safeParse(request.body)
+  const input = employeeRecordSchema.safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter an employee number, name, and positive gross monthly pay.' }); return }
   try {
     const id = randomUUID()
-    const employee = { ...input.data, email: input.data.email?.toLowerCase() || '', otherTaxableDeductions: input.data.deductions.filter((item) => item.kind === 'taxable_base').reduce((sum, item) => sum + item.amount, input.data.otherTaxableDeductions), otherTaxReliefs: input.data.deductions.filter((item) => item.kind === 'tax_relief').reduce((sum, item) => sum + item.amount, input.data.otherTaxReliefs) }
+    const employee = normalizeEmployeeRecord(input.data)
     await pool!.query('INSERT INTO employees (id, workspace_id, employee_data_encrypted) VALUES ($1, $2, $3)', [id, request.session!.workspaceId, encryptPayrollData(employee)])
     const client = await pool!.connect()
     try {
@@ -1983,6 +2007,24 @@ app.post('/v1/payroll/employees', requirePool, verifyOrigin, requireSession, req
     } catch (error) { await client.query('ROLLBACK'); throw error }
     finally { client.release() }
     response.status(201).json({ employee: { id, ...employee, active: true } })
+  } catch (error) { next(error) }
+})
+
+app.put('/v1/payroll/employees/:employeeId', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  const input = employeeRecordSchema.safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter an employee number, name, and positive gross monthly pay.' }); return }
+  try {
+    const employee = normalizeEmployeeRecord(input.data)
+    const result = await pool!.query('UPDATE employees SET employee_data_encrypted = $1, updated_at = now() WHERE id = $2 AND workspace_id = $3 RETURNING id, active', [encryptPayrollData(employee), request.params.employeeId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Employee not found.' }); return }
+    const client = await pool!.connect()
+    try {
+      await client.query('BEGIN')
+      await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'employee.updated', entityType: 'employee', entityId: String(result.rows[0].id), eventData: { employeeNumber: employee.employeeNumber } })
+      await client.query('COMMIT')
+    } catch (error) { await client.query('ROLLBACK'); throw error }
+    finally { client.release() }
+    response.json({ employee: { id: result.rows[0].id, ...employee, active: result.rows[0].active } })
   } catch (error) { next(error) }
 })
 
@@ -1998,7 +2040,10 @@ app.patch('/v1/payroll/employees/:employeeId/status', requirePool, verifyOrigin,
 
 app.get('/v1/payroll/runs', requirePool, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT id, period, status, rule_set, employee_count, gross_total::text, net_total::text, paye_total::text, shif_total::text, nssf_employee_total::text, nssf_employer_total::text, housing_employee_total::text, housing_employer_total::text, created_at FROM payroll_runs WHERE workspace_id = $1 ORDER BY period DESC', [request.session!.workspaceId])
+    const result = await pool!.query(`SELECT id, period, status, rule_set, employee_count, gross_total::text, net_total::text, paid_total::text,
+      GREATEST(net_total - paid_total, 0)::text AS outstanding_total, paye_total::text, shif_total::text,
+      nssf_employee_total::text, nssf_employer_total::text, housing_employee_total::text, housing_employer_total::text, created_at
+      FROM payroll_runs WHERE workspace_id = $1 ORDER BY period DESC`, [request.session!.workspaceId])
     response.json({ runs: result.rows })
   } catch (error) { next(error) }
 })
@@ -2093,18 +2138,31 @@ app.post('/v1/payroll/runs/:runId/post', requirePool, verifyOrigin, requireSessi
 })
 
 app.post('/v1/payroll/runs/:runId/pay', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requirePayrollEncryption, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    amount: z.coerce.number().finite().positive().max(100_000_000),
+    paymentReference: z.string().trim().min(1).max(120),
+    paymentDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).default(nairobiToday()),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter the externally paid amount, payment reference, and a valid payment date.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const result = await client.query('SELECT id, period, status, net_total::text FROM payroll_runs WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.runId, request.session!.workspaceId])
+    const result = await client.query('SELECT id, period, status, net_total::text, paid_total::text FROM payroll_runs WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.runId, request.session!.workspaceId])
     const run = result.rows[0]
     if (!run) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Payroll run not found.' }); return }
-    if (run.status !== 'posted') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only a posted run can be recorded as paid.' }); return }
-    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Net payroll paid ${run.period}`, sourceType: 'payroll_payment', sourceId: String(run.id), lines: [{ accountCode: '2000', debit: Number(run.net_total), credit: 0 }, { accountCode: '1000', debit: 0, credit: Number(run.net_total) }] })
-    await client.query('UPDATE payroll_runs SET status = $1 WHERE id = $2', ['paid', run.id])
-    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'payroll_run.payment_recorded', entityType: 'payroll_run', entityId: String(run.id), eventData: { period: run.period, amount: String(run.net_total) } })
+    if (!['posted', 'partially_paid'].includes(String(run.status))) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only a posted or partially paid payroll run can receive a payment.' }); return }
+    const outstanding = Math.round((Number(run.net_total) - Number(run.paid_total)) * 100) / 100
+    if (input.data.amount > outstanding) { await client.query('ROLLBACK'); response.status(409).json({ error: `Payment exceeds the remaining payroll payable of KSh ${outstanding.toFixed(2)}.` }); return }
+    const paidTotal = Math.round((Number(run.paid_total) + input.data.amount) * 100) / 100
+    const status = paidTotal >= Number(run.net_total) ? 'paid' : 'partially_paid'
+    const paymentId = randomUUID()
+    await client.query('INSERT INTO payroll_payments (id, payroll_run_id, workspace_id, amount, payment_reference, payment_date, recorded_by) VALUES ($1, $2, $3, $4, $5, $6, $7)', [paymentId, run.id, request.session!.workspaceId, input.data.amount.toFixed(2), input.data.paymentReference, input.data.paymentDate, request.session!.userId])
+    await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [paymentId, request.session!.workspaceId, `Net payroll paid ${run.period}`, input.data.amount.toFixed(2), 'expense', `Payroll · ${input.data.paymentReference}`, input.data.paymentDate])
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.paymentDate, description: `Net payroll paid ${run.period}`, sourceType: 'payroll_payment', sourceId: paymentId, lines: [{ accountCode: '2000', debit: input.data.amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: input.data.amount }] })
+    await client.query('UPDATE payroll_runs SET paid_total = $1, status = $2 WHERE id = $3', [paidTotal.toFixed(2), status, run.id])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'payroll_run.payment_recorded', entityType: 'payroll_run', entityId: String(run.id), eventData: { period: run.period, amount: input.data.amount.toFixed(2), outstanding: (Number(run.net_total) - paidTotal).toFixed(2), paymentReference: input.data.paymentReference } })
     await client.query('COMMIT')
-    response.json({ runId: run.id, status: 'paid' })
+    response.json({ runId: run.id, paymentId, status, paidTotal: paidTotal.toFixed(2), outstanding: (Number(run.net_total) - paidTotal).toFixed(2) })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
