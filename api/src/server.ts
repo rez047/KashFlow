@@ -349,7 +349,7 @@ async function requireSession(request: AuthedRequest, response: express.Response
       ? rolePermissionDefaults.admin
       : Array.isArray(overrides)
         ? overrides.filter((permission: unknown): permission is WorkspacePermission => workspacePermissionNames.includes(permission as WorkspacePermission))
-        : rolePermissionDefaults[request.workspaceRole] ?? []
+        : rolePermissionDefaults[request.workspaceRole] ?? (await pool!.query('SELECT permissions FROM custom_workspace_roles WHERE workspace_id = $1 AND role_key = $2', [request.session!.workspaceId, request.workspaceRole])).rows[0]?.permissions ?? []
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
       const permission = permissionForRequest(request) ?? 'operations.write'
       if (permission && !(request.workspacePermissions ?? []).includes(permission)) {
@@ -363,7 +363,7 @@ async function requireSession(request: AuthedRequest, response: express.Response
 function permissionForRequest(request: AuthedRequest): WorkspacePermission | null {
   const routePath = String(request.route?.path ?? '')
   if (routePath === '/v1/workspaces/:workspaceId/activate') return null
-  if (routePath.includes('/invitations') || routePath.includes('/members')) return 'team.manage'
+  if (routePath.includes('/invitations') || routePath.includes('/members') || routePath.includes('/roles')) return 'team.manage'
   if (routePath.startsWith('/v1/payroll') || routePath.startsWith('/v1/integrations/statutory')) return 'payroll.manage'
   if (routePath.startsWith('/v1/integrations')) return 'integrations.manage'
   if (routePath.startsWith('/v1/settings')) return 'workspace.manage'
@@ -595,7 +595,7 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
 const workspaceRecordTypes = ['customers', 'suppliers', 'inventory', 'projects'] as const
 const workspaceRecordSchemas = {
   customers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default('') }),
-  suppliers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default('') }),
+  suppliers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default(''), supplyItemIds: z.array(z.string().uuid()).max(100).default([]) }),
   inventory: z.object({ name: z.string().trim().min(1).max(160), sku: z.string().trim().max(80).default(''), barcode: z.string().trim().max(80).default(''), reorderPoint: z.coerce.number().finite().min(0).default(0), quantity: z.coerce.number().finite().min(0).default(0), unit: z.string().trim().max(30).default('unit'), cost: z.coerce.number().finite().min(0).default(0), price: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
   projects: z.object({ name: z.string().trim().min(1).max(160), customer: z.string().trim().max(160).default(''), status: z.enum(['planned', 'active', 'on_hold', 'completed']).default('planned'), startDate: z.string().date().or(z.literal('')).default(''), endDate: z.string().date().or(z.literal('')).default(''), budget: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
 }
@@ -608,6 +608,15 @@ const workspaceRecordDatabaseTypes: Record<WorkspaceRecordType, string> = {
 }
 function parseRecordType(value: string): WorkspaceRecordType | null {
   return workspaceRecordTypes.find((type) => type === value) ?? null
+}
+async function validateSupplierItemLinks(client: PoolClient, workspaceId: string, itemIds: string[]) {
+  const uniqueIds = new Set(itemIds)
+  if (uniqueIds.size !== itemIds.length) return 'Choose each inventory item only once.'
+  for (const itemId of uniqueIds) {
+    const item = await client.query("SELECT 1 FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory'", [itemId, workspaceId])
+    if (!item.rowCount) return 'Every supplier item must be an inventory record in this business.'
+  }
+  return null
 }
 async function ensureDefaultInventoryLocation(client: PoolClient, workspaceId: string) {
   const existing = await client.query('SELECT id FROM inventory_locations WHERE workspace_id = $1 AND is_default = true', [workspaceId])
@@ -750,6 +759,10 @@ app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, require
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
+    if (type === 'suppliers') {
+      const invalidLinks = await validateSupplierItemLinks(client, request.session!.workspaceId, (input.data as z.infer<typeof workspaceRecordSchemas.suppliers>).supplyItemIds)
+      if (invalidLinks) { await client.query('ROLLBACK'); response.status(400).json({ error: invalidLinks }); return }
+    }
     const result = await client.query('INSERT INTO workspace_records (id, workspace_id, record_type, data) VALUES ($1, $2, $3, $4::jsonb) RETURNING id, data, created_at, updated_at', [randomUUID(), request.session!.workspaceId, workspaceRecordDatabaseTypes[type], JSON.stringify(input.data)])
     if (inventoryInput && inventoryInput.quantity > 0 && inventoryInput.cost > 0) {
       const movementId = randomUUID()
@@ -1295,6 +1308,10 @@ app.put('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
+    if (type === 'suppliers') {
+      const invalidLinks = await validateSupplierItemLinks(client, request.session!.workspaceId, (input.data as z.infer<typeof workspaceRecordSchemas.suppliers>).supplyItemIds)
+      if (invalidLinks) { await client.query('ROLLBACK'); response.status(400).json({ error: invalidLinks }); return }
+    }
     if (type === 'inventory') {
       const current = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [request.params.recordId, request.session!.workspaceId])
       if (!current.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Record not found in this workspace.' }); return }
@@ -1815,17 +1832,26 @@ app.post('/v1/workspaces', requirePool, verifyOrigin, requireSession, async (req
 app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
   const input = z.object({
     email: z.string().trim().email().max(254).transform((value) => value.toLowerCase()),
-    role: z.enum(['accountant', 'staff', 'viewer']),
+    role: z.string().trim().min(1).max(60),
     scope: z.enum(['single', 'all_owned']).default('single'),
   }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Choose a valid email, accountant, staff, or viewer role.' }); return }
+  if (!input.success) { response.status(400).json({ error: 'Provide a valid email and workspace role.' }); return }
   if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Invitations can only be created for the active business.' }); return }
 
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const currentAdmin = await client.query('SELECT 1 FROM workspace_members WHERE user_id = $1 AND workspace_id = $2 AND role = $3', [request.session!.userId, request.session!.workspaceId, 'admin'])
-    if (!currentAdmin.rowCount) { await client.query('ROLLBACK'); response.status(403).json({ error: 'Only a business admin can invite team members.' }); return }
+    const currentMember = await client.query('SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2', [request.session!.userId, request.session!.workspaceId])
+    if (!currentMember.rowCount || (currentMember.rows[0].role !== 'admin' && !(request.workspacePermissions ?? []).includes('team.manage'))) {
+      await client.query('ROLLBACK'); response.status(403).json({ error: 'Team management permission is required to invite members.' }); return
+    }
+    const customRole = await client.query('SELECT role_key FROM custom_workspace_roles WHERE workspace_id = $1 AND role_key = $2', [request.session!.workspaceId, input.data.role])
+    if (!['accountant', 'staff', 'viewer'].includes(input.data.role) && !customRole.rowCount) {
+      await client.query('ROLLBACK'); response.status(400).json({ error: 'Choose an existing built-in or custom business role.' }); return
+    }
+    if (customRole.rowCount && input.data.scope === 'all_owned') {
+      await client.query('ROLLBACK'); response.status(400).json({ error: 'Custom roles are business-specific. Invite this role to the current business only.' }); return
+    }
 
     let targets: Array<{ workspace_id: string; name: string }> = []
     if (input.data.scope === 'all_owned') {
@@ -1882,19 +1908,61 @@ app.get('/v1/workspaces/:workspaceId/invitations', requirePool, requireSession, 
     response.json({ invitations: result.rows })
   } catch (error) { next(error) }
 })
+app.get('/v1/workspaces/:workspaceId/roles', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Roles can only be managed for the active business.' }); return }
+  try {
+    const result = await pool!.query('SELECT id, role_key, role_name, permissions FROM custom_workspace_roles WHERE workspace_id = $1 ORDER BY role_name', [request.session!.workspaceId])
+    response.json({ roles: result.rows.map((role: Record<string, unknown>) => ({ id: String(role.id), roleKey: String(role.role_key), roleName: String(role.role_name), permissions: role.permissions })) })
+  } catch (error) { next(error) }
+})
+app.post('/v1/workspaces/:workspaceId/roles', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Roles can only be managed for the active business.' }); return }
+  const input = z.object({
+    name: z.string().trim().min(2).max(60).regex(/^[A-Za-z0-9][A-Za-z0-9 _-]*$/),
+    permissions: z.array(z.enum(workspacePermissionNames)).max(workspacePermissionNames.length),
+  }).safeParse(request.body)
+  if (!input.success || new Set(input.data.permissions).size !== input.data.permissions.length) { response.status(400).json({ error: 'Enter a role name and select unique supported permissions.' }); return }
+  const roleKey = input.data.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+  if (!roleKey || ['admin', 'accountant', 'staff', 'viewer'].includes(roleKey)) { response.status(400).json({ error: 'Choose a name that does not conflict with a built-in role.' }); return }
+  try {
+    const result = await pool!.query(`INSERT INTO custom_workspace_roles (id, workspace_id, role_key, role_name, permissions)
+      VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id, role_key, role_name, permissions`,
+    [randomUUID(), request.session!.workspaceId, roleKey, input.data.name, JSON.stringify(input.data.permissions)])
+    const role = result.rows[0]
+    response.status(201).json({ role: { id: String(role.id), roleKey: String(role.role_key), roleName: String(role.role_name), permissions: role.permissions } })
+  } catch (error) {
+    if ((error as { code?: string }).code === '23505') { response.status(409).json({ error: 'A role with that name already exists in this business.' }); return }
+    next(error)
+  }
+})
+app.put('/v1/workspaces/:workspaceId/roles/:roleKey', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Roles can only be managed for the active business.' }); return }
+  const input = z.object({ permissions: z.array(z.enum(workspacePermissionNames)).max(workspacePermissionNames.length) }).safeParse(request.body)
+  if (!input.success || new Set(input.data.permissions).size !== input.data.permissions.length) { response.status(400).json({ error: 'Select unique supported permissions.' }); return }
+  try {
+    const result = await pool!.query(`UPDATE custom_workspace_roles SET permissions = $1::jsonb, updated_at = now()
+      WHERE workspace_id = $2 AND role_key = $3 RETURNING id, role_key, role_name, permissions`,
+    [JSON.stringify(input.data.permissions), request.session!.workspaceId, request.params.roleKey])
+    if (!result.rowCount) { response.status(404).json({ error: 'Custom role not found.' }); return }
+    const role = result.rows[0]
+    response.json({ role: { id: String(role.id), roleKey: String(role.role_key), roleName: String(role.role_name), permissions: role.permissions } })
+  } catch (error) { next(error) }
+})
 app.get('/v1/workspaces/:workspaceId/members', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Members can only be managed for the active business.' }); return }
   try {
     const result = await pool!.query(`SELECT wm.user_id, wm.role, wm.permissions, u.email, u.phone
       FROM workspace_members wm JOIN users u ON u.id = wm.user_id
       WHERE wm.workspace_id = $1 ORDER BY wm.role, u.email, u.phone`, [request.session!.workspaceId])
+    const customRoles = await pool!.query('SELECT role_key, permissions FROM custom_workspace_roles WHERE workspace_id = $1', [request.session!.workspaceId])
+    const customPermissions = new Map(customRoles.rows.map((role: Record<string, unknown>) => [String(role.role_key), role.permissions as WorkspacePermission[]]))
     response.json({ members: result.rows.map((member: Record<string, unknown>) => ({
       userId: String(member.user_id),
       role: String(member.role),
       email: member.email ?? '',
       phone: member.phone ?? '',
       permissions: Array.isArray(member.permissions) ? member.permissions : null,
-      defaultPermissions: rolePermissionDefaults[String(member.role)] ?? [],
+      defaultPermissions: rolePermissionDefaults[String(member.role)] ?? customPermissions.get(String(member.role)) ?? [],
     })) })
   } catch (error) { next(error) }
 })

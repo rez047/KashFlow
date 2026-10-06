@@ -76,6 +76,7 @@ type StoreOrder = { id: string; status: string; source: string; external_order_i
 type WooConnection = { store_url: string; enabled: boolean; last_synced_at?: string | null; credentialsConfigured: boolean }
 type MemberPermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
 type WorkspaceMember = { userId: string; role: string; email: string; phone: string; permissions: MemberPermission[] | null; defaultPermissions: MemberPermission[] }
+type CustomRole = { id: string; roleKey: string; roleName: string; permissions: MemberPermission[] }
 type TimeEntry = { id: string; description: string; work_date: string; hours: string; hourly_cost: string; billable: boolean; status: string }
 type AgingReport = { asOf: string; receivables: { items: Array<{ id: string; counterparty: string; amount: string; amount_paid: string; due_date: string; days_overdue: number }>; buckets: Record<string, string> }; payables: { items: Array<{ id: string; counterparty: string; amount: string; amount_paid: string; due_date: string; days_overdue: number }>; buckets: Record<string, string> } }
 type BudgetLine = { id: string; account_code: string; account_name: string; period: string; budget: string; actual: string; variance: string }
@@ -213,6 +214,8 @@ function App() {
   const [posLocationId, setPosLocationId] = useState('')
   const [posCart, setPosCart] = useState<PosCartLine[]>([])
   const [posCustomer, setPosCustomer] = useState('')
+  const [posCustomerType, setPosCustomerType] = useState<'walk_in' | 'remote'>('walk_in')
+  const [posCustomerEmail, setPosCustomerEmail] = useState('')
   const [posPaymentMethod, setPosPaymentMethod] = useState<'cash' | 'mpesa'>('cash')
   const [posPaymentPhone, setPosPaymentPhone] = useState('')
   const [posReceipt, setPosReceipt] = useState<PosReceipt | null>(null)
@@ -235,6 +238,10 @@ function App() {
   const [wooCredentials, setWooCredentials] = useState({ storeUrl: '', consumerKey: '', consumerSecret: '' })
   const [teamMembers, setTeamMembers] = useState<WorkspaceMember[]>([])
   const [memberPermissionDrafts, setMemberPermissionDrafts] = useState<Record<string, MemberPermission[]>>({})
+  const [customRoles, setCustomRoles] = useState<CustomRole[]>([])
+  const [customRoleDraft, setCustomRoleDraft] = useState({ name: '', permissions: [] as MemberPermission[] })
+  const [editingCustomRoleKey, setEditingCustomRoleKey] = useState('')
+  const [supplierItemIds, setSupplierItemIds] = useState<string[]>([''])
   const [posBridgeStatus, setPosBridgeStatus] = useState('')
   const [posBridgeBusy, setPosBridgeBusy] = useState(false)
   const [posBridgeAddress, setPosBridgeAddress] = useState(() => localStorage.getItem('kashflow-pos-bridge') || 'http://127.0.0.1:17371')
@@ -457,6 +464,7 @@ function App() {
           setTeamMembers(result.members)
           setMemberPermissionDrafts(Object.fromEntries(result.members.map((member) => [member.userId, member.permissions ?? member.defaultPermissions])))
         }),
+        request<{ roles: CustomRole[] }>(`/v1/workspaces/${account.workspace.id}/roles`).then((result) => setCustomRoles(result.roles)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load store, WooCommerce, or team settings.'))
     }
     else if (account) void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
@@ -540,6 +548,43 @@ function App() {
       const next = enabled ? [...new Set([...active, permission])] : active.filter((value) => value !== permission)
       return { ...current, [userId]: next }
     })
+  }
+
+  function toggleCustomRolePermission(permission: MemberPermission, enabled: boolean) {
+    setCustomRoleDraft((current) => ({
+      ...current,
+      permissions: enabled ? [...new Set([...current.permissions, permission])] : current.permissions.filter((item) => item !== permission),
+    }))
+  }
+
+  async function saveCustomRole(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      const url = `/v1/workspaces/${account?.workspace.id}/roles${editingCustomRoleKey ? `/${encodeURIComponent(editingCustomRoleKey)}` : ''}`
+      const result = await request<{ role: CustomRole }>(url, { method: editingCustomRoleKey ? 'PUT' : 'POST', body: JSON.stringify({ name: customRoleDraft.name, permissions: customRoleDraft.permissions }) })
+      setCustomRoles((current) => editingCustomRoleKey ? current.map((role) => role.roleKey === editingCustomRoleKey ? result.role : role) : [...current, result.role])
+      setEditingCustomRoleKey(''); setCustomRoleDraft({ name: '', permissions: [] }); notify('Custom role saved.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save custom role.') }
+    finally { setBusy(false) }
+  }
+
+  function editCustomRole(role: CustomRole) {
+    setEditingCustomRoleKey(role.roleKey)
+    setCustomRoleDraft({ name: role.roleName, permissions: [...role.permissions] })
+  }
+
+  function cancelCustomRoleEdit() {
+    setEditingCustomRoleKey('')
+    setCustomRoleDraft({ name: '', permissions: [] })
+  }
+
+  function beginInvoiceForCustomer(customer: WorkspaceRecord) {
+    setInvoice({ customer: String(customer.data.name ?? ''), customerEmail: String(customer.data.email ?? ''), description: '', amount: '', dueDate: today })
+    setInvoiceLines([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])
+    setInvoiceLocationId('')
+    setInvoicePreview(null)
+    setError('')
+    setModal('invoice')
   }
 
   function changePosBridgeAddress(value: string) {
@@ -752,7 +797,11 @@ function App() {
       setError('Enter the customer’s M-Pesa phone number before requesting payment.')
       return
     }
-    const customer = posCustomer.trim() || 'Walk-in customer'
+    if (posCustomerType === 'remote' && !posCustomer.trim()) {
+      setError('Enter the remote customer’s name before checkout.')
+      return
+    }
+    const customer = posCustomerType === 'walk_in' ? 'Walk-in customer' : posCustomer.trim()
     const saleLines = posCart.map((line) => ({ ...line }))
     const total = saleLines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
     if (total <= 0) {
@@ -770,7 +819,7 @@ function App() {
         method: 'POST',
         body: JSON.stringify({
           customer,
-          customerEmail: '',
+          customerEmail: posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
           locationId: posLocationId || undefined,
           dueDate: today,
           lines: saleLines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: 0 })),
@@ -780,6 +829,8 @@ function App() {
       setPosReceipt(receipt)
       setPosCart([])
       setPosCustomer('')
+      setPosCustomerType('walk_in')
+      setPosCustomerEmail('')
       setPosPaymentPhone('')
 
       if (posPaymentMethod === 'cash') {
@@ -1294,11 +1345,12 @@ function App() {
   async function saveWorkspaceRecord(event: FormEvent<HTMLFormElement>, type: 'customers' | 'suppliers' | 'inventory' | 'projects') {
     event.preventDefault(); setBusy(true); setError('')
     const body: Record<string, unknown> = { ...recordForm }
+    if (type === 'suppliers') body.supplyItemIds = supplierItemIds.filter(Boolean)
     if (type === 'inventory' || type === 'projects') for (const key of type === 'inventory' ? ['quantity', 'cost', 'price', 'reorderPoint'] : ['budget']) body[key] = Number(body[key] || 0)
     try {
       await request(editingRecordId ? `/v1/records/${type}/${editingRecordId}` : `/v1/records/${type}`, { method: editingRecordId ? 'PUT' : 'POST', body: JSON.stringify(body) })
       const result = await request<{ records: WorkspaceRecord[] }>(`/v1/records/${type}`)
-      setRecords((current) => ({ ...current, [type]: result.records })); setRecordForm({}); setEditingRecordId(''); notify(`${type.slice(0, -1)} saved`)
+      setRecords((current) => ({ ...current, [type]: result.records })); setRecordForm({}); setEditingRecordId(''); setSupplierItemIds(['']); notify(`${type.slice(0, -1)} saved`)
     } catch (reason) { setError(reason instanceof Error ? reason.message : `Could not save ${type.slice(0, -1)}.`) }
     finally { setBusy(false) }
   }
@@ -1900,8 +1952,8 @@ function App() {
           }
           return <section className="module-page"><div className="eyebrow"><span className="live-dot" /> {page.toUpperCase()} · WORKSPACE DATABASE</div><h1>{page}</h1><p className="welcome-subtitle">Create and maintain records for {dashboard?.workspaceName}. Data is private to this business.</p>
             {error && <p className="form-error" role="alert">{error}</p>}
-            <form className="module-card" onSubmit={(event) => void saveWorkspaceRecord(event, type)}><h2>{editingRecordId ? 'Edit' : 'Add'} {page.slice(0, -1).toLowerCase()}</h2><div className="record-form-grid">{fields[type].map((field) => <label className="field-label" key={field.name}>{field.label}{field.kind === 'status' ? <select value={recordForm[field.name] ?? 'planned'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="planned">Planned</option><option value="active">Active</option><option value="on_hold">On hold</option><option value="completed">Completed</option></select> : <input required={field.name === 'name'} type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : field.kind ?? 'text'} min={field.kind === 'number' ? '0' : undefined} step={field.kind === 'number' ? '0.01' : undefined} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} />}</label>)}</div><div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : `${editingRecordId ? 'Update' : 'Save'} ${page.slice(0, -1).toLowerCase()}`}</button>{editingRecordId && <button type="button" className="button button-secondary" onClick={() => { setEditingRecordId(''); setRecordForm({}) }}>Cancel edit</button>}</div></form>
-            <article className="module-card"><h2>Saved {page.toLowerCase()} ({records[type].length})</h2>{records[type].map((record) => <div className="transaction-row" key={record.id}><span><strong>{record.data.name}</strong><small>{type === 'inventory' ? `SKU ${record.data.sku || '—'} · Qty ${record.data.quantity} ${record.data.unit}` : type === 'projects' ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}` : `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'}`}</small></span><div className="button-row"><button className="button button-small" onClick={() => { setEditingRecordId(record.id); setRecordForm(Object.fromEntries(Object.entries(record.data).map(([key, value]) => [key, String(value ?? '')]))) }}>Edit</button><button className="button button-small" onClick={() => void deleteWorkspaceRecord(type, record.id)}>Delete</button></div></div>)}{!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}</article>
+            <form className="module-card" onSubmit={(event) => void saveWorkspaceRecord(event, type)}><h2>{editingRecordId ? 'Edit' : 'Add'} {page.slice(0, -1).toLowerCase()}</h2><div className="record-form-grid">{fields[type].map((field) => <label className="field-label" key={field.name}>{field.label}{field.kind === 'status' ? <select value={recordForm[field.name] ?? 'planned'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="planned">Planned</option><option value="active">Active</option><option value="on_hold">On hold</option><option value="completed">Completed</option></select> : <input required={field.name === 'name'} type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : field.kind ?? 'text'} min={field.kind === 'number' ? '0' : undefined} step={field.kind === 'number' ? '0.01' : undefined} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} />}</label>)}</div>{type === 'suppliers' && <fieldset className="module-card supplier-items-fieldset"><legend>Inventory items supplied (optional)</legend><p className="dialog-note">Link one or more items this supplier provides. These are reference links only; they do not change stock or purchase orders.</p>{supplierItemIds.map((itemId, index) => <div className="field-row" key={`supplier-item-${index}`}><label className="field-label">Inventory item<select aria-label={`Supplier inventory item ${index + 1}`} value={itemId} onChange={(event) => setSupplierItemIds((current) => current.map((value, row) => row === index ? event.target.value : value))}><option value="">Choose item (optional)</option>{records.inventory.filter((item) => !supplierItemIds.includes(item.id) || item.id === itemId).map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')}{item.data.sku ? ` · ${item.data.sku}` : ''}</option>)}</select></label>{supplierItemIds.length > 1 && <button type="button" className="button button-small" aria-label="Remove supplier item row" onClick={() => setSupplierItemIds((current) => current.filter((_, row) => row !== index))}>Remove</button>}</div>)}<button type="button" className="button button-secondary" onClick={() => setSupplierItemIds((current) => [...current, ''])}>Add another item</button></fieldset>}<div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : `${editingRecordId ? 'Update' : 'Save'} ${page.slice(0, -1).toLowerCase()}`}</button>{editingRecordId && <button type="button" className="button button-secondary" onClick={() => { setEditingRecordId(''); setRecordForm({}); setSupplierItemIds(['']) }}>Cancel edit</button>}</div></form>
+            <article className="module-card"><h2>Saved {page.toLowerCase()} ({records[type].length})</h2>{records[type].map((record) => <div className="transaction-row" key={record.id}><span><strong>{record.data.name}</strong><small>{type === 'inventory' ? `SKU ${record.data.sku || '—'} · Qty ${record.data.quantity} ${record.data.unit}` : type === 'projects' ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}` : type === 'suppliers' ? `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'} · ${(Array.isArray(record.data.supplyItemIds) ? record.data.supplyItemIds : []).map((itemId) => String(records.inventory.find((item) => item.id === itemId)?.data.name ?? '')).filter(Boolean).join(', ') || 'No linked inventory items'}` : `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'}`}</small></span><div className="button-row">{type === 'customers' && <button className="button button-small" onClick={() => beginInvoiceForCustomer(record)}>Create invoice</button>}<button className="button button-small" onClick={() => { setEditingRecordId(record.id); setRecordForm(Object.fromEntries(Object.entries(record.data).filter(([key]) => key !== 'supplyItemIds').map(([key, value]) => [key, String(value ?? '')]))); setSupplierItemIds(Array.isArray(record.data.supplyItemIds) && record.data.supplyItemIds.length ? record.data.supplyItemIds.map(String) : ['']) }}>Edit</button><button className="button button-small" onClick={() => void deleteWorkspaceRecord(type, record.id)}>Delete</button></div></div>)}{!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}</article>
             {type === 'suppliers' && <article className="module-card"><h2>Vendor bills and payments</h2><p>Record itemized bills and tax amounts verified for your business. Tax entries are bookkeeping inputs, not statutory determinations.</p><form className="record-form-grid" onSubmit={saveBill}><label className="field-label">Supplier<input required value={billInput.supplier} onChange={(event) => setBillInput({ ...billInput, supplier: event.target.value })} /></label><DraftLineEditor lines={billLines} includeRecoverableTax onChange={(index, key, value) => setBillLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setBillLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0', recoverableTaxAmount: '0' }])} onRemove={(index) => setBillLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} /><p>Total: <strong>{money(draftDocumentTotal(billLines))}</strong></p><label className="field-label">Bill date<input required type="date" value={billInput.billDate} onChange={(event) => setBillInput({ ...billInput, billDate: event.target.value })} /></label><label className="field-label">Due date<input required type="date" min={billInput.billDate} value={billInput.dueDate} onChange={(event) => setBillInput({ ...billInput, dueDate: event.target.value })} /></label><label className="field-label"><input type="checkbox" checked={billInput.requiresApproval} onChange={(event) => setBillInput({ ...billInput, requiresApproval: event.target.checked })} /> Require admin approval before posting</label><button className="button button-primary" disabled={busy}>Record bill</button></form>
               {bills.map((bill) => <div className="transaction-row" key={bill.id}><span><strong>{bill.supplier} · {bill.description}</strong><small>Due {bill.due_date} · {bill.approval_status === 'pending' ? 'awaiting approval' : bill.approval_status === 'rejected' ? 'rejected' : bill.status} · Remaining {money(bill.amount_due ?? bill.amount)}</small></span><strong>{money(bill.amount)}</strong>{bill.approval_status === 'pending' && <button className="button button-small" disabled={busy} onClick={() => void approveBill(bill)}>Approve and post</button>}{bill.status === 'unpaid' && bill.approval_status === 'approved' && <><label className="field-label">Payment (KSh)<input min="0.01" max={bill.amount_due ?? bill.amount} step="0.01" type="number" value={paymentAmounts[bill.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [bill.id]: event.target.value }))} /></label><button className="button button-small" disabled={busy || !paymentAmounts[bill.id]} onClick={() => void payBill(bill)}>Record payment</button></>}</div>)}
               {!bills.length && <div className="empty-state">No bills yet.</div>}
@@ -1998,7 +2050,8 @@ function App() {
             </section>
             <aside className="module-card pos-checkout" aria-label="Current sale">
               <div className="pos-cart-title"><div><h2>Current sale</h2><p>{posCart.reduce((count, line) => count + line.quantity, 0)} items</p></div><button type="button" className="button button-small" disabled={!posCart.length} onClick={() => setPosCart([])}>Clear</button></div>
-              <label className="field-label">Customer (optional)<input maxLength={160} list="pos-customer-records" placeholder="Walk-in customer" value={posCustomer} onChange={(event) => setPosCustomer(event.target.value)} /><datalist id="pos-customer-records">{records.customers.map((customer) => <option key={customer.id} value={String(customer.data.name ?? '')} />)}</datalist></label>
+              <fieldset className="pos-payment-choice"><legend>Customer type</legend><button type="button" className={posCustomerType === 'walk_in' ? 'selected' : ''} aria-pressed={posCustomerType === 'walk_in'} onClick={() => setPosCustomerType('walk_in')}>Walk-in customer</button><button type="button" className={posCustomerType === 'remote' ? 'selected' : ''} aria-pressed={posCustomerType === 'remote'} onClick={() => setPosCustomerType('remote')}>Remote customer</button></fieldset>
+              {posCustomerType === 'remote' && <><label className="field-label">Remote customer name<input required maxLength={160} list="pos-customer-records" placeholder="Customer name" value={posCustomer} onChange={(event) => setPosCustomer(event.target.value)} /><datalist id="pos-customer-records">{records.customers.map((customer) => <option key={customer.id} value={String(customer.data.name ?? '')} />)}</datalist></label><label className="field-label">Customer email (optional)<input type="email" maxLength={254} autoComplete="email" value={posCustomerEmail} onChange={(event) => setPosCustomerEmail(event.target.value)} /></label></>}
               <div className="pos-cart-lines">{posCart.map((line) => <div className="pos-cart-line" key={line.itemId}>
                 <div className="pos-line-main"><strong>{line.description}</strong><small>{money(line.unitPrice)} each · {line.onHand} available</small></div>
                 <div className="pos-quantity"><button type="button" aria-label={`Remove one ${line.description}`} onClick={() => changePosQuantity(line.itemId, line.quantity - 1)}><Minus size={14} /></button><span>{line.quantity}</span><button type="button" aria-label={`Add one ${line.description}`} disabled={line.quantity >= line.onHand} onClick={() => changePosQuantity(line.itemId, line.quantity + 1)}><Plus size={14} /></button></div>
@@ -2073,8 +2126,27 @@ function App() {
               </form>
             </section>
             <section className="module-card">
-              <h2>{t('Team permissions')}</h2>
-              <p>Set business access by work area. Workspace administrators retain full access; changes apply when saved.</p>
+              <h2>Team &amp; Permissions</h2>
+              <p>Invite your team and control access with granular role-based permissions. Create custom roles and select exactly which business areas they can use. Administrators retain full access.</p>
+              <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={15} /> Invite your team</button>
+              <form className="module-card record-form-grid" onSubmit={(event) => void saveCustomRole(event)}>
+                <h3>{editingCustomRoleKey ? `Edit role: ${customRoleDraft.name}` : 'Add a custom role'}</h3>
+                <label className="field-label">Custom role name<input required minLength={2} maxLength={60} disabled={Boolean(editingCustomRoleKey)} value={customRoleDraft.name} onChange={(event) => setCustomRoleDraft({ ...customRoleDraft, name: event.target.value })} placeholder="e.g. Sales assistant" /></label>
+                <div className="field-row">{([
+                  ['operations.write', 'Operations'],
+                  ['sales.write', 'Sales'],
+                  ['inventory.write', 'Inventory'],
+                  ['accounting.write', 'Accounting'],
+                  ['banking.write', 'Banking'],
+                  ['payroll.manage', 'Payroll'],
+                  ['integrations.manage', 'Integrations'],
+                  ['workspace.manage', 'Business settings'],
+                  ['team.manage', 'Team management'],
+                  ['store.manage', 'Online store'],
+                ] as Array<[MemberPermission, string]>).map(([permission, label]) => <label className="field-label checkbox-row" key={permission}><input type="checkbox" checked={customRoleDraft.permissions.includes(permission)} onChange={(event) => toggleCustomRolePermission(permission, event.target.checked)} /> {label}</label>)}</div>
+                <div className="button-row"><button className="button button-primary" disabled={busy || !customRoleDraft.name.trim()}>{editingCustomRoleKey ? 'Save role permissions' : 'Create custom role'}</button>{editingCustomRoleKey && <button type="button" className="button button-secondary" onClick={cancelCustomRoleEdit}>Cancel</button>}</div>
+              </form>
+              {customRoles.map((role) => <div className="transaction-row" key={role.id}><span><strong>{role.roleName}</strong><small>{role.permissions.length ? role.permissions.join(' · ') : 'Read-only access'}</small></span><button className="button button-small" onClick={() => editCustomRole(role)}>Edit permissions</button></div>)}
               {teamMembers.filter((member) => member.role !== 'admin').map((member) => <div className="team-permission-card" key={member.userId}>
                 <h3>{member.email || member.phone} · {member.role}</h3>
                 <div className="field-row">{([
@@ -2158,18 +2230,19 @@ function App() {
         </form> : null}
         {modal === 'invite' ? <form onSubmit={inviteUser}>
           <label className="field-label">Email<input type="email" required value={invite.email} onChange={(event) => setInvite({ ...invite, email: event.target.value })} /></label>
-          <label className="field-label">Role<select value={invite.role} onChange={(event) => setInvite({ ...invite, role: event.target.value })}>
+          <label className="field-label">Role<select value={invite.role} onChange={(event) => { const role = event.target.value; setInvite({ ...invite, role }); if (customRoles.some((item) => item.roleKey === role)) setInviteScope('single') }}>
             <option value="accountant">Accountant</option>
             <option value="staff">Staff</option>
             <option value="viewer">Viewer</option>
+            {customRoles.map((role) => <option key={role.roleKey} value={role.roleKey}>{role.roleName} (custom)</option>)}
           </select></label>
           <fieldset className="field-label" style={{ border: 0, padding: 0, margin: '0 0 16px' }}>
             <legend>Business access</legend>
             <label><input type="radio" name="invite-scope" checked={inviteScope === 'single'} onChange={() => setInviteScope('single')} /> This business only ({dashboard?.workspaceName})</label>
-            <label><input type="radio" name="invite-scope" checked={inviteScope === 'all_owned'} onChange={() => setInviteScope('all_owned')} /> All businesses I administer</label>
-            <small>All-business access applies only to businesses where you are an admin.</small>
+            <label><input type="radio" name="invite-scope" checked={inviteScope === 'all_owned'} disabled={customRoles.some((role) => role.roleKey === invite.role)} onChange={() => setInviteScope('all_owned')} /> All businesses I administer</label>
+            <small>{customRoles.some((role) => role.roleKey === invite.role) ? 'Custom roles are specific to this business.' : 'All-business access applies only to businesses where you are an admin.'}</small>
           </fieldset>
-          <p className="dialog-note"><ShieldCheck size={15} /> Invitations expire after seven days. Accountants can work with records and accounting; staff can update business records; viewers are read-only. If email is not configured, copy and send the secure link yourself.</p>
+          <p className="dialog-note"><ShieldCheck size={15} /> Invitations expire after seven days. Custom roles use this business’s saved permissions and apply to this business only. If email is not configured, copy and send the secure link yourself.</p>
           {inviteLink && <label className="field-label">Secure invitation link<input readOnly value={inviteLink} onFocus={(event) => event.currentTarget.select()} /><small>Share only with the invited person. It expires in seven days and works once.</small></label>}
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? 'Sending…' : 'Send invite'}</button></div>

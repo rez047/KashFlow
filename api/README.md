@@ -29,6 +29,9 @@ Invitations can be scoped to the current business or all businesses the inviter 
 - `PATCH /v1/store/orders/:orderId/status` accepts/rejects pending requests and marks invoiced orders fulfilled. `POST /v1/store/orders/:orderId/convert` requires an accepted request, validates available stock, creates an internal invoice, adjusts inventory and posts the journal in one transaction. The invoice is not a tax invoice.
 - Admin-only `GET/PUT /v1/integrations/woocommerce` manage an HTTPS WooCommerce URL and encrypted REST credentials. `POST /v1/integrations/woocommerce/products/sync` pushes mapped inventory products; `POST /v1/integrations/woocommerce/orders/sync` imports new orders as pending review. Confirm stock, tax, shipping, and payment separately; imported payment status is not trusted as a KashFlow receipt.
 - `GET /v1/workspaces/:workspaceId/members` lists business member permissions. Admin-only `PUT /v1/workspaces/:workspaceId/members/:userId/permissions` sets allowed business-area scopes for a non-admin member. Admins retain full access.
+- `GET/POST /v1/workspaces/:workspaceId/roles` lists and creates workspace-specific custom roles; `PUT /v1/workspaces/:workspaceId/roles/:roleKey` updates a custom role's permission scopes. Invitations may target built-in roles or custom roles in the active business. Custom roles cannot be used for all-owned-business invitations.
+- Supplier workspace records optionally store multiple validated inventory item IDs in `supplyItemIds`; these links are informational and do not modify purchasing or stock. Customer records in the frontend have a direct action to open a prefilled invoice draft.
+- POS invoices can be issued to walk-in customers or named remote customers, optionally including the remote customer's email; sales, stock, and payment behavior is otherwise unchanged.
 
 ## Local POS bridge
 

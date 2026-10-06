@@ -72,6 +72,7 @@
 .team-permission-card{padding:14px 0;border-bottom:1px solid #eeeef3}.team-permission-card:last-child{border-bottom:0}.team-permission-card h3{margin:0 0 10px;font-size:12px}.team-permission-card .field-row{flex-wrap:wrap;gap:8px 15px}.team-permission-card .field-label{min-width:145px}
 .module-footnote summary{cursor:pointer;color:#6250b7;font-weight:650}.module-footnote>p{line-height:1.5}
 .public-store-header>.language-picker{margin-left:auto}
+.supplier-items-fieldset{margin:0;padding:12px;border:1px solid #ececf2;border-radius:9px}.supplier-items-fieldset legend{padding:0 6px;font-weight:650;color:#46465a}.supplier-items-fieldset .field-row{align-items:end}.supplier-items-fieldset .field-label{flex:1}
 @media(max-width:1000px){.topbar{padding:0 20px}.topbar-actions{gap:10px}.topbar-actions .search-box{width:190px}}
 @media(max-width:760px){.language-picker>span{display:none}.topbar-actions>.language-picker select{max-width:75px;padding:5px 3px}.team-permission-card .field-label{min-width:125px}.record-form-grid>.button-row{flex-wrap:wrap}}
 html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl] .nav-link,html[dir=rtl] .help-card{text-align:right}html[dir=rtl] .nav-heading{margin:0 10px 8px 0}html[dir=rtl] .company-switcher{text-align:right}html[dir=rtl] .metric-card-link{text-align:right}

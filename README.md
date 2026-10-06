@@ -9,6 +9,7 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 - Lets a signed-in user create additional businesses/workspaces and switch to the newly created business.
 - Saves manual income/expense records and internal invoice records to PostgreSQL.
 - Provides workspace-scoped customer, supplier, inventory, and project records, plus private document upload/download/delete (5 MB maximum per file).
+- Links suppliers to multiple optional inventory items they provide, creates invoices directly from saved customer records, and lets POS staff choose between walk-in and named remote customers.
 - Supports reviewed CSV bank-statement import and balanced journal posting, and a Mono-backed bank connection/sync/review path when Mono business approval and server API keys are configured. Mono coverage lists Kenya; verify target banks in the Mono dashboard. Feed data is imported for review and is not auto-posted into accounting.
 - Provides workspace-scoped, self-reported onboarding milestone tracking for eTIMS, bank feeds, and statutory filing; milestones do not assert verified certification.
 - Saves eTIMS invoice and payroll statutory-preparation drafts. The **Submit to authority** action uses the implemented KRA OSCU adapter for validated fiscal payloads when the device is initialized; live production remains kill-switched pending KRA certification/approval. Statutory submissions remain blocked pending an authorized return adapter.
@@ -33,7 +34,7 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 - Lets admins configure business-area permissions for team members; administrators retain full access and server-side route enforcement is required for every write path.
 - Supports project time entry and review, recurring invoice/expense schedules with deliberate manual execution, account budgets, receivables/payables aging, and a historical-average cash-flow estimate.
 - Supports accounting period close and reopen, with posting blocked in closed periods.
-- Lets administrators create expiring, single-use team invitations, invitees accept into a workspace, switch businesses, and applies basic admin/accountant/staff/viewer checks to selected write operations.
+- Lets administrators invite team members using built-in or custom business roles, create/tune custom permission sets, and manage member access by business area. Permission enforcement is improving but still requires a full authorization review before production.
 - Uses Kenyan Shillings (KSh) in the finance UI and describes the intended local compliance integrations transparently.
 
 ## Important implementation and readiness limits
