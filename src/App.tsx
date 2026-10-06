@@ -46,7 +46,7 @@ function overviewPeriod(range: OverviewRange, from: string, to: string) {
 const groups = [
   { title: 'WORKSPACE', items: [['Overview', LayoutDashboard], ['Point of sale', ShoppingBag], ['Banking', Landmark], ['Sales', ArrowUpRight], ['Expenses', ArrowDownLeft], ['Payroll', Users]] },
   { title: 'MANAGE', items: [['Customers', Users], ['Suppliers', ShoppingBag], ['Inventory', Package], ['Projects', BriefcaseBusiness], ['Accounting', BookOpen]] },
-  { title: 'INSIGHTS & COMPLIANCE', items: [['Reports', Activity], ['Kenya compliance', ShieldCheck], ['Documents', FileText]] },
+  { title: 'INSIGHTS', items: [['Reports', Activity], ['Documents', FileText]] },
 ] as const
 const descriptions: Record<string, string> = {
   Banking: 'Bank feeds are not configured. Manually entered records remain available in the workspace ledger.',
