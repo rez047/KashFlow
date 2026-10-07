@@ -78,7 +78,7 @@ type Dashboard = {
   cashflow: Array<{ date: string; income: string; expense: string }>
   invoices: { count: number; unpaid_amount: string }
 }
-type Account = { user: { email: string }; workspace: { id: string; name: string }; workspaces?: Array<{ id: string; name: string; role: string }> }
+type Account = { user: { email: string }; workspace: { id: string; name: string; permissions?: MemberPermission[] }; workspaces?: Array<{ id: string; name: string; role: string }> }
 type IntegrationReadiness = { integrations: Array<{ id: string; status: string }> }
 type PayrollEstimate = {
   ruleSet: string; effectiveFrom: string; reviewRequired: true; grossMonthlyPay: number
@@ -2870,7 +2870,7 @@ function App() {
                     )}
                   </span>
                   <div className="button-row">
-                    {type === 'inventory' && account?.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin' && (
+                    {type === 'inventory' && account?.workspace.permissions?.includes('inventory.write') && (
                       <form className="inventory-price-editor" onSubmit={(event) => void saveInventoryPrice(event, record)}>
                         <label className="field-label">Selling price (KSh)<input required type="number" min="0" step="0.01" value={inventoryPriceDrafts[record.id] ?? String(record.data.price ?? 0)} onChange={(event) => setInventoryPriceDrafts((current) => ({ ...current, [record.id]: event.target.value }))} /></label>
                         <button className="button button-small" disabled={busy}>Save price</button>

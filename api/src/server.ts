@@ -639,7 +639,7 @@ app.get('/v1/auth/me', requirePool, requireSession, async (request: AuthedReques
     const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1 ORDER BY w.name ASC', [request.session!.userId])
     const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
     const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: result.rows[0].workspace_id, name: result.rows[0].workspace_name, role: 'admin' }]
-    response.json({ user: { email: result.rows[0].email ?? result.rows[0].phone }, workspace: { id: result.rows[0].workspace_id, name: result.rows[0].workspace_name }, workspaces })
+    response.json({ user: { email: result.rows[0].email ?? result.rows[0].phone }, workspace: { id: result.rows[0].workspace_id, name: result.rows[0].workspace_name, permissions: request.workspacePermissions ?? [] }, workspaces })
   } catch (error) { next(error) }
 })
 
@@ -1486,7 +1486,8 @@ app.post('/v1/integrations/mono/webhook', requirePool, async (request, response,
   }
   response.status(200).json({ received: true })
 })
-app.patch('/v1/records/inventory/:recordId/price', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+app.patch('/v1/records/:type/:recordId/price', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  if (request.params.type !== 'inventory') { response.status(404).json({ error: 'Unknown price record type.' }); return }
   const input = z.object({ price: z.coerce.number().finite().min(0).max(999999999999) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a valid non-negative selling price.' }); return }
   const client = await pool!.connect()
