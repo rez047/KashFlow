@@ -46,14 +46,15 @@ function overviewPeriod(range: OverviewRange, from: string, to: string) {
 }
 const groups = [
   { title: 'WORKSPACE', items: [['Overview', LayoutDashboard], ['Banking', Landmark], ['Expenses', ArrowDownLeft], ['Payroll', Users]] },
-  { title: 'Point of sale', items: [['Point of sale (Small Scale)', ShoppingBag], ['Point of sale (Large Scale)', ArrowUpRight]] },
+  { title: 'Point of sale', items: [['Point of sale (Small Scale)', ShoppingBag], ['Point of sale (Large Scale)', ArrowUpRight], ['Transactions', Wallet]] },
   { title: 'MANAGE', items: [['Customers', Users], ['Suppliers', ShoppingBag], ['Inventory', Package], ['Projects', BriefcaseBusiness], ['Accounting', BookOpen]] },
   { title: 'INSIGHTS', items: [['Reports', Activity], ['Documents', FileText]] },
 ] as const
 const descriptions: Record<string, string> = {
   Banking: 'Bank feeds are not configured. Manually entered records remain available in the workspace ledger.',
   'Point of sale (Small Scale)': 'Serve quick retail transactions and cash/MPesa tills with the small-scale POS flow.',
-  'Point of sale (Large Scale)': 'Create and track internal invoices saved in your workspace for larger sales workflows.',
+  'Point of sale (Large Scale)': 'Manage the larger sales workflow, estimates, and order lifecycle for this business.',
+  Transactions: 'Review written invoices and run recurring schedules from one transaction log for the business.',
   Expenses: 'Record and review expenses entered in your workspace.',
   Payroll: 'Manage encrypted employee records, prepare reviewed monthly payroll drafts, view payslips, post journals, and track external remittance references. Statutory filing is not connected.',
   Customers: 'Customer details are recorded as part of invoices.',
@@ -577,14 +578,18 @@ function App() {
     }
     if (page === 'Point of sale (Large Scale)') {
       void Promise.all([
-        request<{ invoices: InvoiceRecord[] }>('/v1/invoices').then((result) => setInvoicesList(result.invoices)),
         request<{ estimates: EstimateRecord[] }>('/v1/estimates').then((result) => setEstimates(result.estimates)),
-        request<{ templates: RecurringTemplate[] }>('/v1/recurring').then((result) => setRecurringTemplates(result.templates)),
         request<{ orders: SalesOrder[] }>('/v1/sales-orders').then((result) => setSalesOrders(result.orders)),
         request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
         request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setInvoiceLocationId((current) => current || result.defaultLocationId) }),
         request<{ orders: StoreOrder[] }>('/v1/store/orders').then((result) => setStoreOrders(result.orders)),
-      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load sales records.'))
+      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load larger sales workflows.'))
+    }
+    if (page === 'Transactions') {
+      void Promise.all([
+        request<{ invoices: InvoiceRecord[] }>('/v1/invoices').then((result) => setInvoicesList(result.invoices)),
+        request<{ templates: RecurringTemplate[] }>('/v1/recurring').then((result) => setRecurringTemplates(result.templates)),
+      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load transaction records.'))
     }
     if (page === 'Point of sale (Small Scale)') {
       void Promise.all([
@@ -1658,7 +1663,26 @@ function App() {
   async function saveRecurring(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
-      await request('/v1/recurring', { method: 'POST', body: JSON.stringify({ ...recurringInput, amount: Number(recurringInput.amount) }) })
+      let counterparty = recurringInput.counterparty.trim()
+      if (recurringInput.type === 'invoice' && recurringCustomerMode === 'new') {
+        const name = recurringNewCustomer.name.trim()
+        if (!name) throw new Error('Enter a customer name for this recurring invoice.')
+        const created = await request<{ record: WorkspaceRecord }>('/v1/records/customers', { method: 'POST', body: JSON.stringify({
+          name,
+          email: recurringNewCustomer.email.trim(),
+          phone: recurringNewCustomer.phone.trim(),
+          address: '',
+          taxPin: '',
+          notes: 'Created from recurring transactions',
+        }) })
+        setRecords((current) => ({ ...current, customers: [created.record, ...current.customers] }))
+        counterparty = name
+        setRecurringCustomerMode('saved')
+        setRecurringCustomerId(created.record.id)
+        setRecurringNewCustomer({ name: '', email: '', phone: '' })
+      }
+      if (recurringInput.type === 'invoice' && !counterparty) throw new Error('Select or add a customer for this recurring invoice.')
+      await request('/v1/recurring', { method: 'POST', body: JSON.stringify({ ...recurringInput, counterparty, amount: Number(recurringInput.amount) }) })
       const result = await request<{ templates: RecurringTemplate[] }>('/v1/recurring')
       setRecurringTemplates(result.templates); setRecurringInput({ ...recurringInput, description: '', counterparty: '', amount: '' }); notify('Recurring schedule saved; no entry is posted until you run it.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save recurring schedule.') }
@@ -2763,7 +2787,65 @@ function App() {
                 <button className="button button-primary" disabled={busy || settings.inventoryMediumStockThreshold <= settings.inventoryLowStockThreshold}>{busy ? 'Saving…' : 'Save stock thresholds'}</button>
               </form>
             </article>}
-            <article className="module-card"><h2>Saved {page.toLowerCase()} ({records[type].length})</h2>{records[type].map((record) => <div className="transaction-row" key={record.id}><span><strong>{record.data.name}</strong><small>{type === 'inventory' ? `SKU ${record.data.sku || '—'} · Qty ${record.data.quantity} ${record.data.unit}` : type === 'projects' ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}` : type === 'suppliers' ? `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'} · ${(Array.isArray(record.data.supplyItemIds) ? record.data.supplyItemIds : []).map((itemId) => String(records.inventory.find((item) => item.id === itemId)?.data.name ?? '')).filter(Boolean).join(', ') || 'No linked inventory items'}` : `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'}`}</small>{type === 'inventory' && <span className={`stock-status-pill stock-status-${inventoryHealth.find((item) => item.id === record.id)?.status ?? 'healthy'}`}>{inventoryHealth.find((item) => item.id === record.id)?.status === 'low' ? 'Low stock' : inventoryHealth.find((item) => item.id === record.id)?.status === 'medium' ? 'Watch stock' : 'Healthy stock'}</span>}</span><div className="button-row">{type === 'customers' && <button className="button button-small" onClick={() => beginInvoiceForCustomer(record)}>Create invoice</button>}<button className="button button-small" onClick={() => { setEditingRecordId(record.id); setRecordForm(Object.fromEntries(Object.entries(record.data).filter(([key]) => key !== 'supplyItemIds').map(([key, value]) => [key, String(value ?? '')]))); setSupplierItemIds(Array.isArray(record.data.supplyItemIds) && record.data.supplyItemIds.length ? record.data.supplyItemIds.map(String) : ['']) }}>Edit</button><button className="button button-small" onClick={() => void deleteWorkspaceRecord(type, record.id)}>Delete</button></div></div>)}{!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}</article>
+            <article className="module-card">
+              <h2>Saved {page.toLowerCase()} ({records[type].length})</h2>
+              {records[type].map((record) => (
+                <div className="transaction-row" key={record.id}>
+                  <span>
+                    <strong>{record.data.name}</strong>
+                    <small>
+                      {type === 'inventory'
+                        ? `SKU ${record.data.sku || '—'} · Qty ${record.data.quantity} ${record.data.unit}`
+                        : type === 'projects'
+                          ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}`
+                          : type === 'suppliers'
+                            ? `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'} · ${(Array.isArray(record.data.supplyItemIds) ? record.data.supplyItemIds : []).map((itemId) => String(records.inventory.find((item) => item.id === itemId)?.data.name ?? '')).filter(Boolean).join(', ') || 'No linked inventory items'}`
+                            : `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'}`}
+                    </small>
+                    {type === 'inventory' && (
+                      <span className={`stock-status-pill stock-status-${inventoryHealth.find((item) => item.id === record.id)?.status ?? 'healthy'}`}>
+                        {inventoryHealth.find((item) => item.id === record.id)?.status === 'low'
+                          ? 'Low stock'
+                          : inventoryHealth.find((item) => item.id === record.id)?.status === 'medium'
+                            ? 'Watch stock'
+                            : 'Healthy stock'}
+                      </span>
+                    )}
+                  </span>
+                  <div className="button-row">
+                    {type === 'customers' && (
+                      <button className="button button-small" onClick={() => beginInvoiceForCustomer(record)}>Create invoice</button>
+                    )}
+                    {type !== 'inventory' && (
+                      <button
+                        className="button button-small"
+                        onClick={() => {
+                          setEditingRecordId(record.id)
+                          setRecordForm(Object.fromEntries(
+                            Object.entries(record.data)
+                              .filter(([key]) => key !== 'supplyItemIds')
+                              .map(([key, value]) => [key, String(value ?? '')])
+                          ))
+                          setSupplierItemIds(
+                            Array.isArray(record.data.supplyItemIds) && record.data.supplyItemIds.length
+                              ? record.data.supplyItemIds.map(String)
+                              : ['']
+                          )
+                        }}
+                      >
+                        Edit
+                      </button>
+                    )}
+                    {type !== 'inventory' && (
+                      <button className="button button-small" onClick={() => void deleteWorkspaceRecord(type, record.id)}>
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}
+            </article>
             {type === 'suppliers' && <>
               <article className="module-card"><h2>Add vendor</h2><p>Choose an existing vendor from your saved list or add a new one. Every new vendor is saved before you record a bill against it.</p><form className="record-form-grid" onSubmit={(event) => {
                 event.preventDefault();
@@ -2982,8 +3064,7 @@ function App() {
                 {posCustomerHistory && posCustomerHistoryForId === posSavedCustomerId && <><div className="pos-customer-summary"><span><strong>{posCustomerHistory.summary.sale_count}</strong><small>past sales</small></span><span><strong>{money(Number(posCustomerHistory.summary.lifetime_sales))}</strong><small>lifetime invoiced</small></span></div>
                   <div className="pos-customer-sales">{posCustomerHistory.sales.map((sale) => <div className="transaction-row" key={sale.id}><span><strong>{sale.description}</strong><small>{new Date(sale.created_at).toLocaleDateString('en-KE')} · {sale.status}</small></span><strong>{money(Number(sale.amount))}</strong></div>)}
                     {!posCustomerHistory.sales.length && <div className="empty-state">No previous sales found for this customer.</div>}
-                  </div></>}
-              </article>}
+                  </div></>}</article>}
               <div className="pos-cart-lines">{posCart.map((line) => <div className="pos-cart-line" key={line.itemId}>
                 <div className="pos-line-main"><strong>{line.description}</strong><small>{money(line.unitPrice)} each · {line.onHand} available</small></div>
                 <div className="pos-quantity"><button type="button" aria-label={`Remove one ${line.description}`} onClick={() => changePosQuantity(line.itemId, line.quantity - 1)}><Minus size={14} /></button><span>{line.quantity}</span><button type="button" aria-label={`Add one ${line.description}`} disabled={line.quantity >= line.onHand} onClick={() => changePosQuantity(line.itemId, line.quantity + 1)}><Plus size={14} /></button></div>
@@ -3005,52 +3086,98 @@ function App() {
             <details className="module-footnote"><summary>Receipt printer setup · Windows local bridge</summary><p>Install and run the local bridge on this checkout computer, configured for an ESC/POS network printer. It is separate from the browser print option; compatible printer, network access, and drawer cable are required.</p><div className="field-row"><label className="field-label">Local bridge URL<input value={posBridgeAddress} onChange={(event) => changePosBridgeAddress(event.target.value)} placeholder="http://127.0.0.1:17371" /></label><button className="button button-small" disabled={posBridgeBusy} onClick={() => void testPosBridge()}>{posBridgeBusy ? 'Checking…' : t('Test connection')}</button></div>{posBridgeStatus && <p role="status">{t(posBridgeStatus)}</p>}<small>{t('Internal receipt only; not an eTIMS tax invoice.')} Cash drawer is enabled only after a cash payment is recorded.</small></details>
           </div>}
           {posReceipt && <article className="pos-receipt-print"><div className="pos-receipt-brand"><strong>KashFlow</strong><span>{dashboard?.workspaceName}</span></div><h2>{t('SALE RECEIPT')}</h2><p>{t('Invoice')} {posReceipt.invoiceId.slice(0, 8).toUpperCase()} · {today}</p><p>{t('Customer')}: {posReceipt.customer}</p><hr />{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.quantity} × {line.description}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><strong>{t('Total')}</strong><strong>{money(posReceipt.amount)}</strong></div><p>{posReceipt.status}</p><small>{t('Internal receipt only; not an eTIMS tax invoice.')}</small></article>}
-        </section> : page === 'Point of sale (Large Scale)' ? <section className="module-page">
-          <div className="eyebrow"><span className="live-dot" /> POINT OF SALE (LARGE SCALE) · {dashboard?.workspaceName}</div><h1>Invoices</h1><p className="welcome-subtitle">Internal invoices support itemized lines and recorded payments. They are not KRA/eTIMS fiscal tax invoices.</p>
-          <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice</button>
-          <div className="module-card">{error && <p className="form-error" role="alert">{error}</p>}{invoicesList.map((invoiceRow) => {
-            const latestMpesaPayment = invoiceMpesaPayments[invoiceRow.id]?.[0]
-            const promptOpen = mpesaPromptInvoiceId === invoiceRow.id
-            const paidAmount = Number(invoiceRow.amount_paid ?? 0)
-            const invoiceStatusLabel = invoiceRow.status === 'paid' ? 'Paid' : invoiceRow.status === 'void' ? 'Void' : paidAmount > 0 ? 'Partially paid' : 'Not paid'
-            return <div className="invoice-payment-card" key={invoiceRow.id}>
-              <div className="transaction-row">
-                <span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · paid {money(invoiceRow.amount_paid ?? 0)} · due {money(invoiceRow.amount_due ?? invoiceRow.amount)}</small></span>
-                <span className={`status-pill ${invoiceRow.status === 'paid' ? 'green' : 'amber'}`}>{invoiceStatusLabel}</span>
-                <strong>{money(invoiceRow.amount)}</strong>
-                <button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button>
-                {invoiceRow.status !== 'void' && <button className="button button-small" disabled={busy} onClick={() => void shareInvoice(invoiceRow)}>Share invoice</button>}
-                {invoiceRow.status === 'unpaid' && <button className="button button-small" disabled={busy || !invoiceRow.customer_email} title={!invoiceRow.customer_email ? 'Add a customer email to this invoice first.' : undefined} onClick={() => void sendInvoiceReminder(invoiceRow)}>Send reminder</button>}
-                {invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}
-                {invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <>
-                  <label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
-                  <button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button>
-                  <button className="button button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting} title={!mpesaConfigured ? 'Daraja M-Pesa is not configured for this business.' : undefined} onClick={() => {
-                    if (promptOpen) { setMpesaPromptInvoiceId(null); return }
-                    setMpesaPromptInvoiceId(invoiceRow.id)
-                    if (!(invoiceRow.id in invoiceMpesaPayments)) void loadInvoiceMpesaPayments(invoiceRow.id)
-                  }}>M-Pesa prompt{!mpesaConfigured && ' · setup needed'}</button>
+        </section> : page === 'Point of sale (Large Scale)' ? (
+          <section className="module-page">
+            <div className="eyebrow"><span className="live-dot" /> POINT OF SALE (LARGE SCALE) · {dashboard?.workspaceName}</div>
+            <h1>Large-scale sales</h1>
+            <p className="welcome-subtitle">Manage sales orders, accepted estimates, and the wider commercial workflow for this business.</p>
+            <article className="module-card">
+              <h2>Estimates and quotes</h2>
+              <p>Estimates do not post to the ledger. Tax amounts are entered by you after qualified review; these documents are not tax invoices.</p>
+              <form className="record-form-grid" onSubmit={saveEstimate}>
+                <label className="field-label">Customer source<select value={estimateCustomerMode} onChange={(event) => setEstimateCustomerMode(event.target.value as typeof estimateCustomerMode)}><option value="saved">Saved customer</option><option value="new">Create new customer</option></select></label>
+                {estimateCustomerMode === 'saved' ? <label className="field-label">Saved customer<select required value={estimateCustomerId} onChange={(event) => { const customerId = event.target.value; setEstimateCustomerId(customerId); const selectedCustomer = records.customers.find((record) => record.id === customerId); setEstimateInput({ ...estimateInput, customer: selectedCustomer ? String(selectedCustomer.data.name ?? '') : '', customerEmail: selectedCustomer ? String(selectedCustomer.data.email ?? '') : '' }) }}><option value="">Select customer</option>{records.customers.map((customer) => <option key={customer.id} value={customer.id}>{String(customer.data.name ?? 'Customer')}{customer.data.email ? ` · ${customer.data.email}` : ''}</option>)}</select></label> : <><label className="field-label">New customer name<input required maxLength={160} value={estimateNewCustomer.name} onChange={(event) => setEstimateNewCustomer({ ...estimateNewCustomer, name: event.target.value })} /></label><label className="field-label">Customer email<input type="email" value={estimateNewCustomer.email} onChange={(event) => setEstimateNewCustomer({ ...estimateNewCustomer, email: event.target.value })} /></label></>}
+                {estimateCustomerMode === 'new' && <label className="field-label">Customer phone (optional)<input maxLength={30} value={estimateNewCustomer.phone} onChange={(event) => setEstimateNewCustomer({ ...estimateNewCustomer, phone: event.target.value })} /></label>}
+                <button className="button button-primary" disabled={busy}>Save estimate</button>
+              </form>
+              {estimates.length ? <div className="transaction-list">{estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'sent')}>Mark sent</button>}{['draft', 'sent'].includes(estimate.status) && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'accepted')}>Accept</button>}{estimate.status === 'accepted' && !salesOrders.some((order) => order.estimate_id === estimate.id) && <button className="button button-primary" disabled={busy} onClick={() => void createSalesOrder(estimate)}>Create sales order</button>}</div></div>)}</div> : <div className="empty-state">No estimates yet. Save a quote to start the commercial flow.</div>}
+              <h3>Sales order lifecycle</h3>
+              {salesOrders.length ? salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>) : <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
+            </article>
+          </section>
+        ) : page === 'Transactions' ? (
+          <section className="module-page">
+            <div className="eyebrow"><span className="live-dot" /> TRANSACTIONS · {dashboard?.workspaceName}</div>
+            <h1>Transactions</h1>
+            <p className="welcome-subtitle">Review recurring schedules and invoice activity for this business.</p>
+            <article className="module-card">
+              <h2>Recurring transactions</h2>
+              <p>Create an invoice or expense schedule. KashFlow never posts a recurring transaction automatically; an admin must run each due item.</p>
+              <form className="record-form-grid" onSubmit={saveRecurring}>
+                <label className="field-label">Type<select value={recurringInput.type} onChange={(event) => setRecurringInput({ ...recurringInput, type: event.target.value as 'invoice' | 'expense' })}><option value="invoice">Invoice</option><option value="expense">Expense</option></select></label>
+                <label className="field-label">Description<input required value={recurringInput.description} onChange={(event) => setRecurringInput({ ...recurringInput, description: event.target.value })} /></label>
+                {recurringInput.type === 'invoice' && <>
+                  <label className="field-label">Customer source<select value={recurringCustomerMode} onChange={(event) => setRecurringCustomerMode(event.target.value as typeof recurringCustomerMode)}><option value="saved">Saved customer</option><option value="new">Create new customer</option></select></label>
+                  {recurringCustomerMode === 'saved'
+                    ? <label className="field-label">Saved customer<select required value={recurringCustomerId} onChange={(event) => {
+                      const customerId = event.target.value
+                      setRecurringCustomerId(customerId)
+                      const selectedCustomer = records.customers.find((record) => record.id === customerId)
+                      setRecurringInput({ ...recurringInput, counterparty: selectedCustomer ? String(selectedCustomer.data.name ?? '') : '' })
+                    }}><option value="">Select customer</option>{records.customers.map((customer) => <option key={customer.id} value={customer.id}>{String(customer.data.name ?? 'Customer')}{customer.data.email ? ` · ${customer.data.email}` : ''}</option>)}</select></label>
+                    : <>
+                      <label className="field-label">New customer name<input required maxLength={160} value={recurringNewCustomer.name} onChange={(event) => setRecurringNewCustomer({ ...recurringNewCustomer, name: event.target.value })} /></label>
+                      <label className="field-label">Customer email (optional)<input type="email" maxLength={254} value={recurringNewCustomer.email} onChange={(event) => setRecurringNewCustomer({ ...recurringNewCustomer, email: event.target.value })} /></label>
+                      <label className="field-label">Customer phone (optional)<input maxLength={30} value={recurringNewCustomer.phone} onChange={(event) => setRecurringNewCustomer({ ...recurringNewCustomer, phone: event.target.value })} /></label>
+                    </>}
                 </>}
-                {latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}</span>}
-              </div>
-              {promptOpen && invoiceRow.status === 'unpaid' && <div className="invoice-mpesa-prompt">
-                <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="0712345678" value={invoiceMpesaPhones[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaPhones((current) => ({ ...current, [invoiceRow.id]: event.target.value }))} /></label>
-                <button className="button button-primary button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting || !invoiceMpesaPhones[invoiceRow.id]?.trim() || ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment?.status ?? '')} onClick={() => void sendInvoiceMpesaPrompt(invoiceRow)}>{mpesaPromptSubmitting ? 'Sending…' : 'Send prompt'}</button>
-                {latestMpesaPayment && ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment.status) && <p className="dialog-note">A request is already {latestMpesaPayment.status.replaceAll('_', ' ')} for this invoice. Refresh its status before sending another prompt.</p>}
-                {latestMpesaPayment?.result_description && latestMpesaPayment.status === 'failed' && <p className="form-error" role="alert">Last M-Pesa attempt failed: {latestMpesaPayment.result_description}</p>}
-                <button className="button button-small" disabled={mpesaPromptSubmitting} onClick={() => void loadInvoiceMpesaPayments(invoiceRow.id)}>Refresh payment status</button>
-                <p className="dialog-note">The invoice remains unpaid until Daraja confirms payment. Verify the result before releasing goods.</p>
-              </div>}
-            </div>
-          })}{!invoicesList.length && <div className="empty-state">No invoices yet. Create one to review and preview it here.</div>}</div>
-          <article className="module-card"><h2>Estimates and quotes</h2><p>Estimates do not post to the ledger. Tax amounts are entered by you after qualified review; these documents are not tax invoices.</p><form className="record-form-grid" onSubmit={saveEstimate}><label className="field-label">Customer source<select value={estimateCustomerMode} onChange={(event) => setEstimateCustomerMode(event.target.value as typeof estimateCustomerMode)}><option value="saved">Saved customer</option><option value="new">Create new customer</option></select></label>{estimateCustomerMode === 'saved' ? <label className="field-label">Saved customer<select required value={estimateCustomerId} onChange={(event) => { const customerId = event.target.value; setEstimateCustomerId(customerId); const selectedCustomer = records.customers.find((record) => record.id === customerId); setEstimateInput({ ...estimateInput, customer: selectedCustomer ? String(selectedCustomer.data.name ?? '') : '', customerEmail: selectedCustomer ? String(selectedCustomer.data.email ?? '') : '' }) }}><option value="">Select customer</option>{records.customers.map((customer) => <option key={customer.id} value={customer.id}>{String(customer.data.name ?? 'Customer')}{customer.data.email ? ` · ${customer.data.email}` : ''}</option>)}</select></label> : <><label className="field-label">New customer name<input required maxLength={160} value={estimateNewCustomer.name} onChange={(event) => setEstimateNewCustomer({ ...estimateNewCustomer, name: event.target.value })} /></label><label className="field-label">Customer email<input type="email" value={estimateNewCustomer.email} onChange={(event) => setEstimateNewCustomer({ ...estimateNewCustomer, email: event.target.value })} /></label></>}{estimateCustomerMode === 'new' && <label className="field-label">Customer phone (optional)<input maxLength={30} value={estimateNewCustomer.phone} onChange={(event) => setEstimateNewCustomer({ ...estimateNewCustomer, phone: event.target.value })} /></label>}<label className="field-label">Customer email<input type="email" value={estimateInput.customerEmail} onChange={(event) => setEstimateInput({ ...estimateInput, customerEmail: event.target.value })} /></label><DraftLineEditor lines={estimateLines} inventoryItems={records.inventory} onChange={(index, key, value) => setEstimateLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setEstimateLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])} onRemove={(index) => setEstimateLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} /><p>Estimate total: <strong>{money(draftDocumentTotal(estimateLines))}</strong></p><label className="field-label">Valid until<input required type="date" value={estimateInput.validUntil} onChange={(event) => setEstimateInput({ ...estimateInput, validUntil: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Save estimate</button></form>
-            {estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'sent')}>Mark sent</button>}{['draft', 'sent'].includes(estimate.status) && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'accepted')}>Accept</button>}{estimate.status === 'accepted' && !salesOrders.some((order) => order.estimate_id === estimate.id) && <button className="button button-primary" disabled={busy} onClick={() => void createSalesOrder(estimate)}>Create sales order</button>}</div></div>)}
-            <h3>Sales order lifecycle</h3>{salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>)}{!salesOrders.length && <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
-          </article>
-          <article className="module-card"><h2>Recurring transactions</h2><p>Create an invoice or expense schedule. KashFlow never posts a recurring transaction automatically; an admin must run each due item.</p><form className="record-form-grid" onSubmit={saveRecurring}><label className="field-label">Type<select value={recurringInput.type} onChange={(event) => setRecurringInput({ ...recurringInput, type: event.target.value as 'invoice' | 'expense' })}><option value="invoice">Invoice</option><option value="expense">Expense</option></select></label><label className="field-label">Description<input required value={recurringInput.description} onChange={(event) => setRecurringInput({ ...recurringInput, description: event.target.value })} /></label>{recurringInput.type === 'invoice' && <><label className="field-label">Customer source<select value={recurringCustomerMode} onChange={(event) => setRecurringCustomerMode(event.target.value as typeof recurringCustomerMode)}><option value="saved">Saved customer</option><option value="new">Create new customer</option></select></label>{recurringCustomerMode === 'saved' ? <label className="field-label">Saved customer<select required value={recurringCustomerId} onChange={(event) => { const customerId = event.target.value; setRecurringCustomerId(customerId); const selectedCustomer = records.customers.find((record) => record.id === customerId); setRecurringInput({ ...recurringInput, counterparty: selectedCustomer ? String(selectedCustomer.data.name ?? '') : '' }) }}><option value="">Select customer</option>{records.customers.map((customer) => <option key={customer.id} value={customer.id}>{String(customer.data.name ?? 'Customer')}{customer.data.email ? ` · ${customer.data.email}` : ''}</option>)}</select></label> : <><label className="field-label">New customer name<input required maxLength={160} value={recurringNewCustomer.name} onChange={(event) => setRecurringNewCustomer({ ...recurringNewCustomer, name: event.target.value })} /></label><label className="field-label">Customer email<input type="email" value={recurringNewCustomer.email} onChange={(event) => setRecurringNewCustomer({ ...recurringNewCustomer, email: event.target.value })} /></label><label className="field-label">Customer phone (optional)<input maxLength={30} value={recurringNewCustomer.phone} onChange={(event) => setRecurringNewCustomer({ ...recurringNewCustomer, phone: event.target.value })} /></label></>}</>}{recurringInput.type === 'invoice' && <label className="field-label">Customer name<input required value={recurringInput.counterparty} onChange={(event) => setRecurringInput({ ...recurringInput, counterparty: event.target.value })} /></label>}<label className="field-label">Amount (KSh)<input required min="0.01" step="0.01" type="number" value={recurringInput.amount} onChange={(event) => setRecurringInput({ ...recurringInput, amount: event.target.value })} /></label><label className="field-label">Frequency<select value={recurringInput.frequency} onChange={(event) => setRecurringInput({ ...recurringInput, frequency: event.target.value as typeof recurringInput.frequency })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option></select></label><label className="field-label">First due date<input required type="date" value={recurringInput.nextDate} onChange={(event) => setRecurringInput({ ...recurringInput, nextDate: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Save schedule</button></form>
-            {recurringTemplates.map((template) => <div className="transaction-row" key={template.id}><span><strong>{template.template_type} · {template.description}</strong><small>{template.frequency} · next {template.next_date} · {template.active ? 'active' : 'paused'}</small></span><strong>{money(template.amount)}</strong><button className="button button-small" disabled={busy || !template.active || template.next_date > today} onClick={() => void runRecurring(template)}>Run due entry</button></div>)}
-          </article>
-        </section> : page === 'Settings' ? <section className="module-page">
+                <label className="field-label">Amount (KSh)<input required min="0.01" step="0.01" type="number" value={recurringInput.amount} onChange={(event) => setRecurringInput({ ...recurringInput, amount: event.target.value })} /></label>
+                <label className="field-label">Frequency<select value={recurringInput.frequency} onChange={(event) => setRecurringInput({ ...recurringInput, frequency: event.target.value as typeof recurringInput.frequency })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option><option value="weekly">Weekly</option></select></label>
+                <label className="field-label">Next run date<input required type="date" value={recurringInput.nextDate} onChange={(event) => setRecurringInput({ ...recurringInput, nextDate: event.target.value })} /></label>
+                <button className="button button-primary" disabled={busy}>Save recurring entry</button>
+              </form>
+              {recurringTemplates.length ? <div className="transaction-list">{recurringTemplates.map((template) => <div className="transaction-row" key={template.id}><span><strong>{template.template_type} · {template.description}</strong><small>{template.frequency} · next {template.next_date} · {template.active ? 'active' : 'paused'}</small></span><strong>{money(template.amount)}</strong><button className="button button-small" disabled={busy || !template.active || template.next_date > today} onClick={() => void runRecurring(template)}>Run due entry</button></div>)}</div> : <div className="empty-state">No recurring transactions yet.</div>}
+            </article>
+            <article className="module-card">
+              <div className="panel-header"><div><h2>Invoices</h2><p>Internal invoices are not KRA/eTIMS fiscal tax invoices.</p></div><button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice</button></div>
+              {invoicesList.length ? invoicesList.map((invoiceRow) => {
+                const latestMpesaPayment = invoiceMpesaPayments[invoiceRow.id]?.[0]
+                const promptOpen = mpesaPromptInvoiceId === invoiceRow.id
+                const paidAmount = Number(invoiceRow.amount_paid ?? 0)
+                const invoiceStatusLabel = invoiceRow.status === 'paid' ? 'Paid' : invoiceRow.status === 'void' ? 'Void' : paidAmount > 0 ? 'Partially paid' : 'Not paid'
+                return <div className="invoice-payment-card" key={invoiceRow.id}>
+                  <div className="transaction-row">
+                    <span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · paid {money(invoiceRow.amount_paid ?? 0)} · due {money(invoiceRow.amount_due ?? invoiceRow.amount)}</small></span>
+                    <span className={`status-pill ${invoiceRow.status === 'paid' ? 'green' : 'amber'}`}>{invoiceStatusLabel}</span>
+                    <strong>{money(invoiceRow.amount)}</strong>
+                    <button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button>
+                    {invoiceRow.status !== 'void' && <button className="button button-small" disabled={busy} onClick={() => void shareInvoice(invoiceRow)}>Share invoice</button>}
+                    {invoiceRow.status === 'unpaid' && <button className="button button-small" disabled={busy || !invoiceRow.customer_email} title={!invoiceRow.customer_email ? 'Add a customer email to this invoice first.' : undefined} onClick={() => void sendInvoiceReminder(invoiceRow)}>Send reminder</button>}
+                    {invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}
+                    {invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <>
+                      <label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
+                      <button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button>
+                      <button className="button button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting} title={!mpesaConfigured ? 'Daraja M-Pesa is not configured for this business.' : undefined} onClick={() => {
+                        if (promptOpen) { setMpesaPromptInvoiceId(null); return }
+                        setMpesaPromptInvoiceId(invoiceRow.id)
+                        if (!(invoiceRow.id in invoiceMpesaPayments)) void loadInvoiceMpesaPayments(invoiceRow.id)
+                      }}>M-Pesa prompt{!mpesaConfigured && ' · setup needed'}</button>
+                    </>}
+                    {latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}</span>}
+                  </div>
+                  {promptOpen && invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <div className="invoice-mpesa-prompt">
+                    <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="0712345678" value={invoiceMpesaPhones[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaPhones((current) => ({ ...current, [invoiceRow.id]: event.target.value }))} /></label>
+                    <button className="button button-primary button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting || !invoiceMpesaPhones[invoiceRow.id]?.trim() || ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment?.status ?? '')} onClick={() => void sendInvoiceMpesaPrompt(invoiceRow)}>{mpesaPromptSubmitting ? 'Sending…' : 'Send prompt'}</button>
+                    {latestMpesaPayment && ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment.status) && <p className="dialog-note">A request is already {latestMpesaPayment.status.replaceAll('_', ' ')} for this invoice. Refresh its status before sending another prompt.</p>}
+                    {latestMpesaPayment?.result_description && latestMpesaPayment.status === 'failed' && <p className="form-error" role="alert">Last M-Pesa attempt failed: {latestMpesaPayment.result_description}</p>}
+                    <button className="button button-small" disabled={mpesaPromptSubmitting} onClick={() => void loadInvoiceMpesaPayments(invoiceRow.id)}>Refresh payment status</button>
+                    <p className="dialog-note">The invoice remains unpaid until Daraja confirms payment. Verify the result before releasing goods.</p>
+                  </div>}
+                </div>
+              }) : <div className="empty-state">No invoices yet. Create one to review and preview it here.</div>}
+            </article>
+          </section>
+        ) : page === 'Settings' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> SETTINGS · {dashboard?.workspaceName}</div>
           <h1>Business settings</h1>
           <p className="welcome-subtitle">Update saved workspace defaults and provider preferences for this business. These toggles control whether this workspace allows live integrations and statutory routes.</p>

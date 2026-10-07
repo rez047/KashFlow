@@ -1587,7 +1587,11 @@ app.post('/v1/inventory/:itemId/movements', requirePool, verifyOrigin, requireSe
           : [{ accountCode: '1200', debit: movementValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: movementValue }]
         : [{ accountCode: '5100', debit: movementValue, credit: 0 }, { accountCode: '1200', debit: 0, credit: movementValue }]
       const movementDescription = `Inventory ${input.data.movementType}: ${String(data.name ?? 'item')}${input.data.reference ? ` · ${input.data.reference}` : ''}`.slice(0, 240)
-      if (input.data.addToExpenses) await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, movementDescription, movementValue.toFixed(2), 'expense', 'Inventory purchase', input.data.date])
+      if (input.data.movementType === 'adjustment' && quantityDelta < 0) {
+        await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, movementDescription, movementValue.toFixed(2), 'expense', 'Damaged stock write-off', input.data.date])
+      } else if (input.data.addToExpenses) {
+        await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, movementDescription, movementValue.toFixed(2), 'expense', 'Inventory purchase', input.data.date])
+      }
       await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: movementDescription, sourceType: 'inventory_movement', sourceId: movementId, lines })
     }
     await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'inventory.movement_recorded', entityType: 'inventory_item', entityId: String(request.params.itemId), eventData: { movementId, movementType: input.data.movementType, quantityDelta, newQuantity, reference: input.data.reference } })
