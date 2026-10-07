@@ -46,15 +46,14 @@ function overviewPeriod(range: OverviewRange, from: string, to: string) {
 }
 const groups = [
   { title: 'WORKSPACE', items: [['Overview', LayoutDashboard], ['Banking', Landmark], ['Expenses', ArrowDownLeft], ['Payroll', Users]] },
-  { title: 'Point of sale', items: [['Point of sale (Small Scale)', ShoppingBag], ['Point of sale (Large Scale)', ArrowUpRight], ['Transactions', Wallet]] },
+  { title: 'Point of sale', items: [['Point of sale', ShoppingBag], ['Networking', ArrowUpRight]] },
   { title: 'MANAGE', items: [['Customers', Users], ['Suppliers', ShoppingBag], ['Inventory', Package], ['Projects', BriefcaseBusiness], ['Accounting', BookOpen]] },
   { title: 'INSIGHTS', items: [['Reports', Activity], ['Documents', FileText]] },
 ] as const
 const descriptions: Record<string, string> = {
   Banking: 'Bank feeds are not configured. Manually entered records remain available in the workspace ledger.',
-  'Point of sale (Small Scale)': 'Serve quick retail transactions and cash/MPesa tills with the small-scale POS flow.',
-  'Point of sale (Large Scale)': 'Manage the larger sales workflow, estimates, and order lifecycle for this business.',
-  Transactions: 'Review written invoices and run recurring schedules from one transaction log for the business.',
+  'Point of sale': 'Serve quick retail transactions and cash/M-Pesa tills with the counter checkout.',
+  Networking: 'Manage estimates, sales orders, invoices, and recurring transactions for this business.',
   Expenses: 'Record and review expenses entered in your workspace.',
   Payroll: 'Manage encrypted employee records, prepare reviewed monthly payroll drafts, view payslips, post journals, and track external remittance references. Statutory filing is not connected.',
   Customers: 'Customer details are recorded as part of invoices.',
@@ -237,6 +236,7 @@ function draftDocumentTotal(lines: DraftLine[]) {
 function App() {
   const { language, setLanguage, t } = useTranslation()
   const [page, setPage] = useState('Overview')
+  const [networkingTab, setNetworkingTab] = useState<'sales' | 'transactions'>('sales')
   const [pageHistory, setPageHistory] = useState<string[]>([])
   const teamPermissionsScrollPending = useRef(false)
   const [overviewRange, setOverviewRange] = useState<OverviewRange>('mtd')
@@ -593,22 +593,18 @@ function App() {
         request<FinancialStatements>(`/v1/accounting/reports/financial-statements?from=${yearStart}&to=${today}`).then(setFinancialStatements),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load accounting records.'))
     }
-    if (page === 'Point of sale (Large Scale)') {
+    if (page === 'Networking') {
       void Promise.all([
         request<{ estimates: EstimateRecord[] }>('/v1/estimates').then((result) => setEstimates(result.estimates)),
         request<{ orders: SalesOrder[] }>('/v1/sales-orders').then((result) => setSalesOrders(result.orders)),
+        request<{ invoices: InvoiceRecord[] }>('/v1/invoices').then((result) => setInvoicesList(result.invoices)),
+        request<{ templates: RecurringTemplate[] }>('/v1/recurring').then((result) => setRecurringTemplates(result.templates)),
         request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
         request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setInvoiceLocationId((current) => current || result.defaultLocationId) }),
         request<{ orders: StoreOrder[] }>('/v1/store/orders').then((result) => setStoreOrders(result.orders)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load larger sales workflows.'))
     }
-    if (page === 'Transactions') {
-      void Promise.all([
-        request<{ invoices: InvoiceRecord[] }>('/v1/invoices').then((result) => setInvoicesList(result.invoices)),
-        request<{ templates: RecurringTemplate[] }>('/v1/recurring').then((result) => setRecurringTemplates(result.templates)),
-      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load transaction records.'))
-    }
-    if (page === 'Point of sale (Small Scale)') {
+    if (page === 'Point of sale') {
       void Promise.all([
         request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
         request<{ records: WorkspaceRecord[] }>('/v1/records/customers').then((result) => setRecords((current) => ({ ...current, customers: result.records }))),
@@ -1306,7 +1302,7 @@ function App() {
       setInvoiceLocationId('')
       setInvoiceLines([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])
       void request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))).catch((reason) => setError(reason instanceof Error ? `Invoice saved, but stock could not be refreshed: ${reason.message}` : 'Invoice saved, but stock could not be refreshed.'))
-      if (page === 'Point of sale (Large Scale)') {
+      if (page === 'Networking') {
         const listed = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices'); setInvoicesList(listed.invoices)
       }
       const mobileNumber = paymentPhone.trim()
@@ -2435,7 +2431,7 @@ function App() {
   const helpResources = useMemo(() => [
     { title: 'Create an admin account', category: 'Setup', keywords: ['admin', 'create account', 'business name', 'signup', 'register', 'sign up'] },
     { title: 'Add a transaction', category: 'Accounting', keywords: ['transaction', 'income', 'expense', 'ledger', 'money', 'bookkeeping'] },
-    { title: 'Create an invoice', category: 'Point of sale (Large Scale)', keywords: ['invoice', 'customer', 'payment', 'sales', 'bill', 'receipt'] },
+    { title: 'Create an invoice', category: 'Networking', keywords: ['invoice', 'customer', 'payment', 'sales', 'bill', 'receipt'] },
     { title: 'Manage payroll', category: 'Payroll', keywords: ['payroll', 'employee', 'salary', 'payslip', 'nhif', 'nssf', 'shif', 'tax'] },
     { title: 'Business settings', category: 'Settings', keywords: ['settings', 'business name', 'currency', 'timezone', 'notifications', 'audit trail', 'security'] },
     { title: 'Upload receipts and bank statements', category: 'Documents', keywords: ['receipt', 'bank statement', 'attachment', 'file upload', 'document', 'csv', 'upload'] },
@@ -2511,7 +2507,7 @@ function App() {
     { title: `Income · ${periodLabel}`, value: dashboard?.totals.income ?? '0', Icon: ArrowDownLeft, tone: 'purple-icon', destination: 'Accounting' },
     { title: `Expenses · ${periodLabel}`, value: dashboard?.totals.expenses ?? '0', Icon: ArrowUpRight, tone: 'peach-icon', destination: 'Expenses' },
     { title: `Net movement · ${periodLabel}`, value: dashboard?.totals.net ?? '0', Icon: Gauge, tone: 'blue-icon', destination: 'Accounting' },
-    { title: 'Unpaid invoices', value: dashboard?.invoices.unpaid_amount ?? '0', Icon: Wallet, tone: 'mint-icon', destination: 'Point of sale (Large Scale)' },
+    { title: 'Unpaid invoices', value: dashboard?.invoices.unpaid_amount ?? '0', Icon: Wallet, tone: 'mint-icon', destination: 'Networking' },
   ]
 
   if (window.location.pathname.startsWith('/store/') || window.location.pathname.startsWith('/portal/') || window.location.pathname.startsWith('/invoice/')) {
@@ -3077,8 +3073,8 @@ function App() {
             {budgets.map((budget) => <div className="transaction-row" key={budget.id}><span><strong>{budget.period} · {budget.account_code} {budget.account_name}</strong><small>Budget {money(budget.budget)} · actual {money(budget.actual)}</small></span><strong>Variance {money(budget.variance)}</strong></div>)}
           </article>
           {agingReport && <article className="module-card"><h2>Receivables and payables aging as at {agingReport.asOf}</h2><div className="dashboard-grid"><div><h3>Customer invoices</h3>{Object.entries(agingReport.receivables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ar-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div><div><h3>Supplier bills</h3>{Object.entries(agingReport.payables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ap-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div></div></article>}
-        </section> : page === 'Point of sale (Small Scale)' ? <section className="module-page pos-page">
-          <div className="eyebrow"><span className="live-dot" /> POINT OF SALE (SMALL SCALE) · {dashboard?.workspaceName}</div>
+        </section> : page === 'Point of sale' ? <section className="module-page pos-page">
+          <div className="eyebrow"><span className="live-dot" /> POINT OF SALE · {dashboard?.workspaceName}</div>
           <h1>{t('Counter checkout')}</h1>
           <p className="welcome-subtitle">Sell from saved inventory. Checkout creates an internal invoice, deducts stock, and records cash payments in your workspace.</p>
           <p className={`pos-connectivity ${isOnline ? 'online' : 'offline'}`} role="status">{isOnline ? 'Online · inventory and prices are current when refreshed.' : 'Offline · using this business’s last cached catalog; stock may have changed. Sales save locally and are not posted until synced.'}</p>
@@ -3130,7 +3126,14 @@ function App() {
                   </div></>}</article>}
               <div className="pos-cart-lines">{posCart.map((line) => <div className="pos-cart-line" key={line.itemId}>
                 <div className="pos-line-main"><strong>{line.description}</strong><small>{money(line.unitPrice)} each · {line.onHand} available</small></div>
-                <div className="pos-quantity"><button type="button" aria-label={`Remove one ${line.description}`} onClick={() => changePosQuantity(line.itemId, line.quantity - 1)}><Minus size={14} /></button><span>{line.quantity}</span><button type="button" aria-label={`Add one ${line.description}`} disabled={line.quantity >= line.onHand} onClick={() => changePosQuantity(line.itemId, line.quantity + 1)}><Plus size={14} /></button></div>
+                <div className="pos-quantity"><button type="button" aria-label={`Remove one ${line.description}`} onClick={() => changePosQuantity(line.itemId, line.quantity - 1)}><Minus size={14} /></button><input key={`${line.itemId}-${line.quantity}`} aria-label={`Quantity for ${line.description}`} type="number" min="1" max={line.onHand} step="1" defaultValue={line.quantity} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur() } }} onBlur={(event) => {
+                  const nextQuantity = Number(event.currentTarget.value)
+                  if (!Number.isInteger(nextQuantity) || nextQuantity < 1) {
+                    event.currentTarget.value = String(line.quantity)
+                    return
+                  }
+                  changePosQuantity(line.itemId, nextQuantity)
+                }} /><button type="button" aria-label={`Add one ${line.description}`} disabled={line.quantity >= line.onHand} onClick={() => changePosQuantity(line.itemId, line.quantity + 1)}><Plus size={14} /></button></div>
                 <strong className="pos-line-total">{money(line.quantity * line.unitPrice)}</strong>
                 <button type="button" className="icon-button pos-remove" aria-label={`Remove ${line.description} from sale`} onClick={() => changePosQuantity(line.itemId, 0)}><Trash2 size={15} /></button>
               </div>)}{!posCart.length && <div className="pos-cart-empty"><ShoppingBag size={22} /><strong>Your sale is empty</strong><span>Select an item to add it to the cart.</span></div>}</div>
@@ -3145,15 +3148,19 @@ function App() {
             </aside>
           </div>
           {posReceipt && <div className="module-card pos-last-sale"><div><div className="eyebrow">LAST SALE · {posReceipt.invoiceId.slice(0, 8).toUpperCase()}</div><h2>{money(posReceipt.amount)}</h2><p>{posReceipt.customer} · {posReceipt.status}</p></div>
-            <div className="button-row"><button className="button button-secondary" onClick={() => window.print()}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod === 'cash' && posReceipt.status.startsWith('Paid') && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}<button className="button button-secondary" onClick={() => navigateTo('Point of sale (Large Scale)')}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
+            <div className="button-row"><button className="button button-secondary" onClick={() => window.print()}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod === 'cash' && posReceipt.status.startsWith('Paid') && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}<button className="button button-secondary" onClick={() => { setNetworkingTab('sales'); navigateTo('Networking') }}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
             <details className="module-footnote"><summary>Receipt printer setup · Windows local bridge</summary><p>Install and run the local bridge on this checkout computer, configured for an ESC/POS network printer. It is separate from the browser print option; compatible printer, network access, and drawer cable are required.</p><div className="field-row"><label className="field-label">Local bridge URL<input value={posBridgeAddress} onChange={(event) => changePosBridgeAddress(event.target.value)} placeholder="http://127.0.0.1:17371" /></label><button className="button button-small" disabled={posBridgeBusy} onClick={() => void testPosBridge()}>{posBridgeBusy ? 'Checking…' : t('Test connection')}</button></div>{posBridgeStatus && <p role="status">{t(posBridgeStatus)}</p>}<small>{t('Internal receipt only; not an eTIMS tax invoice.')} Cash drawer is enabled only after a cash payment is recorded.</small></details>
           </div>}
           {posReceipt && <article className="pos-receipt-print"><div className="pos-receipt-brand"><strong>KashFlow</strong><span>{dashboard?.workspaceName}</span></div><h2>{t('SALE RECEIPT')}</h2><p>{t('Invoice')} {posReceipt.invoiceId.slice(0, 8).toUpperCase()} · {today}</p><p>{t('Customer')}: {posReceipt.customer}</p><hr />{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.quantity} × {line.description}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><strong>{t('Total')}</strong><strong>{money(posReceipt.amount)}</strong></div><p>{posReceipt.status}</p><small>{t('Internal receipt only; not an eTIMS tax invoice.')}</small></article>}
-        </section> : page === 'Point of sale (Large Scale)' ? (
+        </section> : page === 'Networking' && networkingTab === 'sales' ? (
           <section className="module-page">
-            <div className="eyebrow"><span className="live-dot" /> POINT OF SALE (LARGE SCALE) · {dashboard?.workspaceName}</div>
-            <h1>Large-scale sales</h1>
-            <p className="welcome-subtitle">Manage sales orders, accepted estimates, and the wider commercial workflow for this business.</p>
+            <div className="eyebrow"><span className="live-dot" /> NETWORKING · {dashboard?.workspaceName}</div>
+            <h1>Networking</h1>
+            <p className="welcome-subtitle">Manage estimates, sales orders, invoices, and recurring schedules for this business.</p>
+            <div className="networking-tabs" role="tablist" aria-label="Networking views">
+              <button type="button" role="tab" aria-selected="true" className="active" onClick={() => setNetworkingTab('sales')}>Sales &amp; quotes</button>
+              <button type="button" role="tab" aria-selected="false" onClick={() => setNetworkingTab('transactions')}>Invoices &amp; recurring</button>
+            </div>
             <article className="module-card">
               <h2>Estimates and quotes</h2>
               <p>Estimates do not post to the ledger. Tax amounts are entered by you after qualified review; these documents are not tax invoices.</p>
@@ -3170,11 +3177,15 @@ function App() {
               {salesOrders.length ? salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>) : <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
             </article>
           </section>
-        ) : page === 'Transactions' ? (
+        ) : page === 'Networking' && networkingTab === 'transactions' ? (
           <section className="module-page">
-            <div className="eyebrow"><span className="live-dot" /> TRANSACTIONS · {dashboard?.workspaceName}</div>
-            <h1>Transactions</h1>
-            <p className="welcome-subtitle">Review recurring schedules and invoice activity for this business.</p>
+            <div className="eyebrow"><span className="live-dot" /> NETWORKING · {dashboard?.workspaceName}</div>
+            <h1>Networking</h1>
+            <p className="welcome-subtitle">Review invoice activity and run recurring schedules.</p>
+            <div className="networking-tabs" role="tablist" aria-label="Networking views">
+              <button type="button" role="tab" aria-selected="false" onClick={() => setNetworkingTab('sales')}>Sales &amp; quotes</button>
+              <button type="button" role="tab" aria-selected="true" className="active" onClick={() => setNetworkingTab('transactions')}>Invoices &amp; recurring</button>
+            </div>
             <article className="module-card">
               <h2>Recurring transactions</h2>
               <p>Create an invoice or expense schedule. KashFlow never posts a recurring transaction automatically; an admin must run each due item.</p>
