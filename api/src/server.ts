@@ -651,7 +651,7 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
   try {
     const workspaceId = request.session!.workspaceId
     const monthStart = `${today.slice(0, 7)}-01`
-    const [workspace, totals, transactions, cashflow, invoices] = await Promise.all([
+    const [workspace, totals, transactions, cashflow, invoices, invoiceIncome] = await Promise.all([
       pool!.query('SELECT name FROM workspaces WHERE id = $1', [workspaceId]),
       pool!.query(`SELECT COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= $2 AND transaction_date <= $3), 0)::text AS income,
         COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $2 AND transaction_date <= $3), 0)::text AS expenses,
@@ -659,15 +659,31 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
         COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $4 AND transaction_date <= $5), 0)::text AS month_expenses
         FROM ledger_transactions WHERE workspace_id = $1`,
       [workspaceId, query.data.from, query.data.to, monthStart, today]),
-      pool!.query('SELECT id, description, amount::text, direction, account, transaction_date, created_at FROM ledger_transactions WHERE workspace_id = $1 ORDER BY transaction_date DESC, created_at DESC LIMIT 20', [workspaceId]),
+      pool!.query(`SELECT id, description, amount::text, direction, account, transaction_date, created_at
+        FROM ledger_transactions WHERE workspace_id = $1
+        UNION ALL
+        SELECT e.id, e.description, COALESCE(SUM(l.credit - l.debit), 0)::text AS amount, 'income' AS direction, 'Sales invoice' AS account, e.entry_date AS transaction_date, e.created_at
+        FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
+        JOIN workspace_accounts a ON a.id = l.account_id AND a.code = '4000'
+        WHERE e.workspace_id = $1 AND e.source_type IN ('invoice', 'online_store_invoice', 'recurring_invoice')
+        GROUP BY e.id, e.description, e.entry_date, e.created_at
+        ORDER BY transaction_date DESC, created_at DESC LIMIT 20`, [workspaceId]),
       pool!.query(`SELECT transaction_date AS date, COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS income,
         COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS expense
         FROM ledger_transactions WHERE workspace_id = $1 AND transaction_date >= $2 GROUP BY transaction_date ORDER BY transaction_date`,
       [workspaceId, monthStart]),
       pool!.query("SELECT count(*)::int AS count, COALESCE(SUM(amount) FILTER (WHERE status = 'unpaid'), 0)::text AS unpaid_amount FROM invoices WHERE workspace_id = $1", [workspaceId]),
+      pool!.query(`SELECT COALESCE(SUM(l.credit - l.debit) FILTER (WHERE e.entry_date >= $2 AND e.entry_date <= $3), 0)::text AS income,
+        COALESCE(SUM(l.credit - l.debit) FILTER (WHERE e.entry_date >= $4 AND e.entry_date <= $5), 0)::text AS month_income
+        FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
+        JOIN workspace_accounts a ON a.id = l.account_id AND a.code = '4000'
+        WHERE e.workspace_id = $1 AND e.source_type IN ('invoice', 'online_store_invoice', 'recurring_invoice')`,
+      [workspaceId, query.data.from, query.data.to, monthStart, today]),
     ])
     const asDateString = (value: unknown) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
-    response.json({ workspaceName: workspace.rows[0]?.name ?? '', period: query.data, totals: { income: totals.rows[0].income, expenses: totals.rows[0].expenses, net: (Number(totals.rows[0].income) - Number(totals.rows[0].expenses)).toFixed(2), monthIncome: totals.rows[0].month_income, monthExpenses: totals.rows[0].month_expenses }, transactions: transactions.rows.map((row: Record<string, unknown>) => ({ ...row, transaction_date: asDateString(row.transaction_date) })), cashflow: cashflow.rows.map((row: Record<string, unknown>) => ({ ...row, date: asDateString(row.date) })), invoices: invoices.rows[0] })
+    const income = Number(totals.rows[0].income) + Number(invoiceIncome.rows[0].income)
+    const monthIncome = Number(totals.rows[0].month_income) + Number(invoiceIncome.rows[0].month_income)
+    response.json({ workspaceName: workspace.rows[0]?.name ?? '', period: query.data, totals: { income: income.toFixed(2), expenses: totals.rows[0].expenses, net: (income - Number(totals.rows[0].expenses)).toFixed(2), monthIncome: monthIncome.toFixed(2), monthExpenses: totals.rows[0].month_expenses }, transactions: transactions.rows.map((row: Record<string, unknown>) => ({ ...row, transaction_date: asDateString(row.transaction_date) })), cashflow: cashflow.rows.map((row: Record<string, unknown>) => ({ ...row, date: asDateString(row.date) })), invoices: invoices.rows[0] })
   } catch (error) { next(error) }
 })
 

@@ -278,6 +278,11 @@ function App() {
   const [billInput, setBillInput] = useState({ supplier: '', description: '', amount: '', billDate: today, dueDate: today, requiresApproval: false })
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([])
   const [purchaseOrderInput, setPurchaseOrderInput] = useState({ supplier: '', orderDate: today, dueDate: today, expectedDate: today, locationId: '', itemId: '', quantity: '1', unitCost: '0' })
+  const [purchaseOrderSupplierMode, setPurchaseOrderSupplierMode] = useState<'saved' | 'new'>('saved')
+  const [purchaseOrderSupplierId, setPurchaseOrderSupplierId] = useState('')
+  const [purchaseOrderNewSupplier, setPurchaseOrderNewSupplier] = useState({ name: '', email: '', phone: '' })
+  const [purchaseOrderItemMode, setPurchaseOrderItemMode] = useState<'saved' | 'new'>('saved')
+  const [purchaseOrderNewItem, setPurchaseOrderNewItem] = useState({ name: '', sku: '', unit: 'unit' })
   const [stockMovementInput, setStockMovementInput] = useState({ itemId: '', locationId: '', movementType: 'purchase' as 'purchase' | 'sale' | 'adjustment', adjustmentDirection: 'increase' as 'increase' | 'decrease', quantity: '1', unitCost: '0', reference: '', date: today })
   const [inventoryLocations, setInventoryLocations] = useState<InventoryLocation[]>([])
   const [inventoryLocationStock, setInventoryLocationStock] = useState<InventoryLocationStock[]>([])
@@ -577,6 +582,7 @@ function App() {
     }
     if (page === 'Inventory') void Promise.all([
       request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
+      request<{ records: WorkspaceRecord[] }>('/v1/records/suppliers').then((result) => setRecords((current) => ({ ...current, suppliers: result.records }))),
       request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders').then((result) => setPurchaseOrders(result.purchaseOrders)),
       request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setStockMovementInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })); setInventoryWriteOffInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })); setPurchaseOrderInput((current) => ({ ...current, locationId: current.locationId || result.defaultLocationId })) }),
       request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock').then((result) => setInventoryLocationStock(result.stock)),
@@ -1351,11 +1357,18 @@ function App() {
   }
 
   async function recordStockMovement(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy(true); setError('')
+    event.preventDefault()
+    const selectedItem = records.inventory.find((item) => item.id === stockMovementInput.itemId)
+    const unitCost = Number(stockMovementInput.unitCost) || Number(selectedItem?.data.cost ?? 0)
+    const purchaseTotal = Number((Number(stockMovementInput.quantity) * unitCost).toFixed(2))
+    const addToExpenses = stockMovementInput.movementType === 'purchase' && purchaseTotal > 0
+      ? window.confirm(`Add ${money(purchaseTotal)} for this stock purchase to expenses? Choose Cancel to keep it recorded as inventory only.`)
+      : false
+    setBusy(true); setError('')
     try {
-      await request(`/v1/inventory/${stockMovementInput.itemId}/movements`, { method: 'POST', body: JSON.stringify({ ...stockMovementInput, quantity: Number(stockMovementInput.quantity), unitCost: Number(stockMovementInput.unitCost) }) })
+      await request(`/v1/inventory/${stockMovementInput.itemId}/movements`, { method: 'POST', body: JSON.stringify({ ...stockMovementInput, quantity: Number(stockMovementInput.quantity), unitCost, addToExpenses }) })
       const result = await request<{ records: WorkspaceRecord[] }>('/v1/records/inventory')
-      setRecords((current) => ({ ...current, inventory: result.records })); await refresh(); notify('Stock movement posted and recorded.')
+      setRecords((current) => ({ ...current, inventory: result.records })); await refresh(); notify(addToExpenses ? 'Stock received and purchase added to expenses.' : 'Stock movement posted and recorded.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not record stock movement.') }
     finally { setBusy(false) }
   }
@@ -1443,28 +1456,79 @@ function App() {
   async function createPurchaseOrder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
+      let itemId = purchaseOrderInput.itemId
+      if (purchaseOrderItemMode === 'new') {
+        const createdItem = await request<{ record: WorkspaceRecord }>('/v1/records/inventory', { method: 'POST', body: JSON.stringify({
+          name: purchaseOrderNewItem.name.trim(), sku: purchaseOrderNewItem.sku.trim(), barcode: '', reorderPoint: 0,
+          quantity: 0, unit: purchaseOrderNewItem.unit.trim() || 'unit', cost: Number(purchaseOrderInput.unitCost), price: 0,
+          notes: 'Created from purchase order',
+        }) })
+        itemId = createdItem.record.id
+        setRecords((current) => ({ ...current, inventory: [createdItem.record, ...current.inventory] }))
+        setPurchaseOrderItemMode('saved')
+        setPurchaseOrderInput((current) => ({ ...current, itemId }))
+      }
+
+      let supplierName = ''
+      if (purchaseOrderSupplierMode === 'new') {
+        const createdSupplier = await request<{ record: WorkspaceRecord }>('/v1/records/suppliers', { method: 'POST', body: JSON.stringify({
+          ...purchaseOrderNewSupplier,
+          supplyItemIds: itemId ? [itemId] : [],
+        }) })
+        supplierName = String(createdSupplier.record.data.name ?? purchaseOrderNewSupplier.name)
+        setRecords((current) => ({ ...current, suppliers: [createdSupplier.record, ...current.suppliers] }))
+        setPurchaseOrderSupplierMode('saved')
+        setPurchaseOrderSupplierId(createdSupplier.record.id)
+      } else {
+        const supplier = records.suppliers.find((record) => record.id === purchaseOrderSupplierId)
+        if (!supplier) throw new Error('Choose a saved supplier or create a new one.')
+        supplierName = String(supplier.data.name ?? '')
+        if (purchaseOrderItemMode === 'new') {
+          const existingItemIds = Array.isArray(supplier.data.supplyItemIds) ? supplier.data.supplyItemIds.map(String) : []
+          if (!existingItemIds.includes(itemId)) {
+            const updatedSupplier = await request<{ record: WorkspaceRecord }>(`/v1/records/suppliers/${supplier.id}`, { method: 'PUT', body: JSON.stringify({
+              ...supplier.data,
+              supplyItemIds: [...existingItemIds, itemId],
+            }) })
+            setRecords((current) => ({ ...current, suppliers: current.suppliers.map((record) => record.id === supplier.id ? updatedSupplier.record : record) }))
+          }
+        }
+      }
       await request('/v1/purchase-orders', { method: 'POST', body: JSON.stringify({
-        supplier: purchaseOrderInput.supplier,
+        supplier: supplierName,
         locationId: purchaseOrderInput.locationId,
         orderDate: purchaseOrderInput.orderDate,
         dueDate: purchaseOrderInput.dueDate,
         expectedDate: purchaseOrderInput.expectedDate,
-        lines: [{ itemId: purchaseOrderInput.itemId, quantity: Number(purchaseOrderInput.quantity), unitCost: Number(purchaseOrderInput.unitCost) }],
+        lines: [{ itemId, quantity: Number(purchaseOrderInput.quantity), unitCost: Number(purchaseOrderInput.unitCost) }],
       }) })
-      const result = await request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders')
-      setPurchaseOrders(result.purchaseOrders); notify('Purchase order saved; inventory changes only when goods are received.')
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save purchase order.') }
+      const [result, inventory, suppliers] = await Promise.all([
+        request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders'),
+        request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
+        request<{ records: WorkspaceRecord[] }>('/v1/records/suppliers'),
+      ])
+      setPurchaseOrders(result.purchaseOrders)
+      setRecords((current) => ({ ...current, inventory: inventory.records, suppliers: suppliers.records }))
+      setPurchaseOrderInput((current) => ({ ...current, itemId: '', quantity: '1', unitCost: '0' }))
+      setPurchaseOrderNewItem({ name: '', sku: '', unit: 'unit' })
+      setPurchaseOrderNewSupplier({ name: '', email: '', phone: '' })
+      notify('Purchase order saved. New suppliers and items were added to their records; stock stays at zero until goods are received.')
+    } catch (reason) { setError(reason instanceof Error ? `${reason.message} Any supplier or inventory item already created remains saved.` : 'Could not save purchase order.') }
     finally { setBusy(false) }
   }
 
   async function receivePurchaseOrder(order: PurchaseOrder) {
+    const lines = order.lines.map((line) => ({ lineId: line.id, quantity: Number(line.quantity) - Number(line.received_quantity), unitCost: Number(line.unit_cost) })).filter((line) => line.quantity > 0)
+    const purchaseTotal = Number(lines.reduce((sum, line) => sum + line.quantity * line.unitCost, 0).toFixed(2))
+    const addToExpenses = purchaseTotal > 0
+      ? window.confirm(`Add ${money(purchaseTotal)} for these received products to expenses? Choose Cancel to keep them recorded as inventory only.`)
+      : false
     setBusy(true); setError('')
     try {
-      const lines = order.lines.map((line) => ({ lineId: line.id, quantity: Number(line.quantity) - Number(line.received_quantity) })).filter((line) => line.quantity > 0)
-      await request(`/v1/purchase-orders/${order.id}/receive`, { method: 'POST', body: JSON.stringify({ lines, date: today }) })
+      await request(`/v1/purchase-orders/${order.id}/receive`, { method: 'POST', body: JSON.stringify({ lines: lines.map(({ lineId, quantity }) => ({ lineId, quantity })), date: today, addToExpenses }) })
       const result = await request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders')
       setPurchaseOrders(result.purchaseOrders); const inventory = await request<{ records: WorkspaceRecord[] }>('/v1/records/inventory')
-      setRecords((current) => ({ ...current, inventory: inventory.records })); await refresh(); notify('Received goods posted to inventory and accounts payable.')
+      setRecords((current) => ({ ...current, inventory: inventory.records })); await refresh(); notify(addToExpenses ? 'Received goods posted to expenses and accounts payable.' : 'Received goods posted to inventory and accounts payable.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not receive purchase order.') }
     finally { setBusy(false) }
   }
@@ -1760,10 +1824,18 @@ function App() {
   }
 
   async function saveWorkspaceRecord(event: FormEvent<HTMLFormElement>, type: 'customers' | 'suppliers' | 'inventory' | 'projects') {
-    event.preventDefault(); setBusy(true); setError('')
+    event.preventDefault()
     const body: Record<string, unknown> = { ...recordForm }
     if (type === 'suppliers') body.supplyItemIds = supplierItemIds.filter(Boolean)
     if (type === 'inventory' || type === 'projects') for (const key of type === 'inventory' ? ['quantity', 'cost', 'price', 'reorderPoint'] : ['budget']) body[key] = Number(body[key] || 0)
+    const openingStockValue = type === 'inventory' && !editingRecordId
+      ? Number((Number(body.quantity) * Number(body.cost)).toFixed(2))
+      : 0
+    const addToExpenses = openingStockValue > 0
+      ? window.confirm(`Add ${money(openingStockValue)} for this item’s opening stock to expenses? Choose Cancel to keep it recorded as inventory only.`)
+      : false
+    if (type === 'inventory') body.addToExpenses = addToExpenses
+    setBusy(true); setError('')
     try {
       await request(editingRecordId ? `/v1/records/${type}/${editingRecordId}` : `/v1/records/${type}`, { method: editingRecordId ? 'PUT' : 'POST', body: JSON.stringify(body) })
       const result = await request<{ records: WorkspaceRecord[] }>(`/v1/records/${type}`)
@@ -2563,7 +2635,7 @@ function App() {
           const fields: Record<string, Array<{ name: string; label: string; kind?: string }>> = {
             customers: [{ name: 'name', label: 'Customer name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
             suppliers: [{ name: 'name', label: 'Supplier name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
-            inventory: [{ name: 'name', label: 'Item or service name' }, { name: 'sku', label: 'SKU' }, { name: 'barcode', label: 'Barcode (scanner input)' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'reorderPoint', label: 'Low-stock alert at', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
+            inventory: [{ name: 'name', label: 'Item or service name' }, { name: 'sku', label: 'SKU' }, { name: 'barcode', label: 'Barcode (scanner input)' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
             projects: [{ name: 'name', label: 'Project name' }, { name: 'customer', label: 'Customer' }, { name: 'status', label: 'Status', kind: 'status' }, { name: 'startDate', label: 'Start date', kind: 'date' }, { name: 'endDate', label: 'End date', kind: 'date' }, { name: 'budget', label: 'Budget (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
           }
           const inventoryHealth = type === 'inventory' ? records.inventory.map((record) => {
@@ -2631,7 +2703,29 @@ function App() {
               </form>}
               <div className="transaction-row"><span><strong>Stock by location</strong><small>{inventoryLocationStock.map((stock) => `${records.inventory.find((item) => item.id === stock.item_id)?.data.name ?? 'Item'} · ${stock.location_name}: ${stock.quantity}`).join(' | ') || 'No location stock saved yet'}</small></span></div>
               <form className="record-form-grid" onSubmit={recordStockMovement}><label className="field-label">Inventory item<select required value={stockMovementInput.itemId} onChange={(event) => { const item = records.inventory.find((record) => record.id === event.target.value); setStockMovementInput({ ...stockMovementInput, itemId: event.target.value, unitCost: String(item?.data.cost ?? stockMovementInput.unitCost) }) }}><option value="">Select item</option>{records.inventory.map((item) => <option value={item.id} key={item.id}>{String(item.data.name)} · total {item.data.quantity}</option>)}</select></label><label className="field-label">Location<select required value={stockMovementInput.locationId} onChange={(event) => setStockMovementInput({ ...stockMovementInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Movement<select value={stockMovementInput.movementType} onChange={(event) => setStockMovementInput({ ...stockMovementInput, movementType: event.target.value as typeof stockMovementInput.movementType })}><option value="purchase">Receive stock</option><option value="sale">Issue stock (COGS only)</option><option value="adjustment">Stock count adjustment</option></select></label>{stockMovementInput.movementType === 'adjustment' && <label className="field-label">Adjustment direction<select value={stockMovementInput.adjustmentDirection} onChange={(event) => setStockMovementInput({ ...stockMovementInput, adjustmentDirection: event.target.value as typeof stockMovementInput.adjustmentDirection })}><option value="increase">Increase stock</option><option value="decrease">Decrease stock</option></select></label>}<label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={stockMovementInput.quantity} onChange={(event) => setStockMovementInput({ ...stockMovementInput, quantity: event.target.value })} /></label><label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" disabled={stockMovementInput.movementType === 'sale'} value={stockMovementInput.unitCost} onChange={(event) => setStockMovementInput({ ...stockMovementInput, unitCost: event.target.value })} /></label><label className="field-label">Reference<input maxLength={200} value={stockMovementInput.reference} onChange={(event) => setStockMovementInput({ ...stockMovementInput, reference: event.target.value })} /></label><label className="field-label">Date<input required type="date" value={stockMovementInput.date} onChange={(event) => setStockMovementInput({ ...stockMovementInput, date: event.target.value })} /></label><button className="button button-primary" disabled={busy || !records.inventory.length}>Post movement</button></form>
-              <h3>Purchase orders</h3><form className="record-form-grid" onSubmit={createPurchaseOrder}><label className="field-label">Supplier<input required value={purchaseOrderInput.supplier} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, supplier: event.target.value })} /></label><label className="field-label">Receive into<select required value={purchaseOrderInput.locationId} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Item<select required value={purchaseOrderInput.itemId} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, itemId: event.target.value })}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)}</option>)}</select></label><label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={purchaseOrderInput.quantity} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, quantity: event.target.value })} /></label><label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" value={purchaseOrderInput.unitCost} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, unitCost: event.target.value })} /></label><label className="field-label">Order date<input required type="date" value={purchaseOrderInput.orderDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, orderDate: event.target.value })} /></label><label className="field-label">Payment due date<input type="date" min={purchaseOrderInput.orderDate} value={purchaseOrderInput.dueDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, dueDate: event.target.value })} /></label><label className="field-label">Expected date<input type="date" value={purchaseOrderInput.expectedDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, expectedDate: event.target.value })} /></label><button className="button button-secondary" disabled={busy || !records.inventory.length}>Create purchase order</button></form>
+              <h3>Purchase orders</h3>
+              <form className="record-form-grid" onSubmit={createPurchaseOrder}>
+                <label className="field-label">Supplier source<select value={purchaseOrderSupplierMode} onChange={(event) => setPurchaseOrderSupplierMode(event.target.value as typeof purchaseOrderSupplierMode)}><option value="saved">Saved supplier</option><option value="new">Create new supplier</option></select></label>
+                {purchaseOrderSupplierMode === 'saved' ? <label className="field-label">Supplier<select required value={purchaseOrderSupplierId} onChange={(event) => setPurchaseOrderSupplierId(event.target.value)}><option value="">Select supplier</option>{records.suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{String(supplier.data.name ?? 'Supplier')}</option>)}</select></label> : <>
+                  <label className="field-label">New supplier name<input required maxLength={160} value={purchaseOrderNewSupplier.name} onChange={(event) => setPurchaseOrderNewSupplier({ ...purchaseOrderNewSupplier, name: event.target.value })} /></label>
+                  <label className="field-label">Supplier email (optional)<input type="email" maxLength={254} value={purchaseOrderNewSupplier.email} onChange={(event) => setPurchaseOrderNewSupplier({ ...purchaseOrderNewSupplier, email: event.target.value })} /></label>
+                  <label className="field-label">Supplier phone (optional)<input maxLength={30} value={purchaseOrderNewSupplier.phone} onChange={(event) => setPurchaseOrderNewSupplier({ ...purchaseOrderNewSupplier, phone: event.target.value })} /></label>
+                </>}
+                <label className="field-label">Receive into<select required value={purchaseOrderInput.locationId} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
+                <label className="field-label">Item source<select value={purchaseOrderItemMode} onChange={(event) => setPurchaseOrderItemMode(event.target.value as typeof purchaseOrderItemMode)}><option value="saved">Saved inventory item</option><option value="new">Create new inventory item</option></select></label>
+                {purchaseOrderItemMode === 'saved' ? <label className="field-label">Item<select required value={purchaseOrderInput.itemId} onChange={(event) => { const item = records.inventory.find((record) => record.id === event.target.value); setPurchaseOrderInput({ ...purchaseOrderInput, itemId: event.target.value, unitCost: String(item?.data.cost ?? purchaseOrderInput.unitCost) }) }}><option value="">Select item</option>{records.inventory.map((item) => <option key={item.id} value={item.id}>{String(item.data.name)}</option>)}</select></label> : <>
+                  <label className="field-label">New item name<input required maxLength={160} value={purchaseOrderNewItem.name} onChange={(event) => setPurchaseOrderNewItem({ ...purchaseOrderNewItem, name: event.target.value })} /></label>
+                  <label className="field-label">SKU (optional)<input maxLength={80} value={purchaseOrderNewItem.sku} onChange={(event) => setPurchaseOrderNewItem({ ...purchaseOrderNewItem, sku: event.target.value })} /></label>
+                  <label className="field-label">Unit<input maxLength={30} value={purchaseOrderNewItem.unit} onChange={(event) => setPurchaseOrderNewItem({ ...purchaseOrderNewItem, unit: event.target.value })} /></label>
+                  <p className="dialog-note">The new item will be saved with 0 on hand. Stock increases only when the order is received.</p>
+                </>}
+                <label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={purchaseOrderInput.quantity} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, quantity: event.target.value })} /></label>
+                <label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" value={purchaseOrderInput.unitCost} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, unitCost: event.target.value })} /></label>
+                <label className="field-label">Order date<input required type="date" value={purchaseOrderInput.orderDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, orderDate: event.target.value })} /></label>
+                <label className="field-label">Payment due date<input type="date" min={purchaseOrderInput.orderDate} value={purchaseOrderInput.dueDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, dueDate: event.target.value })} /></label>
+                <label className="field-label">Expected date<input type="date" value={purchaseOrderInput.expectedDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, expectedDate: event.target.value })} /></label>
+                <button className="button button-secondary" disabled={busy}>Create purchase order</button>
+              </form>
               {purchaseOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.supplier} · PO {order.id.slice(0, 8)}</strong><small>{order.status} · {order.lines.map((line) => `${line.item_name}: ${line.received_quantity}/${line.quantity}`).join(' · ')}</small></span>{order.status !== 'received' && order.status !== 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => void receivePurchaseOrder(order)}>Receive remaining</button>}</div>)}
             </article>}
             {type === 'projects' && <article className="module-card"><h2>Time and project costing</h2><p>Approved time is a management cost estimate and billable value, not a payroll posting or invoice.</p><label className="field-label">Project<select value={timeInput.projectId} onChange={(event) => void loadProjectTime(event.target.value)}><option value="">Select project</option>{records.projects.map((project) => <option key={project.id} value={project.id}>{String(project.data.name)}</option>)}</select></label>
