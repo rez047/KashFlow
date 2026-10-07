@@ -2915,53 +2915,6 @@ function App() {
               {!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}
             </article>
             {type === 'suppliers' && <>
-              <article className="module-card"><h2>Add vendor</h2><p>Choose an existing vendor from your saved list or add a new one. Every new vendor is saved before you record a bill against it.</p><form className="record-form-grid" onSubmit={(event) => {
-                event.preventDefault();
-                if (billSupplierMode === 'saved') {
-                  const selectedSupplier = records.suppliers.find((record) => record.id === billSupplierId)
-                  if (!selectedSupplier) {
-                    setError('Choose a saved supplier or enter a new one below.')
-                    return
-                  }
-                  setBillInput({ ...billInput, supplier: String(selectedSupplier.data.name ?? '') })
-                  notify('Vendor selected from your saved suppliers.')
-                  return
-                }
-                const nextVendorName = billNewSupplier.name.trim()
-                if (!nextVendorName) {
-                  setError('Enter a vendor name before saving it.')
-                  return
-                }
-                void (async () => {
-                  try {
-                    setBusy(true); setError('')
-                    const createdSupplier = await request<{ record: WorkspaceRecord }>('/v1/records/suppliers', { method: 'POST', body: JSON.stringify({
-                      name: nextVendorName,
-                      email: billNewSupplier.email.trim(),
-                      phone: billNewSupplier.phone.trim(),
-                      address: '',
-                      taxPin: '',
-                      notes: 'Created from vendor section',
-                    }) })
-                    setRecords((current) => ({ ...current, suppliers: [createdSupplier.record, ...current.suppliers] }))
-                    setBillSupplierMode('saved')
-                    setBillSupplierId(createdSupplier.record.id)
-                    setBillInput({ ...billInput, supplier: nextVendorName })
-                    setBillNewSupplier({ name: '', email: '', phone: '' })
-                    notify('Vendor saved and selected for this bill.')
-                  } catch (reason) {
-                    setError(reason instanceof Error ? reason.message : 'Could not save vendor.')
-                  } finally { setBusy(false) }
-                })()
-              }}>
-                <label className="field-label">Vendor source<select value={billSupplierMode} onChange={(event) => setBillSupplierMode(event.target.value as typeof billSupplierMode)}><option value="saved">Saved vendor</option><option value="new">Create new vendor</option></select></label>
-                {billSupplierMode === 'saved' ? <label className="field-label">Saved vendor<select value={billSupplierId} onChange={(event) => { setBillSupplierId(event.target.value); const selectedSupplier = records.suppliers.find((record) => record.id === event.target.value); if (selectedSupplier) setBillInput({ ...billInput, supplier: String(selectedSupplier.data.name ?? '') }) }}><option value="">Select vendor</option>{records.suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{String(supplier.data.name ?? 'Supplier')}{supplier.data.email ? ` · ${supplier.data.email}` : ''}</option>)}</select></label> : <>
-                  <label className="field-label">New vendor name<input required maxLength={160} value={billNewSupplier.name} onChange={(event) => setBillNewSupplier({ ...billNewSupplier, name: event.target.value })} /></label>
-                  <label className="field-label">Vendor email (optional)<input type="email" value={billNewSupplier.email} onChange={(event) => setBillNewSupplier({ ...billNewSupplier, email: event.target.value })} /></label>
-                  <label className="field-label">Vendor phone (optional)<input maxLength={30} value={billNewSupplier.phone} onChange={(event) => setBillNewSupplier({ ...billNewSupplier, phone: event.target.value })} /></label>
-                </>}
-                <button className="button button-secondary" disabled={busy}>{billSupplierMode === 'saved' ? 'Select vendor' : 'Save vendor'}</button>
-              </form></article>
               <article className="module-card"><h2>Vendor bills and payments</h2><p>Record itemized bills and tax amounts verified for your business. Tax entries are bookkeeping inputs, not statutory determinations.</p><form className="record-form-grid" onSubmit={saveBill}><label className="field-label">Supplier<select value={billSupplierMode === 'saved' ? billSupplierId : 'new'} onChange={(event) => {
                 const nextValue = event.target.value
                 if (nextValue === 'new') {
@@ -3493,7 +3446,7 @@ function App() {
           <div className="invoice-preview-brand"><div><strong>KashFlow</strong><small>{dashboard?.workspaceName}</small></div><span>{invoicePreview.id ? `Invoice ${invoicePreview.id.slice(0, 8).toUpperCase()}` : 'INVOICE PREVIEW'}</span></div>
           <h2>Invoice</h2><div className="invoice-preview-grid"><span>Bill to<strong>{invoicePreview.customer}</strong><small>{invoicePreview.customer_email || 'No email address added'}</small></span><span>Due date<strong>{invoicePreview.due_date}</strong><small>Status: {invoicePreview.status || 'Draft'}</small></span></div>
           <div className="invoice-preview-line"><span>{invoicePreview.description}</span><strong>{money(invoicePreview.amount)}</strong></div><div className="invoice-preview-total"><span>Total due</span><strong>{money(invoicePreview.amount)}</strong></div>
-          <label className="field-label invoice-email-body-field">Email message<textarea rows={5} maxLength={5000} value={invoiceEmailBody} onChange={(event) => setInvoiceEmailBody(event.target.value)} /><small>This message is included before the invoice details in the email.</small></label>
+          <label className="field-label invoice-email-body-field">Editable email message<textarea autoFocus rows={5} maxLength={5000} placeholder="Write a message for your customer" value={invoiceEmailBody} onChange={(event) => setInvoiceEmailBody(event.target.value)} /><small>Edit this text before sending; the invoice description, amount, due date, and disclaimer stay attached.</small></label>
           <p className="dialog-note"><ShieldCheck size={15} /> Internal business invoice preview—not an eTIMS fiscal tax invoice. {emailConfigured ? 'Send uses the configured Resend provider; accepted does not guarantee recipient delivery.' : 'Outbound provider delivery is not configured; the email-draft option opens your mail application.'}</p>
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => { setInvoicePreview(null); setModal(invoicePreview.id ? null : 'invoice') }}>{invoicePreview.id ? 'Close preview' : 'Edit invoice'}</button><button type="button" className="button button-secondary" onClick={() => window.print()}>Print</button>{invoicePreview.id && invoicePreview.customer_email && (emailConfigured ? <button type="button" className="button button-primary" disabled={busy} onClick={() => void sendInvoiceEmail(invoicePreview.id, invoiceEmailBody)}>{busy ? 'Sending…' : 'Send invoice email'}</button> : <a className="button button-primary" href={`mailto:${encodeURIComponent(invoicePreview.customer_email)}?subject=${encodeURIComponent(`Invoice ${invoicePreview.id.slice(0, 8)} from ${dashboard?.workspaceName}`)}&body=${encodeURIComponent(invoiceEmailDraftBody(invoicePreview, invoiceEmailBody))}`}>Open email draft</a>)}</div>
         </article> : null}
