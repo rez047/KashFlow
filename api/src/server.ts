@@ -1541,12 +1541,13 @@ app.post('/v1/inventory/:itemId/movements', requirePool, verifyOrigin, requireSe
     movementType: z.enum(['purchase', 'sale', 'adjustment']),
     quantity: z.coerce.number().finite().positive().max(1_000_000),
     adjustmentDirection: z.enum(['increase', 'decrease']).default('increase'),
+    addToExpenses: z.boolean().default(false),
     locationId: z.string().uuid().optional(),
     unitCost: z.coerce.number().finite().min(0).max(999999999999),
     reference: z.string().trim().max(200).default(''),
     date: z.string().date(),
   }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Enter a valid stock movement, quantity, unit cost, reference, and date.' }); return }
+  if (!input.success || (input.data.addToExpenses && input.data.movementType !== 'purchase')) { response.status(400).json({ error: 'Enter a valid stock movement, quantity, unit cost, reference, and date.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
@@ -1581,9 +1582,12 @@ app.post('/v1/inventory/:itemId/movements', requirePool, verifyOrigin, requireSe
     const movementValue = Number((Math.abs(quantityDelta) * movementCost).toFixed(2))
     if (movementValue > 0) {
       const lines: JournalLineInput[] = quantityDelta > 0
-        ? [{ accountCode: '1200', debit: movementValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: movementValue }]
+        ? input.data.addToExpenses
+          ? [{ accountCode: '6000', debit: movementValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: movementValue }]
+          : [{ accountCode: '1200', debit: movementValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: movementValue }]
         : [{ accountCode: '5100', debit: movementValue, credit: 0 }, { accountCode: '1200', debit: 0, credit: movementValue }]
       const movementDescription = `Inventory ${input.data.movementType}: ${String(data.name ?? 'item')}${input.data.reference ? ` · ${input.data.reference}` : ''}`.slice(0, 240)
+      if (input.data.addToExpenses) await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, movementDescription, movementValue.toFixed(2), 'expense', 'Inventory purchase', input.data.date])
       await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: movementDescription, sourceType: 'inventory_movement', sourceId: movementId, lines })
     }
     await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'inventory.movement_recorded', entityType: 'inventory_item', entityId: String(request.params.itemId), eventData: { movementId, movementType: input.data.movementType, quantityDelta, newQuantity, reference: input.data.reference } })
@@ -1636,7 +1640,7 @@ app.post('/v1/purchase-orders', requirePool, verifyOrigin, requireSession, requi
   finally { client.release() }
 })
 app.post('/v1/purchase-orders/:orderId/receive', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ lines: z.array(z.object({ lineId: z.string().uuid(), quantity: z.coerce.number().finite().positive().max(1_000_000) })).min(1).max(100), date: z.string().date() }).safeParse(request.body)
+  const input = z.object({ lines: z.array(z.object({ lineId: z.string().uuid(), quantity: z.coerce.number().finite().positive().max(1_000_000) })).min(1).max(100), date: z.string().date(), addToExpenses: z.boolean().default(false) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Provide received quantities and a valid receiving date.' }); return }
   const client = await pool!.connect()
   try {
@@ -1673,22 +1677,24 @@ app.post('/v1/purchase-orders/:orderId/receive', requirePool, verifyOrigin, requ
     await ensureDefaultAccounts(request.session!.workspaceId)
     if (receivedValue > 0) {
       const billId = randomUUID()
-      const description = `Purchase order receipt ${String(order.id).slice(0, 8)}`
+      const billDescription = `Purchase order receipt ${String(order.id).slice(0, 8)}`
       const dueDate = order.due_date ? String(order.due_date).slice(0, 10) : input.data.date
       await client.query(`INSERT INTO vendor_bills (id, workspace_id, supplier, description, amount, bill_date, due_date, approval_status, approved_by, approved_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved', $8, now())`,
-      [billId, request.session!.workspaceId, order.supplier, description, receivedValue.toFixed(2), input.data.date, dueDate, request.session!.userId])
+      [billId, request.session!.workspaceId, order.supplier, billDescription, receivedValue.toFixed(2), input.data.date, dueDate, request.session!.userId])
       for (const [index, line] of receivedLines.entries()) {
         await client.query(`INSERT INTO vendor_bill_lines (id, bill_id, line_number, description, quantity, unit_price, total_amount)
           VALUES ($1, $2, $3, $4, $5, $6, $7)`, [randomUUID(), billId, index + 1, line.description, line.quantity.toFixed(3), line.unitCost.toFixed(2), line.total.toFixed(2)])
       }
-      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: `Goods received from ${order.supplier}`, sourceType: 'vendor_bill', sourceId: billId, lines: [{ accountCode: '1200', debit: receivedValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: receivedValue }] })
+      const description = `Goods received from ${order.supplier}`
+      if (input.data.addToExpenses) await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, description, receivedValue.toFixed(2), 'expense', 'Inventory purchase', input.data.date])
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description, sourceType: 'vendor_bill', sourceId: billId, lines: input.data.addToExpenses ? [{ accountCode: '6000', debit: receivedValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: receivedValue }] : [{ accountCode: '1200', debit: receivedValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: receivedValue }] })
     }
     const remaining = await client.query('SELECT count(*)::int AS count FROM purchase_order_lines WHERE purchase_order_id = $1 AND received_quantity < quantity', [order.id])
     const status = Number(remaining.rows[0].count) === 0 ? 'received' : 'partially_received'
     await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2', [status, order.id])
     await client.query('COMMIT')
-    response.json({ status, receivedValue: Number(receivedValue.toFixed(2)) })
+    response.json({ status, receivedValue: Number(receivedValue.toFixed(2)), expenseRecorded: input.data.addToExpenses })
   } catch (error) {
     await client.query('ROLLBACK')
     if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
