@@ -691,7 +691,7 @@ const workspaceRecordTypes = ['customers', 'suppliers', 'inventory', 'projects']
 const workspaceRecordSchemas = {
   customers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default('') }),
   suppliers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default(''), supplyItemIds: z.array(z.string().uuid()).max(100).default([]) }),
-  inventory: z.object({ name: z.string().trim().min(1).max(160), sku: z.string().trim().max(80).default(''), barcode: z.string().trim().max(80).default(''), reorderPoint: z.coerce.number().finite().min(0).default(0), quantity: z.coerce.number().finite().min(0).default(0), unit: z.string().trim().max(30).default('unit'), cost: z.coerce.number().finite().min(0).default(0), price: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
+  inventory: z.object({ name: z.string().trim().min(1).max(160), sku: z.string().trim().max(80).default(''), barcode: z.string().trim().max(80).default(''), reorderPoint: z.coerce.number().finite().min(0).default(0), quantity: z.coerce.number().finite().min(0).default(0), unit: z.string().trim().max(30).default('unit'), cost: z.coerce.number().finite().min(0).default(0), price: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default(''), addToExpenses: z.boolean().default(false) }),
   projects: z.object({ name: z.string().trim().min(1).max(160), customer: z.string().trim().max(160).default(''), status: z.enum(['planned', 'active', 'on_hold', 'completed']).default('planned'), startDate: z.string().date().or(z.literal('')).default(''), endDate: z.string().date().or(z.literal('')).default(''), budget: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
 }
 type WorkspaceRecordType = typeof workspaceRecordTypes[number]
@@ -946,7 +946,9 @@ app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, require
       const invalidLinks = await validateSupplierItemLinks(client, request.session!.workspaceId, (input.data as z.infer<typeof workspaceRecordSchemas.suppliers>).supplyItemIds)
       if (invalidLinks) { await client.query('ROLLBACK'); response.status(400).json({ error: invalidLinks }); return }
     }
-    const result = await client.query('INSERT INTO workspace_records (id, workspace_id, record_type, data) VALUES ($1, $2, $3, $4::jsonb) RETURNING id, data, created_at, updated_at', [randomUUID(), request.session!.workspaceId, workspaceRecordDatabaseTypes[type], JSON.stringify(input.data)])
+    const recordData = { ...input.data } as Record<string, unknown>
+    delete recordData.addToExpenses
+    const result = await client.query('INSERT INTO workspace_records (id, workspace_id, record_type, data) VALUES ($1, $2, $3, $4::jsonb) RETURNING id, data, created_at, updated_at', [randomUUID(), request.session!.workspaceId, workspaceRecordDatabaseTypes[type], JSON.stringify(recordData)])
     if (inventoryInput && inventoryInput.quantity > 0 && inventoryInput.cost > 0) {
       const movementId = randomUUID()
       const value = Number((inventoryInput.quantity * inventoryInput.cost).toFixed(2))
@@ -954,7 +956,9 @@ app.post('/v1/records/:type', requirePool, verifyOrigin, requireSession, require
       await client.query('INSERT INTO inventory_location_stock (workspace_id, location_id, item_id, quantity) VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, location_id, item_id) DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = now()', [request.session!.workspaceId, locationId, result.rows[0].id, inventoryInput.quantity.toFixed(3)])
       await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, $4, 'opening', $5, $6, 'Opening stock', $7, $8)", [movementId, request.session!.workspaceId, result.rows[0].id, locationId, inventoryInput.quantity.toFixed(3), inventoryInput.cost.toFixed(2), nairobiToday(), request.session!.userId])
       await ensureDefaultAccounts(request.session!.workspaceId)
-      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Opening inventory: ${input.data.name}`, sourceType: 'inventory_opening', sourceId: movementId, lines: [{ accountCode: '1200', debit: value, credit: 0 }, { accountCode: '3000', debit: 0, credit: value }] })
+      const description = `Opening inventory: ${inventoryInput.name}`
+      if (inventoryInput.addToExpenses) await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, description, value.toFixed(2), 'expense', 'Inventory purchase', nairobiToday()])
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description, sourceType: 'inventory_opening', sourceId: movementId, lines: inventoryInput.addToExpenses ? [{ accountCode: '6000', debit: value, credit: 0 }, { accountCode: '3000', debit: 0, credit: value }] : [{ accountCode: '1200', debit: value, credit: 0 }, { accountCode: '3000', debit: 0, credit: value }] })
     }
     await client.query('COMMIT')
     response.status(201).json({ record: result.rows[0] })
@@ -1506,7 +1510,9 @@ app.put('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession
         return
       }
     }
-    const result = await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3 AND record_type = $4 RETURNING id, data, created_at, updated_at', [JSON.stringify(input.data), request.params.recordId, request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
+    const recordData = { ...input.data } as Record<string, unknown>
+    delete recordData.addToExpenses
+    const result = await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3 AND record_type = $4 RETURNING id, data, created_at, updated_at', [JSON.stringify(recordData), request.params.recordId, request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
     if (!result.rowCount) { response.status(404).json({ error: 'Record not found in this workspace.' }); return }
     await client.query('COMMIT')
     response.json({ record: result.rows[0] })

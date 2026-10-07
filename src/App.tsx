@@ -277,7 +277,7 @@ function App() {
   const [estimateInput, setEstimateInput] = useState({ customer: '', customerEmail: '', description: '', amount: '', validUntil: today })
   const [billInput, setBillInput] = useState({ supplier: '', description: '', amount: '', billDate: today, dueDate: today, requiresApproval: false })
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([])
-  const [purchaseOrderInput, setPurchaseOrderInput] = useState({ supplier: '', orderDate: today, dueDate: today, expectedDate: today, locationId: '', itemId: '', quantity: '1', unitCost: '0' })
+  const [purchaseOrderInput, setPurchaseOrderInput] = useState({ supplier: '', orderDate: today, dueDate: today, expectedDate: today, locationId: '', itemId: '', quantity: '0', unitCost: '0' })
   const [purchaseOrderSupplierMode, setPurchaseOrderSupplierMode] = useState<'saved' | 'new'>('saved')
   const [purchaseOrderSupplierId, setPurchaseOrderSupplierId] = useState('')
   const [purchaseOrderNewSupplier, setPurchaseOrderNewSupplier] = useState({ name: '', email: '', phone: '' })
@@ -1509,7 +1509,7 @@ function App() {
       ])
       setPurchaseOrders(result.purchaseOrders)
       setRecords((current) => ({ ...current, inventory: inventory.records, suppliers: suppliers.records }))
-      setPurchaseOrderInput((current) => ({ ...current, itemId: '', quantity: '1', unitCost: '0' }))
+      setPurchaseOrderInput((current) => ({ ...current, itemId: '', quantity: '0', unitCost: '0' }))
       setPurchaseOrderNewItem({ name: '', sku: '', unit: 'unit' })
       setPurchaseOrderNewSupplier({ name: '', email: '', phone: '' })
       notify('Purchase order saved. New suppliers and items were added to their records; stock stays at zero until goods are received.')
@@ -1839,7 +1839,9 @@ function App() {
     try {
       await request(editingRecordId ? `/v1/records/${type}/${editingRecordId}` : `/v1/records/${type}`, { method: editingRecordId ? 'PUT' : 'POST', body: JSON.stringify(body) })
       const result = await request<{ records: WorkspaceRecord[] }>(`/v1/records/${type}`)
-      setRecords((current) => ({ ...current, [type]: result.records })); setRecordForm({}); setEditingRecordId(''); setSupplierItemIds(['']); notify(`${type.slice(0, -1)} saved`)
+      setRecords((current) => ({ ...current, [type]: result.records })); setRecordForm({}); setEditingRecordId(''); setSupplierItemIds([''])
+      if (addToExpenses) await refresh()
+      notify(addToExpenses ? 'Inventory saved and opening stock added to expenses.' : `${type.slice(0, -1)} saved`)
     } catch (reason) { setError(reason instanceof Error ? reason.message : `Could not save ${type.slice(0, -1)}.`) }
     finally { setBusy(false) }
   }
@@ -2719,7 +2721,7 @@ function App() {
                   <label className="field-label">Unit<input maxLength={30} value={purchaseOrderNewItem.unit} onChange={(event) => setPurchaseOrderNewItem({ ...purchaseOrderNewItem, unit: event.target.value })} /></label>
                   <p className="dialog-note">The new item will be saved with 0 on hand. Stock increases only when the order is received.</p>
                 </>}
-                <label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={purchaseOrderInput.quantity} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, quantity: event.target.value })} /></label>
+                <label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" placeholder="0" value={purchaseOrderInput.quantity} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, quantity: event.target.value })} /></label>
                 <label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" value={purchaseOrderInput.unitCost} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, unitCost: event.target.value })} /></label>
                 <label className="field-label">Order date<input required type="date" value={purchaseOrderInput.orderDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, orderDate: event.target.value })} /></label>
                 <label className="field-label">Payment due date<input type="date" min={purchaseOrderInput.orderDate} value={purchaseOrderInput.dueDate} onChange={(event) => setPurchaseOrderInput({ ...purchaseOrderInput, dueDate: event.target.value })} /></label>
