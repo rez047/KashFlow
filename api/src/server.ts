@@ -1676,19 +1676,23 @@ app.post('/v1/purchase-orders/:orderId/receive', requirePool, verifyOrigin, requ
     }
     await ensureDefaultAccounts(request.session!.workspaceId)
     if (receivedValue > 0) {
-      const billId = randomUUID()
-      const billDescription = `Purchase order receipt ${String(order.id).slice(0, 8)}`
-      const dueDate = order.due_date ? String(order.due_date).slice(0, 10) : input.data.date
-      await client.query(`INSERT INTO vendor_bills (id, workspace_id, supplier, description, amount, bill_date, due_date, approval_status, approved_by, approved_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved', $8, now())`,
-      [billId, request.session!.workspaceId, order.supplier, billDescription, receivedValue.toFixed(2), input.data.date, dueDate, request.session!.userId])
-      for (const [index, line] of receivedLines.entries()) {
-        await client.query(`INSERT INTO vendor_bill_lines (id, bill_id, line_number, description, quantity, unit_price, total_amount)
-          VALUES ($1, $2, $3, $4, $5, $6, $7)`, [randomUUID(), billId, index + 1, line.description, line.quantity.toFixed(3), line.unitCost.toFixed(2), line.total.toFixed(2)])
-      }
       const description = `Goods received from ${order.supplier}`
-      if (input.data.addToExpenses) await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, description, receivedValue.toFixed(2), 'expense', 'Inventory purchase', input.data.date])
-      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description, sourceType: 'vendor_bill', sourceId: billId, lines: input.data.addToExpenses ? [{ accountCode: '6000', debit: receivedValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: receivedValue }] : [{ accountCode: '1200', debit: receivedValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: receivedValue }] })
+      if (input.data.addToExpenses) {
+        await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, description, receivedValue.toFixed(2), 'expense', 'Inventory purchase', input.data.date])
+        await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description, sourceType: 'purchase_order_expense', sourceId: String(order.id), lines: [{ accountCode: '6000', debit: receivedValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: receivedValue }] })
+      } else {
+        const billId = randomUUID()
+        const billDescription = `Purchase order receipt ${String(order.id).slice(0, 8)}`
+        const dueDate = order.due_date ? String(order.due_date).slice(0, 10) : input.data.date
+        await client.query(`INSERT INTO vendor_bills (id, workspace_id, supplier, description, amount, bill_date, due_date, approval_status, approved_by, approved_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved', $8, now())`,
+        [billId, request.session!.workspaceId, order.supplier, billDescription, receivedValue.toFixed(2), input.data.date, dueDate, request.session!.userId])
+        for (const [index, line] of receivedLines.entries()) {
+          await client.query(`INSERT INTO vendor_bill_lines (id, bill_id, line_number, description, quantity, unit_price, total_amount)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)`, [randomUUID(), billId, index + 1, line.description, line.quantity.toFixed(3), line.unitCost.toFixed(2), line.total.toFixed(2)])
+        }
+        await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description, sourceType: 'vendor_bill', sourceId: billId, lines: [{ accountCode: '1200', debit: receivedValue, credit: 0 }, { accountCode: '2200', debit: 0, credit: receivedValue }] })
+      }
     }
     const remaining = await client.query('SELECT count(*)::int AS count FROM purchase_order_lines WHERE purchase_order_id = $1 AND received_quantity < quantity', [order.id])
     const status = Number(remaining.rows[0].count) === 0 ? 'received' : 'partially_received'
@@ -2957,7 +2961,11 @@ app.post('/v1/bills', requirePool, verifyOrigin, requireSession, requireWorkspac
     }
     if (approvalStatus === 'approved') {
       const expenseAmount = financials.total - financials.recoverableTax
-      const journalLines: JournalLineInput[] = [{ accountCode: '6000', debit: expenseAmount, credit: 0 }]
+      const journalLines: JournalLineInput[] = []
+      if (expenseAmount > 0) {
+        journalLines.push({ accountCode: '6000', debit: expenseAmount, credit: 0 })
+        await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, `Bill: ${input.data.supplier} — ${description}`, expenseAmount.toFixed(2), 'expense', 'Vendor bill', input.data.billDate])
+      }
       if (financials.recoverableTax > 0) journalLines.push({ accountCode: '1300', debit: financials.recoverableTax, credit: 0 })
       journalLines.push({ accountCode: '2200', debit: 0, credit: financials.total })
       await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.billDate, description: `Bill: ${input.data.supplier} — ${description}`, sourceType: 'vendor_bill', sourceId: id, lines: journalLines })
@@ -2983,7 +2991,12 @@ app.post('/v1/bills/:billId/approval', requirePool, verifyOrigin, requireSession
       const amount = Number(bill.amount)
       const lines = await client.query('SELECT COALESCE(SUM(recoverable_tax_amount), 0)::text AS recoverable_tax FROM vendor_bill_lines WHERE bill_id = $1', [bill.id])
       const recoverableTax = Number(lines.rows[0].recoverable_tax)
-      const journalLines: JournalLineInput[] = [{ accountCode: '6000', debit: amount - recoverableTax, credit: 0 }]
+      const expenseAmount = amount - recoverableTax
+      const journalLines: JournalLineInput[] = []
+      if (expenseAmount > 0) {
+        journalLines.push({ accountCode: '6000', debit: expenseAmount, credit: 0 })
+        await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), request.session!.workspaceId, `Bill: ${bill.supplier} — ${bill.description}`, expenseAmount.toFixed(2), 'expense', 'Vendor bill', String(bill.bill_date).slice(0, 10)])
+      }
       if (recoverableTax > 0) journalLines.push({ accountCode: '1300', debit: recoverableTax, credit: 0 })
       journalLines.push({ accountCode: '2200', debit: 0, credit: amount })
       await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: String(bill.bill_date).slice(0, 10), description: `Bill: ${bill.supplier} — ${bill.description}`, sourceType: 'vendor_bill', sourceId: String(bill.id), lines: journalLines })

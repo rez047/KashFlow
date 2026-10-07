@@ -1525,10 +1525,10 @@ function App() {
       : false
     setBusy(true); setError('')
     try {
-      const receipt = await request<{ expenseApprovalRequired: boolean }>(`/v1/purchase-orders/${order.id}/receive`, { method: 'POST', body: JSON.stringify({ lines: lines.map(({ lineId, quantity }) => ({ lineId, quantity })), date: today, addToExpenses }) })
+      const receipt = await request<{ expenseRecorded: boolean }>(`/v1/purchase-orders/${order.id}/receive`, { method: 'POST', body: JSON.stringify({ lines: lines.map(({ lineId, quantity }) => ({ lineId, quantity })), date: today, addToExpenses }) })
       const result = await request<{ purchaseOrders: PurchaseOrder[] }>('/v1/purchase-orders')
       setPurchaseOrders(result.purchaseOrders); const inventory = await request<{ records: WorkspaceRecord[] }>('/v1/records/inventory')
-      setRecords((current) => ({ ...current, inventory: inventory.records })); await refresh(); notify(receipt.expenseApprovalRequired ? 'Goods received. The vendor bill is pending admin approval; the expense will post after approval.' : 'Received goods posted to inventory and accounts payable.')
+      setRecords((current) => ({ ...current, inventory: inventory.records })); await refresh(); notify(receipt.expenseRecorded ? 'Goods received and added directly to expenses.' : 'Received goods posted to inventory and accounts payable.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not receive purchase order.') }
     finally { setBusy(false) }
   }
