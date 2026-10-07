@@ -193,250 +193,683 @@ This email contains the complete bill details together with the total amount, am
     Number(info?.amount_due ?? bill.amount_due ?? total - paid),
   )
 
+  const statusLabel =
+    info?.approval_status === 'pending'
+      ? 'Awaiting approval'
+      : info?.approval_status === 'rejected'
+        ? 'Rejected'
+        : info?.status
+
   return (
-    <div
-      style={{
-        marginTop: 12,
-        borderTop: '1px solid var(--border, #e5e7eb)',
-        paddingTop: 12,
-      }}
-    >
-      <button
-        type="button"
-        className="button button-small"
-        onClick={() => setOpen((value) => !value)}
+    <>
+      <div
+        style={{
+          marginTop: 12,
+          borderTop: '1px solid var(--border, #e5e7eb)',
+          paddingTop: 12,
+        }}
       >
-        {open ? 'Hide supplier email section' : 'Send bill to supplier'}
-      </button>
+        <button
+          type="button"
+          className="button button-small"
+          onClick={() => setOpen(true)}
+        >
+          Send bill to supplier
+        </button>
+      </div>
 
       {open && (
         <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={`supplier-bill-email-title-${bill.id}`}
+          onClick={(event) => {
+            if (event.target === event.currentTarget) {
+              setOpen(false)
+            }
+          }}
           style={{
-            marginTop: 14,
-            padding: 18,
-            borderRadius: 14,
-            background: 'var(--surface-muted, #f8fafc)',
-            border: '1px solid var(--border, #e5e7eb)',
+            position: 'fixed',
+            inset: 0,
+            zIndex: 9999,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '24px',
+            background: 'rgba(15, 23, 42, 0.58)',
+            backdropFilter: 'blur(3px)',
+            overflowY: 'auto',
           }}
         >
-          <div style={{ marginBottom: 16 }}>
-            <strong>Supplier Bill Email</strong>
-            <p
+          <div
+            style={{
+              width: 'min(920px, 100%)',
+              maxHeight: 'calc(100vh - 48px)',
+              overflowY: 'auto',
+              background: 'var(--surface, #ffffff)',
+              color: 'var(--text, inherit)',
+              border: '1px solid var(--border, #e5e7eb)',
+              borderRadius: 18,
+              boxShadow:
+                '0 24px 70px rgba(15, 23, 42, 0.22)',
+            }}
+          >
+            {/* Header */}
+            <div
               style={{
-                margin: '5px 0 0',
-                fontSize: 13,
-                opacity: 0.7,
+                position: 'sticky',
+                top: 0,
+                zIndex: 2,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 16,
+                padding: '18px 22px',
+                background: 'var(--surface, #ffffff)',
+                borderBottom:
+                  '1px solid var(--border, #e5e7eb)',
               }}
             >
-              Send the complete recorded bill to the supplier, including
-              total amount, paid amount and remaining balance.
-            </p>
-          </div>
-
-          {loading && (
-            <p className="dialog-note">
-              Loading the complete supplier bill...
-            </p>
-          )}
-
-          {!loading && (
-            <>
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns:
-                    'repeat(auto-fit,minmax(150px,1fr))',
-                  gap: 10,
-                  marginBottom: 18,
-                }}
-              >
-                <div className="module-card">
-                  <small>Total amount</small>
-                  <strong>{money(total)}</strong>
+              <div>
+                <div
+                  style={{
+                    fontSize: 18,
+                    fontWeight: 700,
+                    letterSpacing: '-0.01em',
+                  }}
+                  id={`supplier-bill-email-title-${bill.id}`}
+                >
+                  Send Bill to Supplier
                 </div>
 
-                <div className="module-card">
-                  <small>Paid</small>
-                  <strong>{money(paid)}</strong>
-                </div>
-
-                <div className="module-card">
-                  <small>Remaining</small>
-                  <strong>{money(remaining)}</strong>
+                <div
+                  style={{
+                    marginTop: 4,
+                    fontSize: 13,
+                    opacity: 0.65,
+                  }}
+                >
+                  Send the recorded bill and payment summary directly
+                  to the supplier.
                 </div>
               </div>
 
-              <div
+              <button
+                type="button"
+                aria-label="Close"
+                onClick={() => setOpen(false)}
                 style={{
-                  display: 'grid',
-                  gridTemplateColumns:
-                    'repeat(auto-fit,minmax(180px,1fr))',
-                  gap: 12,
-                  marginBottom: 16,
+                  width: 36,
+                  height: 36,
+                  borderRadius: 9,
+                  border:
+                    '1px solid var(--border, #e5e7eb)',
+                  background:
+                    'var(--surface-muted, #f8fafc)',
+                  cursor: 'pointer',
+                  fontSize: 20,
+                  lineHeight: 1,
+                  opacity: 0.75,
                 }}
               >
-                <div>
-                  <small>Supplier</small>
-                  <div><strong>{info?.supplier}</strong></div>
-                </div>
+                ×
+              </button>
+            </div>
 
-                <div>
-                  <small>Bill date</small>
-                  <div><strong>{info?.bill_date}</strong></div>
+            <div style={{ padding: 22 }}>
+              {loading && (
+                <div
+                  style={{
+                    padding: '50px 20px',
+                    textAlign: 'center',
+                    opacity: 0.7,
+                  }}
+                >
+                  Loading the complete supplier bill...
                 </div>
+              )}
 
-                <div>
-                  <small>Due date</small>
-                  <div><strong>{info?.due_date}</strong></div>
-                </div>
-
-                <div>
-                  <small>Status</small>
-                  <div>
-                    <strong>
-                      {info?.approval_status === 'pending'
-                        ? 'Awaiting approval'
-                        : info?.approval_status === 'rejected'
-                          ? 'Rejected'
-                          : info?.status}
-                    </strong>
-                  </div>
-                </div>
-              </div>
-
-              {lines.length > 0 && (
-                <div style={{ overflowX: 'auto', marginBottom: 18 }}>
-                  <table
+              {!loading && (
+                <>
+                  {/* Financial summary */}
+                  <div
                     style={{
-                      width: '100%',
-                      borderCollapse: 'collapse',
-                      fontSize: 13,
+                      display: 'grid',
+                      gridTemplateColumns:
+                        'repeat(3, minmax(0, 1fr))',
+                      gap: 12,
+                      marginBottom: 20,
                     }}
                   >
-                    <thead>
-                      <tr>
-                        <th align="left">Description</th>
-                        <th align="right">Qty</th>
-                        <th align="right">Unit price</th>
-                        <th align="right">Discount</th>
-                        <th align="right">Tax</th>
-                        <th align="right">Recoverable tax</th>
-                        <th align="right">Total</th>
-                      </tr>
-                    </thead>
-
-                    <tbody>
-                      {lines.map((line) => (
-                        <tr key={line.id}>
-                          <td>{line.description}</td>
-                          <td align="right">{line.quantity}</td>
-                          <td align="right">{money(line.unit_price)}</td>
-                          <td align="right">
-                            {money(line.discount_amount)}
-                          </td>
-                          <td align="right">{money(line.tax_amount)}</td>
-                          <td align="right">
-                            {money(line.recoverable_tax_amount)}
-                          </td>
-                          <td align="right">
-                            <strong>{money(line.total_amount)}</strong>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              <label className="field-label">
-                Supplier email
-                <input
-                  type="email"
-                  value={recipient}
-                  onChange={(event) =>
-                    setRecipient(event.target.value)
-                  }
-                  placeholder="supplier@example.com"
-                />
-              </label>
-
-              <label className="field-label">
-                Email message
-                <textarea
-                  rows={7}
-                  maxLength={5000}
-                  value={message}
-                  onChange={(event) =>
-                    setMessage(event.target.value)
-                  }
-                />
-              </label>
-
-              <p className="dialog-note">
-                The email automatically includes the complete bill
-                information and the financial summary:
-                <strong> Total</strong>, <strong>Paid</strong>, and
-                <strong> Remaining</strong>.
-              </p>
-
-              {error && (
-                <p className="form-error" role="alert">
-                  {error}
-                </p>
-              )}
-
-              {success && (
-                <p className="dialog-note">
-                  ✓ {success}
-                </p>
-              )}
-
-              <div className="button-row">
-                <button
-                  type="button"
-                  className="button button-primary"
-                  disabled={sending || !recipient.trim()}
-                  onClick={() => void send()}
-                >
-                  {sending ? 'Sending…' : 'Send supplier bill'}
-                </button>
-              </div>
-
-              {events.length > 0 && (
-                <details style={{ marginTop: 18 }}>
-                  <summary>
-                    Email history ({events.length})
-                  </summary>
-
-                  <div style={{ marginTop: 10 }}>
-                    {events.map((event) => (
+                    <div
+                      style={{
+                        padding: '16px 18px',
+                        borderRadius: 12,
+                        background:
+                          'var(--surface-muted, #f8fafc)',
+                        border:
+                          '1px solid var(--border, #e5e7eb)',
+                      }}
+                    >
                       <div
-                        key={event.id}
-                        className="transaction-row"
+                        style={{
+                          fontSize: 12,
+                          opacity: 0.62,
+                          marginBottom: 7,
+                        }}
                       >
-                        <span>
-                          <strong>{event.recipient}</strong>
-                          <small>
-                            {new Date(
-                              event.created_at,
-                            ).toLocaleString('en-KE')}
-                          </small>
-                        </span>
-
-                        <strong>
-                          {event.status === 'accepted'
-                            ? 'Accepted'
-                            : 'Failed'}
-                        </strong>
+                        Total amount
                       </div>
-                    ))}
+
+                      <div
+                        style={{
+                          fontSize: 19,
+                          fontWeight: 700,
+                        }}
+                      >
+                        {money(total)}
+                      </div>
+                    </div>
+
+                    <div
+                      style={{
+                        padding: '16px 18px',
+                        borderRadius: 12,
+                        background:
+                          'var(--surface-muted, #f8fafc)',
+                        border:
+                          '1px solid var(--border, #e5e7eb)',
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontSize: 12,
+                          opacity: 0.62,
+                          marginBottom: 7,
+                        }}
+                      >
+                        Paid
+                      </div>
+
+                      <div
+                        style={{
+                          fontSize: 19,
+                          fontWeight: 700,
+                        }}
+                      >
+                        {money(paid)}
+                      </div>
+                    </div>
+
+                    <div
+                      style={{
+                        padding: '16px 18px',
+                        borderRadius: 12,
+                        background:
+                          'var(--surface-muted, #f8fafc)',
+                        border:
+                          '1px solid var(--border, #e5e7eb)',
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontSize: 12,
+                          opacity: 0.62,
+                          marginBottom: 7,
+                        }}
+                      >
+                        Remaining
+                      </div>
+
+                      <div
+                        style={{
+                          fontSize: 19,
+                          fontWeight: 700,
+                        }}
+                      >
+                        {money(remaining)}
+                      </div>
+                    </div>
                   </div>
-                </details>
+
+                  {/* Bill information */}
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns:
+                        'repeat(4, minmax(0, 1fr))',
+                      gap: 16,
+                      padding: '16px 18px',
+                      marginBottom: 20,
+                      border:
+                        '1px solid var(--border, #e5e7eb)',
+                      borderRadius: 12,
+                    }}
+                  >
+                    <div>
+                      <small style={{ opacity: 0.6 }}>
+                        Supplier
+                      </small>
+                      <div
+                        style={{
+                          marginTop: 4,
+                          fontWeight: 600,
+                        }}
+                      >
+                        {info?.supplier || '—'}
+                      </div>
+                    </div>
+
+                    <div>
+                      <small style={{ opacity: 0.6 }}>
+                        Bill date
+                      </small>
+                      <div
+                        style={{
+                          marginTop: 4,
+                          fontWeight: 600,
+                        }}
+                      >
+                        {info?.bill_date || '—'}
+                      </div>
+                    </div>
+
+                    <div>
+                      <small style={{ opacity: 0.6 }}>
+                        Due date
+                      </small>
+                      <div
+                        style={{
+                          marginTop: 4,
+                          fontWeight: 600,
+                        }}
+                      >
+                        {info?.due_date || '—'}
+                      </div>
+                    </div>
+
+                    <div>
+                      <small style={{ opacity: 0.6 }}>
+                        Status
+                      </small>
+                      <div
+                        style={{
+                          marginTop: 4,
+                          fontWeight: 600,
+                        }}
+                      >
+                        {statusLabel || '—'}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Bill lines */}
+                  {lines.length > 0 && (
+                    <div style={{ marginBottom: 22 }}>
+                      <div
+                        style={{
+                          fontSize: 14,
+                          fontWeight: 700,
+                          marginBottom: 9,
+                        }}
+                      >
+                        Bill details
+                      </div>
+
+                      <div
+                        style={{
+                          overflowX: 'auto',
+                          border:
+                            '1px solid var(--border, #e5e7eb)',
+                          borderRadius: 12,
+                        }}
+                      >
+                        <table
+                          style={{
+                            width: '100%',
+                            minWidth: 720,
+                            borderCollapse: 'collapse',
+                            fontSize: 12.5,
+                          }}
+                        >
+                          <thead>
+                            <tr>
+                              <th
+                                align="left"
+                                style={{
+                                  padding: '11px 12px',
+                                  borderBottom:
+                                    '1px solid var(--border, #e5e7eb)',
+                                  background:
+                                    'var(--surface-muted, #f8fafc)',
+                                }}
+                              >
+                                Description
+                              </th>
+
+                              <th
+                                align="right"
+                                style={{
+                                  padding: '11px 10px',
+                                  borderBottom:
+                                    '1px solid var(--border, #e5e7eb)',
+                                  background:
+                                    'var(--surface-muted, #f8fafc)',
+                                }}
+                              >
+                                Qty
+                              </th>
+
+                              <th
+                                align="right"
+                                style={{
+                                  padding: '11px 10px',
+                                  borderBottom:
+                                    '1px solid var(--border, #e5e7eb)',
+                                  background:
+                                    'var(--surface-muted, #f8fafc)',
+                                }}
+                              >
+                                Unit price
+                              </th>
+
+                              <th
+                                align="right"
+                                style={{
+                                  padding: '11px 10px',
+                                  borderBottom:
+                                    '1px solid var(--border, #e5e7eb)',
+                                  background:
+                                    'var(--surface-muted, #f8fafc)',
+                                }}
+                              >
+                                Discount
+                              </th>
+
+                              <th
+                                align="right"
+                                style={{
+                                  padding: '11px 10px',
+                                  borderBottom:
+                                    '1px solid var(--border, #e5e7eb)',
+                                  background:
+                                    'var(--surface-muted, #f8fafc)',
+                                }}
+                              >
+                                Tax
+                              </th>
+
+                              <th
+                                align="right"
+                                style={{
+                                  padding: '11px 10px',
+                                  borderBottom:
+                                    '1px solid var(--border, #e5e7eb)',
+                                  background:
+                                    'var(--surface-muted, #f8fafc)',
+                                }}
+                              >
+                                Recoverable tax
+                              </th>
+
+                              <th
+                                align="right"
+                                style={{
+                                  padding: '11px 12px',
+                                  borderBottom:
+                                    '1px solid var(--border, #e5e7eb)',
+                                  background:
+                                    'var(--surface-muted, #f8fafc)',
+                                }}
+                              >
+                                Total
+                              </th>
+                            </tr>
+                          </thead>
+
+                          <tbody>
+                            {lines.map((line) => (
+                              <tr key={line.id}>
+                                <td
+                                  style={{
+                                    padding: '11px 12px',
+                                    borderBottom:
+                                      '1px solid var(--border, #e5e7eb)',
+                                  }}
+                                >
+                                  {line.description}
+                                </td>
+
+                                <td
+                                  align="right"
+                                  style={{
+                                    padding: '11px 10px',
+                                    borderBottom:
+                                      '1px solid var(--border, #e5e7eb)',
+                                  }}
+                                >
+                                  {line.quantity}
+                                </td>
+
+                                <td
+                                  align="right"
+                                  style={{
+                                    padding: '11px 10px',
+                                    borderBottom:
+                                      '1px solid var(--border, #e5e7eb)',
+                                  }}
+                                >
+                                  {money(line.unit_price)}
+                                </td>
+
+                                <td
+                                  align="right"
+                                  style={{
+                                    padding: '11px 10px',
+                                    borderBottom:
+                                      '1px solid var(--border, #e5e7eb)',
+                                  }}
+                                >
+                                  {money(line.discount_amount)}
+                                </td>
+
+                                <td
+                                  align="right"
+                                  style={{
+                                    padding: '11px 10px',
+                                    borderBottom:
+                                      '1px solid var(--border, #e5e7eb)',
+                                  }}
+                                >
+                                  {money(line.tax_amount)}
+                                </td>
+
+                                <td
+                                  align="right"
+                                  style={{
+                                    padding: '11px 10px',
+                                    borderBottom:
+                                      '1px solid var(--border, #e5e7eb)',
+                                  }}
+                                >
+                                  {money(
+                                    line.recoverable_tax_amount,
+                                  )}
+                                </td>
+
+                                <td
+                                  align="right"
+                                  style={{
+                                    padding: '11px 12px',
+                                    borderBottom:
+                                      '1px solid var(--border, #e5e7eb)',
+                                    fontWeight: 700,
+                                  }}
+                                >
+                                  {money(line.total_amount)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Email section */}
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns:
+                        'minmax(0, 1fr) minmax(0, 1.6fr)',
+                      gap: 16,
+                      marginBottom: 14,
+                    }}
+                  >
+                    <label className="field-label">
+                      Supplier email
+                      <input
+                        type="email"
+                        value={recipient}
+                        onChange={(event) =>
+                          setRecipient(event.target.value)
+                        }
+                        placeholder="supplier@example.com"
+                      />
+                    </label>
+
+                    <label className="field-label">
+                      Email message
+                      <textarea
+                        rows={5}
+                        maxLength={5000}
+                        value={message}
+                        onChange={(event) =>
+                          setMessage(event.target.value)
+                        }
+                      />
+                    </label>
+                  </div>
+
+                  <div
+                    style={{
+                      padding: '11px 13px',
+                      marginBottom: 14,
+                      borderRadius: 9,
+                      background:
+                        'var(--surface-muted, #f8fafc)',
+                      border:
+                        '1px solid var(--border, #e5e7eb)',
+                      fontSize: 12.5,
+                      lineHeight: 1.5,
+                      opacity: 0.78,
+                    }}
+                  >
+                    The email automatically includes the complete bill
+                    information and the financial summary:
+                    <strong> Total</strong>, <strong>Paid</strong>,
+                    and <strong> Remaining</strong>.
+                  </div>
+
+                  {error && (
+                    <p className="form-error" role="alert">
+                      {error}
+                    </p>
+                  )}
+
+                  {success && (
+                    <p className="dialog-note">
+                      ✓ {success}
+                    </p>
+                  )}
+
+                  {/* Footer */}
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 12,
+                      paddingTop: 6,
+                    }}
+                  >
+                    <button
+                      type="button"
+                      className="button"
+                      onClick={() => setOpen(false)}
+                      disabled={sending}
+                    >
+                      Cancel
+                    </button>
+
+                    <button
+                      type="button"
+                      className="button button-primary"
+                      disabled={
+                        sending || !recipient.trim()
+                      }
+                      onClick={() => void send()}
+                    >
+                      {sending
+                        ? 'Sending…'
+                        : 'Send supplier bill'}
+                    </button>
+                  </div>
+
+                  {/* Email history */}
+                  {events.length > 0 && (
+                    <details
+                      style={{
+                        marginTop: 20,
+                        paddingTop: 14,
+                        borderTop:
+                          '1px solid var(--border, #e5e7eb)',
+                      }}
+                    >
+                      <summary
+                        style={{
+                          cursor: 'pointer',
+                          fontWeight: 600,
+                          fontSize: 13,
+                        }}
+                      >
+                        Email history ({events.length})
+                      </summary>
+
+                      <div style={{ marginTop: 10 }}>
+                        {events.map((event) => (
+                          <div
+                            key={event.id}
+                            className="transaction-row"
+                          >
+                            <span>
+                              <strong>
+                                {event.recipient}
+                              </strong>
+
+                              <small>
+                                {new Date(
+                                  event.created_at,
+                                ).toLocaleString('en-KE')}
+                              </small>
+                            </span>
+
+                            <strong>
+                              {event.status === 'accepted'
+                                ? 'Accepted'
+                                : 'Failed'}
+                            </strong>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                </>
               )}
-            </>
-          )}
+            </div>
+          </div>
         </div>
       )}
-    </div>
+    </>
   )
 }
