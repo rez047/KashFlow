@@ -3008,6 +3008,515 @@ app.get('/v1/bills', requirePool, requireSession, async (request: AuthedRequest,
     response.json({ bills: result.rows })
   } catch (error) { next(error) }
 })
+
+app.get('/v1/bills/:billId/email-info', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const billResult = await pool!.query(`
+      SELECT
+        b.id,
+        b.supplier,
+        b.description,
+        b.amount::text,
+        b.amount_paid::text,
+        GREATEST(b.amount - b.amount_paid, 0)::text AS amount_due,
+        b.bill_date,
+        b.due_date,
+        b.status,
+        b.approval_status,
+        w.name AS business_name,
+        COALESCE(supplier_record.email, '') AS supplier_email
+      FROM vendor_bills b
+      JOIN workspaces w
+        ON w.id = b.workspace_id
+      LEFT JOIN LATERAL (
+        SELECT NULLIF(TRIM(sr.data->>'email'), '') AS email
+        FROM workspace_records sr
+        WHERE sr.workspace_id = b.workspace_id
+          AND sr.record_type = 'suppliers'
+          AND LOWER(TRIM(sr.data->>'name')) = LOWER(TRIM(b.supplier))
+        ORDER BY sr.created_at DESC
+        LIMIT 1
+      ) supplier_record ON true
+      WHERE b.id = $1
+        AND b.workspace_id = $2
+    `, [
+      request.params.billId,
+      request.session!.workspaceId,
+    ])
+
+    const bill = billResult.rows[0]
+
+    if (!bill) {
+      response.status(404).json({
+        error: 'Supplier bill not found in this business.',
+      })
+      return
+    }
+
+    const lines = await pool!.query(`
+      SELECT
+        id,
+        line_number,
+        description,
+        quantity::text,
+        unit_price::text,
+        discount_amount::text,
+        tax_amount::text,
+        recoverable_tax_amount::text,
+        total_amount::text
+      FROM vendor_bill_lines
+      WHERE bill_id = $1
+      ORDER BY line_number
+    `, [bill.id])
+
+    response.json({
+      bill,
+      lines: lines.rows,
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+app.get('/v1/bills/:billId/email-history', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const bill = await pool!.query(
+      'SELECT id FROM vendor_bills WHERE id = $1 AND workspace_id = $2',
+      [
+        request.params.billId,
+        request.session!.workspaceId,
+      ],
+    )
+
+    if (!bill.rowCount) {
+      response.status(404).json({
+        error: 'Supplier bill not found in this business.',
+      })
+      return
+    }
+
+    const result = await pool!.query(`
+      SELECT
+        id,
+        recipient,
+        provider,
+        status,
+        provider_message_id,
+        failure_reason,
+        created_at
+      FROM vendor_bill_email_events
+      WHERE vendor_bill_id = $1
+        AND workspace_id = $2
+      ORDER BY created_at DESC
+      LIMIT 20
+    `, [
+      request.params.billId,
+      request.session!.workspaceId,
+    ])
+
+    response.json({
+      events: result.rows,
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+app.post('/v1/bills/:billId/email', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  if (!emailConfigured) {
+    response.status(503).json({
+      error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.',
+    })
+    return
+  }
+
+  const emailInput = z.object({
+    recipient: z.string().trim().email().max(320),
+    message: z.string().max(5000).optional(),
+  }).safeParse(request.body ?? {})
+
+  if (!emailInput.success) {
+    response.status(400).json({
+      error: 'Enter a valid supplier email address and a message of 5,000 characters or fewer.',
+    })
+    return
+  }
+
+  try {
+    const result = await pool!.query(`
+      SELECT
+        b.id,
+        b.supplier,
+        b.description,
+        b.amount::text,
+        b.amount_paid::text,
+        GREATEST(b.amount - b.amount_paid, 0)::text AS amount_due,
+        b.bill_date,
+        b.due_date,
+        b.status,
+        b.approval_status,
+        w.name AS business_name
+      FROM vendor_bills b
+      JOIN workspaces w
+        ON w.id = b.workspace_id
+      WHERE b.id = $1
+        AND b.workspace_id = $2
+    `, [
+      request.params.billId,
+      request.session!.workspaceId,
+    ])
+
+    const bill = result.rows[0]
+
+    if (!bill) {
+      response.status(404).json({
+        error: 'Supplier bill not found in this business.',
+      })
+      return
+    }
+
+    if (bill.status === 'void') {
+      response.status(409).json({
+        error: 'Voided supplier bills cannot be sent.',
+      })
+      return
+    }
+
+    const linesResult = await pool!.query(`
+      SELECT
+        description,
+        quantity::text,
+        unit_price::text,
+        discount_amount::text,
+        tax_amount::text,
+        recoverable_tax_amount::text,
+        total_amount::text
+      FROM vendor_bill_lines
+      WHERE bill_id = $1
+      ORDER BY line_number
+    `, [bill.id])
+
+    const lines = linesResult.rows as Array<{
+      description: string
+      quantity: string
+      unit_price: string
+      discount_amount: string
+      tax_amount: string
+      recoverable_tax_amount: string
+      total_amount: string
+    }>
+
+    const formatAmount = (value: string | number) =>
+      Number(value).toLocaleString('en-KE', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })
+
+    const billNumber = String(bill.id).slice(0, 8).toUpperCase()
+
+    const billDate = String(bill.bill_date).slice(0, 10)
+    const dueDate = String(bill.due_date).slice(0, 10)
+
+    const total = Number(bill.amount)
+    const paid = Number(bill.amount_paid)
+    const remaining = Math.max(0, total - paid)
+
+    const customerMessage =
+      emailInput.data.message?.trim() ||
+      `Hello ${String(bill.supplier)},
+
+Please find below the supplier bill recorded by ${String(bill.business_name)}.
+
+This email contains the complete bill details together with the total amount, amount paid and remaining balance.`
+
+    const messageHtml = escapeHtml(customerMessage)
+      .replace(/\r?\n/g, '<br>')
+
+    const lineRows = lines.map((line) => `
+      <tr>
+        <td style="padding:10px;border-bottom:1px solid #e5e7eb">
+          ${escapeHtml(String(line.description))}
+        </td>
+        <td align="right" style="padding:10px;border-bottom:1px solid #e5e7eb">
+          ${Number(line.quantity).toLocaleString('en-KE')}
+        </td>
+        <td align="right" style="padding:10px;border-bottom:1px solid #e5e7eb">
+          KSh ${formatAmount(line.unit_price)}
+        </td>
+        <td align="right" style="padding:10px;border-bottom:1px solid #e5e7eb">
+          KSh ${formatAmount(line.discount_amount)}
+        </td>
+        <td align="right" style="padding:10px;border-bottom:1px solid #e5e7eb">
+          KSh ${formatAmount(line.tax_amount)}
+        </td>
+        <td align="right" style="padding:10px;border-bottom:1px solid #e5e7eb">
+          KSh ${formatAmount(line.recoverable_tax_amount)}
+        </td>
+        <td align="right" style="padding:10px;border-bottom:1px solid #e5e7eb">
+          <strong>KSh ${formatAmount(line.total_amount)}</strong>
+        </td>
+      </tr>
+    `).join('')
+
+    const statusText =
+      bill.approval_status === 'pending'
+        ? 'Awaiting approval'
+        : bill.approval_status === 'rejected'
+          ? 'Rejected'
+          : String(bill.status)
+
+    const html = `
+      <main style="font-family:Arial,sans-serif;color:#242537;max-width:900px;margin:auto">
+
+        <div style="padding:24px 0;border-bottom:2px solid #242537">
+          <h1 style="margin:0 0 6px">
+            Supplier Bill ${billNumber}
+          </h1>
+
+          <p style="margin:0;color:#666">
+            ${escapeHtml(String(bill.business_name))}
+          </p>
+        </div>
+
+        <div style="padding:20px 0">
+          <p>${messageHtml}</p>
+        </div>
+
+        <table style="width:100%;border-collapse:collapse;margin-bottom:20px">
+          <tr>
+            <td style="padding:8px 0">
+              <strong>Supplier</strong>
+            </td>
+            <td style="padding:8px 0">
+              ${escapeHtml(String(bill.supplier))}
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:8px 0">
+              <strong>Bill description</strong>
+            </td>
+            <td style="padding:8px 0">
+              ${escapeHtml(String(bill.description))}
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:8px 0">
+              <strong>Bill date</strong>
+            </td>
+            <td style="padding:8px 0">
+              ${escapeHtml(billDate)}
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:8px 0">
+              <strong>Due date</strong>
+            </td>
+            <td style="padding:8px 0">
+              ${escapeHtml(dueDate)}
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:8px 0">
+              <strong>Status</strong>
+            </td>
+            <td style="padding:8px 0">
+              ${escapeHtml(statusText)}
+            </td>
+          </tr>
+        </table>
+
+        <h2>Bill details</h2>
+
+        <table style="border-collapse:collapse;width:100%;font-size:13px">
+          <thead>
+            <tr>
+              <th align="left" style="padding:10px;border-bottom:2px solid #999">
+                Description
+              </th>
+              <th align="right" style="padding:10px;border-bottom:2px solid #999">
+                Qty
+              </th>
+              <th align="right" style="padding:10px;border-bottom:2px solid #999">
+                Unit price
+              </th>
+              <th align="right" style="padding:10px;border-bottom:2px solid #999">
+                Discount
+              </th>
+              <th align="right" style="padding:10px;border-bottom:2px solid #999">
+                Tax
+              </th>
+              <th align="right" style="padding:10px;border-bottom:2px solid #999">
+                Recoverable tax
+              </th>
+              <th align="right" style="padding:10px;border-bottom:2px solid #999">
+                Line total
+              </th>
+            </tr>
+          </thead>
+
+          <tbody>
+            ${lineRows}
+          </tbody>
+        </table>
+
+        <table style="border-collapse:collapse;width:100%;max-width:420px;margin:30px 0 0 auto">
+          <tr>
+            <td style="padding:10px;border-bottom:1px solid #ddd">
+              Total amount
+            </td>
+            <td align="right" style="padding:10px;border-bottom:1px solid #ddd">
+              <strong>KSh ${formatAmount(total)}</strong>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:10px;border-bottom:1px solid #ddd">
+              Amount paid
+            </td>
+            <td align="right" style="padding:10px;border-bottom:1px solid #ddd">
+              KSh ${formatAmount(paid)}
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:12px;background:#f5f5f5">
+              <strong>Remaining amount owed</strong>
+            </td>
+            <td align="right" style="padding:12px;background:#f5f5f5">
+              <strong>KSh ${formatAmount(remaining)}</strong>
+            </td>
+          </tr>
+        </table>
+
+        <p style="margin-top:30px;color:#777;font-size:12px">
+          This supplier bill is an internal accounting document generated by KashFlow.
+          It is not a KRA/eTIMS fiscal tax invoice.
+        </p>
+
+      </main>
+    `
+
+    const textLines = lines.map((line) =>
+      `${String(line.description)} · Qty ${line.quantity} · Unit price KSh ${formatAmount(line.unit_price)} · Discount KSh ${formatAmount(line.discount_amount)} · Tax KSh ${formatAmount(line.tax_amount)} · Recoverable tax KSh ${formatAmount(line.recoverable_tax_amount)} · Line total KSh ${formatAmount(line.total_amount)}`
+    ).join('\n')
+
+    const text = `
+${customerMessage}
+
+Supplier Bill ${billNumber}
+Business: ${String(bill.business_name)}
+Supplier: ${String(bill.supplier)}
+Description: ${String(bill.description)}
+Bill date: ${billDate}
+Due date: ${dueDate}
+Status: ${statusText}
+
+Bill lines:
+${textLines}
+
+TOTAL AMOUNT: KSh ${formatAmount(total)}
+AMOUNT PAID: KSh ${formatAmount(paid)}
+REMAINING AMOUNT OWED: KSh ${formatAmount(remaining)}
+
+This is an internal accounting document and not a KRA/eTIMS fiscal tax invoice.
+`
+
+    const providerResponse = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `supplier-bill/${bill.id}/${emailInput.data.recipient}`,
+      },
+      body: JSON.stringify({
+        from: env.EMAIL_FROM,
+        to: [emailInput.data.recipient],
+        subject: `Supplier Bill ${billNumber} · ${String(bill.business_name)}`,
+        html,
+        text,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    })
+
+    const providerPayload = await providerResponse
+      .json()
+      .catch(() => ({})) as { id?: string; message?: string }
+
+    const deliveryId = randomUUID()
+
+    if (!providerResponse.ok || !providerPayload.id) {
+      await pool!.query(`
+        INSERT INTO vendor_bill_email_events
+          (id, workspace_id, vendor_bill_id, recipient, provider, status, failure_reason, sent_by)
+        VALUES
+          ($1, $2, $3, $4, $5, 'failed', $6, $7)
+      `, [
+        deliveryId,
+        request.session!.workspaceId,
+        bill.id,
+        emailInput.data.recipient,
+        'resend',
+        String(
+          providerPayload.message ??
+          `Provider returned HTTP ${providerResponse.status}`
+        ).slice(0, 500),
+        request.session!.userId,
+      ])
+
+      response.status(502).json({
+        error: 'Email provider did not accept the supplier bill. Check the Resend sender-domain configuration.',
+      })
+      return
+    }
+
+    await pool!.query(`
+      INSERT INTO vendor_bill_email_events
+        (id, workspace_id, vendor_bill_id, recipient, provider, status, provider_message_id, sent_by)
+      VALUES
+        ($1, $2, $3, $4, $5, 'accepted', $6, $7)
+    `, [
+      deliveryId,
+      request.session!.workspaceId,
+      bill.id,
+      emailInput.data.recipient,
+      'resend',
+      providerPayload.id,
+      request.session!.userId,
+    ])
+
+    await pool!.query(`
+      INSERT INTO audit_events
+        (id, workspace_id, actor_user_id, event_type, entity_type, entity_id, event_data)
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7::jsonb)
+    `, [
+      randomUUID(),
+      request.session!.workspaceId,
+      request.session!.userId,
+      'vendor_bill.email_sent',
+      'vendor_bill',
+      bill.id,
+      JSON.stringify({
+        recipient: emailInput.data.recipient,
+        providerMessageId: providerPayload.id,
+      }),
+    ])
+
+    response.status(202).json({
+      delivery: {
+        id: deliveryId,
+        status: 'accepted',
+        providerMessageId: providerPayload.id,
+        recipient: emailInput.data.recipient,
+      },
+      message: 'Supplier bill email accepted by Resend; recipient delivery is not guaranteed.',
+    })
+  } catch (error) {
+    next(error)
+  }
+})
 app.post('/v1/bills', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   const input = z.object({
     supplier: z.string().trim().min(1).max(160),

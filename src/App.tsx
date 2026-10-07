@@ -9,6 +9,7 @@ import {
   Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Trash2, Users, Wallet, X,
 } from 'lucide-react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { SupplierBillEmailSection } from './SupplierBillEmailSection'
 import './App.css'
 import './Sidebar.css'
 
@@ -2932,6 +2933,7 @@ function App() {
                   <strong>{money(bill.amount)}</strong>
                   {bill.approval_status === 'pending' && account?.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin' && <div className="button-row"><button className="button button-small" disabled={busy} onClick={() => void reviewBill(bill, 'approved')}>Approve and post</button><button className="button button-small" disabled={busy} onClick={() => void reviewBill(bill, 'rejected')}>Reject</button></div>}
                   {bill.status === 'unpaid' && bill.approval_status === 'approved' && <><label className="field-label">Payment (KSh)<input min="0.01" max={bill.amount_due ?? bill.amount} step="0.01" type="number" value={paymentAmounts[bill.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [bill.id]: event.target.value }))} /></label><button className="button button-small" disabled={busy || !paymentAmounts[bill.id]} onClick={() => void payBill(bill)}>Record payment</button></>}
+                  <SupplierBillEmailSection bill={bill} />
                 </div>)}
                 {!bills.length && <div className="empty-state">No bills yet.</div>}
               </article>
