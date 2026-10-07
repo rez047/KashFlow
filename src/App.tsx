@@ -170,6 +170,14 @@ function money(value: string | number) {
   return `KSh ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
+function defaultInvoiceEmailMessage(invoice: InvoiceRecord, businessName: string) {
+  return `Hello ${invoice.customer},\n\nPlease find your invoice from ${businessName}.`
+}
+
+function invoiceEmailDraftBody(invoice: InvoiceRecord, message: string) {
+  return `${message}\n\nInvoice ${invoice.id.slice(0, 8)}: ${invoice.description}\nTotal: ${money(invoice.amount)}\nDue: ${invoice.due_date}\n\nThis is an internal invoice, not a KRA/eTIMS fiscal tax invoice.`
+}
+
 function parseCsvRow(line: string) {
   const cells: string[] = []
   let value = ''; let quoted = false
@@ -391,6 +399,7 @@ function App() {
   const [storedDocuments, setStoredDocuments] = useState<StoredDocument[]>([])
   const [bankImportRows, setBankImportRows] = useState<Array<{ date: string; description: string; amount: string; direction: 'income' | 'expense' }>>([])
   const [invoicePreview, setInvoicePreview] = useState<InvoiceRecord | null>(null)
+  const [invoiceEmailBody, setInvoiceEmailBody] = useState('')
   const [returnInvoice, setReturnInvoice] = useState<InvoiceRecord | null>(null)
   const [returnLines, setReturnLines] = useState<ReturnLine[]>([])
   const [returnQuantities, setReturnQuantities] = useState<Record<string, string>>({})
@@ -1818,10 +1827,10 @@ function App() {
     finally { setBusy(false) }
   }
 
-  async function sendInvoiceEmail(invoiceId: string) {
+  async function sendInvoiceEmail(invoiceId: string, message: string) {
     setBusy(true); setError('')
     try {
-      const result = await request<{ message: string }>(`/v1/invoices/${invoiceId}/email`, { method: 'POST', body: '{}' })
+      const result = await request<{ message: string }>(`/v1/invoices/${invoiceId}/email`, { method: 'POST', body: JSON.stringify({ message }) })
       notify(result.message)
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Email provider could not accept the invoice.') }
     finally { setBusy(false) }
@@ -3232,7 +3241,7 @@ function App() {
                     <span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>Due {invoiceRow.due_date} · paid {money(invoiceRow.amount_paid ?? 0)} · due {money(invoiceRow.amount_due ?? invoiceRow.amount)}</small></span>
                     <span className={`status-pill ${invoiceRow.status === 'paid' ? 'green' : 'amber'}`}>{invoiceStatusLabel}</span>
                     <strong>{money(invoiceRow.amount)}</strong>
-                    <button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setModal('invoice') }}>Preview / email draft</button>
+                    <button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setInvoiceEmailBody(defaultInvoiceEmailMessage(invoiceRow, dashboard?.workspaceName ?? 'your business')); setModal('invoice') }}>Preview / email draft</button>
                     {invoiceRow.status !== 'void' && <button className="button button-small" disabled={busy} onClick={() => void shareInvoice(invoiceRow)}>Share invoice</button>}
                     {invoiceRow.status === 'unpaid' && <button className="button button-small" disabled={busy || !invoiceRow.customer_email} title={!invoiceRow.customer_email ? 'Add a customer email to this invoice first.' : undefined} onClick={() => void sendInvoiceReminder(invoiceRow)}>Send reminder</button>}
                     {invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}
@@ -3484,8 +3493,9 @@ function App() {
           <div className="invoice-preview-brand"><div><strong>KashFlow</strong><small>{dashboard?.workspaceName}</small></div><span>{invoicePreview.id ? `Invoice ${invoicePreview.id.slice(0, 8).toUpperCase()}` : 'INVOICE PREVIEW'}</span></div>
           <h2>Invoice</h2><div className="invoice-preview-grid"><span>Bill to<strong>{invoicePreview.customer}</strong><small>{invoicePreview.customer_email || 'No email address added'}</small></span><span>Due date<strong>{invoicePreview.due_date}</strong><small>Status: {invoicePreview.status || 'Draft'}</small></span></div>
           <div className="invoice-preview-line"><span>{invoicePreview.description}</span><strong>{money(invoicePreview.amount)}</strong></div><div className="invoice-preview-total"><span>Total due</span><strong>{money(invoicePreview.amount)}</strong></div>
+          <label className="field-label invoice-email-body-field">Email message<textarea rows={5} maxLength={5000} value={invoiceEmailBody} onChange={(event) => setInvoiceEmailBody(event.target.value)} /><small>This message is included before the invoice details in the email.</small></label>
           <p className="dialog-note"><ShieldCheck size={15} /> Internal business invoice preview—not an eTIMS fiscal tax invoice. {emailConfigured ? 'Send uses the configured Resend provider; accepted does not guarantee recipient delivery.' : 'Outbound provider delivery is not configured; the email-draft option opens your mail application.'}</p>
-          <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => { setInvoicePreview(null); setModal(invoicePreview.id ? null : 'invoice') }}>{invoicePreview.id ? 'Close preview' : 'Edit invoice'}</button><button type="button" className="button button-secondary" onClick={() => window.print()}>Print</button>{invoicePreview.id && invoicePreview.customer_email && (emailConfigured ? <button type="button" className="button button-primary" disabled={busy} onClick={() => void sendInvoiceEmail(invoicePreview.id)}>{busy ? 'Sending…' : 'Send invoice email'}</button> : <a className="button button-primary" href={`mailto:${encodeURIComponent(invoicePreview.customer_email)}?subject=${encodeURIComponent(`Invoice ${invoicePreview.id.slice(0, 8)} from ${dashboard?.workspaceName}`)}&body=${encodeURIComponent(`Hello ${invoicePreview.customer},\n\nPlease find invoice ${invoicePreview.id.slice(0, 8)} for ${money(invoicePreview.amount)} due ${invoicePreview.due_date}.\n\n${invoicePreview.description}\n\nRegards,\n${dashboard?.workspaceName}`)}`}>Open email draft</a>)}</div>
+          <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => { setInvoicePreview(null); setModal(invoicePreview.id ? null : 'invoice') }}>{invoicePreview.id ? 'Close preview' : 'Edit invoice'}</button><button type="button" className="button button-secondary" onClick={() => window.print()}>Print</button>{invoicePreview.id && invoicePreview.customer_email && (emailConfigured ? <button type="button" className="button button-primary" disabled={busy} onClick={() => void sendInvoiceEmail(invoicePreview.id, invoiceEmailBody)}>{busy ? 'Sending…' : 'Send invoice email'}</button> : <a className="button button-primary" href={`mailto:${encodeURIComponent(invoicePreview.customer_email)}?subject=${encodeURIComponent(`Invoice ${invoicePreview.id.slice(0, 8)} from ${dashboard?.workspaceName}`)}&body=${encodeURIComponent(invoiceEmailDraftBody(invoicePreview, invoiceEmailBody))}`}>Open email draft</a>)}</div>
         </article> : null}
         {modal === 'invoice' && !invoicePreview ? <form onSubmit={saveInvoice}>
           <label className="field-label">Customer source<select value={invoiceCustomerMode} onChange={(event) => setInvoiceCustomerMode(event.target.value as typeof invoiceCustomerMode)}><option value="saved">Saved customer</option><option value="new">Create new customer</option></select></label>
@@ -3501,7 +3511,7 @@ function App() {
           </label>
           <p className="dialog-note"><ShieldCheck size={15} /> The invoice itself is not emailed and is not a KRA/eTIMS tax invoice. An optional phone number sends a separate M-Pesa payment prompt.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
-          <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button type="button" className="button button-secondary" onClick={() => setInvoicePreview({ id: '', customer: invoice.customer, customer_email: invoice.customerEmail, description: invoiceLines.map((line) => line.description).filter(Boolean).join('; '), amount: String(draftDocumentTotal(invoiceLines)), due_date: invoice.dueDate, status: 'Draft' })}>Preview</button><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save invoice'}</button></div>
+          <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button type="button" className="button button-secondary" onClick={() => { const preview = { id: '', customer: invoice.customer, customer_email: invoice.customerEmail, description: invoiceLines.map((line) => line.description).filter(Boolean).join('; '), amount: String(draftDocumentTotal(invoiceLines)), due_date: invoice.dueDate, status: 'Draft' }; setInvoicePreview(preview); setInvoiceEmailBody(defaultInvoiceEmailMessage(preview, dashboard?.workspaceName ?? 'your business')) }}>Preview</button><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save invoice'}</button></div>
         </form> : null}
         {modal === 'transaction' ? <form onSubmit={saveTransaction}>
           <label className="field-label">Description<input required maxLength={240} value={transaction.description} onChange={(event) => setTransaction({ ...transaction, description: event.target.value })} /></label>

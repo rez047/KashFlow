@@ -2511,6 +2511,8 @@ app.get('/v1/invoices/:invoiceId/reminders', requirePool, requireSession, async 
 })
 app.post('/v1/invoices/:invoiceId/email', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.' }); return }
+  const emailInput = z.object({ message: z.string().max(5000).optional() }).safeParse(request.body ?? {})
+  if (!emailInput.success) { response.status(400).json({ error: 'Email message must be 5,000 characters or fewer.' }); return }
   try {
     const result = await pool!.query('SELECT id, customer, customer_email, description, amount::text, due_date, status FROM invoices WHERE id = $1 AND workspace_id = $2', [request.params.invoiceId, request.session!.workspaceId])
     const invoiceRow = result.rows[0]
@@ -2519,17 +2521,18 @@ app.post('/v1/invoices/:invoiceId/email', requirePool, verifyOrigin, requireSess
     if (!recipient) { response.status(409).json({ error: 'Add a customer email to this invoice before sending.' }); return }
     if (invoiceRow.status === 'void') { response.status(409).json({ error: 'Voided invoices cannot be sent.' }); return }
     const invoiceNumber = String(invoiceRow.id).slice(0, 8).toUpperCase()
-    const customer = escapeHtml(String(invoiceRow.customer))
     const description = escapeHtml(String(invoiceRow.description))
     const dueDate = escapeHtml(new Date(String(invoiceRow.due_date)).toISOString().slice(0, 10))
     const amount = Number(invoiceRow.amount).toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
     const origin = await pool!.query('SELECT name FROM workspaces WHERE id = $1', [request.session!.workspaceId])
     const businessName = String(origin.rows[0]?.name ?? 'KashFlow business')
-    const html = `<main style="font-family:Arial,sans-serif;color:#242537;max-width:640px;margin:auto"><h1>Invoice ${invoiceNumber}</h1><p>Hello ${customer},</p><p>Please find your invoice from ${escapeHtml(businessName)}.</p><table style="border-collapse:collapse;width:100%"><tr><th align="left" style="padding:12px;border-bottom:1px solid #ddd">Description</th><th align="right" style="padding:12px;border-bottom:1px solid #ddd">Amount (KSh)</th></tr><tr><td style="padding:12px;border-bottom:1px solid #ddd">${description}</td><td align="right" style="padding:12px;border-bottom:1px solid #ddd">${amount}</td></tr></table><p>Due date: ${dueDate}</p><p>This is an internal invoice, not a KRA/eTIMS fiscal tax invoice.</p></main>`
+    const message = emailInput.data.message?.trim() || `Hello ${String(invoiceRow.customer)},\n\nPlease find your invoice from ${businessName}.`
+    const messageHtml = escapeHtml(message).replace(/\r?\n/g, '<br>')
+    const html = `<main style="font-family:Arial,sans-serif;color:#242537;max-width:640px;margin:auto"><h1>Invoice ${invoiceNumber}</h1><p>${messageHtml}</p><table style="border-collapse:collapse;width:100%"><tr><th align="left" style="padding:12px;border-bottom:1px solid #ddd">Description</th><th align="right" style="padding:12px;border-bottom:1px solid #ddd">Amount (KSh)</th></tr><tr><td style="padding:12px;border-bottom:1px solid #ddd">${description}</td><td align="right" style="padding:12px;border-bottom:1px solid #ddd">${amount}</td></tr></table><p>Due date: ${dueDate}</p><p>This is an internal invoice, not a KRA/eTIMS fiscal tax invoice.</p></main>`
     const providerResponse = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: env.EMAIL_FROM, to: [recipient], subject: `Invoice ${invoiceNumber} from ${businessName}`, html, text: `Hello ${String(invoiceRow.customer)},\n\nInvoice ${invoiceNumber} from ${businessName}: ${String(invoiceRow.description)} — KSh ${amount}. Due ${dueDate}.\n\nThis is not a KRA/eTIMS fiscal tax invoice.` }),
+      body: JSON.stringify({ from: env.EMAIL_FROM, to: [recipient], subject: `Invoice ${invoiceNumber} from ${businessName}`, html, text: `${message}\n\nInvoice ${invoiceNumber} from ${businessName}: ${String(invoiceRow.description)} — KSh ${amount}. Due ${dueDate}.\n\nThis is not a KRA/eTIMS fiscal tax invoice.` }),
       signal: AbortSignal.timeout(15_000),
     })
     const providerPayload = await providerResponse.json().catch(() => ({})) as { id?: string; message?: string }
