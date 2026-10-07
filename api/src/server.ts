@@ -1486,6 +1486,21 @@ app.post('/v1/integrations/mono/webhook', requirePool, async (request, response,
   }
   response.status(200).json({ received: true })
 })
+app.patch('/v1/records/inventory/:recordId/price', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ price: z.coerce.number().finite().min(0).max(999999999999) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a valid non-negative selling price.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const current = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [request.params.recordId, request.session!.workspaceId])
+    if (!current.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Inventory item not found in this business.' }); return }
+    const data = current.rows[0].data as Record<string, unknown>
+    const record = await client.query('UPDATE workspace_records SET data = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3 RETURNING id, data, created_at, updated_at', [JSON.stringify({ ...data, price: input.data.price }), request.params.recordId, request.session!.workspaceId])
+    await client.query('COMMIT')
+    response.json({ record: record.rows[0] })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
 app.put('/v1/records/:type/:recordId', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const type = parseRecordType(String(request.params.type ?? ''))
   if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
@@ -1817,21 +1832,23 @@ app.get('/v1/reports/cash-flow-forecast', requirePool, requireSession, async (re
 
 app.get('/v1/recurring', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT id, template_type, description, counterparty, amount::text, account, frequency, next_date, active FROM recurring_templates WHERE workspace_id = $1 ORDER BY next_date', [request.session!.workspaceId])
+    const result = await pool!.query('SELECT id, template_type, description, counterparty, customer_email, customer_phone, amount::text, account, frequency, next_date, active FROM recurring_templates WHERE workspace_id = $1 ORDER BY next_date', [request.session!.workspaceId])
     response.json({ templates: result.rows })
   } catch (error) { next(error) }
 })
 app.post('/v1/recurring', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ type: z.enum(['invoice', 'expense']), description: z.string().trim().min(1).max(240), counterparty: z.string().trim().max(160).default(''), amount: z.coerce.number().finite().positive().max(999999999999), account: z.string().trim().max(80).default('Operating expenses'), frequency: z.enum(['monthly', 'quarterly', 'annually']), nextDate: z.string().date() }).safeParse(request.body)
+  const input = z.object({ type: z.enum(['invoice', 'expense']), description: z.string().trim().min(1).max(240), counterparty: z.string().trim().max(160).default(''), customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''), customerPhone: z.string().trim().max(30).default(''), amount: z.coerce.number().finite().positive().max(999999999999), account: z.string().trim().max(80).default('Operating expenses'), frequency: z.enum(['monthly', 'quarterly', 'annually']), nextDate: z.string().date() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Provide a valid recurring invoice or expense schedule.' }); return }
   try {
-    const result = await pool!.query(`INSERT INTO recurring_templates (id, workspace_id, template_type, description, counterparty, amount, account, frequency, next_date, created_by)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, template_type, next_date, active`,
-    [randomUUID(), request.session!.workspaceId, input.data.type, input.data.description, input.data.counterparty, input.data.amount.toFixed(2), input.data.account, input.data.frequency, input.data.nextDate, request.session!.userId])
+    const result = await pool!.query(`INSERT INTO recurring_templates (id, workspace_id, template_type, description, counterparty, customer_email, customer_phone, amount, account, frequency, next_date, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id, template_type, next_date, active`,
+    [randomUUID(), request.session!.workspaceId, input.data.type, input.data.description, input.data.counterparty, input.data.customerEmail, input.data.customerPhone, input.data.amount.toFixed(2), input.data.account, input.data.frequency, input.data.nextDate, request.session!.userId])
     response.status(201).json({ template: result.rows[0] })
   } catch (error) { next(error) }
 })
 app.post('/v1/recurring/:templateId/run', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ skipPosting: z.boolean().default(false) }).safeParse(request.body ?? {})
+  if (!input.success) { response.status(400).json({ error: 'Provide a valid recurring-run choice.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
@@ -1841,22 +1858,31 @@ app.post('/v1/recurring/:templateId/run', requirePool, verifyOrigin, requireSess
     if (!template) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active recurring schedule not found.' }); return }
     const nextDate = template.next_date instanceof Date ? template.next_date.toISOString().slice(0, 10) : String(template.next_date).slice(0, 10)
     if (nextDate > currentDate) { await client.query('ROLLBACK'); response.status(409).json({ error: `This schedule is next due on ${nextDate}.` }); return }
+    if (input.data.skipPosting && template.template_type !== 'expense') { await client.query('ROLLBACK'); response.status(400).json({ error: 'Only recurring expenses can be skipped as already recorded.' }); return }
     const entryDate = nextDate
+    const dueDate = new Date(`${entryDate}T00:00:00Z`)
+    dueDate.setUTCMonth(dueDate.getUTCMonth() + (template.frequency === 'monthly' ? 1 : template.frequency === 'quarterly' ? 3 : 12))
+    const followingDate = dueDate.toISOString().slice(0, 10)
+    if (input.data.skipPosting) {
+      await client.query('UPDATE recurring_templates SET next_date = $1 WHERE id = $2', [followingDate, template.id])
+      await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'recurring.skipped_as_already_recorded', entityType: 'recurring_template', entityId: String(template.id), eventData: { type: template.template_type, date: entryDate, amount: Number(template.amount) } })
+      await client.query('COMMIT')
+      response.status(200).json({ skipped: true, date: entryDate, nextDate: followingDate })
+      return
+    }
     const amount = Number(template.amount)
     const generatedId = randomUUID()
     if (template.template_type === 'invoice') {
-      const invoice = await client.query('INSERT INTO invoices (id, workspace_id, customer, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id', [generatedId, request.session!.workspaceId, template.counterparty || 'Recurring customer', template.description, amount.toFixed(2), entryDate])
+      const invoice = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id', [generatedId, request.session!.workspaceId, template.counterparty || 'Recurring customer', template.customer_email ?? '', template.description, amount.toFixed(2), entryDate])
       await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: entryDate, description: `Recurring invoice: ${template.description}`, sourceType: 'recurring_invoice', sourceId: String(invoice.rows[0].id), lines: [{ accountCode: '1100', debit: amount, credit: 0 }, { accountCode: '4000', debit: 0, credit: amount }] })
     } else {
       await client.query('INSERT INTO ledger_transactions (id, workspace_id, description, amount, direction, account, transaction_date) VALUES ($1, $2, $3, $4, $5, $6, $7)', [generatedId, request.session!.workspaceId, template.description, amount.toFixed(2), 'expense', template.account, entryDate])
       await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: entryDate, description: `Recurring expense: ${template.description}`, sourceType: 'recurring_expense', sourceId: generatedId, lines: [{ accountCode: '6000', debit: amount, credit: 0 }, { accountCode: '1000', debit: 0, credit: amount }] })
     }
-    const dueDate = new Date(`${entryDate}T00:00:00Z`)
-    dueDate.setUTCMonth(dueDate.getUTCMonth() + (template.frequency === 'monthly' ? 1 : template.frequency === 'quarterly' ? 3 : 12))
-    await client.query('UPDATE recurring_templates SET next_date = $1 WHERE id = $2', [dueDate.toISOString().slice(0, 10), template.id])
+    await client.query('UPDATE recurring_templates SET next_date = $1 WHERE id = $2', [followingDate, template.id])
     await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'recurring.generated', entityType: 'recurring_template', entityId: String(template.id), eventData: { generatedId, type: template.template_type, date: entryDate, amount } })
     await client.query('COMMIT')
-    response.status(201).json({ generatedId, date: entryDate, nextDate: dueDate.toISOString().slice(0, 10) })
+    response.status(201).json({ generatedId, date: entryDate, nextDate: followingDate })
   } catch (error) {
     await client.query('ROLLBACK')
     if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
@@ -2814,6 +2840,53 @@ app.post('/v1/estimates', requirePool, verifyOrigin, requireSession, requireWork
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
+app.post('/v1/estimates/:estimateId/send', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.' }); return }
+  try {
+    const found = await pool!.query(`SELECT id, customer, customer_email, description, amount::text, valid_until, status
+      FROM estimates WHERE id = $1 AND workspace_id = $2`, [request.params.estimateId, request.session!.workspaceId])
+    const estimate = found.rows[0]
+    if (!estimate) { response.status(404).json({ error: 'Estimate not found in this business.' }); return }
+    const recipient = String(estimate.customer_email ?? '').trim()
+    if (!recipient) { response.status(409).json({ error: 'Add a customer email to this estimate before sending.' }); return }
+    if (!['draft', 'sent'].includes(String(estimate.status))) { response.status(409).json({ error: 'Only draft or sent estimates can be emailed.' }); return }
+    const lines = await pool!.query(`SELECT description, quantity::text, unit_price::text, discount_amount::text, tax_amount::text, total_amount::text
+      FROM estimate_lines WHERE estimate_id = $1 ORDER BY line_number`, [estimate.id])
+    const estimateLines = lines.rows as Array<{ description: string; quantity: string; unit_price: string; discount_amount: string; tax_amount: string; total_amount: string }>
+    const estimateNumber = String(estimate.id).slice(0, 8).toUpperCase()
+    const customer = escapeHtml(String(estimate.customer))
+    const origin = await pool!.query('SELECT name FROM workspaces WHERE id = $1', [request.session!.workspaceId])
+    const businessName = String(origin.rows[0]?.name ?? 'KashFlow business')
+    const formatAmount = (amount: string | number) => Number(amount).toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    const lineRows = estimateLines.map((line) => `<tr><td style="padding:10px;border-bottom:1px solid #ddd">${escapeHtml(String(line.description))}</td><td align="right" style="padding:10px;border-bottom:1px solid #ddd">${Number(line.quantity).toLocaleString('en-KE')}</td><td align="right" style="padding:10px;border-bottom:1px solid #ddd">${formatAmount(line.unit_price)}</td><td align="right" style="padding:10px;border-bottom:1px solid #ddd">${formatAmount(line.discount_amount)}</td><td align="right" style="padding:10px;border-bottom:1px solid #ddd">${formatAmount(line.tax_amount)}</td><td align="right" style="padding:10px;border-bottom:1px solid #ddd">${formatAmount(line.total_amount)}</td></tr>`).join('')
+    const validUntil = String(estimate.valid_until).slice(0, 10)
+    const html = `<main style="font-family:Arial,sans-serif;color:#242537;max-width:760px;margin:auto"><h1>Estimate ${estimateNumber}</h1><p>Hello ${customer},</p><p>${escapeHtml(businessName)} has prepared this estimate for you.</p><p>${escapeHtml(String(estimate.description))}</p><table style="border-collapse:collapse;width:100%"><thead><tr><th align="left" style="padding:10px;border-bottom:1px solid #bbb">Description</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Qty</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Unit price (KSh)</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Discount (KSh)</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Tax (KSh)</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Line total (KSh)</th></tr></thead><tbody>${lineRows}</tbody></table><p>Estimate total: <strong>KSh ${formatAmount(estimate.amount)}</strong></p><p>Valid until: ${escapeHtml(validUntil)}</p><p>This is a quotation, not a KRA/eTIMS fiscal tax invoice. Tax amounts shown are entered estimate values; they are not a statutory determination.</p></main>`
+    const textLines = estimateLines.map((line) => `${String(line.description)} · ${line.quantity} × KSh ${formatAmount(line.unit_price)} · discount KSh ${formatAmount(line.discount_amount)} · tax KSh ${formatAmount(line.tax_amount)} · line total KSh ${formatAmount(line.total_amount)}`).join('\n')
+    const providerResponse = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: env.EMAIL_FROM, to: [recipient], subject: `Estimate ${estimateNumber} from ${businessName}`, html, text: `Hello ${String(estimate.customer)},\n\nEstimate ${estimateNumber} from ${businessName}\n${String(estimate.description)}\n\n${textLines}\n\nTotal: KSh ${formatAmount(estimate.amount)}\nValid until ${validUntil}.\n\nThis is a quotation, not a KRA/eTIMS fiscal tax invoice.` }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    const providerPayload = await providerResponse.json().catch(() => ({})) as { id?: string; message?: string }
+    const deliveryId = randomUUID()
+    if (!providerResponse.ok || !providerPayload.id) {
+      await pool!.query('INSERT INTO email_delivery_events (id, workspace_id, estimate_id, recipient, provider, status, failure_reason) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, estimate.id, recipient, 'resend', 'failed', String(providerPayload.message ?? `Provider returned HTTP ${providerResponse.status}`).slice(0, 500)])
+      response.status(502).json({ error: 'Email provider did not accept the estimate. Check the API logs and Resend sender-domain configuration.' }); return
+    }
+    const client = await pool!.connect()
+    try {
+      await client.query('BEGIN')
+      const updated = await client.query("UPDATE estimates SET status = 'sent', updated_at = now() WHERE id = $1 AND workspace_id = $2 AND status IN ('draft', 'sent') RETURNING id", [estimate.id, request.session!.workspaceId])
+      if (!updated.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Estimate changed while the email was being sent. Refresh before retrying.' }); return }
+      await client.query('INSERT INTO email_delivery_events (id, workspace_id, estimate_id, recipient, provider, status, provider_message_id) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, estimate.id, recipient, 'resend', 'accepted', providerPayload.id])
+      await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'estimate.email_sent', entityType: 'estimate', entityId: String(estimate.id), eventData: { recipient, providerMessageId: providerPayload.id } })
+      await client.query('COMMIT')
+    } catch (error) { await client.query('ROLLBACK'); throw error }
+    finally { client.release() }
+    response.status(202).json({ estimate: { id: estimate.id, status: 'sent' }, delivery: { id: deliveryId, status: 'accepted', providerMessageId: providerPayload.id, recipient }, message: 'Email accepted by Resend; recipient delivery is not guaranteed.' })
+  } catch (error) { next(error) }
+})
 app.get('/v1/sales-orders', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
     const result = await pool!.query(`SELECT o.id, o.estimate_id, o.invoice_id, o.status, o.created_at, e.customer, e.description, e.amount::text
@@ -2826,7 +2899,7 @@ app.post('/v1/estimates/:estimateId/order', requirePool, verifyOrigin, requireSe
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const estimate = await client.query("SELECT id FROM estimates WHERE id = $1 AND workspace_id = $2 AND status = 'accepted' AND invoice_id IS NULL FOR UPDATE", [request.params.estimateId, request.session!.workspaceId])
+    const estimate = await client.query("SELECT id FROM estimates WHERE id = $1 AND workspace_id = $2 AND status IN ('sent', 'accepted') AND invoice_id IS NULL FOR UPDATE", [request.params.estimateId, request.session!.workspaceId])
     if (!estimate.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only an accepted estimate can become an order.' }); return }
     const existing = await client.query('SELECT id, status FROM sales_orders WHERE workspace_id = $1 AND estimate_id = $2 FOR UPDATE', [request.session!.workspaceId, request.params.estimateId])
     if (existing.rows[0] && existing.rows[0].status !== 'cancelled') { await client.query('ROLLBACK'); response.status(409).json({ error: 'This estimate already has an active sales order.' }); return }
@@ -2869,7 +2942,7 @@ app.post('/v1/estimates/:estimateId/convert', requirePool, verifyOrigin, require
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const found = await client.query("SELECT id, customer, customer_email, description, amount::text, status FROM estimates WHERE id = $1 AND workspace_id = $2 AND status = 'accepted' AND invoice_id IS NULL FOR UPDATE", [request.params.estimateId, request.session!.workspaceId])
+    const found = await client.query("SELECT id, customer, customer_email, description, amount::text, status FROM estimates WHERE id = $1 AND workspace_id = $2 AND status IN ('sent', 'accepted') AND invoice_id IS NULL FOR UPDATE", [request.params.estimateId, request.session!.workspaceId])
     const estimate = found.rows[0]
     if (!estimate) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only an accepted estimate that has not been converted can become an invoice.' }); return }
     const order = await client.query('SELECT id, status FROM sales_orders WHERE estimate_id = $1 AND workspace_id = $2 FOR UPDATE', [estimate.id, request.session!.workspaceId])

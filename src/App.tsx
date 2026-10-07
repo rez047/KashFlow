@@ -113,7 +113,7 @@ type CustomRole = { id: string; roleKey: string; roleName: string; permissions: 
 type TimeEntry = { id: string; description: string; work_date: string; hours: string; hourly_cost: string; billable: boolean; status: string }
 type AgingReport = { asOf: string; receivables: { items: Array<{ id: string; counterparty: string; amount: string; amount_paid: string; due_date: string; days_overdue: number }>; buckets: Record<string, string> }; payables: { items: Array<{ id: string; counterparty: string; amount: string; amount_paid: string; due_date: string; days_overdue: number }>; buckets: Record<string, string> } }
 type BudgetLine = { id: string; account_code: string; account_name: string; period: string; budget: string; actual: string; variance: string }
-type RecurringTemplate = { id: string; template_type: 'invoice' | 'expense'; description: string; counterparty: string; amount: string; frequency: string; next_date: string; active: boolean }
+type RecurringTemplate = { id: string; template_type: 'invoice' | 'expense'; description: string; counterparty: string; customer_email: string; customer_phone: string; amount: string; frequency: string; next_date: string; active: boolean }
 type Reconciliation = { id: string; account_label: string; period_start: string; period_end: string; opening_balance: string; statement_ending_balance: string; status: string; matched_count: number }
 type ReconciliationDetail = { reconciliation: Reconciliation; transactions: Array<{ id: string; description: string; amount: string; direction: 'income' | 'expense'; account: string; transaction_date: string; matched: boolean }>; matchedNet: string; calculatedEndingBalance: string; difference: string }
 type WorkspaceRecord = { id: string; data: Record<string, string | number>; created_at: string; updated_at: string }
@@ -159,6 +159,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+function requestInvoiceMpesaPayment(invoiceId: string, phone: string) {
+  return request<{ customerMessage: string }>(`/v1/invoices/${invoiceId}/payments/mpesa`, {
+    method: 'POST',
+    body: JSON.stringify({ phone }),
+  })
+}
+
 function money(value: string | number) {
   const amount = Number(value)
   return `KSh ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -185,20 +192,29 @@ function Brand() {
   </div>
 }
 
-function DraftLineEditor({ lines, onChange, onAdd, onRemove, includeRecoverableTax = false, inventoryItems = [] }: {
+function DraftLineEditor({ lines, onChange, onAdd, onRemove, includeRecoverableTax = false, inventoryItems = [], descriptionLabel = 'Description' }: {
   lines: DraftLine[]
   onChange: (index: number, key: keyof DraftLine, value: string) => void
   onAdd: () => void
   onRemove: (index: number) => void
   includeRecoverableTax?: boolean
   inventoryItems?: WorkspaceRecord[]
+  descriptionLabel?: string
 }) {
   return <div className="draft-lines">
     <p className="dialog-note">Enter any tax amounts confirmed by your qualified adviser. These are user-provided bookkeeping amounts, not tax calculations or fiscal invoices.</p>
     {lines.map((line, index) => <fieldset className="draft-line" key={index}>
       <legend>Line {index + 1}</legend>
-      {inventoryItems.length > 0 && <label className="field-label">Inventory item (optional; stock is deducted when invoiced)<select value={line.itemId ?? ''} onChange={(event) => onChange(index, 'itemId', event.target.value)}><option value="">No stock tracking</option>{inventoryItems.map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')} · {Number(item.data.quantity ?? 0)} available</option>)}</select></label>}
-      <label className="field-label">Description<input required maxLength={240} value={line.description} onChange={(event) => onChange(index, 'description', event.target.value)} /></label>
+      {inventoryItems.length > 0 && <label className="field-label">Inventory item (optional; saved price shown)<select value={line.itemId ?? ''} onChange={(event) => {
+        const itemId = event.target.value
+        const selectedItem = inventoryItems.find((item) => item.id === itemId)
+        onChange(index, 'itemId', itemId)
+        if (selectedItem) {
+          onChange(index, 'description', String(selectedItem.data.name ?? 'Inventory item'))
+          onChange(index, 'unitPrice', String(selectedItem.data.price ?? ''))
+        }
+      }}><option value="">No stock tracking</option>{inventoryItems.map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')} · {money(Number(item.data.price ?? 0))} · {Number(item.data.quantity ?? 0)} available</option>)}</select></label>}
+      <label className="field-label">{descriptionLabel}<input required maxLength={240} value={line.description} onChange={(event) => onChange(index, 'description', event.target.value)} /></label>
       <div className="field-row">
         <label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={line.quantity} onChange={(event) => onChange(index, 'quantity', event.target.value)} /></label>
         <label className="field-label">Unit price (KSh)<input required min="0" step="0.01" type="number" value={line.unitPrice} onChange={(event) => onChange(index, 'unitPrice', event.target.value)} /></label>
@@ -305,6 +321,7 @@ function App() {
   const [transferInput, setTransferInput] = useState({ itemId: '', fromLocationId: '', toLocationId: '', quantity: '1' })
   const [countInput, setCountInput] = useState({ itemId: '', locationId: '', countedQuantity: '0' })
   const [inventoryWriteOffInput, setInventoryWriteOffInput] = useState({ itemId: '', locationId: '', reason: 'damaged' as 'damaged' | 'expired' | 'custom', customReason: '', quantity: '1', date: today, notes: '' })
+  const [inventoryPriceDrafts, setInventoryPriceDrafts] = useState<Record<string, string>>({})
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
   const [storeConfig, setStoreConfig] = useState<OnlineStoreConfig>({ slug: '', title: '', description: '', enabled: false })
@@ -340,7 +357,7 @@ function App() {
   const [invoicesList, setInvoicesList] = useState<InvoiceRecord[]>([])
   const [estimates, setEstimates] = useState<EstimateRecord[]>([])
   const [recurringTemplates, setRecurringTemplates] = useState<RecurringTemplate[]>([])
-  const [recurringInput, setRecurringInput] = useState({ type: 'invoice' as 'invoice' | 'expense', description: '', counterparty: '', amount: '', frequency: 'monthly' as 'monthly' | 'quarterly' | 'annually', nextDate: today })
+  const [recurringInput, setRecurringInput] = useState({ type: 'invoice' as 'invoice' | 'expense', description: '', counterparty: '', customerEmail: '', customerPhone: '', amount: '', frequency: 'monthly' as 'monthly' | 'quarterly' | 'annually', nextDate: today })
   const [bills, setBills] = useState<VendorBill[]>([])
   const [reconciliations, setReconciliations] = useState<Reconciliation[]>([])
   const [reconciliationDetail, setReconciliationDetail] = useState<ReconciliationDetail | null>(null)
@@ -1199,7 +1216,7 @@ function App() {
         }
       } else {
         try {
-          const result = await request<{ customerMessage: string }>(`/v1/invoices/${created.invoice.id}/payments/mpesa`, { method: 'POST', body: JSON.stringify({ phone: posPaymentPhone.trim() }) })
+          const result = await requestInvoiceMpesaPayment(created.invoice.id, posPaymentPhone.trim())
           receipt.status = 'M-Pesa request started · confirm payment status before releasing goods'
           notify(result.customerMessage)
         } catch (reason) {
@@ -1297,7 +1314,7 @@ function App() {
       await refresh()
       if (mobileNumber) {
         try {
-          const result = await request<{ customerMessage: string }>(`/v1/invoices/${created.invoice.id}/payments/mpesa`, { method: 'POST', body: JSON.stringify({ phone: mobileNumber }) })
+          const result = await requestInvoiceMpesaPayment(created.invoice.id, mobileNumber)
           notify(`Invoice saved. ${result.customerMessage}`)
         } catch (reason) {
           notify(`Invoice saved; M-Pesa request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
@@ -1434,7 +1451,7 @@ function App() {
     if (!phone) { setError('Enter the customer’s M-Pesa number before sending a prompt.'); return }
     setMpesaPromptSubmitting(true); setError('')
     try {
-      const result = await request<{ customerMessage: string }>(`/v1/invoices/${invoiceRow.id}/payments/mpesa`, { method: 'POST', body: JSON.stringify({ phone }) })
+      const result = await requestInvoiceMpesaPayment(invoiceRow.id, phone)
       await loadInvoiceMpesaPayments(invoiceRow.id)
       notify(result.customerMessage)
     } catch (reason) {
@@ -1538,6 +1555,20 @@ function App() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not save stock thresholds.')
     } finally { setBusy(false) }
+  }
+
+  async function saveInventoryPrice(event: FormEvent<HTMLFormElement>, item: WorkspaceRecord) {
+    event.preventDefault()
+    const price = Number(inventoryPriceDrafts[item.id] ?? item.data.price ?? 0)
+    if (!Number.isFinite(price) || price < 0) { setError('Enter a valid non-negative selling price.'); return }
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ record: WorkspaceRecord }>(`/v1/records/inventory/${item.id}/price`, { method: 'PATCH', body: JSON.stringify({ price }) })
+      setRecords((current) => ({ ...current, inventory: current.inventory.map((record) => record.id === item.id ? result.record : record) }))
+      setInventoryPriceDrafts((current) => { const next = { ...current }; delete next[item.id]; return next })
+      notify('Inventory selling price updated. New estimates and invoices use this saved price by default.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not update inventory selling price.') }
+    finally { setBusy(false) }
   }
 
   async function createPurchaseOrder(event: FormEvent<HTMLFormElement>) {
@@ -1664,6 +1695,8 @@ function App() {
     event.preventDefault(); setBusy(true); setError('')
     try {
       let counterparty = recurringInput.counterparty.trim()
+      let customerEmail = recurringInput.customerEmail.trim()
+      let customerPhone = recurringInput.customerPhone.trim()
       if (recurringInput.type === 'invoice' && recurringCustomerMode === 'new') {
         const name = recurringNewCustomer.name.trim()
         if (!name) throw new Error('Enter a customer name for this recurring invoice.')
@@ -1677,35 +1710,59 @@ function App() {
         }) })
         setRecords((current) => ({ ...current, customers: [created.record, ...current.customers] }))
         counterparty = name
+        customerEmail = recurringNewCustomer.email.trim()
+        customerPhone = recurringNewCustomer.phone.trim()
         setRecurringCustomerMode('saved')
         setRecurringCustomerId(created.record.id)
         setRecurringNewCustomer({ name: '', email: '', phone: '' })
       }
       if (recurringInput.type === 'invoice' && !counterparty) throw new Error('Select or add a customer for this recurring invoice.')
-      await request('/v1/recurring', { method: 'POST', body: JSON.stringify({ ...recurringInput, counterparty, amount: Number(recurringInput.amount) }) })
+      await request('/v1/recurring', { method: 'POST', body: JSON.stringify({ ...recurringInput, counterparty, customerEmail, customerPhone, amount: Number(recurringInput.amount) }) })
       const result = await request<{ templates: RecurringTemplate[] }>('/v1/recurring')
-      setRecurringTemplates(result.templates); setRecurringInput({ ...recurringInput, description: '', counterparty: '', amount: '' }); notify('Recurring schedule saved; no entry is posted until you run it.')
+      setRecurringTemplates(result.templates); setRecurringInput({ ...recurringInput, description: '', counterparty: '', customerEmail: '', customerPhone: '', amount: '' }); setRecurringCustomerId(''); setRecurringNewCustomer({ name: '', email: '', phone: '' }); notify('Recurring schedule saved; no entry is posted until you run it.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save recurring schedule.') }
     finally { setBusy(false) }
   }
 
   async function runRecurring(template: RecurringTemplate) {
+    let skipPosting = false
+    if (template.template_type === 'expense') {
+      skipPosting = window.confirm(`Have you already added “${template.description}” (${money(template.amount)}) to expenses for this due date? Choose OK to skip posting and advance the schedule; choose Cancel if it has not been recorded.`)
+      if (!skipPosting && !window.confirm(`Add “${template.description}” (${money(template.amount)}) to expenses now?`)) return
+    }
     setBusy(true); setError('')
     try {
-      await request(`/v1/recurring/${template.id}/run`, { method: 'POST', body: JSON.stringify({}) })
-      const result = await request<{ templates: RecurringTemplate[] }>('/v1/recurring')
-      setRecurringTemplates(result.templates); await refresh(); notify('Recurring entry created and posted.')
+      const run = await request<{ generatedId?: string; skipped?: boolean }>(`/v1/recurring/${template.id}/run`, { method: 'POST', body: JSON.stringify({ skipPosting }) })
+      const [result, invoiceResult] = await Promise.all([
+        request<{ templates: RecurringTemplate[] }>('/v1/recurring'),
+        template.template_type === 'invoice' ? request<{ invoices: InvoiceRecord[] }>('/v1/invoices') : Promise.resolve(null),
+      ])
+      setRecurringTemplates(result.templates)
+      if (invoiceResult) setInvoicesList(invoiceResult.invoices)
+      await refresh()
+      if (run.skipped) {
+        notify('Recurring expense was not posted again; its schedule moved to the next due date.')
+        return
+      }
+      if (template.template_type === 'invoice' && run.generatedId && template.customer_phone) {
+        try {
+          const payment = await requestInvoiceMpesaPayment(run.generatedId, template.customer_phone)
+          notify(`Recurring invoice created. ${payment.customerMessage}`)
+        } catch (reason) {
+          notify(`Recurring invoice created; Daraja request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
+        }
+      } else notify(template.template_type === 'invoice' ? 'Recurring invoice created. No customer M-Pesa number is saved; open the invoice to request payment.' : 'Recurring expense added to expenses and posted.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not run recurring schedule.') }
     finally { setBusy(false) }
   }
 
-  async function updateEstimateStatus(estimate: EstimateRecord, status: 'sent' | 'accepted' | 'declined' | 'void') {
+  async function sendEstimate(estimate: EstimateRecord) {
     setBusy(true); setError('')
     try {
-      await request(`/v1/estimates/${estimate.id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) })
-      setEstimates((current) => current.map((item) => item.id === estimate.id ? { ...item, status } : item))
-      notify(`Estimate marked ${status}.`)
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not update estimate.') }
+      const result = await request<{ message: string }>(`/v1/estimates/${estimate.id}/send`, { method: 'POST', body: '{}' })
+      setEstimates((current) => current.map((item) => item.id === estimate.id ? { ...item, status: 'sent' } : item))
+      notify(result.message)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not send estimate email.') }
     finally { setBusy(false) }
   }
 
@@ -2795,7 +2852,7 @@ function App() {
                     <strong>{record.data.name}</strong>
                     <small>
                       {type === 'inventory'
-                        ? `SKU ${record.data.sku || '—'} · Qty ${record.data.quantity} ${record.data.unit}`
+                        ? `SKU ${record.data.sku || '—'} · Price ${money(Number(record.data.price ?? 0))} · Qty ${record.data.quantity} ${record.data.unit}`
                         : type === 'projects'
                           ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}`
                           : type === 'suppliers'
@@ -2813,6 +2870,12 @@ function App() {
                     )}
                   </span>
                   <div className="button-row">
+                    {type === 'inventory' && account?.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin' && (
+                      <form className="inventory-price-editor" onSubmit={(event) => void saveInventoryPrice(event, record)}>
+                        <label className="field-label">Selling price (KSh)<input required type="number" min="0" step="0.01" value={inventoryPriceDrafts[record.id] ?? String(record.data.price ?? 0)} onChange={(event) => setInventoryPriceDrafts((current) => ({ ...current, [record.id]: event.target.value }))} /></label>
+                        <button className="button button-small" disabled={busy}>Save price</button>
+                      </form>
+                    )}
                     {type === 'customers' && (
                       <button className="button button-small" onClick={() => beginInvoiceForCustomer(record)}>Create invoice</button>
                     )}
@@ -3098,9 +3161,11 @@ function App() {
                 <label className="field-label">Customer source<select value={estimateCustomerMode} onChange={(event) => setEstimateCustomerMode(event.target.value as typeof estimateCustomerMode)}><option value="saved">Saved customer</option><option value="new">Create new customer</option></select></label>
                 {estimateCustomerMode === 'saved' ? <label className="field-label">Saved customer<select required value={estimateCustomerId} onChange={(event) => { const customerId = event.target.value; setEstimateCustomerId(customerId); const selectedCustomer = records.customers.find((record) => record.id === customerId); setEstimateInput({ ...estimateInput, customer: selectedCustomer ? String(selectedCustomer.data.name ?? '') : '', customerEmail: selectedCustomer ? String(selectedCustomer.data.email ?? '') : '' }) }}><option value="">Select customer</option>{records.customers.map((customer) => <option key={customer.id} value={customer.id}>{String(customer.data.name ?? 'Customer')}{customer.data.email ? ` · ${customer.data.email}` : ''}</option>)}</select></label> : <><label className="field-label">New customer name<input required maxLength={160} value={estimateNewCustomer.name} onChange={(event) => setEstimateNewCustomer({ ...estimateNewCustomer, name: event.target.value })} /></label><label className="field-label">Customer email<input type="email" value={estimateNewCustomer.email} onChange={(event) => setEstimateNewCustomer({ ...estimateNewCustomer, email: event.target.value })} /></label></>}
                 {estimateCustomerMode === 'new' && <label className="field-label">Customer phone (optional)<input maxLength={30} value={estimateNewCustomer.phone} onChange={(event) => setEstimateNewCustomer({ ...estimateNewCustomer, phone: event.target.value })} /></label>}
-                <button className="button button-primary" disabled={busy}>Save estimate</button>
+                <DraftLineEditor lines={estimateLines} inventoryItems={records.inventory} descriptionLabel="Description (shown in customer email)" onChange={(index, key, value) => setEstimateLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setEstimateLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])} onRemove={(index) => setEstimateLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} />
+                <p className="dialog-note">Estimate total: <strong>{money(draftDocumentTotal(estimateLines))}</strong>. Tax amounts are quote inputs only; use the initialized KRA integration and qualified review for official code mapping.</p>
+                <button className="button button-primary" disabled={busy || draftDocumentTotal(estimateLines) <= 0}>Save estimate</button>
               </form>
-              {estimates.length ? <div className="transaction-list">{estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'sent')}>Mark sent</button>}{['draft', 'sent'].includes(estimate.status) && <button className="button button-small" disabled={busy} onClick={() => void updateEstimateStatus(estimate, 'accepted')}>Accept</button>}{estimate.status === 'accepted' && !salesOrders.some((order) => order.estimate_id === estimate.id) && <button className="button button-primary" disabled={busy} onClick={() => void createSalesOrder(estimate)}>Create sales order</button>}</div></div>)}</div> : <div className="empty-state">No estimates yet. Save a quote to start the commercial flow.</div>}
+              {estimates.length ? <div className="transaction-list">{estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}{estimate.customer_email ? ` · ${estimate.customer_email}` : ' · no customer email'}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy || !estimate.customer_email} title={!estimate.customer_email ? 'Add the customer email before sending this estimate.' : undefined} onClick={() => void sendEstimate(estimate)}>Mark sent &amp; email</button>}{estimate.status === 'sent' && <button className="button button-small" disabled={busy} onClick={() => void sendEstimate(estimate)}>Resend estimate</button>}{['sent', 'accepted'].includes(estimate.status) && !salesOrders.some((order) => order.estimate_id === estimate.id) && <button className="button button-primary" disabled={busy} onClick={() => void createSalesOrder(estimate)}>Create sales order</button>}</div></div>)}</div> : <div className="empty-state">No estimates yet. Save a quote to start the commercial flow.</div>}
               <h3>Sales order lifecycle</h3>
               {salesOrders.length ? salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>) : <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
             </article>
@@ -3123,7 +3188,12 @@ function App() {
                       const customerId = event.target.value
                       setRecurringCustomerId(customerId)
                       const selectedCustomer = records.customers.find((record) => record.id === customerId)
-                      setRecurringInput({ ...recurringInput, counterparty: selectedCustomer ? String(selectedCustomer.data.name ?? '') : '' })
+                      setRecurringInput({
+                        ...recurringInput,
+                        counterparty: selectedCustomer ? String(selectedCustomer.data.name ?? '') : '',
+                        customerEmail: selectedCustomer ? String(selectedCustomer.data.email ?? '') : '',
+                        customerPhone: selectedCustomer ? String(selectedCustomer.data.phone ?? '') : '',
+                      })
                     }}><option value="">Select customer</option>{records.customers.map((customer) => <option key={customer.id} value={customer.id}>{String(customer.data.name ?? 'Customer')}{customer.data.email ? ` · ${customer.data.email}` : ''}</option>)}</select></label>
                     : <>
                       <label className="field-label">New customer name<input required maxLength={160} value={recurringNewCustomer.name} onChange={(event) => setRecurringNewCustomer({ ...recurringNewCustomer, name: event.target.value })} /></label>
@@ -3131,8 +3201,9 @@ function App() {
                       <label className="field-label">Customer phone (optional)<input maxLength={30} value={recurringNewCustomer.phone} onChange={(event) => setRecurringNewCustomer({ ...recurringNewCustomer, phone: event.target.value })} /></label>
                     </>}
                 </>}
+                {recurringInput.type === 'invoice' && recurringCustomerMode === 'saved' && recurringInput.customerPhone && <p className="dialog-note">Saved customer phone available for a Daraja M-Pesa prompt when this invoice is generated.</p>}
                 <label className="field-label">Amount (KSh)<input required min="0.01" step="0.01" type="number" value={recurringInput.amount} onChange={(event) => setRecurringInput({ ...recurringInput, amount: event.target.value })} /></label>
-                <label className="field-label">Frequency<select value={recurringInput.frequency} onChange={(event) => setRecurringInput({ ...recurringInput, frequency: event.target.value as typeof recurringInput.frequency })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option><option value="weekly">Weekly</option></select></label>
+                <label className="field-label">Frequency<select value={recurringInput.frequency} onChange={(event) => setRecurringInput({ ...recurringInput, frequency: event.target.value as typeof recurringInput.frequency })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option></select></label>
                 <label className="field-label">Next run date<input required type="date" value={recurringInput.nextDate} onChange={(event) => setRecurringInput({ ...recurringInput, nextDate: event.target.value })} /></label>
                 <button className="button button-primary" disabled={busy}>Save recurring entry</button>
               </form>
