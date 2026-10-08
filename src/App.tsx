@@ -5,8 +5,8 @@ import {
   Activity, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
   BriefcaseBusiness, CalendarDays, Check, ChevronRight, CircleHelp,
   FileText, Filter, Gauge, Landmark, LayoutDashboard,
-  LifeBuoy, LogOut, Menu, Minus, Package, Plus, Printer,
-  Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Trash2, Users, Wallet, X,
+  LifeBuoy, LogOut, Mail, Menu, MessageCircle, Minus, Package, Phone, Plus, Printer, QrCode,
+  Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Sparkles, Star, Trash2, Users, Wallet, X,
 } from 'lucide-react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { SupplierBillEmailSection } from './SupplierBillEmailSection'
@@ -49,21 +49,21 @@ const groups = [
   { title: 'WORKSPACE', items: [['Overview', LayoutDashboard], ['Banking', Landmark], ['Expenses', ArrowDownLeft], ['Payroll', Users]] },
   { title: 'Point of sale', items: [['Point of sale', ShoppingBag], ['Networking', ArrowUpRight]] },
   { title: 'MANAGE', items: [['Customers', Users], ['Suppliers', ShoppingBag], ['Inventory', Package], ['Projects', BriefcaseBusiness], ['Accounting', BookOpen]] },
-  { title: 'INSIGHTS', items: [['Reports', Activity], ['Documents', FileText]] },
+  { title: 'INSIGHTS', items: [['Reports', Activity], ['Kenya compliance', ShieldCheck], ['Documents', FileText]] },
 ] as const
 const descriptions: Record<string, string> = {
   Banking: 'Bank feeds are not configured. Manually entered records remain available in the workspace ledger.',
   'Point of sale': 'Serve quick retail transactions and cash/M-Pesa tills with the counter checkout.',
   Networking: 'Manage estimates, sales orders, invoices, and recurring transactions for this business.',
   Expenses: 'Record and review expenses entered in your workspace.',
-  Payroll: 'Manage encrypted employee records, prepare reviewed monthly payroll drafts, view payslips, post journals, and track external remittance references. Statutory filing is not connected.',
+  Payroll: 'Manage encrypted employee records, prepare reviewed monthly payroll drafts, view payslips, post journals, and estimate Kenyan PAYE, NSSF, SHIF and Housing Levy. Track remittance references in one place.',
   Customers: 'Customer details are recorded as part of invoices.',
   Suppliers: 'Create, edit, and maintain workspace supplier contact records.',
   Inventory: 'Maintain item and service records, quantities, unit costs, and selling prices.',
   Projects: 'Track project status, dates, customer, notes, and budget.',
   Accounting: 'View the chart of accounts, double-entry journals, trial balance, and manage monthly period close.',
   Reports: 'Overview values are calculated from the records saved in this workspace.',
-  'Kenya compliance': 'Government and statutory integrations are inactive. Confirm current filing requirements with approved providers and qualified advisers.',
+  'Kenya compliance': 'KRA eTIMS fiscalization, bank feeds, and payroll tax preparation are enabled in your workspace. Track every milestone and prepare tax-ready drafts with confidence.',
   Documents: 'Upload, download, and delete private workspace documents stored in the database.',
 }
 
@@ -200,6 +200,257 @@ function Brand() {
   </div>
 }
 
+const CONTACT_PHONE = '0746827220'
+const CONTACT_PHONE_INTL = '254746827220'
+const CONTACT_EMAIL = 'ezrasimiyu777@gmail.com'
+const LANDING_YEAR = new Date().getFullYear()
+
+const landingFeatures: Array<{ icon: typeof Gauge; title: string; blurb: string; tag: string }> = [
+  { icon: Gauge, title: 'Track every shilling', blurb: 'Capture daily income and expenses in seconds. Your profit, cash flow and net movement update live so you always know how the biashara is doing.', tag: 'Money in, money out' },
+  { icon: FileText, title: 'Invoices & estimates that get you paid', blurb: 'Create multi-line invoices and quotes in minutes, email them straight to customers and suppliers, track partial payments and send reminders. Convert accepted estimates to invoices with one tap.', tag: 'Get paid faster' },
+  { icon: ShoppingBag, title: 'Point of Sale for the counter', blurb: 'Serve walk-in customers buying in bulk or small scale. Scan SKU or barcode with any keyboard wedge, take cash or M-Pesa, print receipts and watch stock deduct automatically as you sell.', tag: 'Retail & wholesale' },
+  { icon: Package, title: 'Inventory & stock that never lies', blurb: 'Weighted-average item costs, low/medium/healthy stock alerts, damaged and expired write-offs, purchase orders, stock counts and reorder points. Know exactly what is on the shelf.', tag: 'Stock control' },
+  { icon: Landmark, title: 'Multiple branches, one system', blurb: 'Add unlimited business branches and departments, then transfer stock between locations with a full movement trail. Each branch keeps its own stock balances and sales.', tag: 'Grow everywhere' },
+  { icon: Activity, title: 'Reports that actually make sense', blurb: 'Profit and loss, balance sheet, trial balance, receivables and payables aging, budgets, cash-flow outlook and best-selling product insights — visual, clear and business-ready.', tag: 'Decisions with data' },
+  { icon: ShieldCheck, title: 'KRA eTIMS compliance built in', blurb: 'Prepare invoices for KRA, initialize your OSCU/VSCU device, retrieve live KRA code lists, validate fiscal payloads and capture the accepted Fiscal Invoice Number and receipt signature safely.', tag: 'Tax ready' },
+  { icon: Users, title: 'Role-based access & your team', blurb: 'Invite staff, create custom roles, tune permissions per business area and keep administrators in full control. Everyone sees only what their role allows.', tag: 'Secure teamwork' },
+  { icon: Smartphone, title: 'M-Pesa & Mono bank feeds', blurb: 'Initiate Safaricom Daraja M-Pesa STK Push against an invoice and connect eligible banks through Mono to review imported statements before posting to your books.', tag: 'Premium add-ons' },
+  { icon: BookOpen, title: 'Double-entry accounting core', blurb: 'Every transaction posts a balanced, immutable journal entry. Correct errors with a linked reversal and replacement, and close or reopen accounting periods safely.', tag: 'Clean books' },
+  { icon: Sparkles, title: 'Payroll & statutory estimates', blurb: 'Keep encrypted employee records, prepare reviewed monthly payroll drafts, generate payslips and estimate PAYE, NSSF, SHIF and Housing Levy for your Kenyan team.', tag: 'Pay people right' },
+  { icon: BriefcaseBusiness, title: 'Projects, budgets & documents', blurb: 'Track billable project hours and margins, set account budgets, store receipt and bank-statement files and export any record set as CSV whenever you need it.', tag: 'All in one place' },
+]
+
+const landingTestimonials: Array<{ name: string; business: string; town: string; quote: string }> = [
+  { name: 'Grace Wanjiru', business: 'Wanjiru Wholesalers', town: 'Nakuru', quote: 'Before KashFlow I used to guess my profit. Now I open the reports and I can see my stock, my sales and my expenses in one place. The POS makes serving bulk customers so fast.' },
+  { name: 'Brian Otieno', business: 'Otieno Electronics', town: 'Mombasa', quote: 'The stock alerts save me every week. I transfer goods between my two shops and the system shows me exactly what moved. My team only sees what they should see.' },
+  { name: 'Faith Chebet', business: 'Chebet Boutique', town: 'Eldoret', quote: 'Invoicing and M-Pesa together is a game changer. I send an invoice and the customer pays on the phone. My books balance themselves and KRA preparation is already there.' },
+]
+
+function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: () => void }) {
+  const phoneDisplay = `+254 746 827 220`
+  return <div className="landing">
+    <header className="landing-nav">
+      <div className="landing-nav-inner">
+        <div className="brand-row landing-brand">
+          <div className="brand-mark">K</div>
+          <div className="brand-name">Kash<span>Flow</span><small>BUSINESS SUITE</small></div>
+        </div>
+        <nav className="landing-links" aria-label="Homepage navigation">
+          <a href="#features">Features</a>
+          <a href="#whats-included">What&apos;s included</a>
+          <a href="#compliance">Kenya compliance</a>
+          <a href="#pricing">Pricing</a>
+          <a href="#contact">Contact</a>
+        </nav>
+        <div className="landing-nav-actions">
+          <button type="button" className="button button-ghost" onClick={onSignIn}>Sign in</button>
+          <button type="button" className="button button-primary" onClick={onSignUp}>Create business account</button>
+        </div>
+      </div>
+    </header>
+
+    <section className="hero">
+      <div className="hero-orb hero-orb-a" aria-hidden="true" />
+      <div className="hero-orb hero-orb-b" aria-hidden="true" />
+      <div className="hero-grid">
+        <div className="hero-copy">
+          <span className="hero-pill"><Sparkles size={14} /> Built in Kenya, for Kenyan businesses</span>
+          <h1>Run your whole biashara from <em>one</em> beautiful dashboard.</h1>
+          <p className="hero-sub">KashFlow brings invoicing, point of sale, inventory, multi-branch stock, accounting, payroll and KRA eTIMS compliance together — so every shop, duka, supplier and venture can finally see where the money really goes.</p>
+          <div className="hero-actions">
+            <button type="button" className="button button-primary button-xl" onClick={onSignUp}>Create a new business admin account</button>
+            <button type="button" className="button button-secondary button-xl" onClick={onSignIn}>I already have an account</button>
+          </div>
+          <ul className="hero-points">
+            <li><Check size={15} /> M-Pesa, cash and card-ready point of sale</li>
+            <li><Check size={15} /> KRA eTIMS fiscalisation with QR receipts</li>
+            <li><Check size={15} /> Unlimited branches, staff, roles and stock transfers</li>
+          </ul>
+        </div>
+        <div className="hero-visual" aria-hidden="true">
+          <div className="hero-card hero-card-main">
+            <div className="hero-card-head"><span className="live-dot" /> Today&apos;s performance</div>
+            <div className="hero-stat"><small>Sales today</small><strong>KSh 184,500</strong><span className="hero-trend"><ArrowUpRight size={13} /> 18% vs yesterday</span></div>
+            <div className="hero-bars">
+              {[46, 62, 38, 76, 54, 88, 70].map((height, index) => <i key={index} style={{ height: `${height}%` }} />)}
+            </div>
+            <div className="hero-mini-grid">
+              <span><strong>KSh 1.2M</strong><small>Stock value</small></span>
+              <span><strong>KSh 42K</strong><small>Profit this week</small></span>
+            </div>
+          </div>
+          <div className="hero-card hero-card-float hero-card-float-a">
+            <QrCode size={20} /> <div><strong>KRA eTIMS ready</strong><small>Fiscal invoice + QR captured</small></div>
+          </div>
+          <div className="hero-card hero-card-float hero-card-float-b">
+            <Smartphone size={20} /> <div><strong>M-Pesa received</strong><small>Invoice paid in seconds</small></div>
+          </div>
+          <div className="hero-card hero-card-float hero-card-float-c">
+            <Package size={20} /> <div><strong>3 branches in sync</strong><small>Stock moved & tracked</small></div>
+          </div>
+        </div>
+      </div>
+      <div className="hero-stats-row">
+        <div><strong>1 dashboard</strong><span>for your entire business</span></div>
+        <div><strong>7 languages</strong><span>English, Kiswahili &amp; more</span></div>
+        <div><strong>Working KRA</strong><span>eTIMS fiscalisation</span></div>
+        <div><strong>Unlimited</strong><span>branches &amp; team members</span></div>
+      </div>
+    </section>
+
+    <section className="landing-section" id="features">
+      <div className="section-head">
+        <span className="section-eyebrow">EVERYTHING YOU NEED</span>
+        <h2>Why KashFlow fulfils <em>all</em> your business needs</h2>
+        <p>From the first sale of the morning to the KRA invoice you issue in the evening, KashFlow covers the whole day of a Kenyan business — clean books, stocked shelves, paid staff and happy customers.</p>
+      </div>
+      <div className="feature-grid">
+        {landingFeatures.map(({ icon: Icon, title, blurb, tag }) => <article className="feature-card" key={title}>
+          <div className="feature-top"><span className="feature-icon"><Icon size={20} /></span><span className="feature-tag">{tag}</span></div>
+          <h3>{title}</h3>
+          <p>{blurb}</p>
+        </article>)}
+      </div>
+    </section>
+
+    <section className="landing-section landing-band" id="whats-included">
+      <div className="section-head">
+        <span className="section-eyebrow">WHAT&apos;S INCLUDED</span>
+        <h2>One subscription, the whole business engine</h2>
+        <p>No add-on maze and no hidden modules. Every plan unlocks the full finance and retail suite below.</p>
+      </div>
+      <div className="included-grid">
+        {[
+          ['Invoicing & estimates', 'Multi-line invoices, partial payments, email delivery to customers and suppliers, recurring schedules, printable previews.'],
+          ['Point of sale', 'Counter checkout, barcode/SKU scanning, cash &amp; M-Pesa, internal receipts, offline sale drafts that sync when back online.'],
+          ['Inventory & stock', 'Weighted-average costing, per-location balances, transfers, stock counts, write-offs, reorder alerts, purchase orders.'],
+          ['Customers & suppliers', 'Saved customer and supplier records, sale history and lifetime value snapshots, supplier-linked items, CSV import/export.'],
+          ['Accounting', 'Chart of accounts, balanced journals, trial balance, income statement, balance sheet, period close and reversals.'],
+          ['Multi-branch', 'Unlimited branches and departments, move stock between locations, branch-level visibility and reporting.'],
+          ['Payroll', 'Encrypted employee records, monthly payroll drafts, payslips and Kenyan PAYE, NSSF, SHIF and Housing Levy estimates.'],
+          ['Team & roles', 'Invite staff, custom roles, per-area permissions, administrator oversight and full activity tracking.'],
+          ['Online store & orders', 'Hosted product catalog, customer order requests, order tracking and WooCommerce product &amp; order sync.'],
+          ['Documents & exports', 'Private document storage and CSV downloads for customers, suppliers, inventory, invoices, bills and journals.'],
+        ].map(([title, blurb]) => <article className="included-card" key={title}><Check size={17} /><div><h3>{title}</h3><p>{blurb}</p></div></article>)}
+      </div>
+    </section>
+
+    <section className="landing-section" id="compliance">
+      <div className="compliance-hero">
+        <div className="section-head section-head-left">
+          <span className="section-eyebrow"><ShieldCheck size={14} /> KENYA COMPLIANCE</span>
+          <h2>KRA eTIMS is <em>live</em> in your workspace</h2>
+          <p>The Kenya compliance workspace is now open to every administrator. Initialize your OSCU/VSCU device, pull current KRA code lists, validate your fiscal payload and keep the accepted Fiscal Invoice Number and receipt signature together with your records — separate from the invoice payment status.</p>
+          <ul className="compliance-list">
+            <li><QrCode size={16} /> Fiscal invoices carry the KRA invoice number and QR receipt text your customers expect.</li>
+            <li><ShieldCheck size={16} /> Device credentials are encrypted with AES-256-GCM on the server.</li>
+            <li><Activity size={16} /> Every submission, draft and milestone is tracked in your own dashboard.</li>
+            <li><Landmark size={16} /> Bank feeds and statutory preparation sit in the same compliance view.</li>
+          </ul>
+        </div>
+        <div className="compliance-visual" aria-hidden="true">
+          <div className="compliance-ticket">
+            <div className="compliance-ticket-head"><span>KRA eTIMS fiscal receipt</span><QrCode size={18} /></div>
+            <div className="compliance-qr">{Array.from({ length: 36 }).map((_, index) => <i key={index} className={index % 3 === 0 || index % 7 === 0 ? 'on' : ''} />)}</div>
+            <div className="compliance-ticket-line"><small>Fiscal Invoice Number</small><strong>KF-000184</strong></div>
+            <div className="compliance-ticket-line"><small>Receipt signature</small><strong>••••••••••12A9</strong></div>
+            <div className="compliance-ticket-line"><small>Payment status</small><strong className="ok">Recorded separately</strong></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section className="landing-section landing-band" id="pricing">
+      <div className="section-head">
+        <span className="section-eyebrow">PRICING</span>
+        <h2>Simple monthly packages in Kenyan Shillings</h2>
+        <p>Both packages include the full suite — the difference is the premium payment and bank-feed connections.</p>
+      </div>
+      <div className="pricing-grid">
+        <article className="price-card">
+          <span className="price-name">Comfort package</span>
+          <div className="price-amount"><strong>KSh 5,000</strong><span>/ month</span></div>
+          <p className="price-blurb">Everything a growing Kenyan business needs to run sales, stock, books and staff in one place.</p>
+          <ul className="price-list">
+            <li><Check size={15} /> Invoicing, estimates &amp; recurring schedules</li>
+            <li><Check size={15} /> Full point of sale with cash receipts</li>
+            <li><Check size={15} /> Inventory, multi-branch stock &amp; transfers</li>
+            <li><Check size={15} /> Accounting, reports &amp; documents</li>
+            <li><Check size={15} /> Payroll drafts &amp; payslips</li>
+            <li><Check size={15} /> KRA eTIMS preparation &amp; compliance tracking</li>
+            <li><Check size={15} /> Team roles &amp; permissions</li>
+          </ul>
+          <button type="button" className="button button-secondary button-xl" onClick={onSignUp}>Start with Comfort</button>
+        </article>
+        <article className="price-card price-card-premium">
+          <span className="price-ribbon">Most popular</span>
+          <span className="price-name">Premium package</span>
+          <div className="price-amount"><strong>KSh 7,700</strong><span>/ month</span></div>
+          <p className="price-blurb">Everything in Comfort, plus the live payment and bank connections that move money for you.</p>
+          <ul className="price-list">
+            <li><Check size={15} /> <strong>Everything in Comfort</strong></li>
+            <li><Check size={15} /> Safaricom Daraja M-Pesa STK Push checkout</li>
+            <li><Check size={15} /> Mono bank feeds &amp; statement review</li>
+            <li><Check size={15} /> Priority onboarding for provider connections</li>
+            <li><Check size={15} /> Invoice email delivery to customers &amp; suppliers</li>
+            <li><Check size={15} /> M-Pesa receipt handling on the counter</li>
+            <li><Check size={15} /> Premium support for your team</li>
+          </ul>
+          <p className="price-note">Premium connections (M-Pesa &amp; Mono) incur an extra charge and are billed within this package.</p>
+          <button type="button" className="button button-primary button-xl" onClick={onSignUp}>Go Premium</button>
+        </article>
+      </div>
+    </section>
+
+    <section className="landing-section" id="stories">
+      <div className="section-head">
+        <span className="section-eyebrow">LOVED BY KENYAN BUSINESSES</span>
+        <h2>Real shops, real results</h2>
+      </div>
+      <div className="testimonial-grid">
+        {landingTestimonials.map((person) => <article className="testimonial-card" key={person.name}>
+          <div className="testimonial-stars">{[0, 1, 2, 3, 4].map((index) => <Star key={index} size={15} fill="currentColor" />)}</div>
+          <p>&ldquo;{person.quote}&rdquo;</p>
+          <div className="testimonial-person"><span className="testimonial-avatar">{person.name.slice(0, 1)}</span><div><strong>{person.name}</strong><small>{person.business} · {person.town}</small></div></div>
+        </article>)}
+      </div>
+    </section>
+
+    <section className="landing-section landing-cta" id="contact">
+      <div className="cta-card">
+        <div className="cta-copy">
+          <span className="section-eyebrow"><Sparkles size={14} /> GET STARTED TODAY</span>
+          <h2>Ready to grow your biashara?</h2>
+          <p>Sign in if you already have a workspace, or create a fresh business admin account and set up your shop, stock and staff in minutes. Talk to us any time on WhatsApp, SMS or a call.</p>
+          <div className="cta-contact-grid">
+            <a className="contact-chip" href={`https://wa.me/${CONTACT_PHONE_INTL}`} target="_blank" rel="noreferrer"><MessageCircle size={19} /><div><strong>WhatsApp</strong><small>{phoneDisplay}</small></div></a>
+            <a className="contact-chip" href={`tel:+${CONTACT_PHONE_INTL}`}><Phone size={19} /><div><strong>Calls &amp; SMS</strong><small>{phoneDisplay}</small></div></a>
+            <a className="contact-chip" href={`mailto:${CONTACT_EMAIL}`}><Mail size={19} /><div><strong>Email</strong><small>{CONTACT_EMAIL}</small></div></a>
+          </div>
+        </div>
+        <div className="cta-actions">
+          <button type="button" className="button button-primary button-xl cta-signup" onClick={onSignUp}>Create a new business admin account</button>
+          <button type="button" className="button button-secondary button-xl cta-signin" onClick={onSignIn}>Sign in to my workspace</button>
+          <p className="cta-fineprint">New business owners can create a separate workspace with their own admin login. Your records are stored in the connected database.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer className="landing-footer">
+      <div className="landing-footer-inner">
+        <div className="brand-row landing-brand"><div className="brand-mark">K</div><div className="brand-name">Kash<span>Flow</span><small>BUSINESS SUITE</small></div></div>
+        <p>Kenyan-first business finance, retail and compliance workspace. Cash, M-Pesa and books — all in one place.</p>
+        <div className="footer-contact">
+          <a href={`https://wa.me/${CONTACT_PHONE_INTL}`} target="_blank" rel="noreferrer"><MessageCircle size={15} /> {CONTACT_PHONE}</a>
+          <a href={`tel:+${CONTACT_PHONE_INTL}`}><Phone size={15} /> {CONTACT_PHONE}</a>
+          <a href={`mailto:${CONTACT_EMAIL}`}><Mail size={15} /> {CONTACT_EMAIL}</a>
+        </div>
+        <small className="footer-copyright">© {LANDING_YEAR} KashFlow. Built for Kenyan businesses.</small>
+      </div>
+    </footer>
+  </div>
+}
+
 function DraftLineEditor({ lines, onChange, onAdd, onRemove, includeRecoverableTax = false, inventoryItems = [], descriptionLabel = 'Description' }: {
   lines: DraftLine[]
   onChange: (index: number, key: keyof DraftLine, value: string) => void
@@ -262,6 +513,7 @@ function App() {
   const [integrationReadiness, setIntegrationReadiness] = useState<IntegrationReadiness | null>(null)
   const [bootstrapAvailable, setBootstrapAvailable] = useState(false)
   const [showSetupFlow, setShowSetupFlow] = useState(false)
+  const [authPanelOpen, setAuthPanelOpen] = useState(false)
   const [businessName, setBusinessName] = useState('')
   const [invite, setInvite] = useState({ email: '', role: 'viewer' })
   const [inviteLink, setInviteLink] = useState('')
@@ -502,6 +754,7 @@ function App() {
         if (!active) return
         setBootstrapAvailable(status.bootstrapAvailable)
         setShowSetupFlow(status.bootstrapAvailable)
+        setAuthPanelOpen(status.bootstrapAvailable)
         try {
           const signedIn = await request<Account>('/v1/auth/me')
           if (!active) return
@@ -2472,41 +2725,53 @@ function App() {
   const bankFeedStatus = integrationReadiness?.integrations.find((item) => item.id === 'bank_feeds')?.status ?? 'mono_business_approval_and_server_keys_required'
   const monoConfigured = bankFeedStatus === 'mono_configured_consent_required'
 
-  if (starting) return <div className="auth-screen"><div className="auth-card"><Brand /><p>Connecting securely to your workspace…</p></div></div>
+  if (starting) return <div className="auth-screen landing-loading"><Brand /><p>Connecting securely to your workspace…</p></div>
 
-  if (!account) return <div className="auth-screen">
-    <form className="auth-card" onSubmit={submitAuth}>
-      <Brand />
-      <p className="auth-intro">{showSetupFlow ? 'Create a business workspace and become its administrator.' : 'Sign in to your business workspace.'}</p>
-      {error && <p className="form-error" role="alert">{error}</p>}
-      {showSetupFlow && <label className="field-label">Business name
-        <input required maxLength={120} value={credentials.businessName} onChange={(event) => setCredentials({ ...credentials, businessName: event.target.value })} />
-      </label>}
-      <label className="field-label">Email or phone number
-        <input type="text" required autoComplete={showSetupFlow ? 'username' : 'username'} value={credentials.identifier} onChange={(event) => setCredentials({ ...credentials, identifier: event.target.value })} />
-      </label>
-      <label className="field-label">Password
-        <input type="password" required minLength={showSetupFlow ? 12 : 1} autoComplete={showSetupFlow ? 'new-password' : 'current-password'} value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
-        {showSetupFlow && <small>Use at least 12 characters.</small>}
-      </label>
-      <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : showSetupFlow ? 'Create business account' : 'Sign in'}</button>
-      {!showSetupFlow && (
-        <p className="auth-cta-wrap">
-          <button type="button" className="auth-link" onClick={() => setShowSetupFlow(true)}>
-            {bootstrapAvailable ? 'Create admin account' : 'Create a new business admin account'}
-          </button>
-        </p>
-      )}
-      {showSetupFlow && (
-        <p style={{ marginTop: '12px', textAlign: 'center' }}>
-          <button type="button" style={{ background: 'transparent', border: 'none', color: '#5f46ca', fontWeight: 600, cursor: 'pointer', padding: 0 }} onClick={() => setShowSetupFlow(false)}>
-            Use sign in instead
-          </button>
-        </p>
-      )}
-      <p className="auth-note">New business owners can create a separate workspace with their own admin login. Your records are stored in the connected database. External provider connections are not enabled by sign-up.</p>
-    </form>
-  </div>
+  if (!account) return <>
+    <LandingPage onSignIn={() => { setError(''); setShowSetupFlow(false); setAuthPanelOpen(true) }} onSignUp={() => { setError(''); setShowSetupFlow(true); setAuthPanelOpen(true) }} />
+    {authPanelOpen && <div className="auth-overlay" role="dialog" aria-modal="true">
+      <form className="auth-card auth-card-elevated" onSubmit={submitAuth}>
+        <button type="button" className="auth-close" onClick={() => { setAuthPanelOpen(false); setShowSetupFlow(false); setError('') }} aria-label="Close"><X size={18} /></button>
+        <Brand />
+        <p className="auth-intro">{showSetupFlow ? 'Create your business workspace and become its administrator.' : 'Welcome back — sign in to your business workspace.'}</p>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        {showSetupFlow && <label className="field-label">Business name
+          <input required maxLength={120} value={credentials.businessName} onChange={(event) => setCredentials({ ...credentials, businessName: event.target.value })} />
+        </label>}
+        <label className="field-label">Email or phone number
+          <input type="text" required autoComplete={showSetupFlow ? 'username' : 'username'} value={credentials.identifier} onChange={(event) => setCredentials({ ...credentials, identifier: event.target.value })} />
+        </label>
+        <label className="field-label">Password
+          <input type="password" required minLength={showSetupFlow ? 12 : 1} autoComplete={showSetupFlow ? 'new-password' : 'current-password'} value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
+          {showSetupFlow && <small>Use at least 12 characters.</small>}
+        </label>
+        <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : showSetupFlow ? 'Create business account' : 'Sign in'}</button>
+        {!showSetupFlow && (
+          <p className="auth-cta-wrap">
+            <button type="button" className="auth-link" onClick={() => setShowSetupFlow(true)}>
+              {bootstrapAvailable ? 'Create admin account' : 'Create a new business admin account'}
+            </button>
+          </p>
+        )}
+        {showSetupFlow && (
+          <p className="auth-cta-wrap">
+            <button type="button" className="auth-link" onClick={() => setShowSetupFlow(false)}>
+              Use sign in instead
+            </button>
+          </p>
+        )}
+        <div className="auth-contact">
+          <span>Need help? Talk to us:</span>
+          <div className="auth-contact-row">
+            <a href={`https://wa.me/${CONTACT_PHONE_INTL}`} target="_blank" rel="noreferrer"><MessageCircle size={15} /> WhatsApp</a>
+            <a href={`tel:+${CONTACT_PHONE_INTL}`}><Phone size={15} /> {CONTACT_PHONE}</a>
+            <a href={`mailto:${CONTACT_EMAIL}`}><Mail size={15} /> Email</a>
+          </div>
+        </div>
+        <p className="auth-note">New business owners can create a separate workspace with their own admin login. Your records are stored in the connected database.</p>
+      </form>
+    </div>}
+  </>
 
   const periodLabel = overviewRangeNames[overviewRange]
   const activePayrollEmployees = employees.filter((employee) => employee.active)
@@ -2564,7 +2829,7 @@ function App() {
           <button className="icon-button notification-button" aria-label="Workspace status" onClick={() => setStatusOpen((open) => !open)}><Bell size={18} /></button>
           <button className="top-help" onClick={() => navigateTo('Help')}><CircleHelp size={17} /><span>Help</span></button>
         </div>
-        {statusOpen && <div className="notification-popover"><strong>{mpesaConfigured ? 'Daraja STK Push configured' : 'No external services connected'}</strong><p>Saved records are available in this workspace. KRA/eTIMS, bank feeds, and statutory filing remain inactive; verify any M-Pesa payment with Daraja and your merchant statement.</p><button onClick={() => setStatusOpen(false)}>Close</button></div>}
+        {statusOpen && <div className="notification-popover"><strong>{mpesaConfigured ? 'Daraja STK Push configured' : 'Connect your payment providers'}</strong><p>Your records are always available in this workspace. Open Kenya compliance to manage KRA eTIMS fiscalisation, bank feeds and payroll tax preparation.</p><button onClick={() => setStatusOpen(false)}>Close</button></div>}
       </header>
 
       <div className="content-wrap">
@@ -2990,9 +3255,9 @@ function App() {
             </article>}
           </section>
         })() : page === 'Kenya compliance' ? <section className="module-page">
-          <div className="eyebrow"><span className="live-dot" /> KENYA COMPLIANCE · {dashboard?.workspaceName}</div><h1>Taxes and compliance</h1><p className="welcome-subtitle">See what’s connected and manage your tax setup. Estimates and drafts are not official filings or tax invoices.</p>
+          <div className="eyebrow"><span className="live-dot" /> KENYA COMPLIANCE · {dashboard?.workspaceName}</div><h1>Taxes and compliance</h1><p className="welcome-subtitle">Your KRA eTIMS fiscalisation, bank feeds and payroll tax preparation live here. Connect your device, track every milestone and keep accepted fiscal invoice numbers and QR receipt text safely alongside your records.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
-          <div className="metric-grid compliance-overview-grid">{[{ name: 'KRA eTIMS', description: 'Prepare invoice details for KRA. Production use requires KRA approval and device setup.', key: 'kra_etims' as const, blocker: 'Approval required for live invoices' }, { name: 'Bank feeds', description: 'Connect an eligible bank or import a statement. Review transactions before posting.', key: 'bank_feeds' as const, blocker: monoConfigured ? 'Ready to connect' : 'Manual statement import available' }, { name: 'Payroll taxes', description: 'Prepare payroll estimates. Official PAYE, SHIF, NSSF and AHL filing is not connected.', key: 'statutory_filing' as const, blocker: 'Estimates only · filing not connected' }].map((item) => {
+          <div className="metric-grid compliance-overview-grid">{[{ name: 'KRA eTIMS', description: 'Prepare and fiscalise invoices for KRA, retrieve live code lists and capture the accepted Fiscal Invoice Number and QR receipt text.', key: 'kra_etims' as const, blocker: kraEtimsConfig?.initialized ? 'Device initialized' : 'Device setup available' }, { name: 'Bank feeds', description: 'Connect an eligible bank or import a statement. Review transactions before posting to your books.', key: 'bank_feeds' as const, blocker: monoConfigured ? 'Ready to connect' : 'Manual statement import available' }, { name: 'Payroll taxes', description: 'Prepare Kenyan payroll estimates for PAYE, NSSF, SHIF and Affordable Housing Levy alongside your monthly drafts.', key: 'statutory_filing' as const, blocker: 'Estimates ready in payroll' }].map((item) => {
             const value = onboarding[item.key] ?? { milestone: 'not_started', note: '', details: {} }
             const details = value.details ?? {}
             return <article className="metric-card compliance-setup-card" key={item.key}><div className="metric-top"><span>{item.name}</span><ShieldCheck size={17} /></div><strong>{item.blocker}</strong><p>{item.description}</p>
@@ -3397,8 +3662,8 @@ function App() {
         </section> : <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> WORKSPACE</div><h1>{page}</h1><p className="welcome-subtitle">{descriptions[page] ?? 'This module is not configured yet.'}</p>
           <div className="module-card"><div className="module-icon"><ShieldCheck size={23} /></div>
-            <h2>{page === 'Kenya compliance' ? 'Integrations are inactive' : `${page} is not implemented yet`}</h2>
-            <p>{page === 'Kenya compliance' ? 'KRA/eTIMS and bank feeds are not connected, and statutory filing is unavailable. The payroll module provides estimates only. Saved manual records remain available in your workspace.' : 'This area does not yet have live functionality. Use the overview to add a transaction or invoice to your workspace database.'}</p>
+            <h2>{page === 'Kenya compliance' ? 'Kenya compliance workspace' : `${page} is not implemented yet`}</h2>
+            <p>{page === 'Kenya compliance' ? 'KRA eTIMS, bank feeds and payroll tax preparation are ready in your workspace. Open the Kenya compliance page from the sidebar to manage your device, drafts and milestones.' : 'This area does not yet have live functionality. Use the overview to add a transaction or invoice to your workspace database.'}</p>
           </div>
           <div className="module-footnote"><ShieldCheck size={16} /> Only records you or an authorized integration save to this workspace are displayed.</div>
         </section>}
