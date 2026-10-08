@@ -585,6 +585,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
             <li><Check size={15} /> Mono bank feeds &amp; statement review</li>
             <li><Check size={15} /> Priority onboarding for provider connections</li>
             <li><Check size={15} /> M-Pesa receipt handling on the counter</li>
+            <li><Check size={15} /> Online store & orders</li>
             <li><Check size={15} /> Premium support for your team</li>
           </ul>
           <p className="price-note">Premium connections (M-Pesa &amp; Mono) incur an extra charge and are billed within this package.</p>
