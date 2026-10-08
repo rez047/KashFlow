@@ -417,3 +417,36 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .segment-cta p{color:#5b5877;font-size:14px}
 @media(max-width:1080px){.segment-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:640px){.segment-grid{grid-template-columns:1fr}}
+
+/* ---------- Guided KRA eTIMS setup wizard ---------- */
+.kra-wizard{margin:22px 0;padding:26px 26px 24px;border-radius:20px;border:1px solid #dcd3fb;background:linear-gradient(150deg,#f7f3ff,#fff 55%,#f3fbff);box-shadow:0 16px 40px rgba(60,40,140,.10)}
+.kra-wizard-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap}
+.kra-wizard-head h2{margin:6px 0 8px;font-size:22px;font-weight:800;color:#231c48}
+.kra-wizard-head p{margin:0;color:#5b5877;font-size:13.5px;max-width:640px;line-height:1.6}
+.kra-steps{list-style:none;margin:22px 0 4px;padding:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.kra-steps li{display:flex;gap:11px;align-items:flex-start;padding:14px;border-radius:13px;background:#fff;border:1px solid #ece7fb}
+.kra-steps li.kra-step-done{border-color:#bfe9d3;background:linear-gradient(140deg,#f1fcf5,#fff)}
+.kra-step-num{width:28px;height:28px;flex:none;display:grid;place-items:center;border-radius:50%;background:#efe9ff;color:#5b3fd6;font-weight:800;font-size:12.5px}
+.kra-step-done .kra-step-num{background:#1fa971;color:#fff}
+.kra-steps strong{display:block;font-size:12.8px;font-weight:800;color:#2a2547}
+.kra-steps small{display:block;margin-top:3px;color:#7a7891;font-size:11.5px;line-height:1.5}
+.kra-quick-form{margin-top:20px;display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+.kra-quick-form .field-label{margin:0}
+.kra-quick-form .field-label small{display:block;margin-top:5px;color:#84819c;font-size:11px;font-weight:500;line-height:1.45}
+.kra-optional{grid-column:1/-1;border:1px solid #ece7fb;border-radius:11px;padding:11px 14px;background:#fff}
+.kra-optional summary{cursor:pointer;font-size:12px;font-weight:700;color:#5b3fd6}
+.kra-optional .field-label{margin-top:11px;max-width:220px}
+.kra-connect{grid-column:1/-1;justify-self:start}
+.kra-reassure{grid-column:1/-1;display:flex;align-items:center;gap:7px;margin:2px 0 0;color:#4c8b6d;font-size:11.5px;font-weight:600}
+.kra-reassure svg{flex:none}
+.kra-connected{margin-top:20px;padding:18px;border-radius:14px;background:#f1fcf5;border:1px solid #bfe9d3}
+.kra-connected p{display:flex;align-items:center;gap:9px;margin:0;color:#166b48;font-weight:700;font-size:14px}
+.kra-connected p svg{flex:none;color:#1fa971}
+.kra-connected-meta{margin-top:8px!important;color:#4c7d68!important;font-weight:600!important;font-size:11.5px!important;font-family:ui-monospace,Consolas,monospace}
+.kra-connected .button-row{margin-top:14px}
+.kra-setup-status{display:flex;align-items:center;gap:8px;margin:16px 0 0;padding:12px 15px;border-radius:11px;font-size:13px;font-weight:650}
+.kra-setup-connecting{background:#fff6e6;color:#8a5a12;border:1px solid #f3ddb3}
+.kra-setup-done{background:#e9f9f0;color:#166b48;border:1px solid #bfe9d3}
+.kra-setup-error{background:#fdeceb;color:#a5352d;border:1px solid #f6cfcb}
+@media(max-width:860px){.kra-steps{grid-template-columns:1fr}.kra-quick-form{grid-template-columns:1fr}}
+.field-hint-warn{display:block;margin-top:5px;color:#b4332c;font-size:11px;font-weight:650}

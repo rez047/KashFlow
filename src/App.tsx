@@ -744,6 +744,9 @@ function App() {
   const [reviewerDetails] = useState({ name: '', qualification: '', registration: '', reference: '' })
   const [kraEtimsConfig, setKraEtimsConfig] = useState<KraEtimsConfig | null>(null)
   const [kraDeviceInput, setKraDeviceInput] = useState({ taxpayerPin: '', branchId: '00', deviceSerial: '' })
+  const [kraSetupStep, setKraSetupStep] = useState<'idle' | 'connecting' | 'done' | 'error'>('idle')
+  const [kraSetupMessage, setKraSetupMessage] = useState('')
+  const [kraAdvancedOpen, setKraAdvancedOpen] = useState(false)
   const [kraCodes, setKraCodes] = useState<Record<string, unknown> | null>(null)
   const [kraPayloadEditors, setKraPayloadEditors] = useState<Record<string, string>>({})
   const [monoConfig, setMonoConfig] = useState<MonoBankConfig | null>(null)
@@ -2393,26 +2396,6 @@ function App() {
     } finally { setBusy(false) }
   }
 
-  async function saveKraDevice() {
-    setBusy(true); setError('')
-    try {
-      await request('/v1/integrations/etims/device', { method: 'PUT', body: JSON.stringify(kraDeviceInput) })
-      const result = await request<KraEtimsConfig>('/v1/integrations/etims/config'); setKraEtimsConfig(result)
-      notify('KRA taxpayer/device information saved encrypted on the API server.')
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save KRA OSCU device configuration.') }
-    finally { setBusy(false) }
-  }
-
-  async function initializeKraDevice() {
-    setBusy(true); setError('')
-    try {
-      const result = await request<{ initialized: boolean; environment: string; device: KraEtimsConfig['device']; notice: string }>('/v1/integrations/etims/initialize', { method: 'POST', body: '{}' })
-      setKraEtimsConfig((current) => current ? { ...current, initialized: result.initialized, device: result.device } : current)
-      notify(`KRA OSCU device initialized in ${result.environment} environment.`)
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'KRA OSCU initialization failed.') }
-    finally { setBusy(false) }
-  }
-
   async function loadKraCodes() {
     setBusy(true); setError('')
     try {
@@ -2420,6 +2403,45 @@ function App() {
       setKraCodes(result.result); notify('Latest KRA code lists retrieved; map the current KRA item/tax codes before preparing an invoice.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not retrieve KRA code lists.') }
     finally { setBusy(false) }
+  }
+
+  // One guided action that removes the hidden gates a normal user would otherwise hit:
+  // 1) switch on the live KRA preference for this business (otherwise KRA calls return 403),
+  // 2) save the encrypted taxpayer/device details, then
+  // 3) initialize the KRA device and report exactly what happened.
+  async function runKraQuickSetup() {
+    setBusy(true); setError(''); setKraSetupStep('connecting'); setKraSetupMessage('Enabling KRA for this business…')
+    try {
+      if (!settings.kraEtimsLiveEnabled) {
+        const nextSettings = { ...settings, kraEtimsLiveEnabled: true }
+        await request('/v1/settings', { method: 'PUT', body: JSON.stringify({ ...nextSettings, businessName: nextSettings.businessName || dashboard?.workspaceName }) })
+        setSettings(nextSettings)
+      }
+      setKraSetupMessage('Saving your KRA details securely…')
+      await request('/v1/integrations/etims/device', { method: 'PUT', body: JSON.stringify(kraDeviceInput) })
+      let config = await request<KraEtimsConfig>('/v1/integrations/etims/config')
+      setKraEtimsConfig(config)
+      setKraSetupMessage(config.initialized ? 'Device already connected.' : `Connecting to KRA ${config.environment}…`)
+      if (!config.initialized) {
+        const result = await request<{ initialized: boolean; environment: string; device: KraEtimsConfig['device']; notice: string }>('/v1/integrations/etims/initialize', { method: 'POST', body: '{}' })
+        config = { ...config, initialized: result.initialized, device: result.device }
+        setKraEtimsConfig(config)
+      }
+      setKraSetupStep('done')
+      setKraSetupMessage(`KRA eTIMS is connected for ${dashboard?.workspaceName ?? 'this business'} in the ${config.environment} environment. You can now fiscalise invoices.`)
+      notify('KRA eTIMS connected. You can now fiscalise invoices.')
+      void loadKraCodes()
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : 'KRA setup could not complete.'
+      setKraSetupStep('error')
+      setKraSetupMessage(message)
+      setError(message)
+    } finally { setBusy(false) }
+  }
+
+  async function refreshKraConfig() {
+    try { setKraEtimsConfig(await request<KraEtimsConfig>('/v1/integrations/etims/config')) }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not check KRA connection status.') }
   }
 
   async function saveKraFiscalPayload(draftId: string) {
@@ -3496,9 +3518,9 @@ function App() {
             </article>}
           </section>
         })() : page === 'Kenya compliance' ? <section className="module-page">
-          <div className="eyebrow"><span className="live-dot" /> KENYA COMPLIANCE · {dashboard?.workspaceName}</div><h1>Taxes and compliance</h1><p className="welcome-subtitle">Your KRA eTIMS fiscalisation, bank feeds and payroll tax preparation live here. Connect your device, track every milestone and keep accepted fiscal invoice numbers and QR receipt text safely alongside your records.</p>
+          <div className="eyebrow"><span className="live-dot" /> KENYA COMPLIANCE · {dashboard?.workspaceName}</div><h1>Taxes and compliance</h1><p className="welcome-subtitle">Connect KRA eTIMS with one guided step, review bank feeds and prepare payroll taxes. You do not need any technical settings — just your KRA PIN and device serial.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
-          <div className="metric-grid compliance-overview-grid">{[{ name: 'KRA eTIMS', description: 'Prepare and fiscalise invoices for KRA, retrieve live code lists and capture the accepted Fiscal Invoice Number and QR receipt text.', key: 'kra_etims' as const, blocker: kraEtimsConfig?.initialized ? 'Device initialized' : 'Device setup available' }, { name: 'Bank feeds', description: 'Connect an eligible bank or import a statement. Review transactions before posting to your books.', key: 'bank_feeds' as const, blocker: monoConfigured ? 'Ready to connect' : 'Manual statement import available' }, { name: 'Payroll taxes', description: 'Prepare Kenyan payroll estimates for PAYE, NSSF, SHIF and Affordable Housing Levy alongside your monthly drafts.', key: 'statutory_filing' as const, blocker: 'Estimates ready in payroll' }].map((item) => {
+          <div className="metric-grid compliance-overview-grid">{[{ name: 'KRA eTIMS', description: 'Connect once below and fiscalise your invoices for KRA in a single guided step.', key: 'kra_etims' as const, blocker: kraEtimsConfig?.initialized ? 'Connected — ready to fiscalise' : 'Ready to connect in one step' }, { name: 'Bank feeds', description: 'Connect an eligible bank or import a statement. Review transactions before posting to your books.', key: 'bank_feeds' as const, blocker: monoConfigured ? 'Ready to connect' : 'Manual statement import available' }, { name: 'Payroll taxes', description: 'Prepare Kenyan payroll estimates for PAYE, NSSF, SHIF and Affordable Housing Levy alongside your monthly drafts.', key: 'statutory_filing' as const, blocker: 'Estimates ready in payroll' }].map((item) => {
             const value = onboarding[item.key] ?? { milestone: 'not_started', note: '', details: {} }
             const details = value.details ?? {}
             return <article className="metric-card compliance-setup-card" key={item.key}><div className="metric-top"><span>{item.name}</span><ShieldCheck size={17} /></div><strong>{item.blocker}</strong><p>{item.description}</p>
@@ -3511,13 +3533,57 @@ function App() {
               </details>
             </article>
           })}</div>
-          <details className="compliance-advanced"><summary>Technical KRA setup and invoice drafts</summary>
-          <article className="module-card"><div className="panel-header"><div><h2>KRA OSCU device connection · {kraEtimsConfig?.environment ?? 'loading'}</h2><p>Uses KRA’s documented OSCU initialization, code-list, and sales endpoint. Device PIN/serial and the KRA communication key are encrypted on the API server.</p></div><span className={`status-pill ${kraEtimsConfig?.initialized ? 'green' : 'amber'}`}>{kraEtimsConfig?.initialized ? 'Device initialized' : 'Setup required'}</span></div>
-            {!kraEtimsConfig?.credentialsEncryptionReady && <p className="form-error">Configure KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY in the API service environment before saving device credentials.</p>}
-            <div className="record-form-grid"><label className="field-label">Taxpayer KRA PIN<input autoComplete="off" maxLength={11} value={kraDeviceInput.taxpayerPin} onChange={(event) => setKraDeviceInput({ ...kraDeviceInput, taxpayerPin: event.target.value.toUpperCase() })} /></label><label className="field-label">Branch ID<input maxLength={2} value={kraDeviceInput.branchId} onChange={(event) => setKraDeviceInput({ ...kraDeviceInput, branchId: event.target.value })} /></label><label className="field-label">KRA-approved device serial number<input maxLength={100} value={kraDeviceInput.deviceSerial} onChange={(event) => setKraDeviceInput({ ...kraDeviceInput, deviceSerial: event.target.value })} /></label></div>
-            <div className="button-row"><button className="button button-secondary" disabled={busy || !kraEtimsConfig?.credentialsEncryptionReady} onClick={() => void saveKraDevice()}>Save encrypted device details</button><button className="button button-primary" disabled={busy || !kraEtimsConfig?.configured || kraEtimsConfig.initialized} onClick={() => void initializeKraDevice()}>{busy ? 'Contacting KRA…' : `Initialize ${kraEtimsConfig?.environment ?? 'OSCU'} device`}</button><button className="button button-small" disabled={busy || !kraEtimsConfig?.initialized} onClick={() => void loadKraCodes()}>Fetch KRA code lists</button></div>
-            {kraEtimsConfig?.device && <p>Device ID {kraEtimsConfig.device.deviceId || '—'} · SDC {kraEtimsConfig.device.sdcId || '—'} · MRC {kraEtimsConfig.device.mrcNo || '—'}</p>}
-            <p className="dialog-note">Production fiscalization requires KRA approval/certification and environment KRA_ETIMS_ENV=production plus KRA_ETIMS_LIVE_ENABLED=true set by the API operator. Sandbox calls are not fiscal invoices. Never share these credentials in chat.</p>
+
+          <article className="kra-wizard">
+            <div className="kra-wizard-head">
+              <div>
+                <span className="section-eyebrow"><ShieldCheck size={14} /> KRA eTIMS · GUIDED SETUP</span>
+                <h2>Connect KRA in one step</h2>
+                <p>Enter your KRA PIN and device serial once. We will switch on live KRA for this business, save your details encrypted, and connect to KRA for you — no environment variables or technical settings to touch.</p>
+              </div>
+              <span className={`status-pill ${kraEtimsConfig?.initialized ? 'green' : 'amber'}`}>{kraEtimsConfig?.initialized ? 'Connected' : 'Not connected yet'}</span>
+            </div>
+
+            <ol className="kra-steps">
+              <li className={kraEtimsConfig?.configured ? 'kra-step-done' : ''}><span className="kra-step-num">{kraEtimsConfig?.configured ? <Check size={14} /> : 1}</span><div><strong>KRA system is ready</strong><small>{kraEtimsConfig?.configured ? `Server connected to KRA ${kraEtimsConfig.environment}.` : 'Waiting for the server KRA configuration.'}</small></div></li>
+              <li className={kraEtimsConfig?.initialized ? 'kra-step-done' : ''}><span className="kra-step-num">{kraEtimsConfig?.initialized ? <Check size={14} /> : 2}</span><div><strong>Your business is switched on</strong><small>{settings.kraEtimsLiveEnabled ? 'Live KRA enabled for this business.' : 'This will be switched on automatically below.'}</small></div></li>
+              <li className={kraEtimsConfig?.initialized ? 'kra-step-done' : ''}><span className="kra-step-num">{kraEtimsConfig?.initialized ? <Check size={14} /> : 3}</span><div><strong>Device connected</strong><small>{kraEtimsConfig?.device?.sdcId ? `SDC ${kraEtimsConfig.device.sdcId} · MRC ${kraEtimsConfig.device.mrcNo || '—'}` : 'Enter your details and click Connect.'}</small></div></li>
+            </ol>
+
+            {!kraEtimsConfig?.credentialsEncryptionReady && <p className="form-error">The server still needs its KRA credential encryption key. Ask the KashFlow operator to set KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY, then reload.</p>}
+
+            {!kraEtimsConfig?.initialized && kraEtimsConfig?.credentialsEncryptionReady && <form className="kra-quick-form" onSubmit={(event) => { event.preventDefault(); void runKraQuickSetup() }}>
+              <label className="field-label">Your KRA PIN
+                <input required autoComplete="off" maxLength={11} placeholder="e.g. P051234567X" value={kraDeviceInput.taxpayerPin} onChange={(event) => setKraDeviceInput({ ...kraDeviceInput, taxpayerPin: event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '') })} />
+                <small>Find this on your KRA iTax portal. It is the 11-character PIN shown on your tax records (letters and numbers only).</small>
+                {kraDeviceInput.taxpayerPin.length > 0 && !/^[A-Z0-9]{11}$/.test(kraDeviceInput.taxpayerPin) && <small className="field-hint-warn">A KRA PIN has 11 characters. You have {kraDeviceInput.taxpayerPin.length} so far.</small>}
+              </label>
+              <label className="field-label">Device serial number
+                <input required maxLength={100} placeholder="Shown on your KRA eTIMS device" value={kraDeviceInput.deviceSerial} onChange={(event) => setKraDeviceInput({ ...kraDeviceInput, deviceSerial: event.target.value })} />
+                <small>From your KRA eTIMS device registration. Ask us if you are unsure — we will help you locate it.</small>
+              </label>
+              <details className="kra-optional"><summary>Optional: branch ID and other settings</summary>
+                <label className="field-label">Branch ID<input maxLength={2} value={kraDeviceInput.branchId} onChange={(event) => setKraDeviceInput({ ...kraDeviceInput, branchId: event.target.value })} />
+                  <small>Leave as 00 for a single-branch business. Use 01, 02… only if KRA registered separate branches.</small>
+                </label>
+              </details>
+              <button className="button button-primary button-xl kra-connect" disabled={busy || !/^[A-Z0-9]{11}$/.test(kraDeviceInput.taxpayerPin) || !kraDeviceInput.deviceSerial.trim()}>{busy ? 'Connecting to KRA…' : 'Connect KRA now'}</button>
+              <p className="kra-reassure"><ShieldCheck size={14} /> Your PIN and serial are encrypted on the server (AES-256-GCM) and never shown in messages or logs.</p>
+            </form>}
+
+            {kraEtimsConfig?.initialized && <div className="kra-connected">
+              <p><Check size={16} /> KRA eTIMS is connected for {dashboard?.workspaceName ?? 'this business'} and ready to fiscalise invoices.</p>
+              {kraEtimsConfig.device && <p className="kra-connected-meta">Device ID {kraEtimsConfig.device.deviceId || '—'} · SDC {kraEtimsConfig.device.sdcId || '—'} · MRC {kraEtimsConfig.device.mrcNo || '—'}</p>}
+              <div className="button-row"><button className="button button-secondary" disabled={busy} onClick={() => void loadKraCodes()}>Refresh KRA code lists</button><button className="button button-small" disabled={busy} onClick={() => void refreshKraConfig()}>Check connection</button></div>
+            </div>}
+
+            {kraSetupStep !== 'idle' && kraSetupMessage && <p className={`kra-setup-status kra-setup-${kraSetupStep}`} role="status">{kraSetupStep === 'connecting' ? '⏳' : kraSetupStep === 'done' ? <Check size={14} /> : <X size={14} />} {kraSetupMessage}</p>}
+          </article>
+
+          <details className="compliance-advanced" open={kraAdvancedOpen} onToggle={(event) => setKraAdvancedOpen((event.target as HTMLDetailsElement).open)}><summary>Advanced KRA options and fiscal invoice drafts</summary>
+          <article className="module-card"><div className="panel-header"><div><h2>KRA device record · {kraEtimsConfig?.environment ?? 'loading'}</h2><p>This shows the taxpayer and device details saved for your business. Use the guided setup card above to connect or reconnect.</p></div><span className={`status-pill ${kraEtimsConfig?.initialized ? 'green' : 'amber'}`}>{kraEtimsConfig?.initialized ? 'Connected' : 'Not connected'}</span></div>
+            {kraEtimsConfig?.device ? <p>Device ID {kraEtimsConfig.device.deviceId || '—'} · SDC {kraEtimsConfig.device.sdcId || '—'} · MRC {kraEtimsConfig.device.mrcNo || '—'} · Initialized {kraEtimsConfig.device.initializedAt ? new Date(kraEtimsConfig.device.initializedAt).toLocaleString('en-KE') : '—'}</p> : <p className="dialog-note">No device details saved yet. Complete the guided setup above.</p>}
+            <div className="button-row"><button className="button button-small" disabled={busy} onClick={() => void refreshKraConfig()}>Check connection status</button><button className="button button-small" disabled={busy || !kraEtimsConfig?.initialized} onClick={() => void loadKraCodes()}>Fetch KRA code lists</button></div>
             {kraCodes && <details><summary>Latest response from KRA standard code lists</summary><pre className="kra-code-list">{JSON.stringify(kraCodes, null, 2)}</pre></details>}
           </article>
           <article className="module-card"><h2>Prepare eTIMS invoice drafts</h2><p>Creates a workspace draft. After taxpayer/device approval, initialization and exact KRA code/tax mapping, reviewed requests call the KRA OSCU sandbox or production endpoint selected by the API operator. Sandbox receipts are not fiscal invoices.</p>{invoicesList.filter((invoiceRow) => !complianceDrafts.some((draft) => draft.integration_type === 'kra_etims' && draft.source_id === invoiceRow.id)).map((invoiceRow) => <div className="transaction-row" key={invoiceRow.id}><span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>{money(invoiceRow.amount)} · {invoiceRow.status}</small></span><button className="button button-small" disabled={busy} onClick={() => void createComplianceDraft('kra_etims', invoiceRow.id)}>Create fiscalization draft</button></div>)}{!invoicesList.length && <div className="empty-state">Create an internal invoice first to prepare a draft snapshot.</div>}</article>
