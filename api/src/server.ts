@@ -70,7 +70,7 @@ const mpesaConfig = {
   transactionType: env.MPESA_TRANSACTION_TYPE,
 }
 const mpesaConfigured = Object.values(mpesaConfig).every((value) => Boolean(value))
-const emailConfigured = Boolean(env.RESEND_API_KEY && env.EMAIL_FROM)
+const emailConfigured = Boolean(env.BREVO_API_KEY && (env.BREVO_SENDER_EMAIL || env.EMAIL_FROM))
 // Brevo (free tier) powers transactional email and SMS. WhatsApp needs an approved Brevo
 // WhatsApp sender, so it stays off until the operator supplies BREVO_WHATSAPP_NUMBER.
 const brevoConfigured = Boolean(env.BREVO_API_KEY)
@@ -413,6 +413,26 @@ async function brevoSend(kind: 'email' | 'sms', payload: Record<string, unknown>
   const result = await response.json().catch(() => ({})) as Record<string, unknown>
   if (!response.ok) throw new Error(String(result.message ?? result.error ?? `Brevo request failed (${response.status}).`).slice(0, 300))
   return result
+}
+// Shared transactional-email sender. This is the single place email is delivered, so every
+// invoice, reminder, estimate, supplier bill, invitation and password reset goes through Brevo.
+async function sendBrevoEmail(input: { to: string; subject: string; html: string; text?: string }): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+  if (!env.BREVO_API_KEY) return { ok: false, error: 'Brevo is not configured. Set BREVO_API_KEY on the API service.' }
+  const senderEmail = env.BREVO_SENDER_EMAIL ?? env.EMAIL_FROM
+  if (!senderEmail) return { ok: false, error: 'Set BREVO_SENDER_EMAIL (a Brevo-verified sender) on the API service.' }
+  try {
+    const result = await brevoSend('email', {
+      sender: { email: senderEmail, name: env.BREVO_SENDER_NAME ?? 'KashFlow' },
+      to: [{ email: input.to }],
+      subject: input.subject,
+      htmlContent: input.html,
+      ...(input.text ? { textContent: input.text } : {}),
+    })
+    const messageId = result.messageId ? String(result.messageId) : undefined
+    return { ok: true, messageId }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message.slice(0, 300) : 'Brevo email failed.' }
+  }
 }
 async function recordMessageDelivery(input: { workspaceId: string; channel: 'email' | 'sms' | 'whatsapp'; recipient: string; subject?: string; status: string; providerMessageId?: string; errorMessage?: string; createdBy?: string }) {
   try {
@@ -919,6 +939,70 @@ app.post('/v1/auth/two-factor/recovery-codes', requirePool, verifyOrigin, requir
     for (const code of codes) await client.query('INSERT INTO user_recovery_codes (user_id, code_hash) VALUES ($1, $2)', [request.session!.userId, hashRecoveryCode(code)])
     await client.query('COMMIT')
     response.json({ recoveryCodes: codes, notice: 'Store these recovery codes safely. Each can be used once if you lose your authenticator.' })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+// ---- Password reset (Brevo email or SMS) ----
+// Always returns the same response so an attacker cannot discover whether an account exists.
+app.post('/v1/auth/forgot-password', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 8, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many password reset requests from this network. Please wait 15 minutes and try again.' } }), async (request, response, next) => {
+  const input = z.object({ identifier: z.string().trim().min(1).max(254), channel: z.enum(['email', 'sms']).default('email') }).safeParse(request.body)
+  const genericReply = { status: 'accepted', message: 'If that email or phone number belongs to a KashFlow account, a reset link has been sent. It expires in one hour.' }
+  if (!input.success) { response.status(400).json({ error: 'Enter the email address or phone number you registered with.' }); return }
+  const normalized = normalizeIdentifier(input.data.identifier)
+  if (!normalized.email && !normalized.phone) { response.status(400).json({ error: 'Enter a valid email address or phone number.' }); return }
+  try {
+    const result = await pool!.query('SELECT id, email, phone FROM users WHERE ($1::text IS NOT NULL AND email = $1) OR ($2::text IS NOT NULL AND phone = $2) LIMIT 1', [normalized.email, normalized.phone])
+    const user = result.rows[0]
+    if (!user) { response.json(genericReply); return }
+    const channel: 'email' | 'sms' = input.data.channel
+    const destination = channel === 'email' ? String(user.email ?? '') : String(user.phone ?? '')
+    if (!destination) { response.json(genericReply); return }
+
+    const token = randomBytes(32).toString('base64url')
+    const tokenHash = createHash('sha256').update(token).digest('hex')
+    // Invalidate any outstanding requests before issuing a new one.
+    await pool!.query('UPDATE password_reset_requests SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL', [user.id])
+    await pool!.query("INSERT INTO password_reset_requests (user_id, token_hash, channel, expires_at) VALUES ($1, $2, $3, now() + interval '1 hour')", [user.id, tokenHash, channel])
+    const resetUrl = new URL('/', env.FRONTEND_ORIGIN)
+    resetUrl.searchParams.set('reset', token)
+    const resetLink = resetUrl.toString()
+
+    if (channel === 'email') {
+      if (!brevoEmailConfigured) { response.json(genericReply); return }
+      await sendBrevoEmail({
+        to: destination,
+        subject: 'Reset your KashFlow password',
+        html: `<main style="font-family:Arial,sans-serif;color:#242537;max-width:560px;margin:auto"><h1>Reset your password</h1><p>We received a request to reset the KashFlow password for this account.</p><p><a href="${escapeHtml(resetLink)}" style="display:inline-block;padding:12px 20px;background:#6d4de0;color:#fff;border-radius:10px;text-decoration:none">Choose a new password</a></p><p>This link expires in one hour. If you did not request it, you can ignore this email; your password has not changed.</p></main>`,
+        text: `Reset your KashFlow password within one hour: ${resetLink}\n\nIf you did not request this, ignore this email.`,
+      })
+    } else {
+      if (!brevoSmsConfigured) { response.json(genericReply); return }
+      try {
+        await brevoSend('sms', { sender: env.BREVO_SMS_SENDER, recipient: normalizeKenyanPhone(destination) ?? destination, content: `KashFlow: reset your password within 1 hour: ${resetLink}`, type: 'transactional', unicodeEnabled: true })
+      } catch (error) { console.error('Password reset SMS failed:', error instanceof Error ? error.message : String(error)) }
+    }
+    response.json(genericReply)
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/auth/reset-password', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many reset attempts from this network. Please wait 15 minutes and try again.' } }), async (request, response, next) => {
+  const input = z.object({ token: z.string().trim().min(20).max(200), password: passwordSchema }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a valid reset link and a password of at least 12 characters.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const tokenHash = createHash('sha256').update(input.data.token).digest('hex')
+    const found = await client.query('SELECT id, user_id, attempts FROM password_reset_requests WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now() FOR UPDATE', [tokenHash])
+    const resetRow = found.rows[0]
+    if (!resetRow) { await client.query('ROLLBACK'); response.status(400).json({ error: 'This reset link is invalid or has expired. Request a new one.' }); return }
+    if (Number(resetRow.attempts) >= 5) { await client.query('ROLLBACK'); response.status(429).json({ error: 'This reset link has been used too many times. Request a new one.' }); return }
+    await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [await hashPassword(input.data.password), resetRow.user_id])
+    await client.query('UPDATE password_reset_requests SET consumed_at = now() WHERE id = $1', [resetRow.id])
+    // A password change revokes every other pending sign-in for safety.
+    await client.query('DELETE FROM pending_two_factor_logins WHERE user_id = $1', [resetRow.user_id])
+    await client.query('COMMIT')
+    response.json({ status: 'reset', message: 'Your password has been changed. You can sign in with the new password.' })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
@@ -2547,22 +2631,15 @@ app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, r
       response.status(201).json({ invitation: { ...invite.rows[0], businesses: targets.map((target) => target.name) }, delivery: 'manual_link', invitationUrl: invitationUrl.toString() })
       return
     }
-    const emailResponse = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        from: env.EMAIL_FROM,
-        to: [input.data.email],
-        subject: `You are invited to ${targets.map((target) => target.name).join(', ')}`,
-        html: `<main style="font-family:Arial,sans-serif;color:#242537"><h1>KashFlow workspace invitation</h1><p>You have been invited as ${escapeHtml(input.data.role)} to ${escapeHtml(targets.map((target) => target.name).join(', '))}.</p><p>This invitation expires in seven days. Sign in or create an account using this email, then accept the invitation:</p><p><a href="${escapeHtml(invitationUrl.toString())}">Review invitation</a></p></main>`,
-        text: `You have been invited as ${input.data.role} to ${targets.map((target) => target.name).join(', ')}. Sign in or create an account using this email, then accept within seven days: ${invitationUrl.toString()}`,
-      }),
-      signal: AbortSignal.timeout(15_000),
+    const inviteEmail = await sendBrevoEmail({
+      to: input.data.email,
+      subject: `You are invited to ${targets.map((target) => target.name).join(', ')}`,
+      html: `<main style="font-family:Arial,sans-serif;color:#242537"><h1>KashFlow workspace invitation</h1><p>You have been invited as ${escapeHtml(input.data.role)} to ${escapeHtml(targets.map((target) => target.name).join(', '))}.</p><p>This invitation expires in seven days. Sign in or create an account using this email, then accept the invitation:</p><p><a href="${escapeHtml(invitationUrl.toString())}">Review invitation</a></p></main>`,
+      text: `You have been invited as ${input.data.role} to ${targets.map((target) => target.name).join(', ')}. Sign in or create an account using this email, then accept within seven days: ${invitationUrl.toString()}`,
     })
-    const emailPayload = await emailResponse.json().catch(() => ({})) as { id?: string; message?: string }
-    if (!emailResponse.ok || !emailPayload.id) {
+    if (!inviteEmail.ok) {
       await pool!.query("UPDATE workspace_invitations SET status = 'declined' WHERE id = $1 AND status = 'pending'", [invite.rows[0].id])
-      response.status(502).json({ error: `Invitation email was not accepted by the provider: ${String(emailPayload.message ?? `HTTP ${emailResponse.status}`).slice(0, 300)}` })
+      response.status(502).json({ error: `Invitation email was not accepted by Brevo: ${String(inviteEmail.error ?? 'provider error').slice(0, 300)}` })
       return
     }
     response.status(201).json({ invitation: { ...invite.rows[0], businesses: targets.map((target) => target.name) }, delivery: 'accepted_by_provider' })
@@ -2619,8 +2696,12 @@ app.put('/v1/workspaces/:workspaceId/roles/:roleKey', requirePool, verifyOrigin,
 app.get('/v1/workspaces/:workspaceId/members', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Members can only be managed for the active business.' }); return }
   try {
-    const result = await pool!.query(`SELECT wm.user_id, wm.role, wm.permissions, u.email, u.phone
+    const result = await pool!.query(`SELECT wm.user_id, wm.role, wm.permissions, wm.created_at AS member_since, u.email, u.phone, u.created_at AS user_created,
+        tf.enabled_at AS two_factor_enabled,
+        (SELECT count(*)::int FROM user_recovery_codes c WHERE c.user_id = u.id AND c.used_at IS NULL) AS recovery_codes,
+        (SELECT max(created_at) FROM audit_events a WHERE a.actor_user_id = u.id AND a.workspace_id = wm.workspace_id) AS last_active
       FROM workspace_members wm JOIN users u ON u.id = wm.user_id
+      LEFT JOIN user_two_factor tf ON tf.user_id = u.id
       WHERE wm.workspace_id = $1 ORDER BY wm.role, u.email, u.phone`, [request.session!.workspaceId])
     const customRoles = await pool!.query('SELECT role_key, permissions FROM custom_workspace_roles WHERE workspace_id = $1', [request.session!.workspaceId])
     const customPermissions = new Map(customRoles.rows.map((role: Record<string, unknown>) => [String(role.role_key), role.permissions as WorkspacePermission[]]))
@@ -2631,6 +2712,12 @@ app.get('/v1/workspaces/:workspaceId/members', requirePool, requireSession, requ
       phone: member.phone ?? '',
       permissions: Array.isArray(member.permissions) ? member.permissions : null,
       defaultPermissions: rolePermissionDefaults[String(member.role)] ?? customPermissions.get(String(member.role)) ?? [],
+      isAdmin: String(member.role) === 'admin',
+      memberSince: member.member_since ?? member.user_created ?? null,
+      accountCreatedAt: member.user_created ?? null,
+      twoFactorEnabled: Boolean(member.two_factor_enabled),
+      recoveryCodesRemaining: Number(member.recovery_codes ?? 0),
+      lastActiveAt: member.last_active ?? null,
     })) })
   } catch (error) { next(error) }
 })
@@ -2666,6 +2753,34 @@ app.put('/v1/workspaces/:workspaceId/members/:userId/permissions', requirePool, 
     const defaults = await pool!.query('SELECT permissions FROM custom_workspace_roles WHERE workspace_id = $1 AND role_key = $2', [request.session!.workspaceId, member.role])
     response.json({ member: { userId: String(member.user_id), role: String(member.role), permissions: member.permissions, defaultPermissions: rolePermissionDefaults[String(member.role)] ?? defaults.rows[0]?.permissions ?? [] } })
   } catch (error) { next(error) }
+})
+// Remove a non-admin user from this business. Administrators cannot be removed here, and the
+// last workspace administrator can never be deleted. Deleting the account also revokes its sessions.
+app.delete('/v1/workspaces/:workspaceId/members/:userId', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Members can only be managed for the active business.' }); return }
+  if (request.params.userId === request.session!.userId) { response.status(400).json({ error: 'You cannot remove your own administrator account.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const target = await client.query('SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 FOR UPDATE', [request.session!.workspaceId, request.params.userId])
+    if (!target.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Workspace member not found.' }); return }
+    if (String(target.rows[0].role) === 'admin') {
+      const admins = await client.query("SELECT count(*)::int AS count FROM workspace_members WHERE workspace_id = $1 AND role = 'admin'", [request.session!.workspaceId])
+      if (Number(admins.rows[0].count) <= 1) { await client.query('ROLLBACK'); response.status(409).json({ error: 'At least one workspace administrator must remain.' }); return }
+      await client.query('ROLLBACK'); response.status(400).json({ error: 'Administrator accounts cannot be removed here. Change the role first, or contact support.' }); return
+    }
+    const userId = String(request.params.userId)
+    await client.query('DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2', [request.session!.workspaceId, userId])
+    const remaining = await client.query('SELECT count(*)::int AS count FROM workspace_members WHERE user_id = $1', [userId])
+    if (Number(remaining.rows[0].count) === 0) {
+      // The user no longer belongs to any workspace, so remove the account entirely.
+      await client.query('DELETE FROM users WHERE id = $1', [userId])
+    }
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'member.removed', entityType: 'workspace_member', entityId: userId, eventData: {} })
+    await client.query('COMMIT')
+    response.status(204).end()
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
 })
 app.post('/v1/invitations/accept', requirePool, verifyOrigin, async (request, response, next) => {
   const input = z.object({ token: z.string().min(32).max(200), email: emailSchema.optional(), password: passwordSchema.optional() }).safeParse(request.body)
@@ -2818,7 +2933,7 @@ app.post('/v1/invoices/:invoiceId/customer-link', requirePool, verifyOrigin, req
   } catch (error) { next(error) }
 })
 app.post('/v1/invoices/:invoiceId/reminders', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
-  if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.' }); return }
+  if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL on the API service.' }); return }
   try {
     const result = await pool!.query(`SELECT i.id, i.customer, i.customer_email, i.description, i.amount::text, i.amount_paid::text, i.due_date,
         COALESCE(r.returned, 0)::text AS returned, COALESCE(r.refunded, 0)::text AS refunded
@@ -2838,23 +2953,16 @@ app.post('/v1/invoices/:invoiceId/reminders', requirePool, verifyOrigin, require
     const businessName = String(business.rows[0]?.name ?? 'KashFlow business')
     const amount = amountDue.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
     const invoiceNumber = String(invoice.id).slice(0, 8).toUpperCase()
-    const responseFromProvider = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        from: env.EMAIL_FROM,
-        to: [recipient],
-        subject: `Payment reminder · Invoice ${invoiceNumber} · ${businessName}`,
-        html: `<main style="font-family:Arial,sans-serif;color:#242537;max-width:640px;margin:auto"><h1>Payment reminder</h1><p>Hello ${escapeHtml(String(invoice.customer))},</p><p>Invoice ${invoiceNumber} from ${escapeHtml(businessName)} has an outstanding balance of <strong>KSh ${amount}</strong>.</p><p><a href="${escapeHtml(publicLink.url)}">View invoice details</a></p><p>This is an internal invoice, not a KRA/eTIMS fiscal tax invoice. This reminder does not collect payment.</p></main>`,
-        text: `Hello ${String(invoice.customer)},\n\nInvoice ${invoiceNumber} from ${businessName} has an outstanding balance of KSh ${amount}.\nView invoice details: ${publicLink.url}\n\nThis is not a KRA/eTIMS fiscal tax invoice. This reminder does not collect payment.`,
-      }),
-      signal: AbortSignal.timeout(15_000),
+    const reminderEmail = await sendBrevoEmail({
+      to: recipient,
+      subject: `Payment reminder · Invoice ${invoiceNumber} · ${businessName}`,
+      html: `<main style="font-family:Arial,sans-serif;color:#242537;max-width:640px;margin:auto"><h1>Payment reminder</h1><p>Hello ${escapeHtml(String(invoice.customer))},</p><p>Invoice ${invoiceNumber} from ${escapeHtml(businessName)} has an outstanding balance of <strong>KSh ${amount}</strong>.</p><p><a href="${escapeHtml(publicLink.url)}">View invoice details</a></p><p>This is an internal invoice, not a KRA/eTIMS fiscal tax invoice. This reminder does not collect payment.</p></main>`,
+      text: `Hello ${String(invoice.customer)},\n\nInvoice ${invoiceNumber} from ${businessName} has an outstanding balance of KSh ${amount}.\nView invoice details: ${publicLink.url}\n\nThis is not a KRA/eTIMS fiscal tax invoice. This reminder does not collect payment.`,
     })
-    const providerPayload = await responseFromProvider.json().catch(() => ({})) as { id?: string; message?: string }
-    const accepted = responseFromProvider.ok && Boolean(providerPayload.id)
+    const accepted = reminderEmail.ok
     await pool!.query(`INSERT INTO invoice_reminder_events (workspace_id, invoice_id, recipient, delivery_status, provider_message_id, failure_reason, sent_by)
       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [request.session!.workspaceId, invoice.id, recipient, accepted ? 'accepted' : 'failed', providerPayload.id ?? null, accepted ? null : String(providerPayload.message ?? `Provider returned HTTP ${responseFromProvider.status}`).slice(0, 500), request.session!.userId])
+    [request.session!.workspaceId, invoice.id, recipient, accepted ? 'accepted' : 'failed', reminderEmail.messageId ?? null, accepted ? null : String(reminderEmail.error ?? 'Brevo did not accept the message').slice(0, 500), request.session!.userId])
     if (!accepted) { response.status(502).json({ error: 'Email provider did not accept the reminder. Check the API service logs and sender-domain configuration.' }); return }
     response.status(202).json({ status: 'accepted', recipient, message: 'Reminder accepted by the email provider; recipient delivery is not guaranteed.' })
   } catch (error) { next(error) }
@@ -2868,7 +2976,7 @@ app.get('/v1/invoices/:invoiceId/reminders', requirePool, requireSession, async 
   } catch (error) { next(error) }
 })
 app.post('/v1/invoices/:invoiceId/email', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
-  if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.' }); return }
+  if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL on the API service.' }); return }
   const emailInput = z.object({ message: z.string().max(5000).optional() }).safeParse(request.body ?? {})
   if (!emailInput.success) { response.status(400).json({ error: 'Email message must be 5,000 characters or fewer.' }); return }
   try {
@@ -2887,20 +2995,14 @@ app.post('/v1/invoices/:invoiceId/email', requirePool, verifyOrigin, requireSess
     const message = emailInput.data.message?.trim() || `Hello ${String(invoiceRow.customer)},\n\nPlease find your invoice from ${businessName}.`
     const messageHtml = escapeHtml(message).replace(/\r?\n/g, '<br>')
     const html = `<main style="font-family:Arial,sans-serif;color:#242537;max-width:640px;margin:auto"><h1>Invoice ${invoiceNumber}</h1><p>${messageHtml}</p><table style="border-collapse:collapse;width:100%"><tr><th align="left" style="padding:12px;border-bottom:1px solid #ddd">Description</th><th align="right" style="padding:12px;border-bottom:1px solid #ddd">Amount (KSh)</th></tr><tr><td style="padding:12px;border-bottom:1px solid #ddd">${description}</td><td align="right" style="padding:12px;border-bottom:1px solid #ddd">${amount}</td></tr></table><p>Due date: ${dueDate}</p><p>This is an internal invoice, not a KRA/eTIMS fiscal tax invoice.</p></main>`
-    const providerResponse = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: env.EMAIL_FROM, to: [recipient], subject: `Invoice ${invoiceNumber} from ${businessName}`, html, text: `${message}\n\nInvoice ${invoiceNumber} from ${businessName}: ${String(invoiceRow.description)} — KSh ${amount}. Due ${dueDate}.\n\nThis is not a KRA/eTIMS fiscal tax invoice.` }),
-      signal: AbortSignal.timeout(15_000),
-    })
-    const providerPayload = await providerResponse.json().catch(() => ({})) as { id?: string; message?: string }
+    const invoiceEmail = await sendBrevoEmail({ to: recipient, subject: `Invoice ${invoiceNumber} from ${businessName}`, html, text: `${message}\n\nInvoice ${invoiceNumber} from ${businessName}: ${String(invoiceRow.description)} — KSh ${amount}. Due ${dueDate}.\n\nThis is not a KRA/eTIMS fiscal tax invoice.` })
     const deliveryId = randomUUID()
-    if (!providerResponse.ok || !providerPayload.id) {
-      await pool!.query('INSERT INTO email_delivery_events (id, workspace_id, invoice_id, recipient, provider, status, failure_reason) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, invoiceRow.id, recipient, 'resend', 'failed', String(providerPayload.message ?? `Provider returned HTTP ${providerResponse.status}`).slice(0, 500)])
-      response.status(502).json({ error: 'Email provider did not accept the invoice. Check the API service logs and Resend sender-domain configuration.' }); return
+    if (!invoiceEmail.ok) {
+      await pool!.query('INSERT INTO email_delivery_events (id, workspace_id, invoice_id, recipient, provider, status, failure_reason) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, invoiceRow.id, recipient, 'brevo', 'failed', String(invoiceEmail.error ?? 'Brevo did not accept the message').slice(0, 500)])
+      response.status(502).json({ error: 'Email provider did not accept the invoice. Check the API service logs and Brevo sender configuration.' }); return
     }
-    await pool!.query('INSERT INTO email_delivery_events (id, workspace_id, invoice_id, recipient, provider, status, provider_message_id) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, invoiceRow.id, recipient, 'resend', 'accepted', providerPayload.id])
-    response.status(202).json({ delivery: { id: deliveryId, status: 'accepted', providerMessageId: providerPayload.id, recipient }, message: 'Email accepted by Resend; recipient delivery is not guaranteed.' })
+    await pool!.query('INSERT INTO email_delivery_events (id, workspace_id, invoice_id, recipient, provider, status, provider_message_id) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, invoiceRow.id, recipient, 'brevo', 'accepted', invoiceEmail.messageId ?? null])
+    response.status(202).json({ delivery: { id: deliveryId, status: 'accepted', providerMessageId: invoiceEmail.messageId ?? null, recipient }, message: 'Email accepted by Brevo; recipient delivery is not guaranteed.' })
   } catch (error) { next(error) }
 })
 app.get('/v1/invoices/:invoiceId/email-history', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
@@ -3203,7 +3305,7 @@ app.post('/v1/estimates', requirePool, verifyOrigin, requireSession, requireWork
   finally { client.release() }
 })
 app.post('/v1/estimates/:estimateId/send', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
-  if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.' }); return }
+  if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL on the API service.' }); return }
   try {
     const found = await pool!.query(`SELECT id, customer, customer_email, description, amount::text, valid_until, status
       FROM estimates WHERE id = $1 AND workspace_id = $2`, [request.params.estimateId, request.session!.workspaceId])
@@ -3224,29 +3326,23 @@ app.post('/v1/estimates/:estimateId/send', requirePool, verifyOrigin, requireSes
     const validUntil = String(estimate.valid_until).slice(0, 10)
     const html = `<main style="font-family:Arial,sans-serif;color:#242537;max-width:760px;margin:auto"><h1>Estimate ${estimateNumber}</h1><p>Hello ${customer},</p><p>${escapeHtml(businessName)} has prepared this estimate for you.</p><p>${escapeHtml(String(estimate.description))}</p><table style="border-collapse:collapse;width:100%"><thead><tr><th align="left" style="padding:10px;border-bottom:1px solid #bbb">Description</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Qty</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Unit price (KSh)</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Discount (KSh)</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Tax (KSh)</th><th align="right" style="padding:10px;border-bottom:1px solid #bbb">Line total (KSh)</th></tr></thead><tbody>${lineRows}</tbody></table><p>Estimate total: <strong>KSh ${formatAmount(estimate.amount)}</strong></p><p>Valid until: ${escapeHtml(validUntil)}</p><p>This is a quotation, not a KRA/eTIMS fiscal tax invoice. Tax amounts shown are entered estimate values; they are not a statutory determination.</p></main>`
     const textLines = estimateLines.map((line) => `${String(line.description)} · ${line.quantity} × KSh ${formatAmount(line.unit_price)} · discount KSh ${formatAmount(line.discount_amount)} · tax KSh ${formatAmount(line.tax_amount)} · line total KSh ${formatAmount(line.total_amount)}`).join('\n')
-    const providerResponse = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: env.EMAIL_FROM, to: [recipient], subject: `Estimate ${estimateNumber} from ${businessName}`, html, text: `Hello ${String(estimate.customer)},\n\nEstimate ${estimateNumber} from ${businessName}\n${String(estimate.description)}\n\n${textLines}\n\nTotal: KSh ${formatAmount(estimate.amount)}\nValid until ${validUntil}.\n\nThis is a quotation, not a KRA/eTIMS fiscal tax invoice.` }),
-      signal: AbortSignal.timeout(15_000),
-    })
-    const providerPayload = await providerResponse.json().catch(() => ({})) as { id?: string; message?: string }
+    const estimateEmail = await sendBrevoEmail({ to: recipient, subject: `Estimate ${estimateNumber} from ${businessName}`, html, text: `Hello ${String(estimate.customer)},\n\nEstimate ${estimateNumber} from ${businessName}\n${String(estimate.description)}\n\n${textLines}\n\nTotal: KSh ${formatAmount(estimate.amount)}\nValid until ${validUntil}.\n\nThis is a quotation, not a KRA/eTIMS fiscal tax invoice.` })
     const deliveryId = randomUUID()
-    if (!providerResponse.ok || !providerPayload.id) {
-      await pool!.query('INSERT INTO email_delivery_events (id, workspace_id, estimate_id, recipient, provider, status, failure_reason) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, estimate.id, recipient, 'resend', 'failed', String(providerPayload.message ?? `Provider returned HTTP ${providerResponse.status}`).slice(0, 500)])
-      response.status(502).json({ error: 'Email provider did not accept the estimate. Check the API logs and Resend sender-domain configuration.' }); return
+    if (!estimateEmail.ok) {
+      await pool!.query('INSERT INTO email_delivery_events (id, workspace_id, estimate_id, recipient, provider, status, failure_reason) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, estimate.id, recipient, 'brevo', 'failed', String(estimateEmail.error ?? 'Brevo did not accept the message').slice(0, 500)])
+      response.status(502).json({ error: 'Email provider did not accept the estimate. Check the API logs and Brevo sender configuration.' }); return
     }
     const client = await pool!.connect()
     try {
       await client.query('BEGIN')
       const updated = await client.query("UPDATE estimates SET status = 'sent', updated_at = now() WHERE id = $1 AND workspace_id = $2 AND status IN ('draft', 'sent') RETURNING id", [estimate.id, request.session!.workspaceId])
       if (!updated.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Estimate changed while the email was being sent. Refresh before retrying.' }); return }
-      await client.query('INSERT INTO email_delivery_events (id, workspace_id, estimate_id, recipient, provider, status, provider_message_id) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, estimate.id, recipient, 'resend', 'accepted', providerPayload.id])
-      await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'estimate.email_sent', entityType: 'estimate', entityId: String(estimate.id), eventData: { recipient, providerMessageId: providerPayload.id } })
+      await client.query('INSERT INTO email_delivery_events (id, workspace_id, estimate_id, recipient, provider, status, provider_message_id) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, estimate.id, recipient, 'brevo', 'accepted', estimateEmail.messageId ?? null])
+      await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'estimate.email_sent', entityType: 'estimate', entityId: String(estimate.id), eventData: { recipient, providerMessageId: estimateEmail.messageId ?? null } })
       await client.query('COMMIT')
     } catch (error) { await client.query('ROLLBACK'); throw error }
     finally { client.release() }
-    response.status(202).json({ estimate: { id: estimate.id, status: 'sent' }, delivery: { id: deliveryId, status: 'accepted', providerMessageId: providerPayload.id, recipient }, message: 'Email accepted by Resend; recipient delivery is not guaranteed.' })
+    response.status(202).json({ estimate: { id: estimate.id, status: 'sent' }, delivery: { id: deliveryId, status: 'accepted', providerMessageId: estimateEmail.messageId ?? null, recipient }, message: 'Email accepted by Brevo; recipient delivery is not guaranteed.' })
   } catch (error) { next(error) }
 })
 app.get('/v1/sales-orders', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
@@ -3481,7 +3577,7 @@ app.get('/v1/bills/:billId/email-history', requirePool, requireSession, async (r
 app.post('/v1/bills/:billId/email', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   if (!emailConfigured) {
     response.status(503).json({
-      error: 'Outbound email is not configured. Set RESEND_API_KEY and EMAIL_FROM on the API service.',
+      error: 'Outbound email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL on the API service.',
     })
     return
   }
@@ -3781,30 +3877,16 @@ REMAINING AMOUNT OWED: KSh ${formatAmount(remaining)}
 This is an internal accounting document and not a KRA/eTIMS fiscal tax invoice.
 `
 
-    const providerResponse = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${env.RESEND_API_KEY}`,
-        'Content-Type': 'application/json',
-        'Idempotency-Key': `supplier-bill/${bill.id}/${emailInput.data.recipient}`,
-      },
-      body: JSON.stringify({
-        from: env.EMAIL_FROM,
-        to: [emailInput.data.recipient],
-        subject: `Supplier Bill ${billNumber} · ${String(bill.business_name)}`,
-        html,
-        text,
-      }),
-      signal: AbortSignal.timeout(15_000),
+    const billEmail = await sendBrevoEmail({
+      to: emailInput.data.recipient,
+      subject: `Supplier Bill ${billNumber} · ${String(bill.business_name)}`,
+      html,
+      text,
     })
-
-    const providerPayload = await providerResponse
-      .json()
-      .catch(() => ({})) as { id?: string; message?: string }
 
     const deliveryId = randomUUID()
 
-    if (!providerResponse.ok || !providerPayload.id) {
+    if (!billEmail.ok) {
       await pool!.query(`
         INSERT INTO vendor_bill_email_events
           (id, workspace_id, vendor_bill_id, recipient, provider, status, failure_reason, sent_by)
@@ -3815,16 +3897,13 @@ This is an internal accounting document and not a KRA/eTIMS fiscal tax invoice.
         request.session!.workspaceId,
         bill.id,
         emailInput.data.recipient,
-        'resend',
-        String(
-          providerPayload.message ??
-          `Provider returned HTTP ${providerResponse.status}`
-        ).slice(0, 500),
+        'brevo',
+        String(billEmail.error ?? 'Brevo did not accept the message').slice(0, 500),
         request.session!.userId,
       ])
 
       response.status(502).json({
-        error: 'Email provider did not accept the supplier bill. Check the Resend sender-domain configuration.',
+        error: 'Email provider did not accept the supplier bill. Check the Brevo sender configuration.',
       })
       return
     }
@@ -3839,8 +3918,8 @@ This is an internal accounting document and not a KRA/eTIMS fiscal tax invoice.
       request.session!.workspaceId,
       bill.id,
       emailInput.data.recipient,
-      'resend',
-      providerPayload.id,
+      'brevo',
+      billEmail.messageId ?? null,
       request.session!.userId,
     ])
 
@@ -3858,7 +3937,7 @@ This is an internal accounting document and not a KRA/eTIMS fiscal tax invoice.
       bill.id,
       JSON.stringify({
         recipient: emailInput.data.recipient,
-        providerMessageId: providerPayload.id,
+        providerMessageId: billEmail.messageId ?? null,
       }),
     ])
 
@@ -3866,10 +3945,10 @@ This is an internal accounting document and not a KRA/eTIMS fiscal tax invoice.
       delivery: {
         id: deliveryId,
         status: 'accepted',
-        providerMessageId: providerPayload.id,
+        providerMessageId: billEmail.messageId ?? null,
         recipient: emailInput.data.recipient,
       },
-      message: 'Supplier bill email accepted by Resend; recipient delivery is not guaranteed.',
+      message: 'Supplier bill email accepted by Brevo; recipient delivery is not guaranteed.',
     })
   } catch (error) {
     next(error)
@@ -4947,7 +5026,7 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
       { id: 'kra_etims', status: kraReady ? 'oscu_production_switches_enabled_approval_and_device_still_required' : settings.kraEtimsLiveEnabled ? `oscu_${env.KRA_ETIMS_ENV}_live_disabled` : 'oscu_workspace_disabled' },
       { id: 'mpesa', status: mpesaReady ? `configured_${env.MPESA_ENV}` : settings.darajaEnabled ? 'daraja_credentials_and_callback_required' : 'workspace_daraja_disabled' },
       { id: 'bank_feeds', status: monoReady ? 'mono_configured_consent_required' : settings.monoEnabled ? 'mono_business_approval_and_server_keys_required' : 'workspace_mono_disabled' },
-      { id: 'email', status: emailConfigured ? 'resend_configured' : 'resend_api_key_and_verified_sender_required' },
+      { id: 'email', status: emailConfigured ? 'brevo_configured' : 'brevo_api_key_and_verified_sender_required' },
       { id: 'payroll', status: `encrypted_internal_runs_${env.PAYROLL_DATA_ENCRYPTION_KEY ? 'configured' : 'encryption_key_required'}_statutory_filing_not_implemented` },
       { id: 'paye_shif_nssf_ahl_filing', status: 'statutory_filing_not_implemented' },
     ], note: `Workspace preferences are enforced on Daraja payment initiation, Mono linking/sync, and production KRA OSCU operations. Render provider credentials remain shared across businesses. KRA readiness here only reports that operator/workspace switches and encryption config are present; KRA approval, certification, initialized production device, fiscal mapping review, and reconciliation are still required. Statutory filing adapters are not implemented, regardless of saved preferences. Payroll estimates remain internal and are not certified.` })

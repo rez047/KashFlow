@@ -98,7 +98,19 @@ type PosCustomerHistory = { sales: PosCustomerSale[]; summary: { sale_count: num
 type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[] }
 type EstimateRecord = { id: string; customer: string; customer_email: string; description: string; amount: string; valid_until: string; status: string; invoice_id?: string | null }
 type VendorBill = { id: string; supplier: string; description: string; amount: string; amount_paid?: string; amount_due?: string; bill_date: string; due_date: string; status: string; approval_status?: string; inventory_expense_requested?: boolean }
-type DraftLine = { itemId?: string; description: string; quantity: string; unitPrice: string; discountAmount: string; taxAmount: string; recoverableTaxAmount?: string }
+type DraftLine = { itemId?: string; description: string; quantity: string; unitPrice: string; discountAmount: string; taxAmount: string; recoverableTaxAmount?: string; vatTreatment?: string }
+
+// Kenyan VAT treatments. Rates are applied to the net line value (quantity x unit price less discount).
+// These are helpers only: the entered tax amount remains editable and the final tax position must be
+// confirmed by a qualified adviser or the business's own tax records.
+const KENYA_VAT_RATES: Array<{ code: string; label: string; rate?: number; hint: string }> = [
+  { code: 'B16', label: 'VAT standard rate', rate: 0.16, hint: 'Standard-rated supply at 16% VAT. Tax amount filled from the net line value.' },
+  { code: 'B08', label: 'VAT reduced rate (fuel/energy)', rate: 0.08, hint: 'Reduced-rate supply at 8% VAT where the law applies it.' },
+  { code: 'A_EXEMPT', label: 'VAT exempt', rate: 0, hint: 'Exempt supply. No VAT is charged and no input VAT is claimable on related costs.' },
+  { code: 'C_ZERO', label: 'Zero-rated', rate: 0, hint: 'Zero-rated supply (for example exports). VAT is 0% but the supply is still reportable.' },
+  { code: 'D_OUT_OF_SCOPE', label: 'Outside the scope of VAT', rate: 0, hint: 'Not a taxable supply for VAT purposes.' },
+  { code: 'E_NON_VATABLE', label: 'Non-VATable / other', rate: 0, hint: 'Treatment does not fall under standard, reduced, exempt or zero-rated categories.' },
+]
 type PurchaseOrder = { id: string; supplier: string; status: string; order_date: string; expected_date?: string; lines: Array<{ id: string; item_id: string; item_name: string; quantity: string; received_quantity: string; unit_cost: string }> }
 type InventoryLocation = { id: string; name: string; code: string; is_default: boolean; active: boolean }
 type InventoryLocationStock = { location_id: string; item_id: string; quantity: string; location_name: string }
@@ -108,7 +120,23 @@ type OnlineStoreConfig = { slug: string; title: string; description: string; ena
 type StoreOrder = { id: string; status: string; source: string; external_order_id?: string | null; customer_name: string; customer_email: string; customer_phone: string; total: string; invoice_id?: string | null; created_at: string }
 type WooConnection = { store_url: string; enabled: boolean; last_synced_at?: string | null; credentialsConfigured: boolean }
 type MemberPermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
-type WorkspaceMember = { userId: string; role: string; email: string; phone: string; permissions: MemberPermission[] | null; defaultPermissions: MemberPermission[] }
+
+// Grouped permission catalogue for role building. Every available permission is listed so admins
+// can see the complete set of control areas rather than a partial selection.
+const ROLE_PERMISSION_GROUPS: Array<{ title: string; permissions: Array<[MemberPermission, string]> }> = [
+  { title: 'Operations', permissions: [['operations.write', 'Daily operations & records']] },
+  { title: 'Sales', permissions: [['sales.write', 'Invoices, estimates & sales orders']] },
+  { title: 'Inventory', permissions: [['inventory.write', 'Stock, items & purchase orders']] },
+  { title: 'Accounting', permissions: [['accounting.write', 'Ledger, journals, bills & returns']] },
+  { title: 'Banking', permissions: [['banking.write', 'Bank feeds & reconciliation']] },
+  { title: 'Payroll', permissions: [['payroll.manage', 'Employees, payroll & payslips']] },
+  { title: 'Integrations', permissions: [['integrations.manage', 'KRA eTIMS, M-Pesa & provider connections']] },
+  { title: 'Business settings', permissions: [['workspace.manage', 'Workspace settings & preferences']] },
+  { title: 'Team management', permissions: [['team.manage', 'Users, invitations & role assignment']] },
+  { title: 'Online store', permissions: [['store.manage', 'Storefront, orders & WooCommerce']] },
+]
+const ROLE_PERMISSION_LABELS: Record<string, string> = Object.fromEntries(ROLE_PERMISSION_GROUPS.flatMap((group) => group.permissions))
+type WorkspaceMember = { userId: string; role: string; email: string; phone: string; permissions: MemberPermission[] | null; defaultPermissions: MemberPermission[]; isAdmin?: boolean; memberSince?: string | null; accountCreatedAt?: string | null; twoFactorEnabled?: boolean; recoveryCodesRemaining?: number; lastActiveAt?: string | null }
 type CustomRole = { id: string; roleKey: string; roleName: string; permissions: MemberPermission[] }
 type TimeEntry = { id: string; description: string; work_date: string; hours: string; hourly_cost: string; billable: boolean; status: string }
 type AgingReport = { asOf: string; receivables: { items: Array<{ id: string; counterparty: string; amount: string; amount_paid: string; due_date: string; days_overdue: number }>; buckets: Record<string, string> }; payables: { items: Array<{ id: string; counterparty: string; amount: string; amount_paid: string; due_date: string; days_overdue: number }>; buckets: Record<string, string> } }
@@ -370,7 +398,7 @@ const landingSegments: Array<{ name: string; icon: typeof Gauge; fit: string }> 
   { name: 'Bookshops & stationers', icon: BookOpen, fit: 'School bulk orders, returns, and textbook stock by branch.' },
 ]
 
-function LandingPage({ onSignIn, onDemo }: { onSignIn: () => void; onDemo: (packageName: string) => void }) {
+function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onDemo: (packageName: string) => void; onForgot: () => void }) {
   const phoneDisplay = `+254 746 827 220`
   return <div className="landing">
     <header className="landing-nav">
@@ -594,6 +622,7 @@ function LandingPage({ onSignIn, onDemo }: { onSignIn: () => void; onDemo: (pack
         <div className="cta-actions">
           <button type="button" className="button button-primary button-xl cta-signup" onClick={() => onDemo('Premium')}>Open the free live demo</button>
           <button type="button" className="button button-secondary button-xl cta-signin" onClick={onSignIn}>Sign in to my workspace</button>
+          <p className="cta-forgot"><button type="button" className="auth-link" onClick={onForgot}>Forgot your password? Reset it by email or SMS</button></p>
           <p className="cta-fineprint">The demo opens a pre-loaded {DEMO_ACCOUNT.businessName} workspace so you can try every feature right away. Give us a call any time.</p>
         </div>
       </div>
@@ -643,8 +672,19 @@ function DraftLineEditor({ lines, onChange, onAdd, onRemove, includeRecoverableT
       </div>
       <div className="field-row">
         <label className="field-label">Discount (KSh)<input min="0" step="0.01" type="number" value={line.discountAmount} onChange={(event) => onChange(index, 'discountAmount', event.target.value)} /></label>
+        <label className="field-label">VAT treatment (Kenya)<select value={line.vatTreatment ?? ''} onChange={(event) => {
+          const treatment = event.target.value
+          onChange(index, 'vatTreatment', treatment)
+          const rate = KENYA_VAT_RATES.find((entry) => entry.code === treatment)?.rate
+          if (rate === undefined) return
+          const net = Math.max(0, Number(line.quantity) * Number(line.unitPrice) - Number(line.discountAmount || 0))
+          onChange(index, 'taxAmount', (net * rate).toFixed(2))
+        }}><option value="">Choose VAT treatment</option>{KENYA_VAT_RATES.map((entry) => <option key={entry.code} value={entry.code}>{entry.code} · {entry.label}</option>)}</select></label>
+      </div>
+      <div className="field-row">
         <label className="field-label">Tax amount (KSh)<input min="0" step="0.01" type="number" value={line.taxAmount} onChange={(event) => onChange(index, 'taxAmount', event.target.value)} /></label>
       </div>
+      {line.vatTreatment && <p className="vat-hint">{KENYA_VAT_RATES.find((entry) => entry.code === line.vatTreatment)?.hint}</p>}
       {includeRecoverableTax && <label className="field-label">Recoverable tax (qualified review required)<input min="0" step="0.01" type="number" value={line.recoverableTaxAmount ?? '0'} onChange={(event) => onChange(index, 'recoverableTaxAmount', event.target.value)} /></label>}
       {lines.length > 1 && <button type="button" className="button button-small" onClick={() => onRemove(index)}>Remove line</button>}
     </fieldset>)}
@@ -689,6 +729,11 @@ function App() {
   const [twoFactorSetup, setTwoFactorSetup] = useState<{ secret: string; otpauthUri: string; recoveryCodes: string[] } | null>(null)
   const [twoFactorCode, setTwoFactorCode] = useState('')
   const [twoFactorBusy, setTwoFactorBusy] = useState(false)
+  const [authMode, setAuthMode] = useState<'signin' | 'forgot' | 'reset'>('signin')
+  const [authChannel, setAuthChannel] = useState<'email' | 'sms'>('email')
+  const [newPassword, setNewPassword] = useState('')
+  const [resetToken, setResetToken] = useState('')
+  const [resetStatus, setResetStatus] = useState('')
   const [transaction, setTransaction] = useState({ description: '', amount: '', direction: 'expense', account: '', date: today })
   const [invoice, setInvoice] = useState({ customer: '', customerEmail: '', description: '', amount: '', dueDate: '' })
   const [invoiceLocationId, setInvoiceLocationId] = useState('')
@@ -869,6 +914,15 @@ function App() {
     nssfEnabled: false,
     ahlEnabled: false,
   })
+
+  // A reset link lands on the homepage with ?reset=<token>, so open the reset form automatically.
+  useEffect(() => {
+    const token = new URLSearchParams(window.location.search).get('reset')
+    if (!token) return
+    setResetToken(token)
+    setAuthMode('reset')
+    setAuthPanelOpen(true)
+  }, [])
 
   function navigateTo(nextPage: string) {
     if (nextPage === page) return
@@ -1222,6 +1276,28 @@ function App() {
     setMemberPermissionOverrides((current) => ({ ...current, [userId]: false }))
   }
 
+  // Permanently remove a user from this business. The API blocks removing administrators and the
+  // last administrator, so this is safe for team clean-up.
+  async function removeTeamMember(member: WorkspaceMember) {
+    const label = member.email || member.phone || 'this user'
+    if (!window.confirm(`Remove ${label} from this business? They will lose all access immediately. This cannot be undone.`)) return
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/workspaces/${account?.workspace.id}/members/${member.userId}`, { method: 'DELETE' })
+      await refreshTeamMembers()
+      notify(`${label} was removed from this business.`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not remove this user.') }
+    finally { setBusy(false) }
+  }
+
+  // Jump the administrator to the editable card for a member from the directory.
+  function editTeamMemberById(member: WorkspaceMember) {
+    document.getElementById('team-permissions')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    setMemberPermissionDrafts((current) => ({ ...current, [member.userId]: member.permissions ?? member.defaultPermissions }))
+    setMemberRoleDrafts((current) => ({ ...current, [member.userId]: member.role }))
+    notify(`Editing access for ${member.email || member.phone || 'this user'}.`)
+  }
+
   async function refreshTeamMembers() {
     const result = await request<{ members: WorkspaceMember[] }>(`/v1/workspaces/${account?.workspace.id}/members`)
     setTeamMembers(result.members)
@@ -1452,6 +1528,29 @@ function App() {
       await loadTwoFactorStatus()
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not regenerate recovery codes.') }
     finally { setTwoFactorBusy(false) }
+  }
+
+  // Request a password reset link by email or SMS through Brevo.
+  async function submitForgotPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError(''); setResetStatus('')
+    try {
+      const result = await request<{ message: string }>('/v1/auth/forgot-password', { method: 'POST', body: JSON.stringify({ identifier: credentials.identifier, channel: authChannel }) })
+      setResetStatus(result.message)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not start the password reset.') }
+    finally { setBusy(false) }
+  }
+
+  async function submitResetPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError(''); setResetStatus('')
+    try {
+      const result = await request<{ message: string }>('/v1/auth/reset-password', { method: 'POST', body: JSON.stringify({ token: resetToken, password: newPassword }) })
+      setResetStatus(result.message)
+      setAuthMode('signin')
+      setNewPassword('')
+      setResetToken('')
+      notify('Your password has been changed. Sign in with your new password.')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not reset the password.') }
+    finally { setBusy(false) }
   }
 
   // Selecting a subscription opens the shared KENYA YETU demo workspace: sign in to the
@@ -3208,7 +3307,7 @@ function App() {
   if (starting) return <div className="auth-screen landing-loading"><Brand /><p>Connecting securely to your workspace…</p></div>
 
   if (!account) return <>
-    <LandingPage onSignIn={() => { setError(''); setShowSetupFlow(false); setAuthPanelOpen(true) }} onDemo={(packageName) => { void startDemoWorkspace(packageName) }} />
+    <LandingPage onSignIn={() => { setError(''); setShowSetupFlow(false); setAuthPanelOpen(true) }} onDemo={(packageName) => { void startDemoWorkspace(packageName) }} onForgot={() => { setError(''); setResetStatus(''); setAuthMode('forgot'); setAuthPanelOpen(true) }} />
     {authPanelOpen && <div className="auth-overlay" role="dialog" aria-modal="true">
       {twoFactorChallenge ? <form className="auth-card auth-card-elevated" onSubmit={(event) => void submitTwoFactorLogin(event)}>
         <button type="button" className="auth-close" onClick={() => { setAuthPanelOpen(false); setTwoFactorChallenge(null); setError('') }} aria-label="Close"><X size={18} /></button>
@@ -3224,6 +3323,31 @@ function App() {
           <button type="button" className="auth-link" disabled={busy} onClick={() => { setTwoFactorChallenge(null); setError('') }}>Use a different account</button>
         </p>
         <p className="auth-note">Lost your device? Enter one of your saved recovery codes above. Each recovery code works only once.</p>
+      </form> : authMode === 'forgot' ? <form className="auth-card auth-card-elevated" onSubmit={(event) => void submitForgotPassword(event)}>
+        <button type="button" className="auth-close" onClick={() => { setAuthMode('signin'); setError(''); setResetStatus('') }} aria-label="Back to sign in"><ArrowLeft size={18} /></button>
+        <Brand />
+        <p className="auth-intro">Reset your password</p>
+        <p className="auth-2fa-hint"><ShieldCheck size={15} /> We will send a one-hour reset link to the email or phone number on your account.</p>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        {resetStatus && <p className="auth-reset-status" role="status">{resetStatus}</p>}
+        <label className="field-label">Email or phone number
+          <input type="text" required autoComplete="username" value={credentials.identifier} onChange={(event) => setCredentials({ ...credentials, identifier: event.target.value })} />
+        </label>
+        <label className="field-label">Send the link by<select value={authChannel} onChange={(event) => setAuthChannel(event.target.value as 'email' | 'sms')}><option value="email">Email (Brevo)</option><option value="sms">SMS (Brevo)</option></select></label>
+        <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Sending…' : 'Send reset link'}</button>
+        <p className="auth-cta-wrap"><button type="button" className="auth-link" onClick={() => { setAuthMode('signin'); setError(''); setResetStatus('') }}>Back to sign in</button></p>
+      </form> : authMode === 'reset' ? <form className="auth-card auth-card-elevated" onSubmit={(event) => void submitResetPassword(event)}>
+        <button type="button" className="auth-close" onClick={() => { setAuthMode('signin'); setError(''); setResetStatus(''); window.history.replaceState(null, '', window.location.pathname) }} aria-label="Back to sign in"><ArrowLeft size={18} /></button>
+        <Brand />
+        <p className="auth-intro">Choose a new password</p>
+        <p className="auth-2fa-hint"><ShieldCheck size={15} /> Use at least 12 characters. Changing the password signs out other pending sign-ins.</p>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        {resetStatus && <p className="auth-reset-status" role="status">{resetStatus}</p>}
+        <label className="field-label">New password
+          <input type="password" required minLength={12} autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} />
+        </label>
+        <button className="button button-primary auth-submit" disabled={busy || newPassword.length < 12}>{busy ? 'Saving…' : 'Change password'}</button>
+        <p className="auth-cta-wrap"><button type="button" className="auth-link" onClick={() => { setAuthMode('signin'); setError(''); setResetStatus(''); window.history.replaceState(null, '', window.location.pathname) }}>Back to sign in</button></p>
       </form> : <form className="auth-card auth-card-elevated" onSubmit={submitAuth}>
         <button type="button" className="auth-close" onClick={() => { setAuthPanelOpen(false); setShowSetupFlow(false); setError('') }} aria-label="Close"><X size={18} /></button>
         <Brand />
@@ -3235,6 +3359,7 @@ function App() {
         <label className="field-label">Password
           <input type="password" required autoComplete="current-password" value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
         </label>
+        <p className="auth-forgot-row"><button type="button" className="auth-link" onClick={() => { setAuthMode('forgot'); setError(''); setResetStatus('') }}>Forgot password?</button></p>
         <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : 'Sign in'}</button>
         <p className="auth-cta-wrap">
           <button type="button" className="auth-link" disabled={busy} onClick={() => { setAuthPanelOpen(false); void startDemoWorkspace('Comfort') }}>
@@ -4189,21 +4314,26 @@ function App() {
               <h2>Team &amp; Permissions</h2>
               <p>Add workspace users even when they are not employees. Invitations create business access only; they do not create payroll or employee records. Assign built-in or custom roles and edit each person’s effective access here.</p>
               <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={15} /> Add user (not an employee)</button>
-              <form className="module-card record-form-grid" onSubmit={(event) => void saveCustomRole(event)}>
+              <form className="module-card role-builder" onSubmit={(event) => void saveCustomRole(event)}>
                 <h3>{editingCustomRoleKey ? `Edit role: ${customRoleDraft.name}` : 'Add a custom role'}</h3>
+                <p className="dialog-note">Pick the business areas this role may change. Administrators always keep full access; every ticked area grants write access to that part of the workspace.</p>
                 <label className="field-label">Custom role name<input required minLength={2} maxLength={60} disabled={Boolean(editingCustomRoleKey)} value={customRoleDraft.name} onChange={(event) => setCustomRoleDraft({ ...customRoleDraft, name: event.target.value })} placeholder="e.g. Sales assistant" /></label>
-                <div className="field-row">{([
-                  ['operations.write', 'Operations'],
-                  ['sales.write', 'Sales'],
-                  ['inventory.write', 'Inventory'],
-                  ['accounting.write', 'Accounting'],
-                  ['banking.write', 'Banking'],
-                  ['payroll.manage', 'Payroll'],
-                  ['integrations.manage', 'Integrations'],
-                  ['workspace.manage', 'Business settings'],
-                  ['team.manage', 'Team management'],
-                  ['store.manage', 'Online store'],
-                ] as Array<[MemberPermission, string]>).map(([permission, label]) => <label className="field-label checkbox-row" key={permission}><input type="checkbox" checked={customRoleDraft.permissions.includes(permission)} onChange={(event) => toggleCustomRolePermission(permission, event.target.checked)} /> {label}</label>)}</div>
+                <div className="role-builder-toolbar">
+                  <span className="role-count"><strong>{customRoleDraft.permissions.length}</strong> of {ROLE_PERMISSION_GROUPS.reduce((sum, group) => sum + group.permissions.length, 0)} areas selected</span>
+                  <div className="button-row"><button type="button" className="button button-small" onClick={() => setCustomRoleDraft((current) => ({ ...current, permissions: ROLE_PERMISSION_GROUPS.flatMap((group) => group.permissions.map(([permission]) => permission)) }))}>Select all</button><button type="button" className="button button-small" onClick={() => setCustomRoleDraft((current) => ({ ...current, permissions: [] }))}>Clear all</button></div>
+                </div>
+                <div className="role-group-grid">
+                  {ROLE_PERMISSION_GROUPS.map((group) => <fieldset className="role-group" key={group.title}>
+                    <legend>{group.title}</legend>
+                    {group.permissions.map(([permission, label]) => {
+                      const checked = customRoleDraft.permissions.includes(permission)
+                      return <label className={`role-option ${checked ? 'role-option-on' : ''}`} key={permission}>
+                        <input type="checkbox" checked={checked} onChange={(event) => toggleCustomRolePermission(permission, event.target.checked)} />
+                        <span><strong>{label}</strong></span>
+                      </label>
+                    })}
+                  </fieldset>)}
+                </div>
                 <div className="button-row"><button className="button button-primary" disabled={busy || !customRoleDraft.name.trim()}>{editingCustomRoleKey ? 'Save role permissions' : 'Create custom role'}</button>{editingCustomRoleKey && <button type="button" className="button button-secondary" onClick={cancelCustomRoleEdit}>Cancel</button>}</div>
               </form>
               {customRoles.map((role) => <div className="transaction-row" key={role.id}><span><strong>{role.roleName}</strong><small>{role.permissions.length ? role.permissions.join(' · ') : 'Read-only access'}</small></span><button className="button button-small" onClick={() => editCustomRole(role)}>Edit permissions</button></div>)}
@@ -4223,21 +4353,31 @@ function App() {
                     setMemberPermissionDrafts((current) => ({ ...current, [member.userId]: permissionsForRole(role) }))
                   }
                 }} /> Customize individual privileges instead of using this role’s defaults</label>
-                <div className={`field-row team-permission-grid ${isOverridden ? '' : 'permissions-inherited'}`}>{([
-                  ['operations.write', 'Operations'],
-                  ['sales.write', 'Sales'],
-                  ['inventory.write', 'Inventory'],
-                  ['accounting.write', 'Accounting'],
-                  ['banking.write', 'Banking'],
-                  ['payroll.manage', 'Payroll'],
-                  ['integrations.manage', 'Integrations'],
-                  ['workspace.manage', 'Business settings'],
-                  ['team.manage', 'Team management'],
-                  ['store.manage', 'Online store'],
-                ] as Array<[MemberPermission, string]>).map(([permission, label]) => <label className="field-label checkbox-row" key={permission}><input type="checkbox" disabled={!isOverridden || busy} checked={permissionDraft.includes(permission)} onChange={(event) => toggleMemberPermission(member.userId, permission, event.target.checked)} /> {label}</label>)}</div>
-                <div className="button-row"><button className="button button-primary" disabled={busy} onClick={() => void saveMemberPermissions(member)}>{busy ? 'Saving…' : 'Save role & privileges'}</button><span className="dialog-note">{isOverridden ? 'Custom privileges will override role defaults.' : 'Using the selected role’s saved privileges.'}</span></div>
+                <div className={`field-row team-permission-grid ${isOverridden ? '' : 'permissions-inherited'}`}>{ROLE_PERMISSION_GROUPS.flatMap((group) => group.permissions).map(([permission, label]) => <label className="field-label checkbox-row" key={permission}><input type="checkbox" disabled={!isOverridden || busy} checked={permissionDraft.includes(permission)} onChange={(event) => toggleMemberPermission(member.userId, permission, event.target.checked)} /> {label}</label>)}</div>
+                <div className="button-row"><button className="button button-primary" disabled={busy} onClick={() => void saveMemberPermissions(member)}>{busy ? 'Saving…' : 'Save role & privileges'}</button><button type="button" className="button button-small user-danger" disabled={busy} onClick={() => void removeTeamMember(member)}>Remove user</button><span className="dialog-note">{isOverridden ? 'Custom privileges will override role defaults.' : 'Using the selected role’s saved privileges.'}</span></div>
               </div>})}
               {!teamMembers.some((member) => member.role !== 'admin') && <div className="empty-state">Invite a team member to manage their access here.</div>}
+
+              <div className="user-directory">
+                <div className="panel-header"><div><h2>All users in this business ({teamMembers.length})</h2><p>Every person with access to {dashboard?.workspaceName}, their role, the privileges they hold, and their account security status.</p></div><button type="button" className="button button-small" disabled={busy} onClick={() => void refreshTeamMembers()}>Refresh</button></div>
+                {teamMembers.map((member) => {
+                  const effective = member.permissions ?? member.defaultPermissions
+                  const isAdminMember = member.isAdmin || member.role === 'admin'
+                  return <div className="user-card" key={`dir-${member.userId}`}>
+                    <div className="user-card-head">
+                      <div className="user-identity"><span className="user-avatar-lg">{(member.email || member.phone || 'U').slice(0, 1).toUpperCase()}</span><div><strong>{member.email || member.phone || 'Unnamed user'}</strong><small>{member.role === 'admin' ? 'Administrator · full access' : member.role}</small></div></div>
+                      <span className={`status-pill ${member.twoFactorEnabled ? 'green' : 'amber'}`}>{member.twoFactorEnabled ? '2FA enabled' : '2FA off'}</span>
+                    </div>
+                    <div className="user-meta">
+                      <span><small>Member since</small><strong>{member.memberSince ? new Date(String(member.memberSince)).toLocaleDateString('en-KE') : '—'}</strong></span>
+                      <span><small>Last recorded activity</small><strong>{member.lastActiveAt ? new Date(String(member.lastActiveAt)).toLocaleString('en-KE') : 'No recorded activity'}</strong></span>
+                      <span><small>Recovery codes left</small><strong>{member.twoFactorEnabled ? String(member.recoveryCodesRemaining ?? 0) : 'Not enabled'}</strong></span>
+                    </div>
+                    <div className="user-perm-list">{isAdminMember ? <span className="user-perm-chip">Full administrator access</span> : effective.length ? effective.map((permission) => <span className="user-perm-chip" key={permission}>{ROLE_PERMISSION_LABELS[permission] ?? permission}</span>) : <span className="user-perm-chip none">Read-only access</span>}</div>
+                    {!isAdminMember && <div className="user-card-actions"><button type="button" className="button button-small" disabled={busy} onClick={() => editTeamMemberById(member)}>Edit access</button><button type="button" className="button button-small user-danger" disabled={busy} onClick={() => void removeTeamMember(member)}>Remove user</button></div>}
+                  </div>
+                })}
+              </div>
             </section>
         </section> : page === 'Help' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> HELP & SUPPORT · {dashboard?.workspaceName}</div>
