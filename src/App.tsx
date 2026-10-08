@@ -741,7 +741,7 @@ function App() {
   const [returnInput, setReturnInput] = useState({ reason: '', refundAmount: '0', restock: true })
   const [complianceDrafts, setComplianceDrafts] = useState<ComplianceDraft[]>([])
   const [onboarding, setOnboarding] = useState<Record<string, { milestone: string; note: string; details: Record<string, string | boolean> }>>({})
-  const [reviewerDetails] = useState({ name: '', qualification: '', registration: '', reference: '' })
+  const [reviewerDetails, setReviewerDetails] = useState({ name: '', qualification: '', registration: '', reference: '' })
   const [kraEtimsConfig, setKraEtimsConfig] = useState<KraEtimsConfig | null>(null)
   const [kraDeviceInput, setKraDeviceInput] = useState({ taxpayerPin: '', branchId: '00', deviceSerial: '' })
   const [kraSetupStep, setKraSetupStep] = useState<'idle' | 'connecting' | 'done' | 'error'>('idle')
@@ -2413,9 +2413,28 @@ function App() {
     setBusy(true); setError(''); setKraSetupStep('connecting'); setKraSetupMessage('Enabling KRA for this business…')
     try {
       if (!settings.kraEtimsLiveEnabled) {
-        const nextSettings = { ...settings, kraEtimsLiveEnabled: true }
-        await request('/v1/settings', { method: 'PUT', body: JSON.stringify({ ...nextSettings, businessName: nextSettings.businessName || dashboard?.workspaceName }) })
-        setSettings(nextSettings)
+        // The settings endpoint validates every field strictly, so send an explicitly typed copy
+        // rather than spreading whatever the server happened to return.
+        await request('/v1/settings', { method: 'PUT', body: JSON.stringify({
+          businessName: settings.businessName || dashboard?.workspaceName || 'This business',
+          currency: settings.currency,
+          timezone: settings.timezone,
+          invoiceTerms: settings.invoiceTerms,
+          emailAlerts: settings.emailAlerts,
+          auditTrail: settings.auditTrail,
+          twoFactor: settings.twoFactor,
+          backupSchedule: settings.backupSchedule,
+          inventoryLowStockThreshold: Number(settings.inventoryLowStockThreshold),
+          inventoryMediumStockThreshold: Number(settings.inventoryMediumStockThreshold),
+          monoEnabled: settings.monoEnabled,
+          darajaEnabled: settings.darajaEnabled,
+          kraEtimsLiveEnabled: true,
+          statutoryFilingsEnabled: settings.statutoryFilingsEnabled,
+          shifEnabled: settings.shifEnabled,
+          nssfEnabled: settings.nssfEnabled,
+          ahlEnabled: settings.ahlEnabled,
+        }) })
+        setSettings((current) => ({ ...current, kraEtimsLiveEnabled: true }))
       }
       setKraSetupMessage('Saving your KRA details securely…')
       await request('/v1/integrations/etims/device', { method: 'PUT', body: JSON.stringify(kraDeviceInput) })
@@ -3578,6 +3597,24 @@ function App() {
             </div>}
 
             {kraSetupStep !== 'idle' && kraSetupMessage && <p className={`kra-setup-status kra-setup-${kraSetupStep}`} role="status">{kraSetupStep === 'connecting' ? '⏳' : kraSetupStep === 'done' ? <Check size={14} /> : <X size={14} />} {kraSetupMessage}</p>}
+
+            {kraEtimsConfig?.initialized && (() => {
+              const kraProfile = onboarding.kra_etims ?? { milestone: 'not_started', note: '', details: {} }
+              const kraDetails = kraProfile.details ?? {}
+              const referencesComplete = kraProfile.milestone === 'certified' && Boolean(kraDetails.solution && kraDetails.sandboxReference && kraDetails.certificationReference && kraDetails.productionApprovalReference)
+              return <div className={`kra-approval ${referencesComplete ? 'kra-approval-done' : ''}`}>
+                <div className="kra-approval-head"><div><strong>Fiscalisation approval references</strong><small>KRA production submission requires these four records. They are evidence notes you hold from KRA — they are self-reported and KashFlow does not verify them.</small></div><span className={`status-pill ${referencesComplete ? 'green' : 'amber'}`}>{referencesComplete ? 'Recorded' : 'Required for production'}</span></div>
+                <div className="kra-approval-grid">
+                  <label className="field-label">KRA system solution<select value={String(kraDetails.solution ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'solution', event.target.value)}><option value="">Select OSCU/VSCU</option><option value="OSCU">OSCU · always-online system</option><option value="VSCU">VSCU · bulk/offline-capable system</option></select><small>Your KRA eTIMS onboarding solution.</small></label>
+                  <label className="field-label">KRA sandbox registration reference<input value={String(kraDetails.sandboxReference ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'sandboxReference', event.target.value)} placeholder="Reference from KRA sandbox" /></label>
+                  <label className="field-label">KRA certification reference<input value={String(kraDetails.certificationReference ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'certificationReference', event.target.value)} placeholder="Certification reference" /></label>
+                  <label className="field-label">Production approval reference<input value={String(kraDetails.productionApprovalReference ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'productionApprovalReference', event.target.value)} placeholder="Production approval reference" /></label>
+                  <label className="field-label">Onboarding milestone<select value={kraProfile.milestone} onChange={(event) => setOnboarding((current) => ({ ...current, kra_etims: { ...kraProfile, milestone: event.target.value } }))}><option value="not_started">Not started</option><option value="application_in_progress">Application in progress</option><option value="sandbox_testing">Sandbox testing</option><option value="certification_review">Certification review</option><option value="certified">Certified (self-reported; not verified)</option></select><small>Set to Certified only after KRA has approved your production use.</small></label>
+                  <label className="field-label">Progress note<textarea maxLength={1000} value={kraProfile.note} onChange={(event) => setOnboarding((current) => ({ ...current, kra_etims: { ...kraProfile, note: event.target.value } }))} placeholder="Track references or next steps; never enter passwords or API keys." /></label>
+                </div>
+                <div className="button-row"><button className="button button-secondary" disabled={busy} onClick={() => void updateOnboarding('kra_etims')}>Save approval references</button><a href="https://www.kra.go.ke/business/etims-electronic-tax-invoice-management-system/learn-about-etims/etims-system-to-system-integration" target="_blank" rel="noreferrer">Open KRA eTIMS integration guidance</a></div>
+              </div>
+            })()}
           </article>
 
           <details className="compliance-advanced" open={kraAdvancedOpen} onToggle={(event) => setKraAdvancedOpen((event.target as HTMLDetailsElement).open)}><summary>Advanced KRA options and fiscal invoice drafts</summary>
@@ -3589,6 +3626,18 @@ function App() {
           <article className="module-card"><h2>Prepare eTIMS invoice drafts</h2><p>Creates a workspace draft. After taxpayer/device approval, initialization and exact KRA code/tax mapping, reviewed requests call the KRA OSCU sandbox or production endpoint selected by the API operator. Sandbox receipts are not fiscal invoices.</p>{invoicesList.filter((invoiceRow) => !complianceDrafts.some((draft) => draft.integration_type === 'kra_etims' && draft.source_id === invoiceRow.id)).map((invoiceRow) => <div className="transaction-row" key={invoiceRow.id}><span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>{money(invoiceRow.amount)} · {invoiceRow.status}</small></span><button className="button button-small" disabled={busy} onClick={() => void createComplianceDraft('kra_etims', invoiceRow.id)}>Create fiscalization draft</button></div>)}{!invoicesList.length && <div className="empty-state">Create an internal invoice first to prepare a draft snapshot.</div>}</article>
           <article className="module-card"><h2>Integration preparation drafts ({complianceDrafts.length})</h2>{complianceDrafts.map((draft) => <div className="compliance-draft-row" key={draft.id}><div className="transaction-row"><span><strong>{draft.integration_type === 'kra_etims' ? 'eTIMS invoice draft' : 'Statutory filing preparation'} · {draft.workflow_status}</strong><small>{draft.payload_version} · Provider status: {draft.provider_status}{draft.external_invoice_number ? ` · KRA invoice ${draft.external_invoice_number}` : ''}</small></span><div className="button-row"><button className="button button-small" onClick={() => downloadComplianceDraft(draft)}>Download snapshot</button>{draft.workflow_status === 'reviewed' && <button className="button button-primary" disabled={busy || draft.provider_status === 'accepted_by_kra' || draft.provider_status === 'submitted_to_kra' || draft.provider_status === 'submission_unknown'} onClick={() => void submitComplianceDraft(draft.id)}>{draft.provider_status === 'accepted_by_kra' ? 'KRA accepted' : draft.provider_status === 'submission_unknown' ? 'Reconcile with KRA' : 'Submit to authority'}</button>}{draft.workflow_status !== 'cancelled' && <button className="button button-small" onClick={() => void updateComplianceDraft(draft.id, 'cancelled')}>Cancel draft</button>}</div></div>
             {draft.integration_type === 'kra_etims' && draft.workflow_status === 'draft' && <div className="kra-fiscal-editor"><h3>KRA OSCU fiscal payload</h3><p>Map the invoice using current KRA codes shown above and qualified tax review. This editor sends a draft to our validator first; no KRA call occurs until “Submit to authority”. Amount and tax groups must reconcile exactly.</p><label className="field-label">KRA sales JSON (OSCU)</label><textarea className="kra-json-editor" rows={18} spellCheck={false} value={kraPayloadEditors[draft.id] ?? JSON.stringify(draft.draft_payload.fiscalPayload ?? {}, null, 2)} onChange={(event) => setKraPayloadEditors((current) => ({ ...current, [draft.id]: event.target.value }))} /><div className="button-row"><button className="button button-secondary" disabled={busy || !kraEtimsConfig?.initialized} onClick={() => void saveKraFiscalPayload(draft.id)}>Validate & save payload</button><button className="button button-small" disabled={busy || !draft.draft_payload.fiscalPayload || !kraEtimsConfig?.initialized} onClick={() => void updateComplianceDraft(draft.id, 'reviewed')}>Mark reviewed</button></div></div>}
+            {draft.integration_type === 'statutory_filing' && draft.workflow_status === 'draft' && <div className="statutory-review-editor">
+              <h3>Qualified Kenyan payroll/tax review</h3>
+              <p>The law requires a qualified professional to review payroll tax preparation before any statutory route is used. Record their details here; the server stores them with the draft. These entries are self-reported and are not independently verified by KashFlow.</p>
+              <div className="record-form-grid">
+                <label className="field-label">Reviewer full name<input maxLength={160} value={reviewerDetails.name} onChange={(event) => setReviewerDetails({ ...reviewerDetails, name: event.target.value })} placeholder="e.g. Jane Wanjiku" /></label>
+                <label className="field-label">Qualification<input maxLength={160} value={reviewerDetails.qualification} onChange={(event) => setReviewerDetails({ ...reviewerDetails, qualification: event.target.value })} placeholder="e.g. CPA(K)" /></label>
+                <label className="field-label">Professional registration / member number<input maxLength={160} value={reviewerDetails.registration} onChange={(event) => setReviewerDetails({ ...reviewerDetails, registration: event.target.value })} placeholder="e.g. ICPAK member number" /></label>
+                <label className="field-label">Review reference<input maxLength={160} value={reviewerDetails.reference} onChange={(event) => setReviewerDetails({ ...reviewerDetails, reference: event.target.value })} placeholder="Internal review reference" /></label>
+              </div>
+              <div className="button-row"><button className="button button-small" disabled={busy || !reviewerDetails.name.trim() || !reviewerDetails.qualification.trim() || !reviewerDetails.registration.trim() || !reviewerDetails.reference.trim()} onClick={() => void updateComplianceDraft(draft.id, 'reviewed', reviewerDetails)}>Record review and mark reviewed</button><small className="dialog-note">All four details are required by the server before a statutory submission is attempted.</small></div>
+            </div>}
+            {draft.integration_type === 'statutory_filing' && draft.workflow_status === 'reviewed' && <small className="reviewer-note">Reviewed by self-reported professional details on file. Statutory filing routes must still be confirmed and no submission occurs from KashFlow until an authorised adapter is installed.</small>}
             {draft.integration_type === 'kra_etims' && draft.provider_status === 'accepted_by_kra' && <small className="reviewer-note">KRA accepted invoice {draft.external_invoice_number ?? '—'} · signature {draft.fiscal_receipt_signature ?? 'not returned'}. Verify this result in your taxpayer records.</small>}
           </div>)}{!complianceDrafts.length && <div className="empty-state">No preparation drafts yet. Generate an eTIMS draft here or a statutory draft from a posted payroll run.</div>}</article>
           </details>

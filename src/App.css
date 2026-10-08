@@ -450,3 +450,24 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .kra-setup-error{background:#fdeceb;color:#a5352d;border:1px solid #f6cfcb}
 @media(max-width:860px){.kra-steps{grid-template-columns:1fr}.kra-quick-form{grid-template-columns:1fr}}
 .field-hint-warn{display:block;margin-top:5px;color:#b4332c;font-size:11px;font-weight:650}
+
+/* ---------- KRA approval references (legally required for production) ---------- */
+.kra-approval{margin-top:18px;padding:20px;border-radius:14px;background:#fffaf3;border:1px solid #f3ddb3}
+.kra-approval-done{background:#f1fcf5;border-color:#bfe9d3}
+.kra-approval-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+.kra-approval-head strong{display:block;font-size:15px;font-weight:800;color:#2a2547}
+.kra-approval-head small{display:block;margin-top:5px;color:#7a6f52;font-size:11.5px;line-height:1.55;max-width:560px}
+.kra-approval-done .kra-approval-head small{color:#5a7d6b}
+.kra-approval-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+.kra-approval-grid .field-label{margin:0}
+.kra-approval-grid .field-label small{display:block;margin-top:5px;color:#8a8171;font-size:10.5px;font-weight:500}
+.kra-approval-grid .field-label:last-child{grid-column:1/-1}
+.kra-approval .button-row{margin-top:16px;align-items:center}
+.kra-approval .button-row a{font-size:12px;font-weight:700;color:#5b3fd6}
+@media(max-width:700px){.kra-approval-grid{grid-template-columns:1fr}}
+
+.statutory-review-editor{margin-top:12px;padding:16px;border:1px solid #e6e0fb;border-radius:12px;background:#fbfaff}
+.statutory-review-editor h3{margin:0 0 6px;font-size:14px;color:#2a2547}
+.statutory-review-editor>p{margin:0 0 12px;color:#6a6785;font-size:12px;line-height:1.6}
+.statutory-review-editor .button-row{margin-top:4px;flex-wrap:wrap;align-items:center;gap:12px}
+.statutory-review-editor .button-row .dialog-note{margin:0;flex:1;min-width:200px}
