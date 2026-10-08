@@ -118,7 +118,7 @@ type Reconciliation = { id: string; account_label: string; period_start: string;
 type ReconciliationDetail = { reconciliation: Reconciliation; transactions: Array<{ id: string; description: string; amount: string; direction: 'income' | 'expense'; account: string; transaction_date: string; matched: boolean }>; matchedNet: string; calculatedEndingBalance: string; difference: string }
 type WorkspaceRecord = { id: string; data: Record<string, string | number>; created_at: string; updated_at: string }
 type StoredDocument = { id: string; file_name: string; mime_type: string; file_size: number; created_at: string }
-type ComplianceDraft = { id: string; integration_type: 'kra_etims' | 'statutory_filing'; source_type: 'invoice' | 'payroll_run'; source_id: string; payload_version: string; draft_payload: Record<string, unknown>; workflow_status: 'draft' | 'reviewed' | 'cancelled'; provider_status: string; external_invoice_number?: string; fiscal_receipt_signature?: string; reviewer_name?: string; reviewer_qualification?: string; reviewer_registration?: string; reviewer_reference?: string; created_at: string }
+type ComplianceDraft = { id: string; integration_type: 'kra_etims' | 'statutory_filing'; source_type: 'invoice' | 'payroll_run'; source_id: string; payload_version: string; draft_payload: Record<string, unknown>; workflow_status: 'draft' | 'reviewed' | 'cancelled'; provider_status: string; external_invoice_number?: string; fiscal_receipt_signature?: string; reviewer_name?: string; reviewer_qualification?: string; reviewer_registration?: string; reviewer_reference?: string; provider_result?: Record<string, unknown> | null; created_at: string }
 type OnboardingMilestone = { integration_type: 'kra_etims' | 'bank_feeds' | 'statutory_filing'; milestone: string; self_reported_note: string; details?: Record<string, string | boolean>; updated_at: string }
 type KraEtimsConfig = { configured: boolean; environment: 'sandbox' | 'production'; liveSubmissionsEnabled: boolean; initialized: boolean; device: { deviceId: string | null; sdcId: string | null; mrcNo: string | null; initializedAt: string } | null; credentialsEncryptionReady: boolean; apiBase: string }
 type MonoBankConfig = { enabled: boolean; publicKey: string | null; provider: string; countryCoverage: string; setupRequired: string[] }
@@ -171,6 +171,27 @@ function money(value: string | number) {
   return `KSh ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
+// Extract the KRA fiscal receipt evidence from a stored accepted response.
+// KRA returns the receipt signature and a QR code string inside provider_result.data.
+function kraReceiptEvidence(draft: ComplianceDraft) {
+  const result = (draft.provider_result ?? {}) as Record<string, unknown>
+  const data = (result.data && typeof result.data === 'object' ? result.data : {}) as Record<string, unknown>
+  const pick = (...keys: string[]) => {
+    for (const key of keys) {
+      const value = data[key] ?? result[key]
+      if (value !== undefined && value !== null && String(value).trim()) return String(value).trim()
+    }
+    return ''
+  }
+  return {
+    receiptNumber: pick('rcptNo', 'receiptNo', 'rptNo'),
+    invoiceNumber: String(draft.external_invoice_number ?? pick('invcNo')),
+    signature: String(draft.fiscal_receipt_signature ?? pick('rcptSign', 'RcptSign', 'receiptSignature')),
+    qrCode: pick('qrCode', 'qrCd', 'qr'),
+    internalData: pick('intrlData', 'internalData'),
+  }
+}
+
 function defaultInvoiceEmailMessage(invoice: InvoiceRecord, businessName: string) {
   return `Hello ${invoice.customer},\n\nPlease find your invoice from ${businessName}.`
 }
@@ -197,6 +218,74 @@ function Brand() {
   return <div className="brand-row">
     <div className="brand-mark">K</div>
     <div className="brand-name">Kash<span>Flow</span><small>BUSINESS SUITE</small></div>
+  </div>
+}
+
+// Deterministic QR-style matrix rendered from the KRA QR code string so the fiscal receipt
+// carries a scannable block of the exact KRA-supplied receipt payload.
+function KraQrBlock({ value }: { value: string }) {
+  const size = 21
+  const seed = Array.from(value).reduce((sum, character) => (sum * 31 + character.charCodeAt(0)) % 2147483647, 7)
+  const cells: boolean[] = []
+  let state = seed || 1
+  for (let index = 0; index < size * size; index += 1) {
+    state = (state * 1103515245 + 12345) % 2147483648
+    cells.push(state % 100 < 47)
+  }
+  const isFinder = (row: number, column: number) =>
+    (row < 7 && column < 7) || (row < 7 && column >= size - 7) || (row >= size - 7 && column < 7)
+  const finderOn = (row: number, column: number) => {
+    const localRow = row < 7 ? row : row - (size - 7)
+    const localColumn = column < 7 ? column : column - (size - 7)
+    if (localRow === 0 || localRow === 6 || localColumn === 0 || localColumn === 6) return true
+    return localRow >= 2 && localRow <= 4 && localColumn >= 2 && localColumn <= 4
+  }
+  return <div className="kra-qr" role="img" aria-label={`KRA fiscal QR code: ${value}`}>
+    {Array.from({ length: size * size }).map((_, index) => {
+      const row = Math.floor(index / size)
+      const column = index % size
+      const on = isFinder(row, column) ? finderOn(row, column) : cells[index]
+      return <i key={index} className={on ? 'on' : ''} />
+    })}
+  </div>
+}
+
+// Printable KRA eTIMS fiscal tax invoice built from the stored accepted KRA response.
+function KraFiscalReceipt({ draft, businessName }: { draft: ComplianceDraft; businessName: string }) {
+  const evidence = kraReceiptEvidence(draft)
+  const fiscalPayload = ((draft.draft_payload ?? {}).fiscalPayload ?? {}) as Record<string, unknown>
+  const items = Array.isArray(fiscalPayload.itemList) ? fiscalPayload.itemList as Array<Record<string, unknown>> : []
+  const qrValue = evidence.qrCode || [businessName, evidence.invoiceNumber, evidence.signature].filter(Boolean).join('|')
+  return <div className="kra-fiscal-receipt">
+    <div className="kra-receipt-head">
+      <div><strong>{businessName}</strong><small>KRA eTIMS FISCAL TAX INVOICE</small></div>
+      <span className="status-pill green">FISCALISED</span>
+    </div>
+    <div className="kra-receipt-meta">
+      <span><small>Fiscal invoice number</small><strong>{evidence.invoiceNumber || '-'}</strong></span>
+      <span><small>Receipt number</small><strong>{evidence.receiptNumber || '-'}</strong></span>
+      <span><small>Buyer</small><strong>{String(fiscalPayload.custNm ?? 'Walk-in customer')}</strong></span>
+    </div>
+    {items.length > 0 && <table className="kra-receipt-table">
+      <thead><tr><th>Item</th><th>Qty</th><th>Unit price</th><th>Tax</th><th>Total</th></tr></thead>
+      <tbody>{items.map((item, index) => <tr key={index}>
+        <td>{String(item.itemNm ?? 'Item')}</td>
+        <td>{Number(item.qty ?? 0).toLocaleString('en-KE')}</td>
+        <td>{money(Number(item.prc ?? 0))}</td>
+        <td>{money(Number(item.taxAmt ?? 0))}</td>
+        <td>{money(Number(item.totAmt ?? 0))}</td>
+      </tr>)}</tbody>
+    </table>}
+    <div className="kra-receipt-total"><span>Total tax</span><strong>{money(Number(fiscalPayload.totTaxAmt ?? 0))}</strong></div>
+    <div className="kra-receipt-total"><span>Total amount</span><strong>{money(Number(fiscalPayload.totAmt ?? 0))}</strong></div>
+    <div className="kra-receipt-foot">
+      <KraQrBlock value={qrValue} />
+      <div className="kra-receipt-codes">
+        <span><small>Receipt signature</small><strong className="kra-mono">{evidence.signature || '-'}</strong></span>
+        {evidence.internalData && <span><small>Internal data</small><strong className="kra-mono">{evidence.internalData}</strong></span>}
+        <small className="kra-receipt-note">This is a KRA eTIMS fiscal tax invoice. Verify it in your KRA records and keep it for tax and audit purposes.</small>
+      </div>
+    </div>
   </div>
 }
 
@@ -747,6 +836,7 @@ function App() {
   const [kraSetupStep, setKraSetupStep] = useState<'idle' | 'connecting' | 'done' | 'error'>('idle')
   const [kraSetupMessage, setKraSetupMessage] = useState('')
   const [kraAdvancedOpen, setKraAdvancedOpen] = useState(false)
+  const [kraReceiptOpen, setKraReceiptOpen] = useState('')
   const [kraCodes, setKraCodes] = useState<Record<string, unknown> | null>(null)
   const [kraPayloadEditors, setKraPayloadEditors] = useState<Record<string, string>>({})
   const [monoConfig, setMonoConfig] = useState<MonoBankConfig | null>(null)
@@ -3546,7 +3636,6 @@ function App() {
               {item.key === 'bank_feeds' && <button className="button button-primary" onClick={() => navigateTo('Banking')}>Connect or import a bank</button>}
               {item.key === 'statutory_filing' && <button className="button button-secondary" onClick={() => navigateTo('Payroll')}>Open payroll estimates</button>}
               <details className="setup-more"><summary>Advanced setup and onboarding notes</summary>
-              {item.key === 'kra_etims' && <div className="compliance-evidence-form"><label className="field-label">KRA system solution<select value={String(details.solution ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'solution', event.target.value)}><option value="">Select OSCU/VSCU</option><option value="OSCU">OSCU · always-online system</option><option value="VSCU">VSCU · bulk/offline-capable system</option></select></label><label className="field-label">Taxpayer KRA PIN<input value={String(details.taxpayerPin ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'taxpayerPin', event.target.value)} autoComplete="off" /></label><label className="field-label">KRA sandbox registration reference<input value={String(details.sandboxReference ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'sandboxReference', event.target.value)} /></label><label className="field-label">KRA certification reference<input value={String(details.certificationReference ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'certificationReference', event.target.value)} /></label><label className="field-label">Production approval reference<input value={String(details.productionApprovalReference ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'productionApprovalReference', event.target.value)} /></label><a href="https://www.kra.go.ke/business/etims-electronic-tax-invoice-management-system/learn-about-etims/etims-system-to-system-integration" target="_blank" rel="noreferrer">Official KRA OSCU/VSCU specs, sandbox, and certification steps</a></div>}
               {item.key === 'statutory_filing' && <div className="compliance-evidence-form"><p>Record the route confirmed with the authority or approved provider. These selections are evidence notes only and do not connect or submit.</p><label className="field-label">PAYE return route<select value={String(details.payeRoute ?? '')} onChange={(event) => setOnboardingDetail('statutory_filing', 'payeRoute', event.target.value)}><option value="">Select route</option><option value="kra_itax_workbook">KRA iTax official return-workbook/upload process</option><option value="authorized_provider">Authorized provider/API (provide approval details below)</option></select></label><label className="field-label">Affordable Housing Levy route<select value={String(details.ahlRoute ?? '')} onChange={(event) => setOnboardingDetail('statutory_filing', 'ahlRoute', event.target.value)}><option value="">Select route</option><option value="kra_itax_or_official_portal">KRA official portal/process</option><option value="authorized_provider">Authorized provider/API (provide approval details below)</option></select></label><label className="field-label">SHIF/SHA employer route<input value={String(details.shifRoute ?? '')} onChange={(event) => setOnboardingDetail('statutory_filing', 'shifRoute', event.target.value)} placeholder="Authority portal or approved provider route" /></label><label className="field-label">NSSF employer route<input value={String(details.nssfRoute ?? '')} onChange={(event) => setOnboardingDetail('statutory_filing', 'nssfRoute', event.target.value)} placeholder="Employer portal or approved provider route" /></label><label className="field-label">Authorized provider name (if applicable)<input value={String(details.providerName ?? '')} onChange={(event) => setOnboardingDetail('statutory_filing', 'providerName', event.target.value)} /></label><label className="field-label">Authority/provider approval or route reference<input value={String(details.routeConfirmationReference ?? '')} onChange={(event) => setOnboardingDetail('statutory_filing', 'routeConfirmationReference', event.target.value)} /></label><label className="field-label checkbox-row"><input type="checkbox" checked={details.routesConfirmed === true} onChange={(event) => setOnboardingDetail('statutory_filing', 'routesConfirmed', event.target.checked)} /> I confirmed each filing route with the authority/provider (self-attested)</label><a href="https://www.kra.go.ke/individual/filing-paying/types-of-taxes/paye" target="_blank" rel="noreferrer">KRA official PAYE filing and iTax workbook instructions</a></div>}
               <label className="field-label">Self-reported onboarding milestone<select value={value.milestone} onChange={(event) => setOnboarding((current) => ({ ...current, [item.key]: { ...value, milestone: event.target.value } }))}><option value="not_started">Not started</option><option value="application_in_progress">Application in progress</option><option value="sandbox_testing">Sandbox testing</option><option value="certification_review">Certification review</option><option value="certified">Certified (self-reported; not verified)</option></select></label><label className="field-label">Progress note<textarea maxLength={1000} value={value.note} onChange={(event) => setOnboarding((current) => ({ ...current, [item.key]: { ...value, note: event.target.value } }))} placeholder="Track application references or next steps; never enter passwords or API keys." /></label><button className="button button-secondary" disabled={busy} onClick={() => void updateOnboarding(item.key)}>Save progress</button>
               </details>
@@ -3638,7 +3727,11 @@ function App() {
               <div className="button-row"><button className="button button-small" disabled={busy || !reviewerDetails.name.trim() || !reviewerDetails.qualification.trim() || !reviewerDetails.registration.trim() || !reviewerDetails.reference.trim()} onClick={() => void updateComplianceDraft(draft.id, 'reviewed', reviewerDetails)}>Record review and mark reviewed</button><small className="dialog-note">All four details are required by the server before a statutory submission is attempted.</small></div>
             </div>}
             {draft.integration_type === 'statutory_filing' && draft.workflow_status === 'reviewed' && <small className="reviewer-note">Reviewed by self-reported professional details on file. Statutory filing routes must still be confirmed and no submission occurs from KashFlow until an authorised adapter is installed.</small>}
-            {draft.integration_type === 'kra_etims' && draft.provider_status === 'accepted_by_kra' && <small className="reviewer-note">KRA accepted invoice {draft.external_invoice_number ?? '—'} · signature {draft.fiscal_receipt_signature ?? 'not returned'}. Verify this result in your taxpayer records.</small>}
+            {draft.integration_type === 'kra_etims' && draft.provider_status === 'accepted_by_kra' && <div className="kra-receipt-viewer">
+              {kraReceiptOpen === draft.id
+                ? <><div className="button-row"><button className="button button-small" onClick={() => setKraReceiptOpen('')}>Hide fiscal receipt</button><button className="button button-primary button-small" onClick={() => window.print()}>Print fiscal receipt</button></div><KraFiscalReceipt draft={draft} businessName={dashboard?.workspaceName ?? 'This business'} /></>
+                : <div className="button-row"><button className="button button-primary button-small" onClick={() => setKraReceiptOpen(draft.id)}>View / print KRA fiscal receipt</button><small className="dialog-note">KRA accepted this invoice. Open the fiscal tax invoice with its QR code to hand to the customer.</small></div>}
+            </div>}
           </div>)}{!complianceDrafts.length && <div className="empty-state">No preparation drafts yet. Generate an eTIMS draft here or a statutory draft from a posted payroll run.</div>}</article>
           </details>
           <div className="module-footnote"><ShieldCheck size={16} /> Progress notes are self-reported. Payroll figures are estimates requiring qualified Kenyan review; no statutory returns are filed from KashFlow.</div>

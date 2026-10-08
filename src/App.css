@@ -471,3 +471,37 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .statutory-review-editor>p{margin:0 0 12px;color:#6a6785;font-size:12px;line-height:1.6}
 .statutory-review-editor .button-row{margin-top:4px;flex-wrap:wrap;align-items:center;gap:12px}
 .statutory-review-editor .button-row .dialog-note{margin:0;flex:1;min-width:200px}
+
+/* ---------- KRA fiscal tax invoice (printable, compliant receipt) ---------- */
+.kra-receipt-viewer{margin-top:12px}
+.kra-receipt-viewer .dialog-note{margin:0}
+.kra-fiscal-receipt{margin-top:14px;padding:22px;border-radius:14px;border:2px solid #1c1a33;background:#fff;color:#14121f;max-width:640px}
+.kra-receipt-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;border-bottom:2px solid #1c1a33;padding-bottom:12px}
+.kra-receipt-head strong{display:block;font-size:17px;font-weight:800}
+.kra-receipt-head small{display:block;margin-top:3px;font-size:10.5px;font-weight:700;letter-spacing:.12em;color:#4b4763}
+.kra-receipt-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:14px 0;border-bottom:1px dashed #b9b5cc}
+.kra-receipt-meta span{display:flex;flex-direction:column;gap:3px;min-width:0}
+.kra-receipt-meta small{color:#6a6785;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}
+.kra-receipt-meta strong{font-size:13px;font-weight:800;word-break:break-word}
+.kra-receipt-table{width:100%;border-collapse:collapse;margin:14px 0;font-size:12px}
+.kra-receipt-table th,.kra-receipt-table td{padding:8px 6px;border-bottom:1px solid #e6e3f0;text-align:left;vertical-align:top}
+.kra-receipt-table th{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#524e6b}
+.kra-receipt-table td:not(:first-child),.kra-receipt-table th:not(:first-child){text-align:right;white-space:nowrap}
+.kra-receipt-total{display:flex;justify-content:space-between;gap:12px;padding:7px 0;font-size:13px;border-bottom:1px solid #e6e3f0}
+.kra-receipt-total strong{font-weight:800}
+.kra-receipt-total:last-of-type{border-bottom:0;border-top:2px solid #1c1a33;margin-top:4px;padding-top:11px;font-size:15px}
+.kra-receipt-foot{display:flex;gap:18px;align-items:flex-start;margin-top:18px;padding-top:16px;border-top:2px solid #1c1a33}
+.kra-qr{display:grid;grid-template-columns:repeat(21,1fr);gap:0;width:150px;height:150px;flex:none;padding:6px;background:#fff;border:1px solid #d8d4e6}
+.kra-qr i{display:block;background:#fff}
+.kra-qr i.on{background:#14121f}
+.kra-receipt-codes{display:flex;flex-direction:column;gap:10px;min-width:0;flex:1}
+.kra-receipt-codes span{display:flex;flex-direction:column;gap:3px}
+.kra-receipt-codes small{color:#6a6785;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}
+.kra-mono{font-family:ui-monospace,Consolas,monospace;font-size:11px;word-break:break-all;font-weight:700}
+.kra-receipt-note{margin-top:6px;color:#4b4763!important;font-size:10px!important;font-weight:600!important;text-transform:none!important;letter-spacing:0!important;line-height:1.5}
+@media(max-width:640px){.kra-receipt-meta{grid-template-columns:1fr}.kra-receipt-foot{flex-direction:column}.kra-qr{width:130px;height:130px}}
+@media print{
+  body *{visibility:hidden!important}
+  .kra-fiscal-receipt,.kra-fiscal-receipt *{visibility:visible!important}
+  .kra-fiscal-receipt{position:absolute!important;left:0;top:0;width:100%;max-width:none;border:0;padding:0;margin:0}
+}

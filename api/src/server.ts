@@ -4426,7 +4426,7 @@ app.put('/v1/integrations/onboarding/:integrationType', requirePool, verifyOrigi
 })
 app.get('/v1/integrations/drafts', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT id, integration_type, source_type, source_id, payload_version, draft_payload, workflow_status, provider_status, external_invoice_number, fiscal_receipt_signature, reviewer_name, reviewer_qualification, reviewer_registration, reviewer_reference, reviewer_attested_at, created_at, updated_at FROM compliance_submission_drafts WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
+    const result = await pool!.query('SELECT id, integration_type, source_type, source_id, payload_version, draft_payload, workflow_status, provider_status, external_invoice_number, fiscal_receipt_signature, provider_result, reviewer_name, reviewer_qualification, reviewer_registration, reviewer_reference, reviewer_attested_at, created_at, updated_at FROM compliance_submission_drafts WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
     response.json({ drafts: result.rows })
   } catch (error) { next(error) }
 })
