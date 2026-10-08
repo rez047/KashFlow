@@ -570,6 +570,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
             <li><Check size={15} /> Payroll drafts &amp; payslips</li>
             <li><Check size={15} /> KRA eTIMS preparation &amp; compliance tracking</li>
             <li><Check size={15} /> Team roles &amp; permissions</li>
+            <li><Check size={15} /> Invoice email delivery to customers &amp; suppliers</li>
           </ul>
           <button type="button" className="button button-secondary button-xl" onClick={() => onDemo('Comfort')}>Start with Comfort</button>
         </article>
@@ -583,7 +584,6 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
             <li><Check size={15} /> Safaricom Daraja M-Pesa STK Push checkout</li>
             <li><Check size={15} /> Mono bank feeds &amp; statement review</li>
             <li><Check size={15} /> Priority onboarding for provider connections</li>
-            <li><Check size={15} /> Invoice email delivery to customers &amp; suppliers</li>
             <li><Check size={15} /> M-Pesa receipt handling on the counter</li>
             <li><Check size={15} /> Premium support for your team</li>
           </ul>
