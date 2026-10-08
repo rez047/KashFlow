@@ -684,6 +684,11 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [credentials, setCredentials] = useState({ identifier: '', password: '', businessName: '' })
+  const [twoFactorChallenge, setTwoFactorChallenge] = useState<{ token: string; code: string } | null>(null)
+  const [twoFactorStatus, setTwoFactorStatus] = useState<{ available: boolean; enabled: boolean; recoveryCodesRemaining: number } | null>(null)
+  const [twoFactorSetup, setTwoFactorSetup] = useState<{ secret: string; otpauthUri: string; recoveryCodes: string[] } | null>(null)
+  const [twoFactorCode, setTwoFactorCode] = useState('')
+  const [twoFactorBusy, setTwoFactorBusy] = useState(false)
   const [transaction, setTransaction] = useState({ description: '', amount: '', direction: 'expense', account: '', date: today })
   const [invoice, setInvoice] = useState({ customer: '', customerEmail: '', description: '', amount: '', dueDate: '' })
   const [invoiceLocationId, setInvoiceLocationId] = useState('')
@@ -889,6 +894,16 @@ function App() {
     const query = new URLSearchParams(period)
     setDashboard(await request<Dashboard>(`/v1/dashboard?${query}`))
   }, [overviewFrom, overviewRange, overviewTo])
+
+  // Load the two-factor status once a signed-in workspace is available.
+  useEffect(() => {
+    if (!account) { setTwoFactorStatus(null); return }
+    let active = true
+    void request<{ available: boolean; enabled: boolean; recoveryCodesRemaining: number }>('/v1/auth/two-factor/status')
+      .then((status) => { if (active) setTwoFactorStatus(status) })
+      .catch(() => { /* status is best-effort */ })
+    return () => { active = false }
+  }, [account])
 
   async function loadOverviewPeriod(range: OverviewRange, from = overviewFrom, to = overviewTo) {
     const period = overviewPeriod(range, from, to)
@@ -1351,12 +1366,92 @@ function App() {
       const body = showSetupFlow
         ? { identifier: credentials.identifier, password: credentials.password, businessName: credentials.businessName }
         : { identifier: credentials.identifier, password: credentials.password }
-      const signedIn = await request<Account>(route, { method: 'POST', body: JSON.stringify(body) })
-      setAccount(signedIn); setShowSetupFlow(false); await refresh()
+      const signedIn = await request<Account | { twoFactorRequired: true; challengeToken: string; message: string }>(route, { method: 'POST', body: JSON.stringify(body) })
+      if ('twoFactorRequired' in signedIn && signedIn.twoFactorRequired) {
+        setTwoFactorChallenge({ token: signedIn.challengeToken, code: '' })
+        setBusy(false)
+        return
+      }
+      setAccount(signedIn as Account); setShowSetupFlow(false); await refresh()
       await acceptPendingInvitation()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not sign in.')
     } finally { setBusy(false) }
+  }
+
+  // Complete a two-factor login challenge and only then obtain a session.
+  async function submitTwoFactorLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    if (!twoFactorChallenge) { setBusy(false); return }
+    try {
+      const signedIn = await request<Account>('/v1/auth/two-factor/verify-login', { method: 'POST', body: JSON.stringify({ challengeToken: twoFactorChallenge.token, code: twoFactorChallenge.code }) })
+      setAccount(signedIn)
+      setTwoFactorChallenge(null)
+      setShowSetupFlow(false)
+      setCredentials({ identifier: '', password: '', businessName: '' })
+      await refresh()
+      await acceptPendingInvitation()
+      notify('Signed in with two-factor authentication.')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not verify the two-factor code.')
+    } finally { setBusy(false) }
+  }
+
+  // ---- Two-factor management (from Settings) ----
+  async function loadTwoFactorStatus() {
+    try { setTwoFactorStatus(await request<{ available: boolean; enabled: boolean; recoveryCodesRemaining: number }>('/v1/auth/two-factor/status')) }
+    catch { /* status is best-effort; the security card shows a retry */ }
+  }
+
+  async function beginTwoFactorEnrollment() {
+    setTwoFactorBusy(true); setError('')
+    try {
+      const result = await request<{ secret: string; otpauthUri: string; recoveryCodes: string[] }>('/v1/auth/two-factor/enroll', { method: 'POST', body: '{}' })
+      setTwoFactorSetup(result)
+      setTwoFactorCode('')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not start two-factor setup.') }
+    finally { setTwoFactorBusy(false) }
+  }
+
+  function downloadRecoveryCodes(codes: string[]) {
+    const blob = new Blob([`KashFlow recovery codes\nKeep these safe. Each code works once.\n\n${codes.join('\n')}\n`], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'kashflow-recovery-codes.txt'; anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  async function activateTwoFactor() {
+    setTwoFactorBusy(true); setError('')
+    try {
+      await request('/v1/auth/two-factor/activate', { method: 'POST', body: JSON.stringify({ code: twoFactorCode }) })
+      notify('Two-factor authentication is now active.')
+      setTwoFactorSetup(null); setTwoFactorCode('')
+      await loadTwoFactorStatus()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not activate two-factor authentication.') }
+    finally { setTwoFactorBusy(false) }
+  }
+
+  async function disableTwoFactor() {
+    setTwoFactorBusy(true); setError('')
+    try {
+      await request('/v1/auth/two-factor/disable', { method: 'POST', body: JSON.stringify({ code: twoFactorCode }) })
+      notify('Two-factor authentication has been disabled.')
+      setTwoFactorCode(''); setTwoFactorSetup(null)
+      await loadTwoFactorStatus()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not disable two-factor authentication.') }
+    finally { setTwoFactorBusy(false) }
+  }
+
+  async function regenerateRecoveryCodes() {
+    setTwoFactorBusy(true); setError('')
+    try {
+      const result = await request<{ recoveryCodes: string[] }>('/v1/auth/two-factor/recovery-codes', { method: 'POST', body: JSON.stringify({ code: twoFactorCode }) })
+      notify('New recovery codes generated. The previous codes no longer work.')
+      setTwoFactorSetup({ secret: '', otpauthUri: '', recoveryCodes: result.recoveryCodes })
+      setTwoFactorCode('')
+      await loadTwoFactorStatus()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not regenerate recovery codes.') }
+    finally { setTwoFactorBusy(false) }
   }
 
   // Selecting a subscription opens the shared KENYA YETU demo workspace: sign in to the
@@ -3115,7 +3210,21 @@ function App() {
   if (!account) return <>
     <LandingPage onSignIn={() => { setError(''); setShowSetupFlow(false); setAuthPanelOpen(true) }} onDemo={(packageName) => { void startDemoWorkspace(packageName) }} />
     {authPanelOpen && <div className="auth-overlay" role="dialog" aria-modal="true">
-      <form className="auth-card auth-card-elevated" onSubmit={submitAuth}>
+      {twoFactorChallenge ? <form className="auth-card auth-card-elevated" onSubmit={(event) => void submitTwoFactorLogin(event)}>
+        <button type="button" className="auth-close" onClick={() => { setAuthPanelOpen(false); setTwoFactorChallenge(null); setError('') }} aria-label="Close"><X size={18} /></button>
+        <Brand />
+        <p className="auth-intro">Two-factor authentication</p>
+        <p className="auth-2fa-hint"><ShieldCheck size={15} /> Open your authenticator app and enter the current 6-digit code for KashFlow.</p>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <label className="field-label">6-digit code
+          <input type="text" required inputMode="numeric" autoComplete="one-time-code" maxLength={20} placeholder="123456" value={twoFactorChallenge.code} onChange={(event) => setTwoFactorChallenge({ ...twoFactorChallenge, code: event.target.value })} />
+        </label>
+        <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Verifying…' : 'Verify and sign in'}</button>
+        <p className="auth-cta-wrap">
+          <button type="button" className="auth-link" disabled={busy} onClick={() => { setTwoFactorChallenge(null); setError('') }}>Use a different account</button>
+        </p>
+        <p className="auth-note">Lost your device? Enter one of your saved recovery codes above. Each recovery code works only once.</p>
+      </form> : <form className="auth-card auth-card-elevated" onSubmit={submitAuth}>
         <button type="button" className="auth-close" onClick={() => { setAuthPanelOpen(false); setShowSetupFlow(false); setError('') }} aria-label="Close"><X size={18} /></button>
         <Brand />
         <p className="auth-intro">Welcome back — sign in to your business workspace.</p>
@@ -3141,7 +3250,7 @@ function App() {
           </div>
         </div>
         <p className="auth-note">Sign in with the email or phone number you registered, or ask us to set up a workspace for your business.</p>
-      </form>
+      </form>}
     </div>}
   </>
 
@@ -3967,6 +4076,55 @@ function App() {
             {error && <p className="form-error" role="alert">{error}</p>}
             <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
           </form>
+            <section className="module-card security-card">
+              <div className="panel-header"><div><h2>Account security · two-factor authentication</h2><p>Protect your business with an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, or any TOTP app). No paid service is required.</p></div><span className={`status-pill ${twoFactorStatus?.enabled ? 'green' : 'amber'}`}>{twoFactorStatus?.enabled ? 'Enabled' : 'Not enabled'}</span></div>
+              {twoFactorStatus && !twoFactorStatus.available && <p className="form-error">The API operator must set TWO_FACTOR_ENCRYPTION_KEY (32+ characters) before two-factor authentication can be enabled.</p>}
+              {error && <p className="form-error" role="alert">{error}</p>}
+
+              {twoFactorStatus?.enabled && !twoFactorSetup && <div className="two-factor-enabled">
+                <p><ShieldCheck size={15} /> Two-factor authentication is active on this account.</p>
+                <p className="dialog-note">Recovery codes still available: <strong>{twoFactorStatus.recoveryCodesRemaining}</strong>. Generate a new set if you are running low, or turn two-factor off.</p>
+                <label className="field-label">Current authenticator or recovery code
+                  <input type="text" inputMode="numeric" autoComplete="one-time-code" maxLength={20} placeholder="123456" value={twoFactorCode} onChange={(event) => setTwoFactorCode(event.target.value)} />
+                </label>
+                <div className="button-row">
+                  <button type="button" className="button button-secondary" disabled={twoFactorBusy || twoFactorCode.length < 6} onClick={() => void regenerateRecoveryCodes()}>Generate new recovery codes</button>
+                  <button type="button" className="button button-small" disabled={twoFactorBusy || twoFactorCode.length < 6} onClick={() => void disableTwoFactor()}>Turn off two-factor</button>
+                </div>
+              </div>}
+
+              {!twoFactorStatus?.enabled && !twoFactorSetup && <div className="two-factor-start">
+                <p>Add a second step to every sign-in so a stolen password alone cannot reach your records.</p>
+                <button type="button" className="button button-primary" disabled={twoFactorBusy || !twoFactorStatus?.available} onClick={() => void beginTwoFactorEnrollment()}>{twoFactorBusy ? 'Preparing…' : 'Set up two-factor authentication'}</button>
+              </div>}
+
+              {twoFactorSetup && <div className="two-factor-setup">
+                {twoFactorSetup.otpauthUri && <>
+                  <ol className="two-factor-steps">
+                    <li>Install a free authenticator app such as Google Authenticator or Authy.</li>
+                    <li>Scan this QR code, or type the setup key shown below.</li>
+                    <li>Enter the 6-digit code the app shows to finish.</li>
+                  </ol>
+                  <div className="two-factor-qr-row">
+                    <KraQrBlock value={twoFactorSetup.otpauthUri} />
+                    <div><small>Setup key</small><strong className="kra-mono">{twoFactorSetup.secret.match(/.{1,4}/g)?.join(' ') ?? twoFactorSetup.secret}</strong></div>
+                  </div>
+                </>}
+                {twoFactorSetup.recoveryCodes.length > 0 && <div className="two-factor-codes">
+                  <strong>Save your recovery codes now</strong>
+                  <p className="dialog-note">Each code works once if you lose your phone. They are shown only this time.</p>
+                  <div className="two-factor-code-grid">{twoFactorSetup.recoveryCodes.map((code) => <code key={code}>{code}</code>)}</div>
+                  <button type="button" className="button button-small" onClick={() => downloadRecoveryCodes(twoFactorSetup.recoveryCodes)}>Download recovery codes</button>
+                </div>}
+                <label className="field-label">6-digit code from your app
+                  <input type="text" inputMode="numeric" autoComplete="one-time-code" maxLength={10} placeholder="123456" value={twoFactorCode} onChange={(event) => setTwoFactorCode(event.target.value)} />
+                </label>
+                <div className="button-row">
+                  <button type="button" className="button button-primary" disabled={twoFactorBusy || twoFactorCode.length < 6} onClick={() => void activateTwoFactor()}>{twoFactorBusy ? 'Verifying…' : 'Verify and turn on two-factor'}</button>
+                  <button type="button" className="button button-small" disabled={twoFactorBusy} onClick={() => { setTwoFactorSetup(null); setTwoFactorCode('') }}>Cancel</button>
+                </div>
+              </div>}
+            </section>
             <section className="module-card">
               <h2>Platform database backups</h2>
               <p>Automatic hourly full-database backups require the API operator to configure S3-compatible storage and `pg_dump`/`pg_restore`. The service rotates 24 UTC hourly slots; a slot is overwritten every 24 hours. Restore affects every business in the database, first creates a safety backup, and should be done during planned downtime.</p>

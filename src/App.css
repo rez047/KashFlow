@@ -505,3 +505,24 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
   .kra-fiscal-receipt,.kra-fiscal-receipt *{visibility:visible!important}
   .kra-fiscal-receipt{position:absolute!important;left:0;top:0;width:100%;max-width:none;border:0;padding:0;margin:0}
 }
+
+/* ---------- Two-factor authentication (authenticator app) ---------- */
+.auth-2fa-hint{display:flex;align-items:center;gap:8px;margin:0 0 14px;padding:11px 13px;border-radius:10px;background:#f2f8ff;border:1px solid #cfe4fb;color:#255a8f;font-size:12.5px;font-weight:600}
+.auth-2fa-hint svg{flex:none}
+.security-card{margin-top:18px}
+.two-factor-start p{margin:0 0 14px;color:#5b5877;font-size:13px}
+.two-factor-enabled p{display:flex;align-items:center;gap:8px;margin:0 0 8px;color:#166b48;font-weight:700;font-size:13.5px}
+.two-factor-enabled p svg{flex:none;color:#1fa971}
+.two-factor-enabled .dialog-note{display:block;color:#7a7891;font-weight:500}
+.two-factor-enabled .field-label{margin-top:12px;max-width:320px}
+.two-factor-enabled .button-row{margin-top:14px;flex-wrap:wrap;align-items:center}
+.two-factor-steps{margin:0 0 16px;padding-left:20px;color:#4c4966;font-size:13px;line-height:1.8}
+.two-factor-qr-row{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:18px}
+.two-factor-qr-row small{display:block;color:#6a6785;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
+.two-factor-codes{margin-bottom:18px;padding:16px;border-radius:12px;background:#fffaf3;border:1px solid #f3ddb3}
+.two-factor-codes>strong{display:block;font-size:13.5px;font-weight:800;color:#7a5a15;margin-bottom:5px}
+.two-factor-code-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:12px 0}
+.two-factor-code-grid code{display:block;padding:9px 8px;border-radius:8px;background:#fff;border:1px solid #efe1c2;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;font-weight:700;text-align:center;letter-spacing:.04em}
+.two-factor-setup .field-label{max-width:320px;margin-bottom:14px}
+.two-factor-setup .button-row{flex-wrap:wrap;align-items:center}
+@media(max-width:640px){.two-factor-code-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}

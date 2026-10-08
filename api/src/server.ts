@@ -44,6 +44,12 @@ const envSchema = z.object({
   BACKUP_S3_BUCKET: z.string().trim().min(3).optional(),
   BACKUP_S3_ACCESS_KEY_ID: z.string().trim().min(1).optional(),
   BACKUP_S3_SECRET_ACCESS_KEY: z.string().min(1).optional(),
+  BREVO_API_KEY: z.string().trim().optional(),
+  BREVO_SENDER_EMAIL: z.string().trim().max(200).optional(),
+  BREVO_SENDER_NAME: z.string().trim().max(120).optional(),
+  BREVO_SMS_SENDER: z.string().trim().max(11).optional(),
+  BREVO_WHATSAPP_NUMBER: z.string().trim().max(30).optional(),
+  TWO_FACTOR_ENCRYPTION_KEY: z.string().min(32).optional(),
 })
 const parsed = envSchema.safeParse(process.env)
 if (!parsed.success) {
@@ -65,6 +71,13 @@ const mpesaConfig = {
 }
 const mpesaConfigured = Object.values(mpesaConfig).every((value) => Boolean(value))
 const emailConfigured = Boolean(env.RESEND_API_KEY && env.EMAIL_FROM)
+// Brevo (free tier) powers transactional email and SMS. WhatsApp needs an approved Brevo
+// WhatsApp sender, so it stays off until the operator supplies BREVO_WHATSAPP_NUMBER.
+const brevoConfigured = Boolean(env.BREVO_API_KEY)
+const brevoEmailConfigured = Boolean(env.BREVO_API_KEY && (env.BREVO_SENDER_EMAIL || env.EMAIL_FROM))
+const brevoSmsConfigured = Boolean(env.BREVO_API_KEY && env.BREVO_SMS_SENDER)
+const brevoWhatsAppConfigured = Boolean(env.BREVO_API_KEY && env.BREVO_WHATSAPP_NUMBER)
+const twoFactorConfigured = Boolean(env.TWO_FACTOR_ENCRYPTION_KEY)
 const monoConfigured = Boolean(env.MONO_PUBLIC_KEY && env.MONO_SECRET_KEY)
 const kraEtimsLiveEnabled = env.KRA_ETIMS_ENV === 'production' && env.KRA_ETIMS_LIVE_ENABLED === 'true'
 const kraEtimsApiBase = env.KRA_ETIMS_ENV === 'production'
@@ -295,6 +308,116 @@ function decryptKraCredentials<T>(encoded: string): T {
   decipher.setAuthTag(Buffer.from(tagText, 'base64'))
   const plaintext = Buffer.concat([decipher.update(Buffer.from(dataText, 'base64')), decipher.final()]).toString('utf8')
   return JSON.parse(plaintext) as T
+}
+
+// ---- Two-factor authentication (TOTP authenticator app) ----
+// Implemented with node:crypto only, so it needs no paid dependency and works on the free tier.
+function twoFactorKey() {
+  const secret = env.TWO_FACTOR_ENCRYPTION_KEY ?? env.SESSION_SECRET
+  if (!secret) throw new Error('Set TWO_FACTOR_ENCRYPTION_KEY (or SESSION_SECRET) before enabling two-factor authentication.')
+  return createHash('sha256').update(`kashflow-2fa:${secret}`).digest()
+}
+function encryptTwoFactorSecret(value: string) {
+  const nonce = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', twoFactorKey(), nonce)
+  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()])
+  return `${nonce.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${ciphertext.toString('base64')}`
+}
+function decryptTwoFactorSecret(encoded: string) {
+  const [nonceText, tagText, dataText] = encoded.split(':')
+  if (!nonceText || !tagText || !dataText) throw new Error('Stored two-factor secret has an invalid format.')
+  const decipher = createDecipheriv('aes-256-gcm', twoFactorKey(), Buffer.from(nonceText, 'base64'))
+  decipher.setAuthTag(Buffer.from(tagText, 'base64'))
+  return Buffer.concat([decipher.update(Buffer.from(dataText, 'base64')), decipher.final()]).toString('utf8')
+}
+const base32Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+function base32Encode(buffer: Buffer) {
+  let bits = 0; let value = 0; let output = ''
+  for (const byte of buffer) {
+    value = (value << 8) | byte
+    bits += 8
+    while (bits >= 5) {
+      output += base32Alphabet[(value >>> (bits - 5)) & 31]
+      bits -= 5
+    }
+  }
+  if (bits > 0) output += base32Alphabet[(value << (5 - bits)) & 31]
+  return output
+}
+function base32Decode(input: string) {
+  const cleaned = input.replace(/=+$/g, '').toUpperCase().replace(/[^A-Z2-7]/g, '')
+  let bits = 0; let value = 0; const output: number[] = []
+  for (const character of cleaned) {
+    const index = base32Alphabet.indexOf(character)
+    if (index === -1) continue
+    value = (value << 5) | index
+    bits += 5
+    if (bits >= 8) {
+      output.push((value >>> (bits - 8)) & 255)
+      bits -= 8
+    }
+  }
+  return Buffer.from(output)
+}
+function generateTotpSecret() {
+  return base32Encode(randomBytes(20))
+}
+function totpCode(secret: string, step: number) {
+  const counter = Buffer.alloc(8)
+  counter.writeBigUInt64BE(BigInt(step))
+  const digest = createHmac('sha1', base32Decode(secret)).update(counter).digest()
+  const offset = digest[digest.length - 1]! & 0x0f
+  const binary = ((digest[offset]! & 0x7f) << 24) | ((digest[offset + 1]! & 0xff) << 16) | ((digest[offset + 2]! & 0xff) << 8) | (digest[offset + 3]! & 0xff)
+  return String(binary % 1_000_000).padStart(6, '0')
+}
+function currentTotpStep(offset = 0) {
+  return Math.floor(Date.now() / 30_000) + offset
+}
+// Accept the current step and one step either side to tolerate mild clock drift.
+function verifyTotpCode(secret: string, code: string) {
+  const normalized = code.replace(/\D/g, '')
+  if (normalized.length !== 6) return null
+  for (const offset of [0, -1, 1]) {
+    const step = currentTotpStep(offset)
+    if (timingSafeEqual(Buffer.from(totpCode(secret, step)), Buffer.from(normalized))) return step
+  }
+  return null
+}
+function hashRecoveryCode(code: string) {
+  return createHmac('sha256', twoFactorKey()).update(code.replace(/\D/g, '')).digest('hex')
+}
+function generateRecoveryCodes(count = 8) {
+  const codes: string[] = []
+  for (let index = 0; index < count; index += 1) {
+    const digits = randomBytes(5).toString('hex').toUpperCase().match(/.{1,4}/g)?.join('-') ?? ''
+    codes.push(digits.slice(0, 9))
+  }
+  return codes
+}
+function twoFactorOtpAuthUri(secret: string, account: string) {
+  const issuer = 'KashFlow'
+  const label = encodeURIComponent(`${issuer}:${account}`)
+  return `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`
+}
+
+// ---- Brevo transactional messaging (free tier) ----
+const brevoApiBase = 'https://api.brevo.com/v3'
+async function brevoSend(kind: 'email' | 'sms', payload: Record<string, unknown>) {
+  if (!env.BREVO_API_KEY) throw new Error('Brevo is not configured. Set BREVO_API_KEY on the API service.')
+  const response = await fetch(`${brevoApiBase}/${kind === 'email' ? 'smtp/email' : 'transactionalSMS/sms'}`, {
+    method: 'POST',
+    headers: { 'api-key': env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(20_000),
+  })
+  const result = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) throw new Error(String(result.message ?? result.error ?? `Brevo request failed (${response.status}).`).slice(0, 300))
+  return result
+}
+async function recordMessageDelivery(input: { workspaceId: string; channel: 'email' | 'sms' | 'whatsapp'; recipient: string; subject?: string; status: string; providerMessageId?: string; errorMessage?: string; createdBy?: string }) {
+  try {
+    await pool!.query('INSERT INTO message_deliveries (workspace_id, channel, recipient, subject, status, provider_message_id, error_message, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [input.workspaceId, input.channel, input.recipient, input.subject ?? null, input.status, input.providerMessageId ?? null, input.errorMessage ?? null, input.createdBy ?? null])
+  } catch (error) { console.error('Could not record message delivery:', error instanceof Error ? error.message : String(error)) }
 }
 const defaultChartOfAccounts = [
   { code: '1000', name: 'Cash and bank', type: 'asset' },
@@ -623,6 +746,21 @@ app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 *
     const user = result.rows[0]
     if (!user || !(await verifyPassword(input.data.password, user.password_hash))) { response.status(401).json({ error: 'Email/phone or password is incorrect.' }); return }
 
+    const twoFactor = await pool!.query('SELECT enabled_at, locked_until FROM user_two_factor WHERE user_id = $1', [user.id])
+    const enabledAt = twoFactor.rows[0]?.enabled_at
+    const lockedUntil = twoFactor.rows[0]?.locked_until
+    if (enabledAt && lockedUntil && new Date(lockedUntil).getTime() > Date.now()) {
+      response.status(429).json({ error: 'Two-factor verification is temporarily locked after repeated failed attempts. Try again shortly or use a recovery code.' }); return
+    }
+    if (enabledAt) {
+      // Password was correct, but no session is issued until the second factor is verified.
+      const challengeToken = randomBytes(32).toString('base64url')
+      const tokenHash = createHash('sha256').update(challengeToken).digest('hex')
+      await pool!.query('INSERT INTO pending_two_factor_logins (user_id, workspace_id, token_hash, expires_at) VALUES ($1, $2, $3, now() + interval \'5 minutes\')', [user.id, user.workspace_id, tokenHash])
+      response.status(200).json({ twoFactorRequired: true, challengeToken, message: 'Enter the 6-digit code from your authenticator app to finish signing in.' })
+      return
+    }
+
     const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1', [user.id])
     const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
     const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: user.workspace_id, name: user.workspace_name, role: 'admin' }]
@@ -632,6 +770,226 @@ app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 *
 })
 
 app.post('/v1/auth/logout', verifyOrigin, (_request, response) => { response.clearCookie(cookieName, { httpOnly: true, secure: env.NODE_ENV === 'production', sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax', path: '/' }); response.status(204).end() })
+
+// ---- Two-factor authentication endpoints ----
+// Finish a password login by proving possession of the authenticator app or a recovery code.
+app.post('/v1/auth/two-factor/verify-login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many two-factor attempts from this network. Please wait 15 minutes and try again.' } }), async (request, response, next) => {
+  const input = z.object({ challengeToken: z.string().trim().min(20).max(200), code: z.string().trim().min(6).max(20) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter the code from your authenticator app.' }); return }
+  const tokenHash = createHash('sha256').update(input.data.challengeToken).digest('hex')
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const pending = await client.query("SELECT id, user_id, workspace_id, attempts FROM pending_two_factor_logins WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now() FOR UPDATE", [tokenHash])
+    const challenge = pending.rows[0]
+    if (!challenge) { await client.query('ROLLBACK'); response.status(401).json({ error: 'This sign-in request has expired. Enter your password again.' }); return }
+    if (Number(challenge.attempts) >= 10) { await client.query('ROLLBACK'); response.status(429).json({ error: 'Too many incorrect codes. Enter your password again.' }); return }
+    const record = await client.query('SELECT secret_encrypted, enabled_at, locked_until, failed_attempts FROM user_two_factor WHERE user_id = $1', [challenge.user_id])
+    const factor = record.rows[0]
+    if (!factor?.enabled_at) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Two-factor authentication is not enabled for this account.' }); return }
+    if (factor.locked_until && new Date(factor.locked_until).getTime() > Date.now()) { await client.query('ROLLBACK'); response.status(429).json({ error: 'Two-factor verification is temporarily locked. Try again shortly.' }); return }
+
+    const secret = decryptTwoFactorSecret(String(factor.secret_encrypted))
+    const rawCode = input.data.code.trim().toUpperCase()
+    const step = verifyTotpCode(secret, rawCode)
+    let method: 'authenticator' | 'recovery' = 'authenticator'
+    if (step === null) {
+      // Fall back to a single-use recovery code.
+      const recovery = await client.query('SELECT id FROM user_recovery_codes WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL', [challenge.user_id, hashRecoveryCode(rawCode)])
+      if (!recovery.rowCount) {
+        await client.query('UPDATE pending_two_factor_logins SET attempts = attempts + 1 WHERE id = $1', [challenge.id])
+        const nextFailed = Number(factor.failed_attempts ?? 0) + 1
+        await client.query("UPDATE user_two_factor SET failed_attempts = $1, locked_until = CASE WHEN $1 >= 8 THEN now() + interval '15 minutes' ELSE locked_until END, updated_at = now() WHERE user_id = $2", [nextFailed, challenge.user_id])
+        await client.query('COMMIT')
+        response.status(401).json({ error: 'That code is not valid. Check your authenticator app, or use a recovery code.' }); return
+      }
+      await client.query('UPDATE user_recovery_codes SET used_at = now() WHERE id = $1', [recovery.rows[0].id])
+      method = 'recovery'
+    } else {
+      const lastStep = factor.last_used_step === null || factor.last_used_step === undefined ? null : Number(factor.last_used_step)
+      if (lastStep !== null && step <= lastStep) { await client.query('ROLLBACK'); response.status(409).json({ error: 'That authenticator code was already used. Wait for the next code.' }); return }
+      await client.query('UPDATE user_two_factor SET last_used_step = $1, failed_attempts = 0, locked_until = NULL, updated_at = now() WHERE user_id = $2', [step, challenge.user_id])
+    }
+    await client.query('UPDATE pending_two_factor_logins SET consumed_at = now() WHERE id = $1', [challenge.id])
+    await client.query('COMMIT')
+
+    const userRow = await pool!.query('SELECT u.id, u.workspace_id, u.email, u.phone, w.name AS workspace_name FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE u.id = $1', [challenge.user_id])
+    const user = userRow.rows[0]
+    const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1', [user.id])
+    const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
+    const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: user.workspace_id, name: user.workspace_name, role: 'admin' }]
+    setSessionCookie(response, { userId: user.id, workspaceId: user.workspace_id, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
+    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces, verifiedWith: method })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+app.get('/v1/auth/two-factor/status', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT enabled_at, created_at FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
+    const recovery = await pool!.query('SELECT count(*)::int AS remaining FROM user_recovery_codes WHERE user_id = $1 AND used_at IS NULL', [request.session!.userId])
+    response.json({
+      available: twoFactorConfigured,
+      enabled: Boolean(result.rows[0]?.enabled_at),
+      enabledAt: result.rows[0]?.enabled_at ?? null,
+      recoveryCodesRemaining: Number(recovery.rows[0]?.remaining ?? 0),
+    })
+  } catch (error) { next(error) }
+})
+
+// Start enrollment: generate a secret and recovery codes. 2FA is not active until verified.
+app.post('/v1/auth/two-factor/enroll', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  if (!twoFactorConfigured) { response.status(503).json({ error: 'Set TWO_FACTOR_ENCRYPTION_KEY on the API service before enabling two-factor authentication.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const secret = generateTotpSecret()
+    await client.query(`INSERT INTO user_two_factor (user_id, secret_encrypted, enabled_at, last_used_step, failed_attempts, locked_until, updated_at)
+      VALUES ($1, $2, NULL, NULL, 0, NULL, now())
+      ON CONFLICT (user_id) DO UPDATE SET secret_encrypted = EXCLUDED.secret_encrypted, enabled_at = NULL, last_used_step = NULL, failed_attempts = 0, locked_until = NULL, updated_at = now()`, [request.session!.userId, encryptTwoFactorSecret(secret)])
+    await client.query('DELETE FROM user_recovery_codes WHERE user_id = $1', [request.session!.userId])
+    const codes = generateRecoveryCodes()
+    for (const code of codes) await client.query('INSERT INTO user_recovery_codes (user_id, code_hash) VALUES ($1, $2)', [request.session!.userId, hashRecoveryCode(code)])
+    await client.query('COMMIT')
+    const account = await pool!.query('SELECT email, phone FROM users WHERE id = $1', [request.session!.userId])
+    const label = String(account.rows[0]?.email ?? account.rows[0]?.phone ?? 'account')
+    response.json({ secret, otpauthUri: twoFactorOtpAuthUri(secret, label), recoveryCodes: codes, notice: 'Confirm a code from your authenticator app to activate two-factor authentication.' })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+// Confirm enrollment with a live code, which switches 2FA on.
+app.post('/v1/auth/two-factor/activate', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ code: z.string().trim().min(6).max(10) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter the 6-digit code from your authenticator app.' }); return }
+  try {
+    const result = await pool!.query('SELECT secret_encrypted FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
+    if (!result.rowCount) { response.status(409).json({ error: 'Start two-factor setup first.' }); return }
+    const secret = decryptTwoFactorSecret(String(result.rows[0].secret_encrypted))
+    const step = verifyTotpCode(secret, input.data.code)
+    if (step === null) { response.status(401).json({ error: 'That code is not valid. Check your phone clock and try the current code.' }); return }
+    await pool!.query('UPDATE user_two_factor SET enabled_at = now(), last_used_step = $1, failed_attempts = 0, locked_until = NULL, updated_at = now() WHERE user_id = $2', [step, request.session!.userId])
+    const auditClient = await pool!.connect()
+    try { await recordAudit(auditClient, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'auth.two_factor_enabled', entityType: 'user', entityId: request.session!.userId, eventData: {} }) } finally { auditClient.release() }
+    response.json({ enabled: true, notice: 'Two-factor authentication is now active for your account.' })
+  } catch (error) { next(error) }
+})
+
+// Disable 2FA. Requires a live code so a hijacked session alone cannot remove the factor.
+app.post('/v1/auth/two-factor/disable', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ code: z.string().trim().min(6).max(20) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a current authenticator or recovery code to disable two-factor authentication.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query('SELECT secret_encrypted, enabled_at FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
+    const factor = result.rows[0]
+    if (!factor?.enabled_at) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Two-factor authentication is not enabled.' }); return }
+    const secret = decryptTwoFactorSecret(String(factor.secret_encrypted))
+    const validTotp = verifyTotpCode(secret, input.data.code) !== null
+    const recovery = validTotp ? null : await client.query('SELECT id FROM user_recovery_codes WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL', [request.session!.userId, hashRecoveryCode(input.data.code)])
+    if (!validTotp && !recovery?.rowCount) { await client.query('ROLLBACK'); response.status(401).json({ error: 'That code is not valid. Two-factor authentication was not changed.' }); return }
+    if (recovery?.rowCount) await client.query('UPDATE user_recovery_codes SET used_at = now() WHERE id = $1', [recovery.rows[0].id])
+    await client.query('DELETE FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
+    await client.query('DELETE FROM user_recovery_codes WHERE user_id = $1', [request.session!.userId])
+    await client.query('DELETE FROM pending_two_factor_logins WHERE user_id = $1', [request.session!.userId])
+    await client.query('COMMIT')
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'auth.two_factor_disabled', entityType: 'user', entityId: request.session!.userId, eventData: {} })
+    response.json({ enabled: false, notice: 'Two-factor authentication has been disabled for your account.' })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+// Issue a fresh set of recovery codes (invalidates the old ones).
+app.post('/v1/auth/two-factor/recovery-codes', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ code: z.string().trim().min(6).max(20) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a current authenticator or recovery code first.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await client.query('SELECT secret_encrypted, enabled_at FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
+    const factor = result.rows[0]
+    if (!factor?.enabled_at) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Two-factor authentication is not enabled.' }); return }
+    const secret = decryptTwoFactorSecret(String(factor.secret_encrypted))
+    const validTotp = verifyTotpCode(secret, input.data.code) !== null
+    const recovery = validTotp ? null : await client.query('SELECT id FROM user_recovery_codes WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL', [request.session!.userId, hashRecoveryCode(input.data.code)])
+    if (!validTotp && !recovery?.rowCount) { await client.query('ROLLBACK'); response.status(401).json({ error: 'That code is not valid. Recovery codes were not changed.' }); return }
+    await client.query('DELETE FROM user_recovery_codes WHERE user_id = $1', [request.session!.userId])
+    const codes = generateRecoveryCodes()
+    for (const code of codes) await client.query('INSERT INTO user_recovery_codes (user_id, code_hash) VALUES ($1, $2)', [request.session!.userId, hashRecoveryCode(code)])
+    await client.query('COMMIT')
+    response.json({ recoveryCodes: codes, notice: 'Store these recovery codes safely. Each can be used once if you lose your authenticator.' })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+// ---- Brevo transactional messaging (free tier) ----
+app.get('/v1/messaging/status', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const recent = await pool!.query('SELECT id, channel, recipient, subject, status, provider_message_id, error_message, created_at FROM message_deliveries WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 25', [request.session!.workspaceId])
+    response.json({
+      channels: {
+        email: { configured: brevoEmailConfigured, sender: env.BREVO_SENDER_EMAIL ?? env.EMAIL_FROM ?? null },
+        sms: { configured: brevoSmsConfigured, sender: env.BREVO_SMS_SENDER ?? null },
+        whatsapp: { configured: brevoWhatsAppConfigured, number: env.BREVO_WHATSAPP_NUMBER ?? null },
+      },
+      brevoConnected: brevoConfigured,
+      freeTierNote: 'Brevo free tier includes limited daily email and SMS credits. WhatsApp requires an approved Brevo WhatsApp sender.',
+      deliveries: recent.rows,
+    })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/messaging/send', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    channel: z.enum(['email', 'sms', 'whatsapp']),
+    recipient: z.string().trim().min(3).max(254),
+    subject: z.string().trim().max(200).optional(),
+    message: z.string().trim().min(1).max(5000),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Choose a channel, recipient, and message.' }); return }
+  if (!brevoConfigured) { response.status(503).json({ error: 'Brevo is not configured. Set BREVO_API_KEY on the API service.' }); return }
+  try {
+    if (input.data.channel === 'email') {
+      if (!brevoEmailConfigured) { response.status(503).json({ error: 'Brevo email needs BREVO_SENDER_EMAIL (or EMAIL_FROM) on the API service.' }); return }
+      const senderEmail = env.BREVO_SENDER_EMAIL ?? env.EMAIL_FROM!
+      const result = await brevoSend('email', {
+        sender: { email: senderEmail, name: env.BREVO_SENDER_NAME ?? 'KashFlow' },
+        to: [{ email: input.data.recipient }],
+        subject: input.data.subject ?? 'Message from KashFlow',
+        htmlContent: `<main style="font-family:Arial,sans-serif;color:#242537;max-width:640px;margin:auto"><p>${input.data.message.replace(/\n/g, '<br/>')}</p><small>Sent from your KashFlow workspace.</small></main>`,
+        textContent: input.data.message,
+      })
+      await recordMessageDelivery({ workspaceId: request.session!.workspaceId, channel: 'email', recipient: input.data.recipient, subject: input.data.subject ?? 'Message from KashFlow', status: 'accepted', providerMessageId: result.messageId ? String(result.messageId) : undefined, createdBy: request.session!.userId })
+      response.status(202).json({ delivery: { channel: 'email', status: 'accepted', providerMessageId: result.messageId ?? null, recipient: input.data.recipient } })
+      return
+    }
+    if (input.data.channel === 'sms') {
+      if (!brevoSmsConfigured) { response.status(503).json({ error: 'Brevo SMS needs BREVO_SMS_SENDER (max 11 characters) on the API service.' }); return }
+      const phone = normalizeKenyanPhone(input.data.recipient)
+      if (!phone) { response.status(400).json({ error: 'Enter a valid Kenyan mobile number (07XXXXXXXX or 2547XXXXXXXX).' }); return }
+      const result = await brevoSend('sms', {
+        sender: env.BREVO_SMS_SENDER,
+        recipient: phone,
+        content: input.data.message,
+        type: 'transactional',
+        unicodeEnabled: true,
+      })
+      await recordMessageDelivery({ workspaceId: request.session!.workspaceId, channel: 'sms', recipient: phone, status: 'accepted', providerMessageId: result.messageId ? String(result.messageId) : undefined, createdBy: request.session!.userId })
+      response.status(202).json({ delivery: { channel: 'sms', status: 'accepted', providerMessageId: result.messageId ?? null, recipient: phone } })
+      return
+    }
+    // WhatsApp is limited to an approved Brevo WhatsApp sender; it is off until the operator
+    // supplies BREVO_WHATSAPP_NUMBER. This keeps the free tier honest rather than silently failing.
+    if (!brevoWhatsAppConfigured) { response.status(503).json({ error: 'Brevo WhatsApp needs an approved sender. Set BREVO_WHATSAPP_NUMBER after Brevo approves your WhatsApp account (not part of the free email/SMS tier).' }); return }
+    response.status(501).json({ error: 'WhatsApp delivery is not enabled. Use email or SMS on the Brevo free tier, or contact us for WhatsApp onboarding.' })
+  } catch (error) {
+    await recordMessageDelivery({ workspaceId: request.session!.workspaceId, channel: input.data.channel, recipient: input.data.recipient, status: 'failed', errorMessage: error instanceof Error ? error.message.slice(0, 300) : 'Provider error.', createdBy: request.session!.userId })
+    if (error instanceof Error && error.message.startsWith('Brevo')) { response.status(502).json({ error: error.message }); return }
+    next(error)
+  }
+})
+
 app.get('/v1/auth/me', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
     const result = await pool!.query('SELECT u.email, u.phone, wm.workspace_id, w.name AS workspace_name FROM users u JOIN workspace_members wm ON wm.user_id = u.id AND wm.workspace_id = $2 JOIN workspaces w ON w.id = wm.workspace_id WHERE u.id = $1', [request.session!.userId, request.session!.workspaceId])
