@@ -428,7 +428,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
       <div className="hero-grid">
         <div className="hero-copy">
           <span className="hero-pill"><Sparkles size={14} /> Built in Kenya, for Kenyan businesses</span>
-          <h1>Run your whole biashara from <em>one</em> beautiful dashboard.</h1>
+          <h1>Run your whole biashara from <em>one</em> insightful dashboard.</h1>
           <p className="hero-sub">KashFlow brings invoicing, point of sale, inventory, multi-branch stock, accounting, payroll and KRA eTIMS compliance together — so every shop, duka, supplier and venture can finally see where the money really goes.</p>
           <div className="hero-actions">
             <button type="button" className="button button-primary button-xl" onClick={() => onDemo('Premium')}>Start the free live demo</button>
@@ -513,7 +513,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
       <div className="included-grid">
         {[
           ['Invoicing & estimates', 'Multi-line invoices, partial payments, email delivery to customers and suppliers, recurring schedules, printable previews.'],
-          ['Point of sale', 'Counter checkout, barcode/SKU scanning, cash &amp; M-Pesa, internal receipts, offline sale drafts that sync when back online.'],
+          ['Point of sale', 'Counter checkout, barcode/SKU scanning, cash & M-Pesa, internal receipts, offline sale drafts that sync when back online.'],
           ['Inventory & stock', 'Weighted-average costing, per-location balances, transfers, stock counts, write-offs, reorder alerts, purchase orders.'],
           ['Customers & suppliers', 'Saved customer and supplier records, sale history and lifetime value snapshots, supplier-linked items, CSV import/export.'],
           ['Accounting', 'Chart of accounts, balanced journals, trial balance, income statement, balance sheet, period close and reversals.'],
