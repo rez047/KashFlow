@@ -3,10 +3,10 @@ import { OnlineStoreApp } from './OnlineStore'
 import { languages, useTranslation, type LanguageCode } from './i18n'
 import {
   Activity, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
-  BriefcaseBusiness, CalendarDays, Check, ChevronRight, CircleHelp,
+  BriefcaseBusiness, CalendarDays, Camera, Check, ChevronRight, CircleHelp,
   FileText, Filter, Gauge, Landmark, LayoutDashboard,
   LifeBuoy, LogOut, Mail, Menu, MessageCircle, Minus, Package, Phone, Plus, Printer, QrCode,
-  Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Sparkles, Star, Trash2, Users, Wallet, X,
+  ScanBarcode, Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Sparkles, Star, Trash2, Users, Volume2, Wallet, X,
 } from 'lucide-react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { SupplierBillEmailSection } from './SupplierBillEmailSection'
@@ -205,6 +205,14 @@ const CONTACT_PHONE_INTL = '254746827220'
 const CONTACT_EMAIL = 'ezrasimiyu777@gmail.com'
 const LANDING_YEAR = new Date().getFullYear()
 
+// Selecting a subscription package signs the visitor into this shared demo workspace.
+const DEMO_ACCOUNT = {
+  businessName: 'KENYA YETU',
+  identifier: 'admin@kashflow.com',
+  phone: '0712345678',
+  password: 'KashFlowDemo2026!',
+}
+
 const landingFeatures: Array<{ icon: typeof Gauge; title: string; blurb: string; tag: string }> = [
   { icon: Gauge, title: 'Track every shilling', blurb: 'Capture daily income and expenses in seconds. Your profit, cash flow and net movement update live so you always know how the biashara is doing.', tag: 'Money in, money out' },
   { icon: FileText, title: 'Invoices & estimates that get you paid', blurb: 'Create multi-line invoices and quotes in minutes, email them straight to customers and suppliers, track partial payments and send reminders. Convert accepted estimates to invoices with one tap.', tag: 'Get paid faster' },
@@ -226,7 +234,54 @@ const landingTestimonials: Array<{ name: string; business: string; town: string;
   { name: 'Faith Chebet', business: 'Chebet Boutique', town: 'Eldoret', quote: 'Invoicing and M-Pesa together is a game changer. I send an invoice and the customer pays on the phone. My books balance themselves and KRA preparation is already there.' },
 ]
 
-function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: () => void }) {
+// Business types and prospects KashFlow is tailored for. Each entry names the sector and
+// how the product fits that specific line of work, in Kenyan terms.
+const landingSegments: Array<{ name: string; icon: typeof Gauge; fit: string }> = [
+  { name: 'Dukas & neighbourhood shops', icon: ShoppingBag, fit: 'Fast counter checkout, stock alerts before you run out, and a daily profit picture for every shop.' },
+  { name: 'Supermarkets & mini-marts', icon: ShoppingBag, fit: 'Barcode scanning, weighed and bulk items, multiple tills, and shelf-level stock counts.' },
+  { name: 'Wholesalers & distributors', icon: Package, fit: 'Bulk sales, credit customers, supplier bills, purchase orders and stock moving between depots.' },
+  { name: 'Hardware & building supplies', icon: Package, fit: 'Hundreds of fast-moving SKUs, quotes converted to invoices, and stock across several yards.' },
+  { name: 'Pharmacies & chemists', icon: ShieldCheck, fit: 'Expiry-aware stock, batch control, prescriptions billed to invoice, and controlled reorder points.' },
+  { name: 'Agrovets & farm input shops', icon: Package, fit: 'Seasonal stock, supplier-linked items, bulk orders to farmers and county-wide branch transfers.' },
+  { name: 'Restaurants, cafés & hotels', icon: ShoppingBag, fit: 'Counter and table sales, daily cash-up, expense tracking for food costs, and staff payroll.' },
+  { name: 'Barbers, salons & spas', icon: Users, fit: 'Service catalog with POS checkout, appointment-based sales, and simple daily reconciliation.' },
+  { name: 'Boutiques & fashion retailers', icon: ShoppingBag, fit: 'Size and variant stock, returns and credits, layaway customers, and best-seller insights.' },
+  { name: 'Electronics & phone shops', icon: Package, fit: 'High-value stock control, serial and SKU tracking, warranty returns, and M-Pesa checkout.' },
+  { name: 'Furniture & home stores', icon: Package, fit: 'Large-ticket invoicing, deposit and partial payments, delivery tracking per branch.' },
+  { name: 'Car dealers & spare parts', icon: Package, fit: 'Parts inventory interchange, quotes to invoices, and workshop job costs as projects.' },
+  { name: 'Auto garages & mechanics', icon: BriefcaseBusiness, fit: 'Billable project hours, parts on the invoice, and clear costing per job.' },
+  { name: 'Transporters & matatu SACCOs', icon: Banknote, fit: 'Daily cash collections, fuel and maintenance expenses, and per-vehicle profit reports.' },
+  { name: 'Logistics & courier services', icon: Package, fit: 'Recurring invoices, waybill-related charges, and expense tracking per client.' },
+  { name: 'Cargo & clearing agents', icon: BriefcaseBusiness, fit: 'Project-per-shipment costing, supplier bills, and multi-currency invoice records.' },
+  { name: 'Fuel stations & minimarts', icon: Banknote, fit: 'Attendant tills, shift cash-up, M-Pesa and cash mix, and pump-side stock.' },
+  { name: 'Milk bars & milk ATMs', icon: Package, fit: 'Litre-based stock in grams or litres, instant POS checkout, and daily reconciliation.' },
+  { name: 'Bakeries & confectioneries', icon: ShoppingBag, fit: 'Production into stock, expiry-aware items, wholesale and retail pricing.' },
+  { name: 'Butcheries & fresh produce', icon: Package, fit: 'Weighted items, shrinkage tracking, spoilage write-offs, and fast counter checkout.' },
+  { name: 'Agribusiness & produce buyers', icon: Package, fit: 'Farmer-linked purchases, seasonal stock, bulk grading, and supplier settlement records.' },
+  { name: 'M-Pesa & agency banking shops', icon: Smartphone, fit: 'Float and transaction records, commission as income, and instant M-Pesa POS collection.' },
+  { name: 'Schools & training colleges', icon: BookOpen, fit: 'Termly fee invoices, customer records per parent, recurring charges and budgets.' },
+  { name: 'Clinics & health centres', icon: ShieldCheck, fit: 'Patient invoices, consumable stock, supplier bills and payroll for staff.' },
+  { name: 'NGOs & CBOs', icon: Users, fit: 'Project budgets, restricted spend tracking, donor-ready reports, and role-based access.' },
+  { name: 'SACCOs & microfinance', icon: Banknote, fit: 'Member invoicing, recurring collections, receivable aging and cash-flow outlook.' },
+  { name: 'Contractors & construction firms', icon: BriefcaseBusiness, fit: 'Site budgets, materials stock, labour hours, and progress invoicing.' },
+  { name: 'Real estate & property agents', icon: Banknote, fit: 'Rent invoices, recurring schedules, tenant records and receivables aging.' },
+  { name: 'Printers, sign makers & creatives', icon: FileText, fit: 'Job quotes to invoices, materials stock, and project time for billable work.' },
+  { name: 'Tailors & uniform suppliers', icon: Package, fit: 'Order tracking as sales orders, deposits, bulk school or staff runs.' },
+  { name: 'Cyber cafés & tech hubs', icon: Smartphone, fit: 'Service POS for printing, browsing and airtime, with simple expense tracking.' },
+  { name: 'Event planners & catering', icon: Users, fit: 'Per-event projects, supplier bills, deposit invoicing and staff payroll.' },
+  { name: 'Cleaning & security services', icon: Users, fit: 'Recurring monthly invoices, guard or staff rosters, and site-based costing.' },
+  { name: 'Consultancies & professional firms', icon: BriefcaseBusiness, fit: 'Billable time, milestone invoices, expense recharges, and client aging reports.' },
+  { name: 'Distributors of FMCG & beverages', icon: Package, fit: 'Route stock transfers, credit customers, and reorder alerts across regions.' },
+  { name: 'Online sellers & social commerce', icon: ShoppingBag, fit: 'Hosted storefront, order requests, WooCommerce sync, and M-Pesa collection.' },
+  { name: 'Suppliers & manufacturers', icon: Package, fit: 'Production to stock, purchase orders, supplier-linked items, and invoicing to buyers.' },
+  { name: 'Church & community groups', icon: Users, fit: 'Contributions as income, event expenses, budgets, and clean records for oversight.' },
+  { name: 'Fitness centres & gyms', icon: Users, fit: 'Membership invoicing, recurring charges, and equipment or class expense tracking.' },
+  { name: 'Car washes & cleaning bays', icon: Banknote, fit: 'Fast daily POS, cash-up per shift, and consumable stock control.' },
+  { name: 'Hardware & paint shops', icon: Package, fit: 'Colour and size variants, wholesale and retail pricing, and credit customers.' },
+  { name: 'Bookshops & stationers', icon: BookOpen, fit: 'School bulk orders, returns, and textbook stock by branch.' },
+]
+
+function LandingPage({ onSignIn, onDemo }: { onSignIn: () => void; onDemo: (packageName: string) => void }) {
   const phoneDisplay = `+254 746 827 220`
   return <div className="landing">
     <header className="landing-nav">
@@ -237,6 +292,7 @@ function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: (
         </div>
         <nav className="landing-links" aria-label="Homepage navigation">
           <a href="#features">Features</a>
+          <a href="#who-we-serve">Who we serve</a>
           <a href="#whats-included">What&apos;s included</a>
           <a href="#compliance">Kenya compliance</a>
           <a href="#pricing">Pricing</a>
@@ -244,7 +300,7 @@ function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: (
         </nav>
         <div className="landing-nav-actions">
           <button type="button" className="button button-ghost" onClick={onSignIn}>Sign in</button>
-          <button type="button" className="button button-primary" onClick={onSignUp}>Create business account</button>
+          <button type="button" className="button button-primary" onClick={() => onDemo('Comfort')}>Try the live demo</button>
         </div>
       </div>
     </header>
@@ -258,7 +314,7 @@ function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: (
           <h1>Run your whole biashara from <em>one</em> beautiful dashboard.</h1>
           <p className="hero-sub">KashFlow brings invoicing, point of sale, inventory, multi-branch stock, accounting, payroll and KRA eTIMS compliance together — so every shop, duka, supplier and venture can finally see where the money really goes.</p>
           <div className="hero-actions">
-            <button type="button" className="button button-primary button-xl" onClick={onSignUp}>Create a new business admin account</button>
+            <button type="button" className="button button-primary button-xl" onClick={() => onDemo('Premium')}>Start the free live demo</button>
             <button type="button" className="button button-secondary button-xl" onClick={onSignIn}>I already have an account</button>
           </div>
           <ul className="hero-points">
@@ -310,6 +366,24 @@ function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: (
           <h3>{title}</h3>
           <p>{blurb}</p>
         </article>)}
+      </div>
+    </section>
+
+    <section className="landing-section landing-band" id="who-we-serve">
+      <div className="section-head">
+        <span className="section-eyebrow">WHO WE SERVE</span>
+        <h2>Tailor-made for <em>{landingSegments.length}+</em> business types</h2>
+        <p>From a single duka in Kawangware to a distributor running depots across three counties, KashFlow fits the way each Kenyan business actually works. Here is how we serve the specific sectors we built for.</p>
+      </div>
+      <div className="segment-grid">
+        {landingSegments.map(({ name, icon: Icon, fit }) => <article className="segment-card" key={name}>
+          <span className="segment-icon"><Icon size={18} /></span>
+          <div><h3>{name}</h3><p>{fit}</p></div>
+        </article>)}
+      </div>
+      <div className="segment-cta">
+        <p>Don&apos;t see your line of business? We tailor KashFlow to any Kenyan business — tell us what you do and we will set up your workspace.</p>
+        <button type="button" className="button button-primary" onClick={() => onDemo('Premium')}>See it live with a demo workspace</button>
       </div>
     </section>
 
@@ -380,7 +454,7 @@ function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: (
             <li><Check size={15} /> KRA eTIMS preparation &amp; compliance tracking</li>
             <li><Check size={15} /> Team roles &amp; permissions</li>
           </ul>
-          <button type="button" className="button button-secondary button-xl" onClick={onSignUp}>Start with Comfort</button>
+          <button type="button" className="button button-secondary button-xl" onClick={() => onDemo('Comfort')}>Start with Comfort</button>
         </article>
         <article className="price-card price-card-premium">
           <span className="price-ribbon">Most popular</span>
@@ -397,7 +471,7 @@ function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: (
             <li><Check size={15} /> Premium support for your team</li>
           </ul>
           <p className="price-note">Premium connections (M-Pesa &amp; Mono) incur an extra charge and are billed within this package.</p>
-          <button type="button" className="button button-primary button-xl" onClick={onSignUp}>Go Premium</button>
+          <button type="button" className="button button-primary button-xl" onClick={() => onDemo('Premium')}>Go Premium</button>
         </article>
       </div>
     </section>
@@ -421,7 +495,7 @@ function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: (
         <div className="cta-copy">
           <span className="section-eyebrow"><Sparkles size={14} /> GET STARTED TODAY</span>
           <h2>Ready to grow your biashara?</h2>
-          <p>Sign in if you already have a workspace, or create a fresh business admin account and set up your shop, stock and staff in minutes. Talk to us any time on WhatsApp, SMS or a call.</p>
+          <p>Sign in if you already have a workspace, or open the free live demo and explore a full Kenyan business workspace in seconds. Talk to us any time on WhatsApp, SMS or a call.</p>
           <div className="cta-contact-grid">
             <a className="contact-chip" href={`https://wa.me/${CONTACT_PHONE_INTL}`} target="_blank" rel="noreferrer"><MessageCircle size={19} /><div><strong>WhatsApp</strong><small>{phoneDisplay}</small></div></a>
             <a className="contact-chip" href={`tel:+${CONTACT_PHONE_INTL}`}><Phone size={19} /><div><strong>Calls &amp; SMS</strong><small>{phoneDisplay}</small></div></a>
@@ -429,9 +503,9 @@ function LandingPage({ onSignIn, onSignUp }: { onSignIn: () => void; onSignUp: (
           </div>
         </div>
         <div className="cta-actions">
-          <button type="button" className="button button-primary button-xl cta-signup" onClick={onSignUp}>Create a new business admin account</button>
+          <button type="button" className="button button-primary button-xl cta-signup" onClick={() => onDemo('Premium')}>Open the free live demo</button>
           <button type="button" className="button button-secondary button-xl cta-signin" onClick={onSignIn}>Sign in to my workspace</button>
-          <p className="cta-fineprint">New business owners can create a separate workspace with their own admin login. Your records are stored in the connected database.</p>
+          <p className="cta-fineprint">The demo opens a pre-loaded {DEMO_ACCOUNT.businessName} workspace so you can try every feature right away. Give us a call any time.</p>
         </div>
       </div>
     </section>
@@ -511,7 +585,6 @@ function App() {
   const [account, setAccount] = useState<Account | null>(null)
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
   const [integrationReadiness, setIntegrationReadiness] = useState<IntegrationReadiness | null>(null)
-  const [bootstrapAvailable, setBootstrapAvailable] = useState(false)
   const [showSetupFlow, setShowSetupFlow] = useState(false)
   const [authPanelOpen, setAuthPanelOpen] = useState(false)
   const [businessName, setBusinessName] = useState('')
@@ -535,6 +608,15 @@ function App() {
   const [mpesaPromptSubmitting, setMpesaPromptSubmitting] = useState(false)
   const [posSearch, setPosSearch] = useState('')
   const [posLocationId, setPosLocationId] = useState('')
+  const [scannerMode, setScannerMode] = useState<'keyboard' | 'camera'>(() => (localStorage.getItem('kashflow-pos-scanner-mode') === 'camera' ? 'camera' : 'keyboard'))
+  const [scannerBeep, setScannerBeep] = useState(() => localStorage.getItem('kashflow-pos-scanner-beep') !== 'off')
+  const [scanFlash, setScanFlash] = useState<{ code: string; ok: boolean; message: string } | null>(null)
+  const [cameraScanning, setCameraScanning] = useState(false)
+  const scanBufferRef = useRef({ value: '', lastKeyAt: 0 })
+  const cameraStreamRef = useRef<MediaStream | null>(null)
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null)
+  const cameraRafRef = useRef<number | null>(null)
+  const scanFlashTimer = useRef<number | null>(null)
   const [posCart, setPosCart] = useState<PosCartLine[]>([])
   const [posCustomer, setPosCustomer] = useState('')
   const [posCustomerType, setPosCustomerType] = useState<'walk_in' | 'remote'>('walk_in')
@@ -752,9 +834,13 @@ function App() {
       try {
         const status = await request<{ bootstrapAvailable: boolean }>('/v1/auth/status')
         if (!active) return
-        setBootstrapAvailable(status.bootstrapAvailable)
-        setShowSetupFlow(status.bootstrapAvailable)
-        setAuthPanelOpen(status.bootstrapAvailable)
+        // No public sign-up on the homepage. When a fresh database has no users yet,
+        // open the sign-in panel prefilled with the default KENYA YETU admin details.
+        if (status.bootstrapAvailable) {
+          setShowSetupFlow(true)
+          setCredentials({ identifier: DEMO_ACCOUNT.identifier, password: DEMO_ACCOUNT.password, businessName: DEMO_ACCOUNT.businessName })
+          setAuthPanelOpen(true)
+        }
         try {
           const signedIn = await request<Account>('/v1/auth/me')
           if (!active) return
@@ -1165,7 +1251,7 @@ function App() {
           clearInvitationFromUrl()
           notify('Account created and invitation accepted.')
         }
-        setBootstrapAvailable(false); setShowSetupFlow(false); await refresh()
+        setShowSetupFlow(false); await refresh()
         return
       }
       const route = showSetupFlow ? '/v1/auth/bootstrap' : '/v1/auth/login'
@@ -1173,10 +1259,41 @@ function App() {
         ? { identifier: credentials.identifier, password: credentials.password, businessName: credentials.businessName }
         : { identifier: credentials.identifier, password: credentials.password }
       const signedIn = await request<Account>(route, { method: 'POST', body: JSON.stringify(body) })
-      setAccount(signedIn); setBootstrapAvailable(false); setShowSetupFlow(false); await refresh()
+      setAccount(signedIn); setShowSetupFlow(false); await refresh()
       await acceptPendingInvitation()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not sign in.')
+    } finally { setBusy(false) }
+  }
+
+  // Selecting a subscription opens the shared KENYA YETU demo workspace: sign in to the
+  // existing demo administrator, or create it on first use. No customer sign-up is shown.
+  async function startDemoWorkspace(packageName: string) {
+    setBusy(true); setError('')
+    try {
+      const demoCredentials = { identifier: DEMO_ACCOUNT.identifier, password: DEMO_ACCOUNT.password }
+      let demoAccount: Account
+      try {
+        demoAccount = await request<Account>('/v1/auth/login', { method: 'POST', body: JSON.stringify(demoCredentials) })
+      } catch {
+        demoAccount = await request<Account>('/v1/auth/bootstrap', {
+          method: 'POST',
+          body: JSON.stringify({ ...demoCredentials, businessName: DEMO_ACCOUNT.businessName }),
+        }).catch(async (reason) => {
+          // A previous session may already hold this demo account; retry the sign-in once.
+          const retry = await request<Account>('/v1/auth/login', { method: 'POST', body: JSON.stringify(demoCredentials) }).catch(() => null)
+          if (retry) return retry
+          throw reason
+        })
+      }
+      setAccount(demoAccount)
+      setShowSetupFlow(false); setAuthPanelOpen(false)
+      await refresh()
+      await acceptPendingInvitation()
+      notify(`${packageName} demo workspace ready · ${DEMO_ACCOUNT.businessName}`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not open the demo workspace.')
+      setAuthPanelOpen(true)
     } finally { setBusy(false) }
   }
 
@@ -1316,17 +1433,154 @@ function App() {
     } finally { setBusy(false) }
   }
 
+  // Resolve a scanned code by barcode or SKU and add it to the current sale.
+  function resolveScanCode(rawCode: string, source: string) {
+    const code = rawCode.trim().toLowerCase()
+    if (!code) return false
+    const item = records.inventory.find((record) => [record.data.barcode, record.data.sku].some((value) => String(value ?? '').trim().toLowerCase() === code))
+    flashScanResult(code, Boolean(item), item ? `Added ${String(item.data.name ?? 'item')}` : `No item matches “${rawCode.trim()}”`)
+    if (!item) return false
+    addPosItem(item)
+    setPosSearch('')
+    notify(`${source}: ${String(item.data.name ?? 'Item')} added to the sale.`)
+    return true
+  }
+
+  function flashScanResult(code: string, ok: boolean, message: string) {
+    setScanFlash({ code, ok, message })
+    if (scanFlashTimer.current) window.clearTimeout(scanFlashTimer.current)
+    scanFlashTimer.current = window.setTimeout(() => setScanFlash(null), 2600)
+    playScanBeep(ok)
+  }
+
+  function playScanBeep(ok: boolean) {
+    if (!scannerBeep) return
+    try {
+      const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+      if (!Ctor) return
+      const context = new Ctor()
+      const oscillator = context.createOscillator()
+      const gain = context.createGain()
+      oscillator.type = 'sine'
+      oscillator.frequency.value = ok ? 1180 : 320
+      gain.gain.value = 0.05
+      oscillator.connect(gain); gain.connect(context.destination)
+      oscillator.start()
+      oscillator.stop(context.currentTime + (ok ? 0.09 : 0.28))
+      oscillator.onended = () => void context.close().catch(() => undefined)
+    } catch { /* audio is best-effort feedback only */ }
+  }
+
+  // Manual Enter submit from the search / scan box.
   function scanPosBarcode(event: KeyboardEvent<HTMLInputElement>) {
     if (event.key !== 'Enter') return
-    const code = event.currentTarget.value.trim().toLowerCase()
+    const code = event.currentTarget.value.trim()
     if (!code) return
-    const item = records.inventory.find((record) => [record.data.barcode, record.data.sku].some((value) => String(value ?? '').trim().toLowerCase() === code))
-    if (item) {
-      event.preventDefault()
-      addPosItem(item)
-      setPosSearch('')
+    event.preventDefault()
+    resolveScanCode(code, 'Manual entry')
+  }
+
+  // Any USB-HID or Bluetooth barcode reader in keyboard-wedge mode types its code very fast
+  // and ends with Enter. This global listener captures those scans wherever focus happens to be.
+  useEffect(() => {
+    if (page !== 'Point of sale' || scannerMode !== 'keyboard') return
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      const target = event.target as HTMLElement | null
+      const tag = target?.tagName?.toLowerCase()
+      const isEditable = tag === 'input' || tag === 'textarea' || tag === 'select' || target?.isContentEditable
+      // Let the dedicated search / scan box handle its own Enter; avoid double capture.
+      if (isEditable && target?.getAttribute('aria-label')?.includes('scan barcode')) return
+      if (event.ctrlKey || event.altKey || event.metaKey) return
+      const now = Date.now()
+      const buffer = scanBufferRef.current
+      if (now - buffer.lastKeyAt > 500) buffer.value = ''
+      buffer.lastKeyAt = now
+      if (event.key === 'Enter') {
+        const code = buffer.value.trim()
+        buffer.value = ''
+        // A wedge scanner emits the whole code within ~50ms per char; require a plausible length.
+        if (code.length >= 3) {
+          event.preventDefault()
+          resolveScanCode(code, 'Scanner')
+        }
+        return
+      }
+      if (event.key.length === 1) buffer.value += event.key
+    }
+    window.addEventListener('keydown', handleKeyDown, true)
+    return () => window.removeEventListener('keydown', handleKeyDown, true)
+  }, [page, scannerMode, records.inventory, scannerBeep])
+
+  function setScannerPreference(mode: 'keyboard' | 'camera') {
+    setScannerMode(mode)
+    localStorage.setItem('kashflow-pos-scanner-mode', mode)
+    if (mode === 'keyboard') stopCameraScan()
+    else void startCameraScan()
+  }
+
+  function toggleScannerBeep() {
+    setScannerBeep((current) => {
+      localStorage.setItem('kashflow-pos-scanner-beep', current ? 'off' : 'on')
+      return !current
+    })
+  }
+
+  // Phone / tablet camera scanning using the native BarcodeDetector API where available.
+  async function startCameraScan() {
+    const Detector = (window as unknown as { BarcodeDetector?: new (options?: { formats?: string[] }) => { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue: string }>> } }).BarcodeDetector
+    if (!Detector) {
+      setError('This browser cannot use camera scanning. Use a USB/Bluetooth keyboard-wedge scanner or the manual scan box instead.')
+      return
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('Camera scanning needs a browser with camera access over HTTPS.')
+      return
+    }
+    setError('')
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+      cameraStreamRef.current = stream
+      setCameraScanning(true)
+      await new Promise((resolve) => window.setTimeout(resolve, 60))
+      const video = cameraVideoRef.current
+      if (!video) return
+      video.srcObject = stream
+      await video.play().catch(() => undefined)
+      const detector = new Detector({ formats: ['ean_13', 'ean_8', 'code_128', 'code_39', 'upc_a', 'upc_e', 'qr_code', 'itf', 'codabar', 'code_93'] })
+      let lastCode = ''; let lastAt = 0
+      const loop = async () => {
+        if (!cameraStreamRef.current || !cameraVideoRef.current) return
+        try {
+          const results = await detector.detect(cameraVideoRef.current)
+          const value = results[0]?.rawValue
+          const now = Date.now()
+          if (value && (value !== lastCode || now - lastAt > 2500)) {
+            lastCode = value; lastAt = now
+            resolveScanCode(value, 'Camera')
+          }
+        } catch { /* frame not ready; keep scanning */ }
+        cameraRafRef.current = window.requestAnimationFrame(() => void loop())
+      }
+      void loop()
+    } catch (reason) {
+      stopCameraScan()
+      setError(reason instanceof Error ? `Camera scanning could not start: ${reason.message}` : 'Camera scanning could not start.')
     }
   }
+
+  function stopCameraScan() {
+    if (cameraRafRef.current) { window.cancelAnimationFrame(cameraRafRef.current); cameraRafRef.current = null }
+    cameraStreamRef.current?.getTracks().forEach((track) => track.stop())
+    cameraStreamRef.current = null
+    if (cameraVideoRef.current) cameraVideoRef.current.srcObject = null
+    setCameraScanning(false)
+  }
+
+  useEffect(() => () => {
+    if (scanFlashTimer.current) window.clearTimeout(scanFlashTimer.current)
+    cameraStreamRef.current?.getTracks().forEach((track) => track.stop())
+    if (cameraRafRef.current) window.cancelAnimationFrame(cameraRafRef.current)
+  }, [])
 
   function changePosQuantity(itemId: string, quantity: number) {
     setPosCart((cart) => quantity <= 0
@@ -2728,38 +2982,25 @@ function App() {
   if (starting) return <div className="auth-screen landing-loading"><Brand /><p>Connecting securely to your workspace…</p></div>
 
   if (!account) return <>
-    <LandingPage onSignIn={() => { setError(''); setShowSetupFlow(false); setAuthPanelOpen(true) }} onSignUp={() => { setError(''); setShowSetupFlow(true); setAuthPanelOpen(true) }} />
+    <LandingPage onSignIn={() => { setError(''); setShowSetupFlow(false); setAuthPanelOpen(true) }} onDemo={(packageName) => { void startDemoWorkspace(packageName) }} />
     {authPanelOpen && <div className="auth-overlay" role="dialog" aria-modal="true">
       <form className="auth-card auth-card-elevated" onSubmit={submitAuth}>
         <button type="button" className="auth-close" onClick={() => { setAuthPanelOpen(false); setShowSetupFlow(false); setError('') }} aria-label="Close"><X size={18} /></button>
         <Brand />
-        <p className="auth-intro">{showSetupFlow ? 'Create your business workspace and become its administrator.' : 'Welcome back — sign in to your business workspace.'}</p>
+        <p className="auth-intro">Welcome back — sign in to your business workspace.</p>
         {error && <p className="form-error" role="alert">{error}</p>}
-        {showSetupFlow && <label className="field-label">Business name
-          <input required maxLength={120} value={credentials.businessName} onChange={(event) => setCredentials({ ...credentials, businessName: event.target.value })} />
-        </label>}
         <label className="field-label">Email or phone number
-          <input type="text" required autoComplete={showSetupFlow ? 'username' : 'username'} value={credentials.identifier} onChange={(event) => setCredentials({ ...credentials, identifier: event.target.value })} />
+          <input type="text" required autoComplete="username" value={credentials.identifier} onChange={(event) => setCredentials({ ...credentials, identifier: event.target.value })} />
         </label>
         <label className="field-label">Password
-          <input type="password" required minLength={showSetupFlow ? 12 : 1} autoComplete={showSetupFlow ? 'new-password' : 'current-password'} value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
-          {showSetupFlow && <small>Use at least 12 characters.</small>}
+          <input type="password" required autoComplete="current-password" value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
         </label>
-        <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : showSetupFlow ? 'Create business account' : 'Sign in'}</button>
-        {!showSetupFlow && (
-          <p className="auth-cta-wrap">
-            <button type="button" className="auth-link" onClick={() => setShowSetupFlow(true)}>
-              {bootstrapAvailable ? 'Create admin account' : 'Create a new business admin account'}
-            </button>
-          </p>
-        )}
-        {showSetupFlow && (
-          <p className="auth-cta-wrap">
-            <button type="button" className="auth-link" onClick={() => setShowSetupFlow(false)}>
-              Use sign in instead
-            </button>
-          </p>
-        )}
+        <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : 'Sign in'}</button>
+        <p className="auth-cta-wrap">
+          <button type="button" className="auth-link" disabled={busy} onClick={() => { setAuthPanelOpen(false); void startDemoWorkspace('Comfort') }}>
+            No account yet? Open the free live demo
+          </button>
+        </p>
         <div className="auth-contact">
           <span>Need help? Talk to us:</span>
           <div className="auth-contact-row">
@@ -2768,7 +3009,7 @@ function App() {
             <a href={`mailto:${CONTACT_EMAIL}`}><Mail size={15} /> Email</a>
           </div>
         </div>
-        <p className="auth-note">New business owners can create a separate workspace with their own admin login. Your records are stored in the connected database.</p>
+        <p className="auth-note">Sign in with the email or phone number you registered, or ask us to set up a workspace for your business.</p>
       </form>
     </div>}
   </>
@@ -3318,6 +3559,21 @@ function App() {
               <div className="pos-catalog-head"><div><h2>Items</h2><p>{records.inventory.length} inventory items · {records.inventory.filter((item) => Number(item.data.quantity ?? 0) > 0).length} in stock</p></div>
                 <label className="field-label">Selling location<select aria-label="POS selling location" value={posLocationId} onChange={(event) => setPosLocationId(event.target.value)}>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
                 <label className="pos-search"><Search size={16} /><input aria-label="Search or scan barcode/SKU" placeholder="Search or scan barcode…" value={posSearch} onKeyDown={scanPosBarcode} onChange={(event) => setPosSearch(event.target.value)} /></label>
+              </div>
+              <div className="pos-scanner-bar">
+                <div className="pos-scanner-modes" role="group" aria-label="Barcode scanner input">
+                  <button type="button" className={`pos-scanner-mode ${scannerMode === 'keyboard' ? 'active' : ''}`} aria-pressed={scannerMode === 'keyboard'} onClick={() => setScannerPreference('keyboard')}><ScanBarcode size={15} /> USB / Bluetooth scanner</button>
+                  <button type="button" className={`pos-scanner-mode ${scannerMode === 'camera' ? 'active' : ''}`} aria-pressed={scannerMode === 'camera'} onClick={() => setScannerPreference('camera')}><Camera size={15} /> Phone camera</button>
+                  <button type="button" className="pos-scanner-mode" onClick={toggleScannerBeep} aria-pressed={scannerBeep}><Volume2 size={15} /> {scannerBeep ? 'Beep on' : 'Beep off'}</button>
+                </div>
+                <p className="pos-scanner-hint">{scannerMode === 'keyboard' ? 'Keyboard-wedge readers work anywhere on this page — just scan. A USB HID or Bluetooth SPP/2D scanner types the code and presses Enter. You can also type a SKU and press Enter.' : cameraScanning ? 'Point the camera at a barcode. Codes scan automatically and add to the sale.' : 'Camera scanning uses these devices: your phone or tablet rear camera (EAN, UPC, Code 128/39/93, ITF, Codabar, QR).'}</p>
+                {scannerMode === 'camera' && <div className="pos-camera">
+                  <video ref={cameraVideoRef} className="pos-camera-video" muted playsInline aria-label="Barcode camera preview" />
+                  <div className="button-row">
+                    {!cameraScanning ? <button type="button" className="button button-primary button-small" onClick={() => void startCameraScan()}><Camera size={14} /> Start camera scanning</button> : <button type="button" className="button button-small" onClick={stopCameraScan}>Stop camera</button>}
+                  </div>
+                </div>}
+                {scanFlash && <p className={`pos-scan-flash ${scanFlash.ok ? 'ok' : 'miss'}`} role="status">{scanFlash.ok ? <Check size={14} /> : <X size={14} />}{scanFlash.message}<small>{scanFlash.code.toUpperCase()}</small></p>}
               </div>
               {!records.inventory.length ? <div className="empty-state">No inventory items yet. Add items with a selling price in Inventory to start a sale.<button className="button button-secondary" onClick={() => navigateTo('Inventory')}>Open inventory</button></div> :
                 <div className="pos-item-grid">{posItems.map((item) => {
