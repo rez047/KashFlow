@@ -520,7 +520,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
           ['Multi-branch', 'Unlimited branches and departments, move stock between locations, branch-level visibility and reporting.'],
           ['Payroll', 'Encrypted employee records, monthly payroll drafts, payslips and Kenyan PAYE, NSSF, SHIF and Housing Levy estimates.'],
           ['Team & roles', 'Invite staff, custom roles, per-area permissions, administrator oversight and full activity tracking.'],
-          ['Online store & orders', 'Hosted product catalog, customer order requests, order tracking and WooCommerce product &amp; order sync.'],
+          ['Online store & orders', 'Hosted product catalog, customer order requests, order tracking and WooCommerce product and order sync.'],
           ['Documents & exports', 'Private document storage and CSV downloads for customers, suppliers, inventory, invoices, bills and journals.'],
         ].map(([title, blurb]) => <article className="included-card" key={title}><Check size={17} /><div><h3>{title}</h3><p>{blurb}</p></div></article>)}
       </div>
