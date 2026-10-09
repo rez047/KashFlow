@@ -20,13 +20,6 @@ const envSchema = z.object({
   DATABASE_SSL_MODE: z.enum(['verify-full', 'require']).default('verify-full'),
   SESSION_SECRET: z.string().min(32).optional(),
   PAYROLL_DATA_ENCRYPTION_KEY: z.string().min(32).optional(),
-  MPESA_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
-  MPESA_CONSUMER_KEY: z.string().trim().optional(),
-  MPESA_CONSUMER_SECRET: z.string().trim().optional(),
-  MPESA_SHORTCODE: z.string().trim().optional(),
-  MPESA_PASSKEY: z.string().trim().optional(),
-  MPESA_CALLBACK_URL: z.string().url().optional(),
-  MPESA_TRANSACTION_TYPE: z.enum(['CustomerPayBillOnline', 'CustomerBuyGoodsOnline']).default('CustomerPayBillOnline'),
   RESEND_API_KEY: z.string().trim().optional(),
   EMAIL_FROM: z.string().trim().max(200).optional(),
   MONO_PUBLIC_KEY: z.string().trim().optional(),
@@ -60,16 +53,15 @@ const env = parsed.data
 const backupSettings: BackupSettings | null = env.DATABASE_URL && env.BACKUP_S3_ENDPOINT && env.BACKUP_S3_REGION && env.BACKUP_S3_BUCKET && env.BACKUP_S3_ACCESS_KEY_ID && env.BACKUP_S3_SECRET_ACCESS_KEY
   ? { databaseUrl: env.DATABASE_URL, endpoint: env.BACKUP_S3_ENDPOINT, region: env.BACKUP_S3_REGION, bucket: env.BACKUP_S3_BUCKET, accessKeyId: env.BACKUP_S3_ACCESS_KEY_ID, secretAccessKey: env.BACKUP_S3_SECRET_ACCESS_KEY }
   : null
-const mpesaConfig = {
-  environment: env.MPESA_ENV,
-  consumerKey: env.MPESA_CONSUMER_KEY,
-  consumerSecret: env.MPESA_CONSUMER_SECRET,
-  shortcode: env.MPESA_SHORTCODE,
-  passkey: env.MPESA_PASSKEY,
-  callbackUrl: env.MPESA_CALLBACK_URL,
-  transactionType: env.MPESA_TRANSACTION_TYPE,
+type DarajaConfig = {
+  environment: 'sandbox' | 'production'
+  consumerKey: string
+  consumerSecret: string
+  shortcode: string
+  passkey: string
+  callbackUrl: string
+  transactionType: 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline'
 }
-const mpesaConfigured = Object.values(mpesaConfig).every((value) => Boolean(value))
 const emailConfigured = Boolean(env.BREVO_API_KEY && (env.BREVO_SENDER_EMAIL || env.EMAIL_FROM))
 // Brevo (free tier) powers transactional email and SMS. WhatsApp needs an approved Brevo
 // WhatsApp sender, so it stays off until the operator supplies BREVO_WHATSAPP_NUMBER.
@@ -83,8 +75,12 @@ const kraEtimsLiveEnabled = env.KRA_ETIMS_ENV === 'production' && env.KRA_ETIMS_
 const kraEtimsApiBase = env.KRA_ETIMS_ENV === 'production'
   ? 'https://etims-api.kra.go.ke/etims-api'
   : 'https://etims-api-sbx.kra.go.ke/etims-api'
-const mpesaApiBase = env.MPESA_ENV === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke'
-let cachedDarajaToken: { value: string; expiresAt: number } | undefined
+function mpesaApiBaseFor(environment: 'sandbox' | 'production') {
+  return environment === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke'
+}
+// Daraja access tokens are cached per credential set (environment + consumer key) so each
+// business reuses its own token without re-authenticating on every request.
+const darajaTokenCache = new Map<string, { value: string; expiresAt: number }>()
 if (env.NODE_ENV === 'production' && (!env.DATABASE_URL || !env.SESSION_SECRET || !env.PAYROLL_DATA_ENCRYPTION_KEY)) {
   console.error('Production requires DATABASE_URL, SESSION_SECRET, and PAYROLL_DATA_ENCRYPTION_KEY (each secret 32+ characters).')
   process.exit(1)
@@ -655,24 +651,26 @@ function normalizeKenyanPhone(value: string) {
   const normalized = digits.startsWith('254') ? digits : digits.startsWith('0') ? `254${digits.slice(1)}` : `254${digits}`
   return /^254[17]\d{8}$/.test(normalized) ? normalized : null
 }
-async function darajaToken() {
-  if (!mpesaConfigured) throw new Error('Daraja is not configured. Add all required MPESA_* environment variables.')
-  if (cachedDarajaToken && cachedDarajaToken.expiresAt > Date.now() + 30_000) return cachedDarajaToken.value
+async function darajaToken(config: DarajaConfig) {
+  const cacheKey = `${config.environment}:${config.consumerKey}`
+  const cached = darajaTokenCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now() + 30_000) return cached.value
 
-  const credentials = Buffer.from(`${mpesaConfig.consumerKey}:${mpesaConfig.consumerSecret}`).toString('base64')
-  const response = await fetch(`${mpesaApiBase}/oauth/v1/generate?grant_type=client_credentials`, {
+  const credentials = Buffer.from(`${config.consumerKey}:${config.consumerSecret}`).toString('base64')
+  const response = await fetch(`${mpesaApiBaseFor(config.environment)}/oauth/v1/generate?grant_type=client_credentials`, {
     headers: { Authorization: `Basic ${credentials}` },
     signal: AbortSignal.timeout(15_000),
   })
   const result = await response.json().catch(() => ({})) as { access_token?: string; expires_in?: string | number; errorMessage?: string }
   if (!response.ok || !result.access_token) throw new Error(result.errorMessage ?? `Daraja authentication failed (${response.status}).`)
   const expiresIn = Number(result.expires_in ?? 3600)
-  cachedDarajaToken = { value: result.access_token, expiresAt: Date.now() + expiresIn * 1000 }
+  const token = { value: result.access_token, expiresAt: Date.now() + expiresIn * 1000 }
+  darajaTokenCache.set(cacheKey, token)
   return result.access_token
 }
-async function darajaPost(path: string, payload: Record<string, unknown>) {
-  const token = await darajaToken()
-  const response = await fetch(`${mpesaApiBase}${path}`, {
+async function darajaPost(config: DarajaConfig, path: string, payload: Record<string, unknown>) {
+  const token = await darajaToken(config)
+  const response = await fetch(`${mpesaApiBaseFor(config.environment)}${path}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -682,17 +680,34 @@ async function darajaPost(path: string, payload: Record<string, unknown>) {
   if (!response.ok) throw new Error(String(result.errorMessage ?? result.ResponseDescription ?? `Daraja request failed (${response.status}).`))
   return result
 }
-function mpesaPassword(timestamp: string) {
-  return Buffer.from(`${mpesaConfig.shortcode}${mpesaConfig.passkey}${timestamp}`).toString('base64')
+function mpesaPassword(config: DarajaConfig, timestamp: string) {
+  return Buffer.from(`${config.shortcode}${config.passkey}${timestamp}`).toString('base64')
 }
-async function queryDarajaPayment(checkoutRequestId: string) {
+async function queryDarajaPayment(config: DarajaConfig, checkoutRequestId: string) {
   const timestamp = darajaTimestamp()
-  return darajaPost('/mpesa/stkpushquery/v1/query', {
-    BusinessShortCode: mpesaConfig.shortcode,
-    Password: mpesaPassword(timestamp),
+  return darajaPost(config, '/mpesa/stkpushquery/v1/query', {
+    BusinessShortCode: config.shortcode,
+    Password: mpesaPassword(config, timestamp),
     Timestamp: timestamp,
     CheckoutRequestID: checkoutRequestId,
   })
+}
+// Resolve only the active workspace's encrypted Daraja credentials. Each business must connect
+// its own merchant account; platform-wide payment credentials are never used as a fallback.
+async function resolveWorkspaceDarajaConfig(workspaceId: string): Promise<DarajaConfig | null> {
+  const row = (await pool!.query('SELECT consumer_key_ciphertext, consumer_secret_ciphertext, shortcode, passkey_ciphertext, callback_url, environment, transaction_type FROM daraja_connections WHERE workspace_id = $1 AND enabled = true', [workspaceId])).rows[0]
+  if (row) {
+    return {
+      environment: String(row.environment) === 'production' ? 'production' : 'sandbox',
+      consumerKey: decryptCommerceSecret(String(row.consumer_key_ciphertext)),
+      consumerSecret: decryptCommerceSecret(String(row.consumer_secret_ciphertext)),
+      shortcode: String(row.shortcode),
+      passkey: decryptCommerceSecret(String(row.passkey_ciphertext)),
+      callbackUrl: String(row.callback_url),
+      transactionType: String(row.transaction_type) === 'CustomerBuyGoodsOnline' ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline',
+    }
+  }
+  return null
 }
 app.disable('x-powered-by')
 app.use(helmet())
@@ -860,7 +875,7 @@ app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 
     const userId = randomUUID()
     const workspace = await client.query('INSERT INTO workspaces (id, name) VALUES ($1, $2) RETURNING id', [workspaceId, input.data.businessName])
     const user = await client.query('INSERT INTO users (id, workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, workspace_id, email, phone, session_version', [userId, workspace.rows[0].id, email, phone, await hashPassword(input.data.password)])
-    await client.query('INSERT INTO workspace_members (user_id, workspace_id, role) VALUES ($1, $2, $3)', [user.rows[0].id, workspace.rows[0].id, 'admin'])
+    await client.query('INSERT INTO workspace_members (id, user_id, workspace_id, role) VALUES ($1, $2, $3, $4)', [randomUUID(), user.rows[0].id, workspace.rows[0].id, 'admin'])
     for (const account of defaultChartOfAccounts) {
       await client.query('INSERT INTO workspace_accounts (id, workspace_id, code, name, account_type) VALUES ($1, $2, $3, $4, $5)', [randomUUID(), workspace.rows[0].id, account.code, account.name, account.type])
     }
@@ -1980,6 +1995,48 @@ app.put('/v1/integrations/woocommerce', requirePool, verifyOrigin, requireSessio
     if (error instanceof Error && (error.message.includes('WooCommerce store address') || error.message.includes('WooCommerce hostname'))) { response.status(400).json({ error: error.message }); return }
     next(error)
   }
+})
+// Per-business Safaricom Daraja (M-Pesa) credentials. Each workspace saves its own app
+// credentials, encrypted with ONLINE_COMMERCE_ENCRYPTION_KEY. Secrets are never returned.
+app.get('/v1/integrations/daraja', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT shortcode, callback_url, environment, transaction_type, enabled, updated_at FROM daraja_connections WHERE workspace_id = $1', [request.session!.workspaceId])
+    response.json({
+      connection: result.rows[0] ? { ...result.rows[0], credentialsConfigured: true } : null,
+      encryptionReady: Boolean(env.ONLINE_COMMERCE_ENCRYPTION_KEY),
+    })
+  } catch (error) { next(error) }
+})
+app.put('/v1/integrations/daraja', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    consumerKey: z.string().trim().min(1).max(300),
+    consumerSecret: z.string().trim().min(1).max(300),
+    shortcode: z.string().trim().regex(/^[A-Za-z0-9]{1,20}$/, 'Enter the PayBill/Till shortcode (letters and numbers only).'),
+    passkey: z.string().trim().min(1).max(300),
+    callbackUrl: z.string().trim().url().max(500),
+    environment: z.enum(['sandbox', 'production']).default('sandbox'),
+    transactionType: z.enum(['CustomerPayBillOnline', 'CustomerBuyGoodsOnline']).default('CustomerPayBillOnline'),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter the Daraja consumer key, consumer secret, shortcode, passkey, and a public callback URL for this business.' }); return }
+  if (input.data.environment === 'production' && !input.data.callbackUrl.startsWith('https://')) { response.status(400).json({ error: 'Production Daraja requires a public HTTPS callback URL.' }); return }
+  if (!env.ONLINE_COMMERCE_ENCRYPTION_KEY) { response.status(503).json({ error: 'Daraja credential storage is disabled. Configure ONLINE_COMMERCE_ENCRYPTION_KEY on the API service.' }); return }
+  try {
+    const encrypted = {
+      key: encryptCommerceSecret(input.data.consumerKey),
+      secret: encryptCommerceSecret(input.data.consumerSecret),
+      passkey: encryptCommerceSecret(input.data.passkey),
+    }
+    const saved = await pool!.query(`INSERT INTO daraja_connections (workspace_id, consumer_key_ciphertext, consumer_secret_ciphertext, shortcode, passkey_ciphertext, callback_url, environment, transaction_type)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (workspace_id) DO UPDATE SET consumer_key_ciphertext = EXCLUDED.consumer_key_ciphertext,
+        consumer_secret_ciphertext = EXCLUDED.consumer_secret_ciphertext, shortcode = EXCLUDED.shortcode,
+        passkey_ciphertext = EXCLUDED.passkey_ciphertext, callback_url = EXCLUDED.callback_url,
+        environment = EXCLUDED.environment, transaction_type = EXCLUDED.transaction_type, enabled = true, updated_at = now()
+      RETURNING shortcode, callback_url, environment, transaction_type, enabled, updated_at`,
+    [request.session!.workspaceId, encrypted.key, encrypted.secret, input.data.shortcode, encrypted.passkey, input.data.callbackUrl, input.data.environment, input.data.transactionType])
+    await recordAudit(pool!, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'integrations.daraja_credentials_saved', entityType: 'workspace', entityId: request.session!.workspaceId, eventData: { environment: input.data.environment, shortcode: input.data.shortcode } })
+    response.json({ connection: { ...saved.rows[0], credentialsConfigured: true } })
+  } catch (error) { next(error) }
 })
 app.post('/v1/integrations/woocommerce/products/sync', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   try {
@@ -3229,7 +3286,7 @@ app.post('/v1/invitations/accept', requirePool, verifyOrigin, rateLimit({ window
       await client.query('INSERT INTO users (id, workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4, $5)', [userId, targets.rows[0].workspace_id, email ?? null, phone ?? null, await hashPassword(input.data.password)])
     }
     for (const target of targets.rows) {
-      await client.query('INSERT INTO workspace_members (user_id, workspace_id, role) VALUES ($1, $2, $3) ON CONFLICT (user_id, workspace_id) DO NOTHING', [userId, target.workspace_id, invite.role])
+      await client.query('INSERT INTO workspace_members (id, user_id, workspace_id, role) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, workspace_id) DO NOTHING', [randomUUID(), userId, target.workspace_id, invite.role])
     }
     await client.query("UPDATE workspace_invitations SET status = 'accepted', accepted_at = now(), token_hash = NULL WHERE id = $1", [invite.id])
     await client.query('COMMIT')
@@ -5040,8 +5097,9 @@ app.post('/v1/payroll/kenya/estimate', requirePool, verifyOrigin, requireSession
 })
 
 app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requireWorkspaceProviderPreference('darajaEnabled'), rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request: AuthedRequest, response, next) => {
-  if (!mpesaConfigured) { response.status(503).json({ error: 'M-Pesa is not configured. Set all required MPESA_* API environment variables and a public callback URL.' }); return }
-  if (env.MPESA_ENV === 'production' && !env.MPESA_CALLBACK_URL!.startsWith('https://')) { response.status(503).json({ error: 'Production Daraja requires a public HTTPS MPESA_CALLBACK_URL.' }); return }
+  const daraja = await resolveWorkspaceDarajaConfig(request.session!.workspaceId)
+  if (!daraja) { response.status(503).json({ error: 'M-Pesa is not configured for this business. A business administrator must add this business’s Daraja consumer key, consumer secret, shortcode, passkey, and callback URL on the Kenya compliance page.' }); return }
+  if (daraja.environment === 'production' && !daraja.callbackUrl.startsWith('https://')) { response.status(503).json({ error: 'Production Daraja requires a public HTTPS callback URL.' }); return }
 
   const input = z.object({ phone: z.string().trim().min(7).max(24) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter the customer’s Safaricom-compatible Kenyan phone number.' }); return }
@@ -5067,16 +5125,16 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
     finally { client.release() }
     const timestamp = darajaTimestamp()
     try {
-      const result = await darajaPost('/mpesa/stkpush/v1/processrequest', {
-        BusinessShortCode: mpesaConfig.shortcode,
-        Password: mpesaPassword(timestamp),
+      const result = await darajaPost(daraja, '/mpesa/stkpush/v1/processrequest', {
+        BusinessShortCode: daraja.shortcode,
+        Password: mpesaPassword(daraja, timestamp),
         Timestamp: timestamp,
-        TransactionType: mpesaConfig.transactionType,
+        TransactionType: daraja.transactionType,
         Amount: invoiceAmount,
         PartyA: phone,
-        PartyB: mpesaConfig.shortcode,
+        PartyB: daraja.shortcode,
         PhoneNumber: phone,
-        CallBackURL: mpesaConfig.callbackUrl,
+        CallBackURL: daraja.callbackUrl,
         AccountReference: `KF-${String(request.params.invoiceId).replace(/-/g, '').slice(0, 10)}`,
         TransactionDesc: 'Invoice payment',
       })
@@ -5086,7 +5144,7 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
       try {
         await client.query('BEGIN')
         await client.query('UPDATE mpesa_payment_requests SET status = $1, merchant_request_id = $2, checkout_request_id = $3 WHERE id = $4', ['pending', String(result.MerchantRequestID ?? ''), checkoutRequestId, paymentId])
-        await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'mpesa.stk_push_requested', entityType: 'mpesa_payment', entityId: paymentId, eventData: { invoiceId: request.params.invoiceId, amount: invoiceAmount, environment: env.MPESA_ENV } })
+        await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'mpesa.stk_push_requested', entityType: 'mpesa_payment', entityId: paymentId, eventData: { invoiceId: request.params.invoiceId, amount: invoiceAmount, environment: daraja.environment } })
         await client.query('COMMIT')
       } catch (error) { await client.query('ROLLBACK'); throw error }
       finally { client.release() }
@@ -5130,7 +5188,13 @@ app.post('/v1/integrations/mpesa/callback', requirePool, rateLimit({ windowMs: 6
       return
     }
 
-    const verification = await queryDarajaPayment(callback.CheckoutRequestID)
+    const daraja = await resolveWorkspaceDarajaConfig(String(payment.workspace_id))
+    if (!daraja) {
+      await pool!.query('UPDATE mpesa_payment_requests SET result_code = $1, result_description = $2, callback_received_at = now() WHERE id = $3', ['verification_required', 'Daraja credentials are no longer configured for this business, so the payment could not be verified.', payment.id])
+      response.status(503).json({ ResultCode: 1, ResultDesc: 'Payment is awaiting verification.' })
+      return
+    }
+    const verification = await queryDarajaPayment(daraja, callback.CheckoutRequestID)
     if (String(verification.ResultCode ?? '') !== '0') {
       await pool!.query('UPDATE mpesa_payment_requests SET result_code = $1, result_description = $2, callback_received_at = now() WHERE id = $3', [String(verification.ResultCode ?? 'verification_pending'), String(verification.ResultDesc ?? 'Awaiting Daraja payment verification.').slice(0, 500), payment.id])
       response.status(503).json({ ResultCode: 1, ResultDesc: 'Payment is awaiting verification.' })
@@ -5443,19 +5507,20 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
   try {
     const workspaceSettings = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId])
     const settings = { ...defaultWorkspaceSettings, ...(workspaceSettings.rows[0]?.preferences ?? {}) }
-    const callbackIsSecure = env.MPESA_ENV !== 'production' || env.MPESA_CALLBACK_URL?.startsWith('https://') === true
-    const mpesaReady = Boolean(settings.darajaEnabled && mpesaConfigured && callbackIsSecure)
+    const daraja = await resolveWorkspaceDarajaConfig(request.session!.workspaceId)
+    const callbackIsSecure = daraja ? (daraja.environment !== 'production' || daraja.callbackUrl.startsWith('https://')) : false
+    const mpesaReady = Boolean(settings.darajaEnabled && daraja && callbackIsSecure)
     const kraReady = Boolean(settings.kraEtimsLiveEnabled && env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY && kraEtimsLiveEnabled)
     const monoReady = Boolean(settings.monoEnabled && monoConfigured)
     response.json({ mode: mpesaReady ? 'mpesa_configured' : 'setup_required', integrations: [
       { id: 'kra_etims', status: kraReady ? 'oscu_production_switches_enabled_approval_and_device_still_required' : settings.kraEtimsLiveEnabled ? `oscu_${env.KRA_ETIMS_ENV}_live_disabled` : 'oscu_workspace_disabled' },
-      { id: 'mpesa', status: mpesaReady ? `configured_${env.MPESA_ENV}` : settings.darajaEnabled ? 'daraja_credentials_and_callback_required' : 'workspace_daraja_disabled' },
+      { id: 'mpesa', status: mpesaReady ? `configured_${daraja!.environment}` : settings.darajaEnabled ? 'daraja_credentials_and_callback_required' : 'workspace_daraja_disabled' },
       { id: 'bank_feeds', status: monoReady ? 'mono_configured_consent_required' : settings.monoEnabled ? 'mono_business_approval_and_server_keys_required' : 'workspace_mono_disabled' },
       { id: 'email', status: emailConfigured ? 'brevo_configured' : 'brevo_api_key_and_verified_sender_required' },
       { id: 'payroll', status: `encrypted_internal_runs_${env.PAYROLL_DATA_ENCRYPTION_KEY ? 'configured' : 'encryption_key_required'}_statutory_filing_not_implemented` },
       { id: 'paye_shif_nssf_ahl_filing', status: 'statutory_filing_not_implemented' },
       { id: 'multi_method_payments', status: settings.multiMethodPayments ? 'workspace_enabled_split_capture' : 'workspace_disabled' },
-    ], note: `Workspace preferences are enforced on Daraja payment initiation, Mono linking/sync, and production KRA OSCU operations. Render provider credentials remain shared across businesses. KRA readiness here only reports that operator/workspace switches and encryption config are present; KRA approval, certification, initialized production device, fiscal mapping review, and reconciliation are still required. Statutory filing adapters are not implemented, regardless of saved preferences. Payroll estimates remain internal and are not certified.` })
+    ], note: `Workspace preferences are enforced on Daraja payment initiation, Mono linking/sync, and production KRA OSCU operations. Every business must save its own encrypted Daraja app credentials on the Kenya compliance page before M-Pesa payments can be requested. KRA readiness here only reports that operator/workspace switches and encryption config are present; KRA approval, certification, initialized production device, fiscal mapping review, and reconciliation are still required. Statutory filing adapters are not implemented, regardless of saved preferences. Payroll estimates remain internal and are not certified.` })
   } catch (error) { next(error) }
 })
 // ---------------------------------------------------------------------------

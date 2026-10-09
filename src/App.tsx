@@ -165,6 +165,7 @@ type RetailReport = { locations: InventoryLocation[]; stockLevels: Array<{ itemI
 type OnlineStoreConfig = { slug: string; title: string; description: string; enabled: boolean }
 type StoreOrder = { id: string; status: string; source: string; external_order_id?: string | null; customer_name: string; customer_email: string; customer_phone: string; total: string; invoice_id?: string | null; created_at: string }
 type WooConnection = { store_url: string; enabled: boolean; last_synced_at?: string | null; credentialsConfigured: boolean }
+type DarajaConnection = { shortcode: string; callback_url: string; environment: 'sandbox' | 'production'; transaction_type: 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline'; enabled: boolean; updated_at?: string | null; credentialsConfigured: boolean }
 type MemberPermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
 
 // Grouped permission catalogue for role building. Every available permission is listed so admins
@@ -753,6 +754,9 @@ function App() {
   const [page, setPage] = useState('Overview')
   const [networkingTab, setNetworkingTab] = useState<'sales' | 'transactions'>('sales')
   const [pageHistory, setPageHistory] = useState<string[]>([])
+  const pageHistoryKey = useRef(`kashflow-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+  const pageHistoryIndex = useRef(0)
+  const pageHistoryPages = useRef(['Overview'])
   const teamPermissionsScrollPending = useRef(false)
   const [overviewRange, setOverviewRange] = useState<OverviewRange>('mtd')
   const [overviewFrom, setOverviewFrom] = useState(`${today.slice(0, 7)}-01`)
@@ -768,6 +772,8 @@ function App() {
   const [modal, setModal] = useState<Modal>(null)
   const [toast, setToast] = useState('')
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [businessMenuOpen, setBusinessMenuOpen] = useState(false)
+  const [switchingBusiness, setSwitchingBusiness] = useState(false)
   const [statusOpen, setStatusOpen] = useState(false)
   const [account, setAccount] = useState<Account | null>(null)
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
@@ -888,6 +894,9 @@ function App() {
   const [wooConnection, setWooConnection] = useState<WooConnection | null>(null)
   const [wooEncryptionReady, setWooEncryptionReady] = useState(false)
   const [wooCredentials, setWooCredentials] = useState({ storeUrl: '', consumerKey: '', consumerSecret: '' })
+  const [darajaConnection, setDarajaConnection] = useState<DarajaConnection | null>(null)
+  const [darajaEncryptionReady, setDarajaEncryptionReady] = useState(false)
+  const [darajaCredentials, setDarajaCredentials] = useState({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', callbackUrl: '', environment: 'sandbox' as 'sandbox' | 'production', transactionType: 'CustomerPayBillOnline' as 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline' })
   const [teamMembers, setTeamMembers] = useState<WorkspaceMember[]>([])
   const [memberPermissionDrafts, setMemberPermissionDrafts] = useState<Record<string, MemberPermission[]>>({})
   const [memberRoleDrafts, setMemberRoleDrafts] = useState<Record<string, string>>({})
@@ -1020,9 +1029,56 @@ function App() {
       .catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load this invitation.'))
   }, [])
 
+  useEffect(() => {
+    if (!account) {
+      pageHistoryIndex.current = 0
+      pageHistoryPages.current = ['Overview']
+      setPageHistory([])
+      return
+    }
+    pageHistoryKey.current = `kashflow-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    pageHistoryIndex.current = 0
+    pageHistoryPages.current = ['Overview']
+    setPageHistory([])
+    window.history.replaceState({
+      kashflowNavigationKey: pageHistoryKey.current,
+      kashflowNavigationIndex: 0,
+      kashflowPage: 'Overview',
+    }, '')
+  }, [Boolean(account)])
+
+  useEffect(() => {
+    function handlePopState(event: PopStateEvent) {
+      const state = event.state as { kashflowNavigationKey?: string; kashflowNavigationIndex?: number; kashflowPage?: string } | null
+      if (state?.kashflowNavigationKey === pageHistoryKey.current && Number.isInteger(state.kashflowNavigationIndex) && typeof state.kashflowPage === 'string') {
+        const targetIndex = Math.max(0, state.kashflowNavigationIndex!)
+        pageHistoryPages.current[targetIndex] = state.kashflowPage
+        pageHistoryIndex.current = targetIndex
+        setPageHistory(pageHistoryPages.current.slice(0, targetIndex))
+        setPage(state.kashflowPage)
+        return
+      }
+      pageHistoryIndex.current = 0
+      pageHistoryPages.current = ['Overview']
+      setPageHistory([])
+      setPage('Overview')
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
   function navigateTo(nextPage: string) {
     if (nextPage === page) return
-    setPageHistory((history) => [...history, page])
+    const nextIndex = pageHistoryIndex.current + 1
+    pageHistoryPages.current = pageHistoryPages.current.slice(0, nextIndex)
+    pageHistoryPages.current[nextIndex] = nextPage
+    pageHistoryIndex.current = nextIndex
+    setPageHistory(pageHistoryPages.current.slice(0, nextIndex))
+    window.history.pushState({
+      kashflowNavigationKey: pageHistoryKey.current,
+      kashflowNavigationIndex: nextIndex,
+      kashflowPage: nextPage,
+    }, '', `${window.location.pathname}${window.location.search}${window.location.hash}`)
     setPage(nextPage)
   }
 
@@ -1034,16 +1090,24 @@ function App() {
   }
 
   function navigateBack() {
+    const state = window.history.state as { kashflowNavigationKey?: string; kashflowNavigationIndex?: number } | null
+    if (state?.kashflowNavigationKey === pageHistoryKey.current && (state.kashflowNavigationIndex ?? 0) > 0) {
+      window.history.back()
+      return
+    }
     const previous = pageHistory.at(-1)
     if (!previous) { setPage('Overview'); return }
-    setPageHistory((history) => history.slice(0, -1))
+    pageHistoryIndex.current = Math.max(0, pageHistoryIndex.current - 1)
+    setPageHistory(pageHistoryPages.current.slice(0, pageHistoryIndex.current))
     setPage(previous)
   }
 
   useEffect(() => {
-    if (page !== 'Settings' || !teamPermissionsScrollPending.current) return
-    teamPermissionsScrollPending.current = false
-    document.getElementById('team-permissions')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    if (page !== 'Settings') return
+    if (teamPermissionsScrollPending.current) {
+      teamPermissionsScrollPending.current = false
+      document.getElementById('team-permissions')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
   }, [page])
 
   const refresh = useCallback(async () => {
@@ -1148,6 +1212,17 @@ function App() {
     window.addEventListener('kashflow:session-expired', handleSessionExpired)
     return () => window.removeEventListener('kashflow:session-expired', handleSessionExpired)
   }, [])
+
+  // Close the business switcher menu when clicking outside of it.
+  useEffect(() => {
+    if (!businessMenuOpen) return
+    function handlePointer(event: MouseEvent) {
+      const target = event.target as HTMLElement | null
+      if (target && !target.closest('.company-switcher-wrap')) setBusinessMenuOpen(false)
+    }
+    document.addEventListener('mousedown', handlePointer)
+    return () => document.removeEventListener('mousedown', handlePointer)
+  }, [businessMenuOpen])
 
   useEffect(() => {
     let active = true
@@ -1314,6 +1389,12 @@ function App() {
         request<{ invoices: InvoiceRecord[] }>('/v1/invoices').then((result) => setInvoicesList(result.invoices)),
         request<KraEtimsConfig>('/v1/integrations/etims/config').then((result) => setKraEtimsConfig(result)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load integration preparation records.'))
+      if (account.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin') {
+        void request<{ connection: DarajaConnection | null; encryptionReady: boolean }>('/v1/integrations/daraja').then((result) => {
+          setDarajaConnection(result.connection); setDarajaEncryptionReady(result.encryptionReady)
+          if (result.connection) setDarajaCredentials((current) => ({ ...current, shortcode: result.connection!.shortcode, callbackUrl: result.connection!.callback_url, environment: result.connection!.environment, transactionType: result.connection!.transaction_type }))
+        }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load this business’s Daraja settings.'))
+      }
     }
     const recordType = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Services: 'services', Projects: 'projects' } as Record<string, string>)[page]
     if (page === 'Services') {
@@ -1391,6 +1472,16 @@ function App() {
       const result = await request<{ connection: WooConnection }>('/v1/integrations/woocommerce', { method: 'PUT', body: JSON.stringify(wooCredentials) })
       setWooConnection(result.connection); setWooCredentials((current) => ({ ...current, consumerKey: '', consumerSecret: '' })); notify('WooCommerce credentials encrypted and saved for this business.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save WooCommerce credentials.') }
+    finally { setBusy(false) }
+  }
+
+  async function saveDaraja(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      const result = await request<{ connection: DarajaConnection }>('/v1/integrations/daraja', { method: 'PUT', body: JSON.stringify(darajaCredentials) })
+      setDarajaConnection(result.connection); setDarajaCredentials((current) => ({ ...current, consumerKey: '', consumerSecret: '', passkey: '' }))
+      notify(`Daraja / M-Pesa credentials encrypted and saved for ${account?.workspace.name ?? 'this business'}.`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save Daraja credentials.') }
     finally { setBusy(false) }
   }
 
@@ -1793,11 +1884,40 @@ function App() {
       const created = await request<{ workspace: { id: string; name: string; role: string } }>('/v1/workspaces', { method: 'POST', body: JSON.stringify({ name: businessName }) })
       const nextAccount = account ? { ...account, workspace: { id: created.workspace.id, name: created.workspace.name }, workspaces: [...(account.workspaces ?? []), { id: created.workspace.id, name: created.workspace.name, role: created.workspace.role }] } : null
       setAccount(nextAccount)
-      setDashboard((current) => current ? { ...current, workspaceName: created.workspace.name } : current)
+      await reloadWorkspaceData()
       setBusinessName(''); setModal(null); notify(`Business “${created.workspace.name}” added.`)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not create business.')
     } finally { setBusy(false) }
+  }
+
+  // Reload the workspace-scoped data the shell shows, after a business is created or switched to.
+  async function reloadWorkspaceData() {
+    const period = overviewPeriod(overviewRange, overviewFrom, overviewTo)
+    const query = new URLSearchParams(period)
+    const data = await request<Dashboard>(`/v1/dashboard?${query}`)
+    setDashboard(data)
+    const preferences = await request<{ settings: Partial<typeof settings> }>('/v1/settings')
+    setSettings((current) => ({ ...current, ...preferences.settings, businessName: preferences.settings.businessName ?? data.workspaceName ?? current.businessName }))
+  }
+
+  // Switch the active business/workspace. The server re-issues the session cookie for the chosen
+  // workspace; we then reload account + dashboard + settings so every screen reflects the change.
+  async function switchBusiness(workspaceId: string) {
+    if (!account || workspaceId === account.workspace.id || switchingBusiness) return
+    setSwitchingBusiness(true); setError(''); setBusinessMenuOpen(false); setSidebarOpen(false)
+    setDarajaConnection(null)
+    setDarajaEncryptionReady(false)
+    setDarajaCredentials({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', callbackUrl: '', environment: 'sandbox', transactionType: 'CustomerPayBillOnline' })
+    try {
+      await request(`/v1/workspaces/${workspaceId}/activate`, { method: 'POST' })
+      const signedIn = await request<Account>('/v1/auth/me')
+      setAccount(signedIn)
+      await reloadWorkspaceData()
+      notify(`Switched to “${signedIn.workspace.name}”.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not switch business.')
+    } finally { setSwitchingBusiness(false) }
   }
 
   async function inviteUser(event: FormEvent<HTMLFormElement>) {
@@ -3877,6 +3997,11 @@ async function createCameraReader(): Promise<CameraReader> {
     return []
   }, [isWorkspaceAdmin, account, currentMember])
   const canUse = useCallback((permission: MemberPermission | null) => !permission || effectivePermissions.includes(permission), [effectivePermissions])
+  useEffect(() => {
+    setDarajaConnection(null)
+    setDarajaEncryptionReady(false)
+    setDarajaCredentials({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', callbackUrl: '', environment: 'sandbox', transactionType: 'CustomerPayBillOnline' })
+  }, [account?.workspace.id])
   const multiMethodEnabled = Boolean(settings.multiMethodPayments)
 
   const filtered = useMemo(() => (dashboard?.transactions ?? []).filter((row) =>
@@ -4040,8 +4165,23 @@ async function createCameraReader(): Promise<CameraReader> {
       <div className="brand-row"><div className="brand-mark">K</div><div className="brand-name">Kash<span>Flow</span><small>{t('BUSINESS SUITE')}</small></div>
         <button className="icon-button sidebar-close" onClick={() => setSidebarOpen(false)} aria-label="Close menu"><X size={18} /></button>
       </div>
-      <div className="company-switcher"><span className="company-avatar">{dashboard?.workspaceName.slice(0, 1).toUpperCase()}</span>
-        <span className="company-copy"><strong>{dashboard?.workspaceName}</strong><small>{account?.workspaces?.length ? `${account.workspaces.length} businesses` : 'Private workspace'}</small></span>
+      <div className={`company-switcher-wrap ${businessMenuOpen ? 'open' : ''}`}>
+        <button type="button" className="company-switcher" aria-label={`Switch business. Current business ${account.workspace.name}`} aria-haspopup="menu" aria-expanded={businessMenuOpen} disabled={switchingBusiness} onClick={() => setBusinessMenuOpen((open) => !open)}>
+          <span className="company-avatar">{account.workspace.name.slice(0, 1).toUpperCase()}</span>
+          <span className="company-copy"><strong>{account.workspace.name}</strong><small>{account.workspaces?.length ? `${account.workspaces.length} ${account.workspaces.length === 1 ? 'business' : 'businesses'}` : 'Private workspace'}</small></span>
+          <ChevronRight size={16} className="company-switcher-caret" />
+        </button>
+        {businessMenuOpen && <div className="business-menu" role="menu">
+          <p className="business-menu-heading">Switch business</p>
+          {(account?.workspaces ?? []).map((workspace) => (
+            <button key={workspace.id} type="button" role="menuitem" className={`business-menu-item ${workspace.id === account.workspace.id ? 'active' : ''}`} disabled={switchingBusiness || workspace.id === account.workspace.id} onClick={() => void switchBusiness(workspace.id)}>
+              <span className="company-avatar">{workspace.name.slice(0, 1).toUpperCase()}</span>
+              <span className="company-copy"><strong>{workspace.name}</strong><small>{workspace.id === account.workspace.id ? 'Current business' : `${workspace.role} · Switch to this business`}</small></span>
+              {workspace.id === account.workspace.id && <Check size={16} />}
+            </button>
+          ))}
+          <button type="button" role="menuitem" className="business-menu-item business-menu-add" onClick={() => { setBusinessMenuOpen(false); setModal('business'); setSidebarOpen(false) }}><Plus size={16} /> Add another business</button>
+        </div>}
       </div>
       <button className="nav-link bottom-link" onClick={() => { setModal('business'); setSidebarOpen(false) }}><Plus size={18} /> {t('Add business')}</button>
       <nav className="side-nav" aria-label="Main navigation">
@@ -4069,6 +4209,7 @@ async function createCameraReader(): Promise<CameraReader> {
       </div>
     </aside>
     {sidebarOpen && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={() => setSidebarOpen(false)} />}
+    {switchingBusiness && <div className="workspace-switching-overlay" role="status" aria-live="polite"><span>Switching business…</span></div>}
 
     <main className="main-area">
       <header className="topbar">
@@ -4097,7 +4238,7 @@ async function createCameraReader(): Promise<CameraReader> {
           <button className="icon-button notification-button" aria-label="Workspace status" onClick={() => setStatusOpen((open) => !open)}><Bell size={18} /></button>
           <button className="top-help" onClick={() => navigateTo('Help')}><CircleHelp size={17} /><span>Help</span></button>
         </div>
-        {statusOpen && <div className="notification-popover"><strong>{mpesaConfigured ? 'Daraja STK Push configured' : 'Connect your payment providers'}</strong><p>Your records are always available in this workspace. Open Kenya compliance to manage KRA eTIMS fiscalisation, bank feeds and payroll tax preparation.</p><button onClick={() => setStatusOpen(false)}>Close</button></div>}
+        {statusOpen && <div className="notification-popover"><strong>{mpesaConfigured ? 'Daraja STK Push configured' : 'Connect your payment providers'}</strong><p>Your records are always available in this workspace. Open Kenya compliance to manage this business’s Daraja account, KRA eTIMS, bank feeds, and payroll tax preparation.</p><button onClick={() => setStatusOpen(false)}>Close</button></div>}
       </header>
 
       <div className="content-wrap">
@@ -4670,7 +4811,7 @@ async function createCameraReader(): Promise<CameraReader> {
             </article>}
           </section>
         })() : page === 'Kenya compliance' ? <section className="module-page">
-          <div className="eyebrow"><span className="live-dot" /> KENYA COMPLIANCE · {dashboard?.workspaceName}</div><h1>Taxes and compliance</h1><p className="welcome-subtitle">Connect KRA eTIMS with one guided step, review bank feeds and prepare payroll taxes. You do not need any technical settings — just your KRA PIN and device serial.</p>
+          <div className="eyebrow"><span className="live-dot" /> KENYA COMPLIANCE · {dashboard?.workspaceName}</div><h1>Taxes and compliance</h1><p className="welcome-subtitle">Connect KRA eTIMS with one guided step, review bank feeds, prepare payroll taxes, and manage this business’s Daraja connection.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="metric-grid compliance-overview-grid">{[{ name: 'KRA eTIMS', description: 'Connect once below and fiscalise your invoices for KRA in a single guided step.', key: 'kra_etims' as const, blocker: kraEtimsConfig?.initialized ? 'Connected — ready to fiscalise' : 'Ready to connect in one step' }, { name: 'Bank feeds', description: 'Connect an eligible bank or import a statement. Review transactions before posting to your books.', key: 'bank_feeds' as const, blocker: monoConfigured ? 'Ready to connect' : 'Manual statement import available' }, { name: 'Payroll taxes', description: 'Prepare Kenyan payroll estimates for PAYE, NSSF, SHIF and Affordable Housing Levy alongside your monthly drafts.', key: 'statutory_filing' as const, blocker: 'Estimates ready in payroll' }].map((item) => {
             const value = onboarding[item.key] ?? { milestone: 'not_started', note: '', details: {} }
@@ -4684,6 +4825,25 @@ async function createCameraReader(): Promise<CameraReader> {
               </details>
             </article>
           })}</div>
+
+          <section className="module-card" aria-labelledby="daraja-business-settings-heading">
+            <div className="panel-header"><div><h2 id="daraja-business-settings-heading">Safaricom Daraja · {account?.workspace.name}</h2><p>Connect this business’s own merchant account. Every business can use different Daraja credentials.</p></div><Smartphone size={20} /></div>
+            {isActiveWorkspaceAdmin ? <>
+              <p>Consumer keys and the STK Push passkey are encrypted by the API and never shown again after saving. Credentials are stored separately for this business.</p>
+              {darajaConnection && <p role="status">Saved for this business · shortcode {darajaConnection.shortcode} · {darajaConnection.environment} · {darajaConnection.transaction_type}{darajaConnection.updated_at ? ` · updated ${new Date(darajaConnection.updated_at).toLocaleString()}` : ''}</p>}
+              {!darajaEncryptionReady && <p className="form-error" role="alert">Secure credential storage is not configured on the API server. Set <code>ONLINE_COMMERCE_ENCRYPTION_KEY</code> before saving credentials.</p>}
+              {!darajaConnection && <p className="dialog-note">No Daraja credentials are saved for {account?.workspace.name}. Add this business’s merchant account to enable its M-Pesa payments.</p>}
+              <form className="record-form-grid" onSubmit={saveDaraja}>
+                <div className="field-row"><label className="field-label">Daraja consumer key<input required autoComplete="off" value={darajaCredentials.consumerKey} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, consumerKey: event.target.value })} /></label><label className="field-label">Daraja consumer secret<input required type="password" autoComplete="new-password" value={darajaCredentials.consumerSecret} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, consumerSecret: event.target.value })} /></label></div>
+                <div className="field-row"><label className="field-label">PayBill / Till shortcode<input required autoComplete="off" placeholder="174379" value={darajaCredentials.shortcode} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, shortcode: event.target.value })} /></label><label className="field-label">STK Push passkey<input required type="password" autoComplete="new-password" value={darajaCredentials.passkey} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, passkey: event.target.value })} /></label></div>
+                <label className="field-label">Public callback URL<input required type="url" placeholder="https://your-api-domain.example/v1/integrations/mpesa/callback" value={darajaCredentials.callbackUrl} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, callbackUrl: event.target.value })} /><small>Must be reachable by Safaricom over the public internet. Production requires HTTPS.</small></label>
+                <div className="field-row"><label className="field-label">Environment<select value={darajaCredentials.environment} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, environment: event.target.value as 'sandbox' | 'production' })}><option value="sandbox">Sandbox (testing)</option><option value="production">Production (live)</option></select></label><label className="field-label">Transaction type<select value={darajaCredentials.transactionType} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, transactionType: event.target.value as 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline' })}><option value="CustomerPayBillOnline">CustomerPayBillOnline (PayBill)</option><option value="CustomerBuyGoodsOnline">CustomerBuyGoodsOnline (Till)</option></select></label></div>
+                <div className="button-row"><button className="button button-primary" disabled={busy || !darajaEncryptionReady}>{busy ? 'Saving…' : 'Save encrypted credentials'}</button></div>
+              </form>
+              <p className="dialog-note">To enable M-Pesa payment requests for this business, turn on “Allow Daraja / M-Pesa for this business” in Settings.</p>
+              <button type="button" className="button button-secondary" onClick={() => navigateTo('Settings')}>Open workspace settings</button>
+            </> : <p className="dialog-note">A business administrator can add or update this business’s encrypted Daraja credentials.</p>}
+          </section>
 
           <article className="kra-wizard">
             <div className="kra-wizard-head">
@@ -4886,7 +5046,7 @@ async function createCameraReader(): Promise<CameraReader> {
                   <button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).filter((_, row) => row !== index) }))}>Remove</button>
                 </div>)}
                 {Boolean((paymentSplits.pos ?? []).length) && <p className="dialog-note">Split total {money((paymentSplits.pos ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0))} of {money(posTotal)}. When splits are set, the button below records each method instead of one payment.</p>}
-                {Boolean((paymentSplits.pos ?? []).filter((split) => split.method === 'mpesa').length) && !mpesaConfigured && <p className="form-error" role="alert">Daraja M-Pesa is not configured, so M-Pesa splits cannot be requested. Remove them or ask the operator to configure Daraja.</p>}
+                {Boolean((paymentSplits.pos ?? []).filter((split) => split.method === 'mpesa').length) && !mpesaConfigured && <p className="form-error" role="alert">Daraja M-Pesa is not configured for this business, so M-Pesa splits cannot be requested. Remove them or ask a business administrator to add this business’s credentials on the Kenya compliance page.</p>}
               </div>}
               <button type="button" className="button button-primary pos-complete" disabled={busy || !posCart.length || posTotal <= 0} onClick={() => void checkoutPos()}>{busy ? 'Processing sale…' : posPaymentMethod === 'mpesa' ? 'Request M-Pesa payment' : 'Complete cash sale'}</button>
               <p className="pos-disclaimer"><ShieldCheck size={14} />Internal invoice only—not a KRA/eTIMS fiscal receipt. M-Pesa requests require configured Daraja; verify payment before releasing goods.</p>

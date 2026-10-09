@@ -31,14 +31,7 @@ This is a full logical database dump, not a physical PostgreSQL cluster backup: 
 - `DATABASE_URL`: PostgreSQL connection string. If left unset, the API falls back to a local in-memory PostgreSQL-compatible database for development-only testing.
 - `SESSION_SECRET`: at least 32 characters; signs HttpOnly session cookies.
 - `PAYROLL_DATA_ENCRYPTION_KEY`: at least 32 characters, independent of `SESSION_SECRET`; required in production and for all employee/payslip storage. Loss of this key makes encrypted payroll fields unreadable.
-- `MPESA_ENV`: `sandbox` (default) or `production`.
-- `MPESA_CONSUMER_KEY`: Daraja app consumer key.
-- `MPESA_CONSUMER_SECRET`: Daraja app consumer secret; server-side only.
-- `MPESA_SHORTCODE`: PayBill/Till shortcode authorized for STK Push.
-- `MPESA_PASSKEY`: Daraja STK Push passkey; server-side only.
-- `MPESA_CALLBACK_URL`: publicly reachable URL ending in `/v1/integrations/mpesa/callback`; HTTPS is required in production.
-- `MPESA_TRANSACTION_TYPE`: `CustomerPayBillOnline` by default or `CustomerBuyGoodsOnline` when supported by the merchant setup.
-- `ONLINE_COMMERCE_ENCRYPTION_KEY`: optional stable 32+ character API-side secret for encrypting WooCommerce REST credentials. Use an independent random key and back it up securely; losing or changing it makes saved WooCommerce credentials unreadable.
+- `ONLINE_COMMERCE_ENCRYPTION_KEY`: stable 32+ character API-side secret required to save encrypted WooCommerce or per-business Daraja credentials. Use an independent random key and back it up securely; losing or changing it makes saved credentials unreadable.
 
 There is no fixed admin email required. The homepage self-serve flow lets the first user create their own workspace admin account using a business name, email or phone number, and a password of at least 12 characters.
 
@@ -49,6 +42,7 @@ Invitations can be scoped to the current business or all businesses the inviter 
 - Admin-only `GET/PUT /v1/store/settings` configure the public product store. Authenticated `GET /v1/store/orders` and `GET /v1/store/orders/:orderId/lines` support order review. Public `GET /v1/public/stores/:slug`, order submission, and token-based tracking create order requests only; they do not take payment.
 - `PATCH /v1/store/orders/:orderId/status` accepts/rejects pending requests and marks invoiced orders fulfilled. `POST /v1/store/orders/:orderId/convert` requires an accepted request, validates available stock, creates an internal invoice, adjusts inventory and posts the journal in one transaction. The invoice is not a tax invoice.
 - Admin-only `GET/PUT /v1/integrations/woocommerce` manage an HTTPS WooCommerce URL and encrypted REST credentials. `POST /v1/integrations/woocommerce/products/sync` pushes mapped inventory products; `POST /v1/integrations/woocommerce/orders/sync` imports new orders as pending review. Confirm stock, tax, shipping, and payment separately; imported payment status is not trusted as a KashFlow receipt.
+- Admin-only `GET/PUT /v1/integrations/daraja` manage this business's own Safaricom Daraja (M-Pesa) credentials from the Kenya compliance page. The consumer key, consumer secret, and passkey are encrypted with `ONLINE_COMMERCE_ENCRYPTION_KEY` and never returned. `POST /v1/invoices/:invoiceId/payments/mpesa` and the Safaricom callback use only the active business's saved credentials; there is no shared merchant credential fallback.
 - `GET /v1/workspaces/:workspaceId/members` lists business member permissions. Admin-only `PUT /v1/workspaces/:workspaceId/members/:userId/permissions` may assign a built-in or existing custom role and set permission overrides; `permissions: null` restores inherited role defaults. Admins retain full access.
 - `GET/POST /v1/workspaces/:workspaceId/roles` lists and creates workspace-specific custom roles; `PUT /v1/workspaces/:workspaceId/roles/:roleKey` updates a custom role's permission scopes. Invitations may target built-in roles or custom roles in the active business. Custom roles cannot be used for all-owned-business invitations.
 - Supplier workspace records optionally store multiple validated inventory item IDs in `supplyItemIds`; these links are informational and do not modify purchasing or stock. Customer records in the frontend have a direct action to open a prefilled invoice draft.
@@ -60,7 +54,12 @@ The optional Windows launcher in `../pos-bridge/start.cmd` runs a separate local
 
 ## M-Pesa Daraja STK Push
 
-The API has a Daraja STK Push integration for whole-KSh, unpaid invoices. To enable it, onboard a Safaricom Daraja application and merchant shortcode, first use sandbox credentials, then set the five required `MPESA_*` values (`MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, `MPESA_SHORTCODE`, `MPESA_PASSKEY`, and `MPESA_CALLBACK_URL`) in this service's server-side environment. `MPESA_ENV` and `MPESA_TRANSACTION_TYPE` have defaults. Set the callback URL to the deployed API callback route. The invoice form's optional M-Pesa phone field initiates the prompt; a successful callback is checked using Daraja's STK Query endpoint before the invoice is marked paid. The API also exposes `GET /v1/invoices/:invoiceId/payments/mpesa` for payment status.
+The API has a Daraja STK Push integration for whole-KSh, unpaid invoices. Each business/workspace can store its **own** Daraja app credentials, so different businesses can use different merchant shortcodes and apps instead of one shared set of server variables.
+
+- Admin-only `GET/PUT /v1/integrations/daraja` manage this business's credentials. `PUT` accepts `consumerKey`, `consumerSecret`, `shortcode`, `passkey`, `callbackUrl`, `environment` (`sandbox`/`production`), and `transactionType` (`CustomerPayBillOnline`/`CustomerBuyGoodsOnline`). The consumer key, consumer secret, and passkey are encrypted with `ONLINE_COMMERCE_ENCRYPTION_KEY` (AES-256-GCM) and are never returned by the API; `GET` returns only the shortcode, callback URL, environment, and transaction type.
+- Every business must save its own credentials before it can request an STK Push. Set the public callback URL to the deployed API callback route in that business's Kenya compliance settings. Sandbox and production credentials remain separate per business.
+
+Enable the integration per business with the "Allow Daraja / M-Pesa for this business" workspace setting. Each business administrator enters that business's credentials on the Kenya compliance page. The invoice form's optional M-Pesa phone field initiates the prompt; a successful callback is checked using Daraja's STK Query endpoint (with that business's credentials) before the invoice is marked paid. The API also exposes `GET /v1/invoices/:invoiceId/payments/mpesa` for payment status.
 
 The callback must be reachable by Safaricom over the public internet; use an HTTPS deployment or secure HTTPS tunnel for sandbox testing. Do not trust a successful browser response as proof of payment; reconcile the saved payment with the callback, Daraja query, and merchant statement. Real transactions require Safaricom approval, correct shortcode/passkey setup, production credentials, HTTPS callback testing, and operational reconciliation. No live credentials are included in the repository.
 

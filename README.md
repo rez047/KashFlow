@@ -17,7 +17,7 @@ KashFlow is a Kenyan-first, cloud-hosted business finance workspace built with R
 - Provides business report charts for recorded income and expenses and a preview/printable internal invoice.
 - Can send invoice email through Resend when a server-side API key and verified sender are configured; accepted messages are audited, but delivery to the recipient is not guaranteed.
 - Shows saved transactions, customizable Overview totals for today, last week, last 30 days, month to date, year to date, or a custom date range (month to date by default), a daily cash-flow chart, and unpaid invoice totals.
-- Can initiate a Safaricom Daraja M-Pesa STK Push for a whole-KSh unpaid invoice when merchant credentials and a public callback URL are configured; it verifies the callback with Daraja's STK Query API before marking the invoice paid.
+- Can initiate a Safaricom Daraja M-Pesa STK Push for a whole-KSh unpaid invoice when merchant credentials and a public callback URL are configured; each business can save its own encrypted Daraja credentials, and it verifies the callback with Daraja's STK Query API before marking the invoice paid.
 - Provides a versioned Kenya payroll estimator for PAYE, employee/employer NSSF, SHIF, and Affordable Housing Levy, with explicit assumptions and review warnings.
 - Provides editable, encrypted employee records (including optional bank details) and payslips. Payroll drafts let admins include/remove active employees, enter per-employee bonuses, and review employee-level salary, estimated taxes, deductions, and net pay before posting. Confirmed external payroll payments are recorded as a separate `Payroll` expense and reduce payroll payable; bank feeds remain read-only, no bank payout is initiated, and any unpaid balance stays payable. Statutory remittances are reference tracking only.
 - Seeds a per-business chart of accounts; posts balanced journal entries for manual transactions, invoices, and posted payroll; exposes a trial balance and journal history. Posted journals stay immutable and can be corrected through a linked reversal in an open period plus a separately posted replacement entry.
@@ -70,8 +70,8 @@ This checklist uses plain language and real provider-issued credentials only. **
 
 ### Before you start: understand the current limit
 
-- Render environment variables belong to the whole API service. In the current app, Daraja and Mono credentials are shared by all workspaces using that service; they are not per-user credentials.
-- The API now checks workspace administrator membership and the saved business opt-in for M-Pesa payment initiation and Mono link/manual sync. Scheduled and webhook-triggered Mono syncs skip businesses that have opted out. Production KRA device operations and submissions also check the workspace opt-in. These controls do not make credentials per-business: Daraja and Mono credentials in Render remain shared by every workspace, so do not use one shared merchant/provider account for unrelated businesses without explicit provider authorization and separate tenant-level credential handling.
+- Render environment variables belong to the whole API service. Each business can enter its own Daraja credentials in its workspace settings; Mono API credentials remain service-wide.
+- The API checks workspace administrator membership and the saved business opt-in for M-Pesa payment initiation and Mono link/manual sync. Scheduled and webhook-triggered Mono syncs skip businesses that have opted out. Production KRA device operations and submissions also check the workspace opt-in. Daraja credentials are stored separately per business and encrypted with the API-side `ONLINE_COMMERCE_ENCRYPTION_KEY`; there is no shared merchant credential fallback.
 - KRA OSCU has API code, but this app is not KRA-certified. Only use production after KRA has approved the taxpayer/device/software and the fiscal invoice mapping has been professionally checked.
 - PAYE, AHL, SHIF/SHA, and NSSF filing adapters are not implemented. No Render variable can make those filings live today. Payroll figures are estimates, and remittance references are manual records only.
 
@@ -91,11 +91,11 @@ Use the provider's official dashboard and obtain credentials issued to your orga
 - **KRA eTIMS:** Register the taxpayer/device, complete KRA sandbox tests and the applicable software certification/production approval. Have a qualified tax professional verify the fiscal invoice fields and tax mapping. Self-entered approval references are not independently verified by this app.
 - **Email (optional):** Verify a sending domain with Resend and create an API key.
 
-### Step 3 — Put that provider's values in Render (API service only)
+### Step 3 - Configure the API and each provider
 
-In Render, open **API service → Environment**, add the relevant variables below using the exact values from the provider, save, and redeploy the API. Never put secret values in the frontend or in this README.
+In Render, open the API service Environment page, add the API-side values below, save, and redeploy if needed. Never put secret values in the frontend or in this README. Each business administrator enters its own Daraja merchant credentials on the Kenya compliance page after signing in.
 
-- **Daraja:** `MPESA_ENV=sandbox`, `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, `MPESA_SHORTCODE`, `MPESA_PASSKEY`, and `MPESA_CALLBACK_URL`. Set the callback to the exact public API address shown by Render, followed by `/v1/integrations/mpesa/callback`. Use production mode and live credentials only after Safaricom approval; the callback must be HTTPS. `MPESA_TRANSACTION_TYPE` is optional and must match the merchant account.
+- **Daraja encryption:** Keep `ONLINE_COMMERCE_ENCRYPTION_KEY` set to a stable API-side random secret of at least 32 characters. Each business enters its own consumer key, secret, shortcode, passkey, callback URL, environment, and transaction type in Kenya compliance settings. Use production credentials only after Safaricom approval; production callbacks must use HTTPS.
 - **Mono:** `MONO_PUBLIC_KEY`, `MONO_SECRET_KEY`, and a strong `MONO_WEBHOOK_SECRET`. Configure Mono's webhook destination using the exact public API address shown by Render, followed by `/v1/integrations/mono/webhook`. The secret key and webhook secret stay on the API.
 - **KRA sandbox:** `KRA_ETIMS_ENV=sandbox` and `KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY` (a separate, stable random secret of at least 32 characters). Save the taxpayer/device credentials in the Kenya compliance page and initialize the device only with KRA-approved sandbox credentials.
 - **KRA production:** Only after KRA has approved production, change to `KRA_ETIMS_ENV=production` and set `KRA_ETIMS_LIVE_ENABLED=true`; keep the encryption key configured and use the approved production taxpayer/device credentials. The server kill switch is a final operator gate, not a substitute for certification or workspace access checks.
@@ -111,12 +111,12 @@ In Render, open **API service → Environment**, add the relevant variables belo
 
 ### Step 5 — Do not mistake workspace preferences for per-business credentials
 
-Workspace provider switches are enforced for the currently implemented live-provider actions, and provider mutations require a workspace administrator. However, Render credentials are still API-service-wide, rather than isolated per business. Separate provider accounts/credentials require a supported provider arrangement and an encrypted, audited tenant credential store; do not use a shared credential for unrelated businesses' live money movement or compliance submissions unless the provider contract expressly permits it and the tenant controls have been independently reviewed and tested.
+Workspace provider switches are enforced for the currently implemented live-provider actions, and provider mutations require a workspace administrator. Daraja credentials are isolated per business; Mono provider credentials remain API-service-wide. Separate provider accounts still require provider onboarding and approval for each business.
 
 ### What cannot be switched on yet
 
 - **Statutory submissions:** PAYE, AHL, SHIF/SHA, and NSSF need approved authority/provider routes, implemented adapters, official formats, credentials, qualified review, and end-to-end tests. These are not available by setting environment variables.
-- **Per-business live provider credentials:** Not supported for Daraja or Mono by the current shared Render environment configuration. The workspace toggles alone do not provide this.
+- **Mono per-business credentials:** Mono credentials remain shared at the API service level. Daraja credentials are per-business and encrypted, but each business still needs its own Safaricom onboarding and merchant approval.
 - **Certified KRA production service:** The app's OSCU client is not itself proof of KRA certification. Production use must wait for KRA's explicit approvals and completion of the workspace authorization and operational safeguards above.
 
 ## Deploy to Render (Blueprint)
@@ -132,14 +132,14 @@ The repository includes [render.yaml](render.yaml), which describes a static fro
    - `DATABASE_URL` is linked to the Render PostgreSQL connection string.
    - `SESSION_SECRET` is a Render-generated secret with at least 32 characters. Keep it private; rotating it signs out existing sessions.
    - `PAYROLL_DATA_ENCRYPTION_KEY` is generated as an independent server-side secret, minimum 32 characters. Never put it in the static frontend. Losing it makes encrypted payroll records unreadable; establish a backup and rotation procedure.
-   - For WooCommerce only, optionally set `ONLINE_COMMERCE_ENCRYPTION_KEY` to a separate stable server-side random secret of at least 32 characters. Back it up securely; it encrypts REST API credentials and is not a frontend variable.
+   - `ONLINE_COMMERCE_ENCRYPTION_KEY` is generated by the Blueprint. Preserve and back it up securely; it encrypts per-business Daraja and WooCommerce credentials. Replacing it without a key migration makes saved credentials unreadable.
    - `FRONTEND_ORIGIN` is the exact HTTPS origin of the deployed frontend, with no path or trailing slash (for example, `https://kashflow-frontend.onrender.com`).
 6. In the frontend static site's **Environment** settings, confirm `VITE_API_BASE_URL` is the exact HTTPS base URL of the API (for example, `https://kashflow-api.onrender.com`), with no path. Because `VITE_*` values are included in the public browser bundle, never put secrets there.
 7. Save environment changes and redeploy both services. If Render generated URLs different from the example, update both sides: set API `FRONTEND_ORIGIN` to the frontend's actual origin and frontend `VITE_API_BASE_URL` to the API's actual URL, then redeploy.
 8. Check `https://<your-api-host>/healthz` returns `{"status":"ok","database":"available"}`. Check the frontend URL loads, create the first admin account, and verify sign-in, sign-out, business creation, and manual record entry.
 9. Keep Render's generated `PAYROLL_DATA_ENCRYPTION_KEY` stable and securely backed up. If changing it, first implement/execute a decrypt-and-re-encrypt rotation; replacing it directly strands existing encrypted employee/payslip rows.
 10. Before production data: configure and test database backups/restore, access and security policies, monitoring/alerts, privacy notices, domain/TLS settings, and incident recovery. Backup tooling is optional and disabled until all S3, token, database, and PostgreSQL tool settings are configured. The app does not provide invitation email delivery.
-11. Optional M-Pesa setup: complete Daraja merchant/app onboarding, add every `MPESA_*` value in the API service environment, set the callback to `https://<your-api-host>/v1/integrations/mpesa/callback`, redeploy the API, then test with sandbox credentials and a Safaricom-reachable HTTPS callback before considering production mode.
+11. Optional M-Pesa setup: keep the API's `ONLINE_COMMERCE_ENCRYPTION_KEY` configured, then have each business administrator enter that business's Daraja sandbox credentials on the Kenya compliance page. Set the callback to `https://<your-api-host>/v1/integrations/mpesa/callback` and test before considering production mode.
 12. Optional invoice email: verify a sending domain in Resend, create an API key, set `RESEND_API_KEY` and `EMAIL_FROM` in the API service environment, then redeploy. Send a test invoice to an address you control and inspect Resend logs. Never add either value to the frontend or source control.
 
 ### Render deployment troubleshooting
@@ -152,7 +152,7 @@ The repository includes [render.yaml](render.yaml), which describes a static fro
 
 ## Required environment variables
 
-These are the variables used by the **current code**. The Blueprint sets or links the core deployment variables. M-Pesa variables are optional for the application, but all listed Daraja credentials and a callback URL are required to initiate STK Push.
+These are the variables used by the current code. The Blueprint sets or links the core deployment variables. Each business enters its own Daraja merchant credentials in the Kenya compliance page; those credentials are not API-wide environment variables.
 
 | Name | Where | Required | Value / purpose |
 |---|---|---:|---|
@@ -162,15 +162,8 @@ These are the variables used by the **current code**. The Blueprint sets or link
 | `DATABASE_URL` | API | Yes in production | PostgreSQL connection URL; linked from the Render database resource. |
 | `SESSION_SECRET` | API | Yes in production | Random secret, minimum 32 characters, used to sign sessions. Generate in Render; never commit or expose to the frontend. |
 | `PAYROLL_DATA_ENCRYPTION_KEY` | API | Yes in production | Independent random secret, minimum 32 characters, used for AES-256-GCM encryption of employee and payslip fields. Back up securely; without this exact key records cannot be decrypted. |
-| `ONLINE_COMMERCE_ENCRYPTION_KEY` | API | Optional for WooCommerce | Separate stable random secret, minimum 32 characters, used to encrypt WooCommerce REST credentials. Back up securely; changing it makes saved credentials unreadable. |
+| `ONLINE_COMMERCE_ENCRYPTION_KEY` | API | Required for Daraja and WooCommerce credentials | Separate stable random secret, minimum 32 characters, used to encrypt each business's Daraja credentials and WooCommerce REST credentials. Back up securely; changing it makes saved credentials unreadable.
 | `VITE_API_BASE_URL` | Static site build | Yes | Public base URL for the API; not a secret. Vite embeds it in the browser build. |
-| `MPESA_ENV` | API | Optional | `sandbox` (default) or `production`. Do not select production until Safaricom has approved and provided live merchant details. |
-| `MPESA_CONSUMER_KEY` | API | Required for STK Push | Daraja app consumer key. Server-side configuration only. |
-| `MPESA_CONSUMER_SECRET` | API | Required for STK Push | Daraja app consumer secret. Keep private. |
-| `MPESA_SHORTCODE` | API | Required for STK Push | PayBill/Till shortcode enabled for the selected STK transaction type. |
-| `MPESA_PASSKEY` | API | Required for STK Push | Daraja STK Push passkey for that shortcode. Keep private. |
-| `MPESA_CALLBACK_URL` | API | Required for STK Push | Public callback URL ending `/v1/integrations/mpesa/callback`; production must use HTTPS and be reachable by Safaricom. |
-| `MPESA_TRANSACTION_TYPE` | API | Optional | `CustomerPayBillOnline` (default) or `CustomerBuyGoodsOnline`, according to merchant configuration. |
 | `RESEND_API_KEY` | API | Optional for invoice email | Resend server API key. Keep it private and configure only after creating a Resend account. |
 | `EMAIL_FROM` | API | Required with `RESEND_API_KEY` | Sender address/domain verified in Resend (for example `billing@yourdomain.co.ke`). |
 | `MONO_PUBLIC_KEY` | API response to authenticated frontend | Optional for bank feeds | Mono app public key; returned by the server only when the Mono adapter is configured. |

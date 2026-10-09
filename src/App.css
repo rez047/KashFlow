@@ -821,3 +821,21 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
   }
   @keyframes sidebar-backdrop-in{from{opacity:0}to{opacity:1}}
 }
+
+/* Business switcher dropdown in the sidebar */
+.company-switcher-wrap{position:relative;margin-bottom:14px}
+.company-switcher-caret{flex:0 0 auto;color:#a6a6b4;transition:transform .15s}
+.company-switcher-wrap.open .company-switcher-caret{transform:rotate(90deg)}
+.company-switcher:hover{border-color:#d9d5f2;background:#fbfaff}
+.business-menu{position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:40;background:#fff;border:1px solid #e7e5f4;border-radius:12px;box-shadow:0 18px 44px #22223a2e;padding:8px;display:flex;flex-direction:column;gap:2px;max-height:60vh;overflow-y:auto}
+.business-menu-heading{font-size:9px;letter-spacing:1.1px;text-transform:uppercase;color:#a1a1ae;font-weight:700;margin:4px 8px 6px}
+.business-menu-item{display:flex;align-items:center;gap:9px;width:100%;text-align:left;border:0;background:transparent;border-radius:9px;padding:8px 9px;cursor:pointer;color:#4b4b5c;font:inherit;transition:background .12s}
+.business-menu-item:hover:not(:disabled){background:#f5f3ff}
+.business-menu-item.active{background:#f0edfd;color:#5b45c4}
+.business-menu-item:disabled{opacity:.85;cursor:default}
+.business-menu-item .company-avatar{width:28px;height:28px;font-size:12px}
+.business-menu-item .company-copy small{white-space:normal}
+.business-menu-add{border-top:1px solid #eeeef4;margin-top:4px;padding-top:10px;color:#644fc5;font-weight:600;gap:8px}
+.business-menu-add:hover{background:#f5f3ff;color:#5441b8}
+.workspace-switching-overlay{position:fixed;inset:0;z-index:30;display:grid;place-items:center;background:#f7f8fbe8;backdrop-filter:blur(2px);color:#51439b;font-size:14px;font-weight:650}
+.workspace-switching-overlay span{padding:15px 20px;background:#fff;border:1px solid #ececf2;border-radius:10px;box-shadow:0 12px 32px #25234212}
