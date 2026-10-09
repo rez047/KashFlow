@@ -205,6 +205,14 @@ Never commit `.env`, `.env.local`, database URLs, session secrets, passwords, pr
 - `api/src/server.ts` — Express API, authentication, database access, and current endpoints.
 - `api/migrations/` — SQL schema migrations, automatically applied on API startup.
 - `render.yaml` — Render Blueprint for the frontend, API, and PostgreSQL resources.
+- `apps/mobile/` — Native React Native iOS/Android field app with SQLCipher-backed offline inventory.
+- `apps/desktop/` — Electron field app with separate desktop pages and an OS-encrypted local vault; packages Windows, macOS, and Linux builds.
+
+## Native field apps
+
+The landing page links each platform to the [KashFlow release page](https://github.com/rez047/KashFlow/releases). That page is the release hub; platform packages appear there when the signed builds are published. Desktop and mobile builds have their own page navigation and offline inventory workflow. Offline counts require an initial successful inventory refresh, are saved encrypted on device, and are posted with idempotency protection when the user syncs. A changed server balance pauses the count for review.
+
+See [`apps/mobile/README.md`](apps/mobile/README.md) for native iOS/Android builds and [`apps/desktop/README.md`](apps/desktop/README.md) for Windows/macOS/Linux installers. iOS distribution needs an Apple Developer account and signing; Android and EAS builds need the release project's Expo credentials. These packages are source-configured here, but this repository does not contain published signed installers yet.
 
 ## Security and accounting notice
 

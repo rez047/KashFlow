@@ -899,3 +899,23 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .help-centre button:focus-visible,.help-centre summary:focus-visible{outline:3px solid #8e7be8;outline-offset:3px}
 @media(max-width:1100px){.help-guide-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:650px){.help-centre{padding:2px 0 24px}.help-hero{padding:19px 16px 17px;border-radius:14px}.help-hero-heading{display:block}.help-hero-heading h1{font-size:25px}.help-hero-heading p{font-size:11px}.help-workspace-badge{display:inline-flex;margin-top:13px;max-width:100%}.help-search-box{height:46px;margin-top:17px;padding:0 11px}.help-guide-grid{grid-template-columns:1fr;gap:10px}.help-guide-card{padding:15px}.help-workspace-section{grid-template-columns:1fr;gap:15px;padding:17px}.help-results-heading h2{font-size:16px}.help-category-bar{margin-right:-2px}}
+
+/* ---------- Field app downloads ---------- */
+.app-download-section{position:relative;overflow:hidden;background:linear-gradient(135deg,#f4f8f4,#f8f7ff 78%);border-top:1px solid #ecebf1;border-bottom:1px solid #ecebf1}
+.app-download-section::before{content:"";position:absolute;width:480px;height:480px;right:-210px;top:-240px;border-radius:50%;border:1px solid rgba(24,130,106,.08);box-shadow:0 0 0 35px rgba(24,130,106,.025),0 0 0 70px rgba(24,130,106,.018);pointer-events:none}
+.app-download-section>.section-head,.app-download-grid,.app-download-note{position:relative;z-index:1}
+.app-download-grid{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px}
+.app-download-card{min-height:205px;display:flex;flex-direction:column;align-items:flex-start;padding:18px;border:1px solid #e6e9e2;border-radius:16px;background:rgba(255,255,255,.94);box-shadow:0 8px 24px rgba(33,55,45,.035);transition:transform .18s,border-color .18s,box-shadow .18s}
+.app-download-card:hover{transform:translateY(-3px);border-color:#cfe2d4;box-shadow:0 15px 30px rgba(31,81,61,.09)}
+.app-download-head{width:100%;display:flex;align-items:center;justify-content:space-between}
+.app-download-icon{width:39px;height:39px;display:grid;place-items:center;border-radius:13px;background:#e8f4ec;color:#16856b}
+.app-download-badge{font-size:7px;font-weight:900;letter-spacing:1.15px;color:#87968d;background:#f1f3ef;padding:5px 7px;border-radius:6px}
+.app-download-card h3{color:#24373a;font-size:14px;margin:15px 0 4px;letter-spacing:-.35px}
+.app-download-card p{color:#89948e;font-size:9px;margin:0;line-height:1.5}
+.app-download-link{width:100%;height:34px;margin-top:auto;padding:0 9px;display:flex;align-items:center;gap:6px;border:1px solid #dfebe1;border-radius:9px;background:#f8fcf8;color:#16836b;font-size:8px;font-weight:800;transition:background .15s,border-color .15s}
+.app-download-link svg:last-child{margin-left:auto}
+.app-download-link:hover{background:#eaf5ed;border-color:#c6dfcf;color:#0c735b}
+.app-download-note{max-width:1180px;margin:17px auto 0;display:flex;align-items:center;justify-content:center;gap:7px;color:#89958d;font-size:9px;line-height:1.5;text-align:center}
+.app-download-note svg{color:#618475;flex:none}
+@media(max-width:1000px){.app-download-grid{grid-template-columns:repeat(2,minmax(0,1fr));max-width:760px}}
+@media(max-width:560px){.app-download-grid{grid-template-columns:1fr;gap:10px}.app-download-card{min-height:174px;padding:15px}.app-download-note{align-items:flex-start;text-align:left;font-size:8px}.app-download-section::before{opacity:.5}}

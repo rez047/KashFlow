@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "KashFlow Inventory",
+    "slug": "kashflow-inventory",
+    "scheme": "kashflow",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "ke.kashflow.inventory",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "ke.kashflow.inventory",
+      "adaptiveIcon": {
+      "backgroundColor": "#123139",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": true
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      ["expo-sqlite", { "useSQLCipher": true }],
+      "expo-secure-store"
+    ]
+  }
+}

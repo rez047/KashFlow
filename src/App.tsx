@@ -5,7 +5,7 @@ import {
   BriefcaseBusiness, CalendarDays, Camera, Check, ChevronRight, CircleHelp,
   FileText, Filter, Gauge, Landmark, LayoutDashboard,
   LifeBuoy, LogOut, Mail, Menu, MessageCircle, Minus, Package, Phone, Plus, Printer, QrCode,
-  ScanBarcode, Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Sparkles, Star, Trash2, Users, Volume2, Wallet, X,
+  ScanBarcode, Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Sparkles, Star, Trash2, Users, Volume2, Wallet, X, Laptop, MonitorDown, Download,
 } from 'lucide-react'
 import { SupplierBillEmailSection } from './SupplierBillEmailSection'
 import './App.css'
@@ -372,6 +372,7 @@ function KraFiscalReceipt({ draft, businessName }: { draft: ComplianceDraft; bus
 const CONTACT_PHONE = '0746827220'
 const CONTACT_PHONE_INTL = '254746827220'
 const CONTACT_EMAIL = 'ezrasimiyu777@gmail.com'
+const APP_RELEASES_URL = 'https://github.com/rez047/KashFlow/releases'
 const LANDING_YEAR = new Date().getFullYear()
 
 // Selecting a subscription package signs the visitor into this shared demo workspace.
@@ -461,6 +462,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
         </div>
         <nav className="landing-links" aria-label="Homepage navigation">
           <a href="#features">Features</a>
+          <a href="#downloads">Apps</a>
           <a href="#who-we-serve">Who we serve</a>
           <a href="#whats-included">What&apos;s included</a>
           <a href="#compliance">Kenya compliance</a>
@@ -521,6 +523,27 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
         <div><strong>Working KRA</strong><span>eTIMS fiscalisation</span></div>
         <div><strong>Unlimited</strong><span>branches &amp; team members</span></div>
       </div>
+    </section>
+
+    <section className="landing-section app-download-section" id="downloads">
+      <div className="section-head">
+        <span className="section-eyebrow"><Download size={14} /> KASHFLOW FIELD APPS</span>
+        <h2>Made for the way your team <em>works</em></h2>
+        <p>Purpose-built screens for counting and managing inventory, with encrypted offline work and clear sync status. Choose a platform to see its release and install options.</p>
+      </div>
+      <div className="app-download-grid">
+        {[
+          { name: 'Windows', detail: 'Windows 10 and newer', label: 'Desktop installer', icon: MonitorDown, badge: 'DESKTOP' },
+          { name: 'macOS', detail: 'Apple Silicon and Intel', label: 'Universal Mac app', icon: Laptop, badge: 'DESKTOP' },
+          { name: 'iPhone & iPad', detail: 'iOS · TestFlight / App Store', label: 'iOS release', icon: Smartphone, badge: 'MOBILE' },
+          { name: 'Android', detail: 'Android phone and tablet', label: 'Android release', icon: Smartphone, badge: 'MOBILE' },
+        ].map(({ name, detail, label, icon: Icon, badge }) => <article className="app-download-card" key={name}>
+          <div className="app-download-head"><span className="app-download-icon"><Icon size={21} /></span><span className="app-download-badge">{badge}</span></div>
+          <h3>{name}</h3><p>{detail}</p>
+          <a className="app-download-link" href={APP_RELEASES_URL} target="_blank" rel="noreferrer" aria-label={`${label} for ${name} on KashFlow releases`}><Download size={14} /> View {label}<ArrowUpRight size={14} /></a>
+        </article>)}
+      </div>
+      <p className="app-download-note"><ShieldCheck size={14} /> Signed release packages and iOS distribution details are published on the KashFlow release page as each platform build is ready.</p>
     </section>
 
     <section className="landing-section" id="features">
@@ -2817,7 +2840,8 @@ async function createCameraReader(): Promise<CameraReader> {
   async function countInventory(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
-      await request('/v1/inventory/counts', { method: 'POST', body: JSON.stringify({ ...countInput, countedQuantity: Number(countInput.countedQuantity), date: today }) })
+      const expectedQuantity = Number(inventoryLocationStock.find((stock) => stock.item_id === countInput.itemId && stock.location_id === countInput.locationId)?.quantity ?? 0)
+      await request('/v1/inventory/counts', { method: 'POST', body: JSON.stringify({ ...countInput, countedQuantity: Number(countInput.countedQuantity), expectedQuantity, idempotencyKey: window.crypto.randomUUID(), date: today }) })
       const [stock, inventory] = await Promise.all([request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock'), request<{ records: WorkspaceRecord[] }>('/v1/records/inventory')])
       setInventoryLocationStock(stock.stock); setRecords((current) => ({ ...current, inventory: inventory.records })); await refresh(); notify('Stock count adjustment recorded.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not post stock count.') }

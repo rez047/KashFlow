@@ -1,0 +1,42 @@
+{
+  "name": "@kashflow/desktop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "start": "electron .",
+    "build": "tsc -b && vite build",
+    "build:win": "npm run build && electron-builder --win nsis --x64",
+    "build:mac": "npm run build && electron-builder --mac dmg zip --universal",
+    "build:linux": "npm run build && electron-builder --linux AppImage deb"
+  },
+  "dependencies": {
+    "lucide-react": "^1.50.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^9.2.1",
+    "electron": "^43.0.0",
+    "electron-builder": "^26.8.1",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0",
+    "wait-on": "^8.0.5"
+  },
+  "build": {
+    "appId": "ke.kashflow.desktop",
+    "productName": "KashFlow Field",
+    "directories": { "output": "release" },
+    "files": ["dist/**/*", "main.cjs", "preload.cjs", "package.json"],
+    "win": { "icon": "assets/icon.ico", "target": ["nsis"], "artifactName": "KashFlow-Desktop-${version}-Setup.${ext}" },
+    "mac": { "icon": "assets/icon.icns", "target": ["dmg", "zip"], "artifactName": "KashFlow-Desktop-${version}-${arch}.${ext}" },
+    "linux": { "icon": "assets/icon.png", "target": ["AppImage", "deb"], "artifactName": "KashFlow-Desktop-${version}-${arch}.${ext}" },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true, "createStartMenuShortcut": true }
+  }
+}

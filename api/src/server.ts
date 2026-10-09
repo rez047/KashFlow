@@ -130,6 +130,7 @@ const app = express()
 app.set('trust proxy', env.NODE_ENV === 'production' ? 1 : false)
 const cookieName = 'kashflow_session'
 const sessionTtlSeconds = 60 * 60 * 12
+const nativeSessionTtlSeconds = 60 * 60 * 24 * 30
 const defaultWorkspaceSettings = {
   businessName: '',
   currency: 'KES',
@@ -191,6 +192,9 @@ function signSession(session: Session) {
   const signature = createHmac('sha256', env.SESSION_SECRET ?? 'local-only-change-this-secret-at-least-32-chars').update(payload).digest('base64url')
   return `${payload}.${signature}`
 }
+function nativeSessionToken(session: Session) {
+  return signSession({ ...session, expiresAt: Date.now() + nativeSessionTtlSeconds * 1000 })
+}
 function readSession(token: string | undefined): Session | null {
   if (!token) return null
   const [payload, signature] = token.split('.')
@@ -217,7 +221,9 @@ function cookies(header: string | undefined) {
   return Object.fromEntries(entries)
 }
 function setSessionCookie(response: express.Response, session: Session) {
-  response.cookie(cookieName, signSession(session), { httpOnly: true, secure: env.NODE_ENV === 'production', sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax', maxAge: sessionTtlSeconds * 1000, path: '/' })
+  const token = signSession(session)
+  response.cookie(cookieName, token, { httpOnly: true, secure: env.NODE_ENV === 'production', sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax', maxAge: sessionTtlSeconds * 1000, path: '/' })
+  return token
 }
 function isAllowedOrigin(origin: string | undefined) {
   if (origin === env.FRONTEND_ORIGIN) return true
@@ -229,6 +235,10 @@ function isAllowedOrigin(origin: string | undefined) {
   } catch {
     return false
   }
+}
+function isNativeClient(request: express.Request) {
+  const origin = request.get('origin')
+  return request.get('x-kashflow-client') === 'native' && (!origin || origin === 'null')
 }
 async function hashPassword(password: string) {
   const salt = randomBytes(16)
@@ -542,7 +552,8 @@ function requirePool(_request: express.Request, response: express.Response, next
   next()
 }
 async function requireSession(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
-  request.session = readSession(cookies(request.headers.cookie)[cookieName]) ?? undefined
+  const bearer = request.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]
+  request.session = readSession(cookies(request.headers.cookie)[cookieName] ?? bearer) ?? undefined
   if (!request.session) { response.status(401).json({ error: 'Authentication is required to access this workspace.' }); return }
   try {
     const membership = await pool!.query(`SELECT wm.role, wm.permissions, u.session_version
@@ -638,7 +649,8 @@ function requirePayrollEncryption(_request: express.Request, response: express.R
   next()
 }
 function verifyOrigin(request: express.Request, response: express.Response, next: express.NextFunction) {
-  if (!isAllowedOrigin(request.get('origin'))) { response.status(403).json({ error: 'Request origin is not allowed.' }); return }
+  const origin = request.get('origin')
+  if (!isAllowedOrigin(origin) && !isNativeClient(request)) { response.status(403).json({ error: 'Request origin is not allowed.' }); return }
   next()
 }
 function darajaTimestamp() {
@@ -711,7 +723,7 @@ async function resolveWorkspaceDarajaConfig(workspaceId: string): Promise<Daraja
 }
 app.disable('x-powered-by')
 app.use(helmet())
-app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization'] }))
+app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Kashflow-Client'] }))
 app.use(express.json({ limit: '8mb', type: 'application/json' }))
 app.use(rateLimit({
   windowMs: 60_000,
@@ -881,8 +893,10 @@ app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 
     }
     await client.query('COMMIT')
     const row = user.rows[0]
-    setSessionCookie(response, { userId: row.id, workspaceId: row.workspace_id, sessionVersion: Number(row.session_version), expiresAt: Date.now() + sessionTtlSeconds * 1000 })
-    response.status(201).json({ user: { email: row.email ?? row.phone }, workspace: { id: row.workspace_id, name: input.data.businessName }, workspaces: [{ id: row.workspace_id, name: input.data.businessName, role: 'admin' }] })
+    const session = { userId: row.id, workspaceId: row.workspace_id, sessionVersion: Number(row.session_version), expiresAt: Date.now() + sessionTtlSeconds * 1000 }
+    setSessionCookie(response, session)
+    const accessToken = isNativeClient(request) ? nativeSessionToken(session) : null
+    response.status(201).json({ user: { email: row.email ?? row.phone }, workspace: { id: row.workspace_id, name: input.data.businessName }, workspaces: [{ id: row.workspace_id, name: input.data.businessName, role: 'admin' }], ...(accessToken ? { accessToken } : {}) })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
@@ -923,8 +937,10 @@ app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 *
     const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1', [user.id])
     const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
     const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: user.workspace_id, name: user.workspace_name, role: 'admin' }]
-    setSessionCookie(response, { userId: user.id, workspaceId: user.workspace_id, sessionVersion: Number(user.session_version ?? 0), expiresAt: Date.now() + sessionTtlSeconds * 1000 })
-    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces })
+    const session = { userId: user.id, workspaceId: user.workspace_id, sessionVersion: Number(user.session_version ?? 0), expiresAt: Date.now() + sessionTtlSeconds * 1000 }
+    setSessionCookie(response, session)
+    const accessToken = isNativeClient(request) ? nativeSessionToken(session) : null
+    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces, ...(accessToken ? { accessToken } : {}) })
   } catch (error) { next(error) }
 })
 
@@ -978,8 +994,10 @@ app.post('/v1/auth/two-factor/verify-login', requirePool, verifyOrigin, rateLimi
     const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1', [user.id])
     const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
     const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: user.workspace_id, name: user.workspace_name, role: 'admin' }]
-    setSessionCookie(response, { userId: user.id, workspaceId: user.workspace_id, sessionVersion: Number(user.session_version ?? 0), expiresAt: Date.now() + sessionTtlSeconds * 1000 })
-    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces, verifiedWith: method })
+    const session = { userId: user.id, workspaceId: user.workspace_id, sessionVersion: Number(user.session_version ?? 0), expiresAt: Date.now() + sessionTtlSeconds * 1000 }
+    setSessionCookie(response, session)
+    const accessToken = isNativeClient(request) ? nativeSessionToken(session) : null
+    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces, verifiedWith: method, ...(accessToken ? { accessToken } : {}) })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
@@ -1614,19 +1632,41 @@ app.post('/v1/inventory/transfers', requirePool, verifyOrigin, requireSession, r
   finally { client.release() }
 })
 app.post('/v1/inventory/counts', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ itemId: z.string().uuid(), locationId: z.string().uuid(), countedQuantity: z.coerce.number().finite().min(0).max(1_000_000), date: z.string().date(), reference: z.string().trim().max(200).default('') }).safeParse(request.body)
+  const input = z.object({ itemId: z.string().uuid(), locationId: z.string().uuid(), countedQuantity: z.coerce.number().finite().min(0).max(1_000_000), expectedQuantity: z.coerce.number().finite().min(0).max(1_000_000).optional(), idempotencyKey: z.string().uuid().optional(), date: z.string().date(), reference: z.string().trim().max(200).default('') }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter an item, location, non-negative count, and valid date.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
+    const workspaceId = request.session!.workspaceId
+    const requestHash = createHash('sha256').update(JSON.stringify([input.data.itemId, input.data.locationId, input.data.countedQuantity.toFixed(3), input.data.expectedQuantity?.toFixed(3) ?? null, input.data.date, input.data.reference])).digest('hex')
+    if (input.data.idempotencyKey) {
+      const lockValue = createHash('sha256').update(`${workspaceId}:inventory-count:${input.data.idempotencyKey}`).digest().readBigInt64BE(0).toString()
+      await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [lockValue])
+      const replay = await client.query('SELECT payload_hash, result FROM inventory_count_submissions WHERE workspace_id = $1 AND idempotency_key = $2', [workspaceId, input.data.idempotencyKey])
+      if (replay.rowCount) {
+        await client.query('ROLLBACK')
+        if (String(replay.rows[0].payload_hash) !== requestHash) { response.status(409).json({ error: 'This offline count ID was already used for different count details.', conflict: true }); return }
+        response.status(200).json({ ...(replay.rows[0].result as Record<string, unknown>), replayed: true }); return
+      }
+    }
     const item = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [input.data.itemId, request.session!.workspaceId])
     if (!item.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Inventory item not found.' }); return }
     const locationId = await ensureInventoryLocation(client, request.session!.workspaceId, input.data.locationId)
     if (!locationId) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active stock location not found.' }); return }
     const row = await client.query('SELECT quantity::text FROM inventory_location_stock WHERE workspace_id = $1 AND location_id = $2 AND item_id = $3 FOR UPDATE', [request.session!.workspaceId, locationId, input.data.itemId])
     const previous = Number(row.rows[0]?.quantity ?? 0)
+    if (input.data.expectedQuantity !== undefined && Number(input.data.expectedQuantity.toFixed(3)) !== Number(previous.toFixed(3))) {
+      await client.query('ROLLBACK')
+      response.status(409).json({ error: 'Stock changed after this count was started. Review the latest balance before applying this count.', conflict: true, expectedQuantity: input.data.expectedQuantity, serverQuantity: previous })
+      return
+    }
     const delta = Number((input.data.countedQuantity - previous).toFixed(3))
-    if (delta === 0) { await client.query('ROLLBACK'); response.status(409).json({ error: 'The counted quantity matches the saved quantity; no adjustment was posted.' }); return }
+    if (delta === 0) {
+      const result = { delta: 0, quantity: input.data.countedQuantity, idempotencyKey: input.data.idempotencyKey ?? null, unchanged: true }
+      if (input.data.idempotencyKey) await client.query('INSERT INTO inventory_count_submissions (workspace_id, idempotency_key, payload_hash, result) VALUES ($1, $2, $3, $4::jsonb)', [workspaceId, input.data.idempotencyKey, requestHash, JSON.stringify(result)])
+      await client.query('COMMIT')
+      response.status(200).json(result); return
+    }
     const itemData = item.rows[0].data as Record<string, unknown>
     const aggregateQuantity = Number((Number(itemData.quantity ?? 0) + delta).toFixed(3))
     if (aggregateQuantity < 0) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Count adjustment cannot reduce total business stock below zero.' }); return }
@@ -1642,8 +1682,10 @@ app.post('/v1/inventory/counts', requirePool, verifyOrigin, requireSession, requ
     [movementId, request.session!.workspaceId, input.data.itemId, locationId, delta.toFixed(3), unitCost.toFixed(2), input.data.reference || 'Stock count adjustment', input.data.date, request.session!.userId])
     const value = Number((Math.abs(delta) * unitCost).toFixed(2))
     if (value > 0) await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.date, description: `Stock count: ${String(itemData.name ?? 'item')}`, sourceType: 'inventory_count', sourceId: movementId, lines: delta > 0 ? [{ accountCode: '1200', debit: value, credit: 0 }, { accountCode: '5100', debit: 0, credit: value }] : [{ accountCode: '5100', debit: value, credit: 0 }, { accountCode: '1200', debit: 0, credit: value }] })
+    const result = { delta, quantity: input.data.countedQuantity, idempotencyKey: input.data.idempotencyKey ?? null, unchanged: false }
+    if (input.data.idempotencyKey) await client.query('INSERT INTO inventory_count_submissions (workspace_id, idempotency_key, payload_hash, result) VALUES ($1, $2, $3, $4::jsonb)', [workspaceId, input.data.idempotencyKey, requestHash, JSON.stringify(result)])
     await client.query('COMMIT')
-    response.status(201).json({ delta, quantity: input.data.countedQuantity })
+    response.status(201).json(result)
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
