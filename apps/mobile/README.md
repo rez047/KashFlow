@@ -24,3 +24,5 @@ Install dependencies with `npm ci`, then run `npm start`. Use a native developme
 - iOS App Store build: `npm run build:ios`
 
 EAS builds require an Expo project linked to this app. Put its ID in `EXPO_PROJECT_ID` (shown in `.env.example`) and authenticate with `EXPO_TOKEN` or `npx eas-cli login`; never commit the token. GitHub Actions can use an `EXPO_TOKEN` repository secret and an `EXPO_PROJECT_ID` repository variable after the project is linked. Android release signing requires the EAS Android signing key. iOS distribution requires Apple Developer signing and App Store Connect setup. EAS can build iOS remotely, but the project still needs Apple signing credentials for device distribution.
+
+After configuring those GitHub settings, run **Actions → Build KashFlow mobile apps** and choose Android, iOS, or both. The `preview` profile produces an Android installable APK and an iOS internal distribution build when the required Apple credentials are configured. `production` produces store-distribution builds; the workflow queues builds on EAS and prints the build links in the job log.
