@@ -4083,7 +4083,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
           {error && <p className="form-error" role="alert">{error}</p>}
           <button className="button button-primary" onClick={() => { setTransaction({ description: '', amount: '', direction: 'expense', account: 'Operating expenses', date: today }); setModal('transaction') }}><Plus size={16} /> Add expense</button>
           <article className="module-card">{(dashboard?.transactions ?? []).filter((row) => row.direction === 'expense').map((row) => <div className="transaction-row" key={row.id}><span><strong>{row.description}</strong><small>{row.transaction_date} · {row.account}</small></span><strong>{money(row.amount)}</strong></div>)}{!(dashboard?.transactions ?? []).some((row) => row.direction === 'expense') && <div className="empty-state">No expenses saved yet.</div>}</article>
-        </section> : ['Customers', 'Suppliers', 'Inventory', 'Projects'].includes(page) ? (() => {
+        </section> : ['Customers', 'Suppliers', 'Inventory', 'Services', 'Projects'].includes(page) ? (() => {
           const type = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Services: 'services', Projects: 'projects' } as Record<string, 'customers' | 'suppliers' | 'inventory' | 'services' | 'projects'>)[page]
           const recordLabel = type === 'inventory' ? 'inventory item' : type === 'services' ? 'service' : page.slice(0, -1).toLowerCase()
           const fields: Record<string, Array<{ name: string; label: string; kind?: string }>> = {
