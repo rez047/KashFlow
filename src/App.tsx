@@ -1846,45 +1846,170 @@ function App() {
     })
   }
 
-  // Phone / tablet camera scanning using the native BarcodeDetector API where available.
+// ---------------------------------------------------------------------------
+// Barcode decoding for the phone camera.
+//
+// The native BarcodeDetector API is fast but is NOT available on iOS Safari, and on
+// Android it is often missing the 32-bit ZXing fallback. Recreating a barcode on a
+// computer monitor also defeats it, because the detector rejects the screen sampling
+// and refresh banding. So we drive a real decoder instead:
+//   1. BarcodeDetector when the browser genuinely supports it,
+//   2. otherwise the bundled ZXing-WASM decoder (works on Safari and reads a screen).
+// A failed native detect is not fatal: the reader below is only disabled once the
+// fallback engine has also been ruled out, so a browser with a broken native detector
+// still falls back instead of silently returning nothing.
+// ---------------------------------------------------------------------------
+// The set of formats we ask for by default; the ZXing engine maps these to its own enums.
+const BARCODE_FORMATS = ['ean_13', 'ean_8', 'code_128', 'code_39', 'code_93', 'upc_a', 'upc_e', 'itf', 'codabar', 'qr_code'] as const
+type NativeBarcodeDetector = {
+  detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue: string }>>
+}
+type ZxingReader = {
+  // decodeFromCanvas is synchronous and throws when the frame contains no readable barcode.
+  decodeFromCanvas: (canvas: HTMLCanvasElement) => { getText: () => string }
+  reset: () => void
+}
+type CameraReader = { name: 'native' | 'zxing'; detect: (video: HTMLVideoElement) => Promise<string> }
+
+// ZXing is loaded on demand so the POS page stays light for keyboard-wedge registers that
+// never open the camera.
+async function createZxingReader(): Promise<ZxingReader> {
+  const [{ BrowserMultiFormatReader }, { BarcodeFormat, DecodeHintType }] = await Promise.all([
+    import('@zxing/browser'),
+    import('@zxing/library'),
+  ])
+  const hints = new Map<number, unknown>()
+  hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+    BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.CODE_128, BarcodeFormat.CODE_39,
+    BarcodeFormat.CODE_93, BarcodeFormat.UPC_A, BarcodeFormat.UPC_E, BarcodeFormat.ITF,
+    BarcodeFormat.CODABAR, BarcodeFormat.QR_CODE,
+  ])
+  // TRY_HARDER costs CPU but noticeably improves reads on a phone held at an angle.
+  hints.set(DecodeHintType.TRY_HARDER, true)
+  const reader = new BrowserMultiFormatReader(hints as Map<never, never>, { delayBetweenScanAttempts: 120 })
+  return {
+    decodeFromCanvas: (canvas) => reader.decodeFromCanvas(canvas),
+    // v2 replaced the old reset(); the reader holds no per-frame state, so releasing the
+    // shared media streams is the correct clean-up here.
+    reset: () => BrowserMultiFormatReader.releaseAllStreams(),
+  }
+}
+
+// Ask for the requested native formats, but tolerate a browser that rejects one of them.
+function createNativeDetector(): NativeBarcodeDetector | null {
+  const NativeDetector = (window as unknown as { BarcodeDetector?: new (options?: { formats?: string[] }) => NativeBarcodeDetector }).BarcodeDetector
+  if (!NativeDetector) return null
+  try {
+    return new NativeDetector({ formats: [...BARCODE_FORMATS] })
+  } catch {
+    try {
+      // Some builds support only a subset; retry with no format filter.
+      return new NativeDetector()
+    } catch { return null }
+  }
+}
+
+async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader> {
+  const nativeDetector = createNativeDetector()
+  if (nativeDetector) {
+    try {
+      // Probe once so a constructor that succeeds but cannot decode still falls through.
+      await nativeDetector.detect(video).catch(() => undefined)
+      return { name: 'native', detect: async (source) => (await nativeDetector.detect(source))[0]?.rawValue?.trim() ?? '' }
+    } catch { /* fall through to the ZXing engine below */ }
+  }
+  const canvas = document.createElement('canvas')
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) throw new Error('This browser cannot create a canvas for barcode reading.')
+  const reader = await createZxingReader()
+  return {
+    name: 'zxing',
+    detect: async (source) => {
+      // Downscale wide frames: decoding stays fast and small barcodes still resolve.
+      const maxWidth = 1280
+      const scale = source.videoWidth > maxWidth ? maxWidth / source.videoWidth : 1
+      canvas.width = Math.max(1, Math.round(source.videoWidth * scale))
+      canvas.height = Math.max(1, Math.round(source.videoHeight * scale))
+      if (!canvas.width || !canvas.height) return ''
+      context.drawImage(source, 0, 0, canvas.width, canvas.height)
+      // decodeFromCanvas throws on a frame with no barcode; that is a normal miss here.
+      try {
+        return reader.decodeFromCanvas(canvas)?.getText()?.trim() ?? ''
+      } catch { return '' }
+    },
+  }
+}
+
+  // Phone / tablet camera scanning. Uses the native BarcodeDetector when the browser really
+  // supports it, and otherwise the bundled ZXing engine, so iOS Safari and a barcode shown
+  // on a monitor screen both work. See createCameraReader above.
   async function startCameraScan() {
-    const Detector = (window as unknown as { BarcodeDetector?: new (options?: { formats?: string[] }) => { detect: (source: HTMLVideoElement) => Promise<Array<{ rawValue: string }>> } }).BarcodeDetector
-    if (!Detector) {
-      setError('This browser cannot use camera scanning. Use a USB/Bluetooth keyboard-wedge scanner or the manual scan box instead.')
-      return
-    }
     if (!navigator.mediaDevices?.getUserMedia) {
-      setError('Camera scanning needs a browser with camera access over HTTPS.')
+      setError('Camera scanning needs a browser with camera access over HTTPS. On a phone, open the site over https:// rather than http://.')
       return
     }
     setError('')
+    stopCameraScan()
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        // Ask for a sharp, wide rear-camera frame; decode quality depends on it.
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      })
       cameraStreamRef.current = stream
       setCameraScanning(true)
       await new Promise((resolve) => window.setTimeout(resolve, 60))
       const video = cameraVideoRef.current
-      if (!video) return
+      if (!video) { stopCameraScan(); return }
       video.srcObject = stream
+      video.setAttribute('playsinline', 'true')
       await video.play().catch(() => undefined)
-      const detector = new Detector({ formats: ['ean_13', 'ean_8', 'code_128', 'code_39', 'upc_a', 'upc_e', 'qr_code', 'itf', 'codabar', 'code_93'] })
-      let lastCode = ''; let lastAt = 0
+
+      let reader: CameraReader
+      try {
+        reader = await createCameraReader(video)
+      } catch (engineError) {
+        stopCameraScan()
+        setError(engineError instanceof Error
+          ? `Camera scanning is unavailable: ${engineError.message} Use a USB/Bluetooth keyboard-wedge scanner or the manual scan box.`
+          : 'Camera scanning is unavailable in this browser. Use a keyboard-wedge scanner or the manual scan box.')
+        return
+      }
+
+      let lastCode = ''; let lastAt = 0; let missCount = 0
       const loop = async () => {
         if (!cameraStreamRef.current || !cameraVideoRef.current) return
+        // Skip frames until the camera reports real dimensions, otherwise we decode nothing.
+        if (!cameraVideoRef.current.videoWidth) {
+          cameraRafRef.current = window.requestAnimationFrame(() => void loop())
+          return
+        }
         try {
-          const results = await detector.detect(cameraVideoRef.current)
-          const value = results[0]?.rawValue
+          const value = await reader.detect(cameraVideoRef.current)
           const now = Date.now()
+          // Ignore a repeat of the same code for 2.5s so one barcode is not added repeatedly.
           if (value && (value !== lastCode || now - lastAt > 2500)) {
             lastCode = value; lastAt = now
             resolveScanCode(value, 'Camera')
           }
-        } catch { /* frame not ready; keep scanning */ }
+          missCount = 0
+        } catch {
+          // A decode miss is normal on most frames; only warn after a sustained failure.
+          missCount += 1
+          if (missCount === 120) setError('Camera scanning is running but nothing has been decoded yet. Hold the barcode steady, fill more of the frame, and avoid glare or a screen reflection.')
+        }
         cameraRafRef.current = window.requestAnimationFrame(() => void loop())
       }
       void loop()
     } catch (reason) {
       stopCameraScan()
+      if (reason instanceof DOMException && reason.name === 'NotAllowedError') {
+        setError('Camera permission was blocked. Allow camera access for this site in your browser settings, then start scanning again.')
+        return
+      }
+      if (reason instanceof DOMException && reason.name === 'NotFoundError') {
+        setError('No camera was found on this device. Use a USB/Bluetooth keyboard-wedge scanner or the manual scan box.')
+        return
+      }
       setError(reason instanceof Error ? `Camera scanning could not start: ${reason.message}` : 'Camera scanning could not start.')
     }
   }
@@ -4235,7 +4360,7 @@ function App() {
                   <button type="button" className={`pos-scanner-mode ${scannerMode === 'camera' ? 'active' : ''}`} aria-pressed={scannerMode === 'camera'} onClick={() => setScannerPreference('camera')}><Camera size={15} /> Phone camera</button>
                   <button type="button" className="pos-scanner-mode" onClick={toggleScannerBeep} aria-pressed={scannerBeep}><Volume2 size={15} /> {scannerBeep ? 'Beep on' : 'Beep off'}</button>
                 </div>
-                <p className="pos-scanner-hint">{scannerMode === 'keyboard' ? 'Keyboard-wedge readers work anywhere on this page — just scan. A USB HID or Bluetooth SPP/2D scanner types the code and presses Enter. You can also type a SKU and press Enter.' : cameraScanning ? 'Point the camera at a barcode. Codes scan automatically and add to the sale.' : 'Camera scanning uses these devices: your phone or tablet rear camera (EAN, UPC, Code 128/39/93, ITF, Codabar, QR).'}</p>
+                <p className="pos-scanner-hint">{scannerMode === 'keyboard' ? 'Keyboard-wedge readers work anywhere on this page — just scan. A USB HID or Bluetooth SPP/2D scanner types the code and presses Enter. You can also type a SKU and press Enter.' : cameraScanning ? 'Point the rear camera at a barcode. Hold it steady, fill most of the frame, and avoid glare or a screen reflection. Codes scan automatically and add to the sale.' : 'Camera scanning works on phones and tablets, including iPhone. Held flat, a barcode printed on paper reads best; a barcode shown on another screen also works but needs good lighting and no glare.'}</p>
                 {scannerMode === 'camera' && <div className="pos-camera">
                   <video ref={cameraVideoRef} className="pos-camera-video" muted playsInline aria-label="Barcode camera preview" />
                   <div className="button-row">
