@@ -817,6 +817,7 @@ function App() {
   const [scanFlash, setScanFlash] = useState<{ code: string; ok: boolean; message: string } | null>(null)
   const [cameraScanning, setCameraScanning] = useState(false)
   const scanBufferRef = useRef({ value: '', lastKeyAt: 0 })
+  const resolveScanCodeRef = useRef<(code: string, source: string) => boolean>(() => false)
   const cameraStreamRef = useRef<MediaStream | null>(null)
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null)
   const cameraRafRef = useRef<number | null>(null)
@@ -1897,6 +1898,31 @@ function App() {
     } finally { setBusy(false) }
   }
 
+  function playScanBeep(ok: boolean) {
+    if (!scannerBeep) return
+    try {
+      const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+      if (!Ctor) return
+      const context = new Ctor()
+      const oscillator = context.createOscillator()
+      const gain = context.createGain()
+      oscillator.type = 'sine'
+      oscillator.frequency.value = ok ? 1180 : 320
+      gain.gain.value = 0.05
+      oscillator.connect(gain); gain.connect(context.destination)
+      oscillator.start()
+      oscillator.stop(context.currentTime + (ok ? 0.09 : 0.28))
+      oscillator.onended = () => void context.close().catch(() => undefined)
+    } catch { /* audio is best-effort feedback only */ }
+  }
+
+  function flashScanResult(code: string, ok: boolean, message: string) {
+    setScanFlash({ code, ok, message })
+    if (scanFlashTimer.current) window.clearTimeout(scanFlashTimer.current)
+    scanFlashTimer.current = window.setTimeout(() => setScanFlash(null), 2600)
+    playScanBeep(ok)
+  }
+
   // Resolve a scanned code by barcode or SKU and add it to the current sale.
   function resolveScanCode(rawCode: string, source: string) {
     const code = rawCode.trim().toLowerCase()
@@ -1916,30 +1942,7 @@ function App() {
     return true
   }
 
-  function flashScanResult(code: string, ok: boolean, message: string) {
-    setScanFlash({ code, ok, message })
-    if (scanFlashTimer.current) window.clearTimeout(scanFlashTimer.current)
-    scanFlashTimer.current = window.setTimeout(() => setScanFlash(null), 2600)
-    playScanBeep(ok)
-  }
-
-  function playScanBeep(ok: boolean) {
-    if (!scannerBeep) return
-    try {
-      const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
-      if (!Ctor) return
-      const context = new Ctor()
-      const oscillator = context.createOscillator()
-      const gain = context.createGain()
-      oscillator.type = 'sine'
-      oscillator.frequency.value = ok ? 1180 : 320
-      gain.gain.value = 0.05
-      oscillator.connect(gain); gain.connect(context.destination)
-      oscillator.start()
-      oscillator.stop(context.currentTime + (ok ? 0.09 : 0.28))
-      oscillator.onended = () => void context.close().catch(() => undefined)
-    } catch { /* audio is best-effort feedback only */ }
-  }
+  useEffect(() => { resolveScanCodeRef.current = resolveScanCode })
 
   // Manual Enter submit from the search / scan box.
   function scanPosBarcode(event: KeyboardEvent<HTMLInputElement>) {
@@ -1971,7 +1974,7 @@ function App() {
         // A wedge scanner emits the whole code within ~50ms per char; require a plausible length.
         if (code.length >= 3) {
           event.preventDefault()
-          resolveScanCode(code, 'Scanner')
+          resolveScanCodeRef.current(code, 'Scanner')
         }
         return
       }
@@ -2148,7 +2151,7 @@ async function createCameraReader(): Promise<CameraReader> {
           // Ignore a repeat of the same code for 2.5s so one barcode is not added repeatedly.
           if (value && (value !== lastCode || now - lastAt > 2500)) {
             lastCode = value; lastAt = now
-            resolveScanCode(value, 'Camera')
+            resolveScanCodeRef.current(value, 'Camera')
           }
           missCount = 0
         } catch {
@@ -3608,6 +3611,7 @@ async function createCameraReader(): Promise<CameraReader> {
       setPasswordChange({ current: '', next: '', confirm: '' })
       setPasswordChangeStatus('Password changed successfully.')
       notify('Account password changed.')
+      window.dispatchEvent(new CustomEvent('kashflow:session-expired', { detail: 'Your password changed, so this session has ended. Sign in again with your new password.' }))
     } catch (reason) {
       setPasswordChangeError(reason instanceof Error ? reason.message : 'Could not change the password.')
     } finally { setBusy(false) }

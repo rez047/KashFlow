@@ -4,7 +4,7 @@ import { isIP } from 'node:net'
 import { promisify } from 'node:util'
 import cors from 'cors'
 import express from 'express'
-import rateLimit from 'express-rate-limit'
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import helmet from 'helmet'
 import { Pool, type PoolClient } from 'pg'
 import { z } from 'zod'
@@ -129,6 +129,9 @@ async function createPool() {
 }
 const pool = await createPool()
 const app = express()
+// Render terminates inbound TLS at one trusted edge proxy. Keep the hop count explicit so
+// request IPs (and IP-based rate limits) use the client address without trusting arbitrary XFF.
+app.set('trust proxy', env.NODE_ENV === 'production' ? 1 : false)
 const cookieName = 'kashflow_session'
 const sessionTtlSeconds = 60 * 60 * 12
 const defaultWorkspaceSettings = {
@@ -166,7 +169,7 @@ const passwordSchema = z.string().min(12).max(200)
 const emailSchema = z.string().email().max(254).transform((value) => value.toLowerCase())
 const phoneSchema = z.string().trim().min(7).max(30).transform((value) => value.replace(/[\s().-]/g, ''))
 
-type Session = { userId: string; workspaceId: string; expiresAt: number }
+type Session = { userId: string; workspaceId: string; expiresAt: number; sessionVersion?: number }
 type WorkspacePermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
 type AuthedRequest = express.Request & { session?: Session; workspaceRole?: string; workspacePermissions?: WorkspacePermission[] }
 const workspacePermissionNames: WorkspacePermission[] = ['operations.write', 'sales.write', 'inventory.write', 'accounting.write', 'banking.write', 'payroll.manage', 'integrations.manage', 'workspace.manage', 'team.manage', 'store.manage']
@@ -202,7 +205,7 @@ function readSession(token: string | undefined): Session | null {
   if (received.length !== expected.length || !timingSafeEqual(received, expected)) return null
   try {
     const value = JSON.parse(Buffer.from(payload, 'base64url').toString()) as Session
-    if (!value.userId || !value.workspaceId || value.expiresAt <= Date.now()) return null
+    if (!value.userId || !value.workspaceId || value.expiresAt <= Date.now() || (value.sessionVersion !== undefined && (!Number.isInteger(value.sessionVersion) || value.sessionVersion < 0))) return null
     return value
   } catch { return null }
 }
@@ -391,15 +394,22 @@ function verifyTotpCode(secret: string, code: string) {
   return null
 }
 function hashRecoveryCode(code: string) {
-  return createHmac('sha256', twoFactorKey()).update(code.replace(/\D/g, '')).digest('hex')
+  return createHmac('sha256', twoFactorKey()).update(code.toUpperCase().replace(/[^A-Z0-9]/g, '')).digest('hex')
 }
 function generateRecoveryCodes(count = 8) {
   const codes: string[] = []
   for (let index = 0; index < count; index += 1) {
-    const digits = randomBytes(5).toString('hex').toUpperCase().match(/.{1,4}/g)?.join('-') ?? ''
-    codes.push(digits.slice(0, 9))
+    codes.push(randomBytes(8).toString('hex').toUpperCase().match(/.{1,4}/g)?.join('-') ?? '')
   }
   return codes
+}
+function twoFactorLockIsActive(lockedUntil: unknown) {
+  return Boolean(lockedUntil && new Date(String(lockedUntil)).getTime() > Date.now())
+}
+async function recordTwoFactorFailure(client: PoolClient, userId: string, previousFailures: unknown) {
+  const nextFailedAttempts = Number(previousFailures ?? 0) + 1
+  await client.query("UPDATE user_two_factor SET failed_attempts = $1, locked_until = CASE WHEN $1 >= 8 THEN now() + interval '15 minutes' ELSE locked_until END, updated_at = now() WHERE user_id = $2", [nextFailedAttempts, userId])
+  return nextFailedAttempts
 }
 function twoFactorOtpAuthUri(secret: string, account: string) {
   const issuer = 'KashFlow'
@@ -539,8 +549,14 @@ async function requireSession(request: AuthedRequest, response: express.Response
   request.session = readSession(cookies(request.headers.cookie)[cookieName]) ?? undefined
   if (!request.session) { response.status(401).json({ error: 'Authentication is required to access this workspace.' }); return }
   try {
-    const membership = await pool!.query('SELECT role, permissions FROM workspace_members WHERE user_id = $1 AND workspace_id = $2', [request.session.userId, request.session.workspaceId])
+    const membership = await pool!.query(`SELECT wm.role, wm.permissions, u.session_version
+      FROM workspace_members wm JOIN users u ON u.id = wm.user_id
+      WHERE wm.user_id = $1 AND wm.workspace_id = $2`, [request.session.userId, request.session.workspaceId])
     if (!membership.rowCount) { response.status(401).json({ error: 'Workspace membership has been revoked or is no longer valid.' }); return }
+    if (Number(membership.rows[0].session_version ?? 0) !== (request.session.sessionVersion ?? 0)) {
+      response.clearCookie(cookieName, { httpOnly: true, secure: env.NODE_ENV === 'production', sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax', path: '/' })
+      response.status(401).json({ error: 'Your password changed, so this session has expired. Sign in again.' }); return
+    }
     request.workspaceRole = String(membership.rows[0].role)
     const overrides = membership.rows[0].permissions
     request.workspacePermissions = request.workspaceRole === 'admin'
@@ -687,7 +703,7 @@ app.use(rateLimit({
   limit: 240,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
-  skip: (request) => request.path.startsWith('/v1/auth/') || request.path === '/v1/integrations/mpesa/callback',
+  skip: (request) => request.path === '/v1/integrations/mpesa/callback',
   handler: (_request, response) => response.status(429).json({ error: 'This service received too many requests from this network. Please wait a minute and try again.' }),
 }))
 app.use((request, response, next) => {
@@ -735,6 +751,29 @@ async function automaticBackupsEnabled() {
 }
 
 const backupOperatorLimit = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false })
+const twoFactorActionLimit = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 12,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many two-factor changes from this network. Wait 15 minutes and try again.' },
+})
+const loginIdentifierLimit = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 10,
+  skipSuccessfulRequests: true,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  keyGenerator: (request) => {
+    const body = request.body as { identifier?: unknown; email?: unknown; phone?: unknown } | undefined
+    const raw = body?.identifier ?? body?.email ?? body?.phone
+    if (typeof raw !== 'string' || !raw.trim()) return ipKeyGenerator(request.ip ?? request.socket.remoteAddress ?? 'unknown')
+    const normalized = normalizeIdentifier(raw)
+    const identity = normalized.email ? `email:${normalized.email}` : normalized.phone ? `phone:${normalized.phone}` : null
+    return identity ? `account:${createHash('sha256').update(identity).digest('hex')}` : ipKeyGenerator(request.ip ?? request.socket.remoteAddress ?? 'unknown')
+  },
+  message: { error: 'Too many failed sign-in attempts for this account. Wait 15 minutes and try again.' },
+})
 
 // Backups are an emergency safety net, so the read/status path must never require an operator
 // secret. When object storage is not configured, report that plainly and direct workspace admins
@@ -820,20 +859,20 @@ app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 
     const workspaceId = randomUUID()
     const userId = randomUUID()
     const workspace = await client.query('INSERT INTO workspaces (id, name) VALUES ($1, $2) RETURNING id', [workspaceId, input.data.businessName])
-    const user = await client.query('INSERT INTO users (id, workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, workspace_id, email, phone', [userId, workspace.rows[0].id, email, phone, await hashPassword(input.data.password)])
+    const user = await client.query('INSERT INTO users (id, workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, workspace_id, email, phone, session_version', [userId, workspace.rows[0].id, email, phone, await hashPassword(input.data.password)])
     await client.query('INSERT INTO workspace_members (user_id, workspace_id, role) VALUES ($1, $2, $3)', [user.rows[0].id, workspace.rows[0].id, 'admin'])
     for (const account of defaultChartOfAccounts) {
       await client.query('INSERT INTO workspace_accounts (id, workspace_id, code, name, account_type) VALUES ($1, $2, $3, $4, $5)', [randomUUID(), workspace.rows[0].id, account.code, account.name, account.type])
     }
     await client.query('COMMIT')
     const row = user.rows[0]
-    setSessionCookie(response, { userId: row.id, workspaceId: row.workspace_id, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
+    setSessionCookie(response, { userId: row.id, workspaceId: row.workspace_id, sessionVersion: Number(row.session_version), expiresAt: Date.now() + sessionTtlSeconds * 1000 })
     response.status(201).json({ user: { email: row.email ?? row.phone }, workspace: { id: row.workspace_id, name: input.data.businessName }, workspaces: [{ id: row.workspace_id, name: input.data.businessName, role: 'admin' }] })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
 
-app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many sign-in attempts from this network. Please wait 15 minutes and try again.' } }), async (request, response, next) => {
+app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many sign-in attempts from this network. Please wait 15 minutes and try again.' } }), loginIdentifierLimit, async (request, response, next) => {
   const input = z.object({
     identifier: z.string().trim().min(1).max(254).optional(),
     email: emailSchema.optional(),
@@ -847,7 +886,7 @@ app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 *
   if (!normalized.email && !normalized.phone) { response.status(400).json({ error: 'Enter a valid email or phone number and password.' }); return }
 
   try {
-    const result = await pool!.query('SELECT u.id, u.workspace_id, u.email, u.phone, u.password_hash, w.name AS workspace_name FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE (u.email = $1 OR u.phone = $2) LIMIT 1', [normalized.email, normalized.phone])
+    const result = await pool!.query('SELECT u.id, u.workspace_id, u.email, u.phone, u.password_hash, u.session_version, w.name AS workspace_name FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE (u.email = $1 OR u.phone = $2) LIMIT 1', [normalized.email, normalized.phone])
     const user = result.rows[0]
     if (!user || !(await verifyPassword(input.data.password, user.password_hash))) { response.status(401).json({ error: 'Email/phone or password is incorrect.' }); return }
 
@@ -861,7 +900,7 @@ app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 *
       // Password was correct, but no session is issued until the second factor is verified.
       const challengeToken = randomBytes(32).toString('base64url')
       const tokenHash = createHash('sha256').update(challengeToken).digest('hex')
-      await pool!.query('INSERT INTO pending_two_factor_logins (user_id, workspace_id, token_hash, expires_at) VALUES ($1, $2, $3, now() + interval \'5 minutes\')', [user.id, user.workspace_id, tokenHash])
+      await pool!.query('INSERT INTO pending_two_factor_logins (id, user_id, workspace_id, token_hash, expires_at) VALUES ($1, $2, $3, $4, now() + interval \'5 minutes\')', [randomUUID(), user.id, user.workspace_id, tokenHash])
       response.status(200).json({ twoFactorRequired: true, challengeToken, message: 'Enter the 6-digit code from your authenticator app to finish signing in.' })
       return
     }
@@ -869,7 +908,7 @@ app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 *
     const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1', [user.id])
     const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
     const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: user.workspace_id, name: user.workspace_name, role: 'admin' }]
-    setSessionCookie(response, { userId: user.id, workspaceId: user.workspace_id, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
+    setSessionCookie(response, { userId: user.id, workspaceId: user.workspace_id, sessionVersion: Number(user.session_version ?? 0), expiresAt: Date.now() + sessionTtlSeconds * 1000 })
     response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces })
   } catch (error) { next(error) }
 })
@@ -889,7 +928,7 @@ app.post('/v1/auth/two-factor/verify-login', requirePool, verifyOrigin, rateLimi
     const challenge = pending.rows[0]
     if (!challenge) { await client.query('ROLLBACK'); response.status(401).json({ error: 'This sign-in request has expired. Enter your password again.' }); return }
     if (Number(challenge.attempts) >= 10) { await client.query('ROLLBACK'); response.status(429).json({ error: 'Too many incorrect codes. Enter your password again.' }); return }
-    const record = await client.query('SELECT secret_encrypted, enabled_at, locked_until, failed_attempts FROM user_two_factor WHERE user_id = $1', [challenge.user_id])
+    const record = await client.query('SELECT secret_encrypted, enabled_at, last_used_step, locked_until, failed_attempts FROM user_two_factor WHERE user_id = $1 FOR UPDATE', [challenge.user_id])
     const factor = record.rows[0]
     if (!factor?.enabled_at) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Two-factor authentication is not enabled for this account.' }); return }
     if (factor.locked_until && new Date(factor.locked_until).getTime() > Date.now()) { await client.query('ROLLBACK'); response.status(429).json({ error: 'Two-factor verification is temporarily locked. Try again shortly.' }); return }
@@ -900,7 +939,7 @@ app.post('/v1/auth/two-factor/verify-login', requirePool, verifyOrigin, rateLimi
     let method: 'authenticator' | 'recovery' = 'authenticator'
     if (step === null) {
       // Fall back to a single-use recovery code.
-      const recovery = await client.query('SELECT id FROM user_recovery_codes WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL', [challenge.user_id, hashRecoveryCode(rawCode)])
+      const recovery = await client.query('SELECT id FROM user_recovery_codes WHERE user_id = $1 AND hash_version = 2 AND code_hash = $2 AND used_at IS NULL', [challenge.user_id, hashRecoveryCode(rawCode)])
       if (!recovery.rowCount) {
         await client.query('UPDATE pending_two_factor_logins SET attempts = attempts + 1 WHERE id = $1', [challenge.id])
         const nextFailed = Number(factor.failed_attempts ?? 0) + 1
@@ -909,6 +948,7 @@ app.post('/v1/auth/two-factor/verify-login', requirePool, verifyOrigin, rateLimi
         response.status(401).json({ error: 'That code is not valid. Check your authenticator app, or use a recovery code.' }); return
       }
       await client.query('UPDATE user_recovery_codes SET used_at = now() WHERE id = $1', [recovery.rows[0].id])
+      await client.query('UPDATE user_two_factor SET failed_attempts = 0, locked_until = NULL, updated_at = now() WHERE user_id = $1', [challenge.user_id])
       method = 'recovery'
     } else {
       const lastStep = factor.last_used_step === null || factor.last_used_step === undefined ? null : Number(factor.last_used_step)
@@ -918,12 +958,12 @@ app.post('/v1/auth/two-factor/verify-login', requirePool, verifyOrigin, rateLimi
     await client.query('UPDATE pending_two_factor_logins SET consumed_at = now() WHERE id = $1', [challenge.id])
     await client.query('COMMIT')
 
-    const userRow = await pool!.query('SELECT u.id, u.workspace_id, u.email, u.phone, w.name AS workspace_name FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE u.id = $1', [challenge.user_id])
+    const userRow = await pool!.query('SELECT u.id, u.workspace_id, u.email, u.phone, u.session_version, w.name AS workspace_name FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE u.id = $1', [challenge.user_id])
     const user = userRow.rows[0]
     const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1', [user.id])
     const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
     const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: user.workspace_id, name: user.workspace_name, role: 'admin' }]
-    setSessionCookie(response, { userId: user.id, workspaceId: user.workspace_id, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
+    setSessionCookie(response, { userId: user.id, workspaceId: user.workspace_id, sessionVersion: Number(user.session_version ?? 0), expiresAt: Date.now() + sessionTtlSeconds * 1000 })
     response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces, verifiedWith: method })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
@@ -932,7 +972,7 @@ app.post('/v1/auth/two-factor/verify-login', requirePool, verifyOrigin, rateLimi
 app.get('/v1/auth/two-factor/status', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
     const result = await pool!.query('SELECT enabled_at, created_at FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
-    const recovery = await pool!.query('SELECT count(*)::int AS remaining FROM user_recovery_codes WHERE user_id = $1 AND used_at IS NULL', [request.session!.userId])
+    const recovery = await pool!.query('SELECT count(*)::int AS remaining FROM user_recovery_codes WHERE user_id = $1 AND hash_version = 2 AND used_at IS NULL', [request.session!.userId])
     response.json({
       available: twoFactorConfigured,
       enabled: Boolean(result.rows[0]?.enabled_at),
@@ -943,18 +983,27 @@ app.get('/v1/auth/two-factor/status', requirePool, requireSession, async (reques
 })
 
 // Start enrollment: generate a secret and recovery codes. 2FA is not active until verified.
-app.post('/v1/auth/two-factor/enroll', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.post('/v1/auth/two-factor/enroll', requirePool, verifyOrigin, requireSession, twoFactorActionLimit, async (request: AuthedRequest, response, next) => {
   if (!twoFactorConfigured) { response.status(503).json({ error: 'Set TWO_FACTOR_ENCRYPTION_KEY on the API service before enabling two-factor authentication.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
+    const existing = await client.query('SELECT enabled_at, locked_until FROM user_two_factor WHERE user_id = $1 FOR UPDATE', [request.session!.userId])
+    if (existing.rows[0]?.enabled_at) {
+      await client.query('ROLLBACK')
+      response.status(409).json({ error: 'Two-factor authentication is already enabled. Verify the current code to disable it before setting up a new authenticator.' }); return
+    }
+    if (twoFactorLockIsActive(existing.rows[0]?.locked_until)) {
+      await client.query('ROLLBACK')
+      response.status(429).json({ error: 'Two-factor setup is temporarily locked. Wait 15 minutes before trying again.' }); return
+    }
     const secret = generateTotpSecret()
     await client.query(`INSERT INTO user_two_factor (user_id, secret_encrypted, enabled_at, last_used_step, failed_attempts, locked_until, updated_at)
       VALUES ($1, $2, NULL, NULL, 0, NULL, now())
       ON CONFLICT (user_id) DO UPDATE SET secret_encrypted = EXCLUDED.secret_encrypted, enabled_at = NULL, last_used_step = NULL, failed_attempts = 0, locked_until = NULL, updated_at = now()`, [request.session!.userId, encryptTwoFactorSecret(secret)])
     await client.query('DELETE FROM user_recovery_codes WHERE user_id = $1', [request.session!.userId])
     const codes = generateRecoveryCodes()
-    for (const code of codes) await client.query('INSERT INTO user_recovery_codes (user_id, code_hash) VALUES ($1, $2)', [request.session!.userId, hashRecoveryCode(code)])
+    for (const code of codes) await client.query('INSERT INTO user_recovery_codes (id, user_id, code_hash, hash_version) VALUES ($1, $2, $3, 2)', [randomUUID(), request.session!.userId, hashRecoveryCode(code)])
     await client.query('COMMIT')
     const account = await pool!.query('SELECT email, phone FROM users WHERE id = $1', [request.session!.userId])
     const label = String(account.rows[0]?.email ?? account.rows[0]?.phone ?? 'account')
@@ -964,64 +1013,98 @@ app.post('/v1/auth/two-factor/enroll', requirePool, verifyOrigin, requireSession
 })
 
 // Confirm enrollment with a live code, which switches 2FA on.
-app.post('/v1/auth/two-factor/activate', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.post('/v1/auth/two-factor/activate', requirePool, verifyOrigin, requireSession, twoFactorActionLimit, async (request: AuthedRequest, response, next) => {
   const input = z.object({ code: z.string().trim().min(6).max(10) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter the 6-digit code from your authenticator app.' }); return }
+  const client = await pool!.connect()
   try {
-    const result = await pool!.query('SELECT secret_encrypted FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
-    if (!result.rowCount) { response.status(409).json({ error: 'Start two-factor setup first.' }); return }
-    const secret = decryptTwoFactorSecret(String(result.rows[0].secret_encrypted))
+    await client.query('BEGIN')
+    const result = await client.query('SELECT secret_encrypted, enabled_at, last_used_step, locked_until, failed_attempts FROM user_two_factor WHERE user_id = $1 FOR UPDATE', [request.session!.userId])
+    const factor = result.rows[0]
+    if (!factor) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Start two-factor setup first.' }); return }
+    if (factor.enabled_at) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Two-factor authentication is already enabled.' }); return }
+    if (twoFactorLockIsActive(factor.locked_until)) { await client.query('ROLLBACK'); response.status(429).json({ error: 'Two-factor verification is temporarily locked. Try again shortly.' }); return }
+    const secret = decryptTwoFactorSecret(String(factor.secret_encrypted))
     const step = verifyTotpCode(secret, input.data.code)
-    if (step === null) { response.status(401).json({ error: 'That code is not valid. Check your phone clock and try the current code.' }); return }
-    await pool!.query('UPDATE user_two_factor SET enabled_at = now(), last_used_step = $1, failed_attempts = 0, locked_until = NULL, updated_at = now() WHERE user_id = $2', [step, request.session!.userId])
-    const auditClient = await pool!.connect()
-    try { await recordAudit(auditClient, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'auth.two_factor_enabled', entityType: 'user', entityId: request.session!.userId, eventData: {} }) } finally { auditClient.release() }
+    if (step === null) {
+      await recordTwoFactorFailure(client, request.session!.userId, factor.failed_attempts)
+      await client.query('COMMIT')
+      response.status(401).json({ error: 'That code is not valid. Check your phone clock and try the current code.' }); return
+    }
+    await client.query('UPDATE user_two_factor SET enabled_at = now(), last_used_step = $1, failed_attempts = 0, locked_until = NULL, updated_at = now() WHERE user_id = $2', [step, request.session!.userId])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'auth.two_factor_enabled', entityType: 'user', entityId: request.session!.userId, eventData: {} })
+    await client.query('COMMIT')
     response.json({ enabled: true, notice: 'Two-factor authentication is now active for your account.' })
-  } catch (error) { next(error) }
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
 })
 
 // Disable 2FA. Requires a live code so a hijacked session alone cannot remove the factor.
-app.post('/v1/auth/two-factor/disable', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.post('/v1/auth/two-factor/disable', requirePool, verifyOrigin, requireSession, twoFactorActionLimit, async (request: AuthedRequest, response, next) => {
   const input = z.object({ code: z.string().trim().min(6).max(20) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a current authenticator or recovery code to disable two-factor authentication.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const result = await client.query('SELECT secret_encrypted, enabled_at FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
+    const result = await client.query('SELECT secret_encrypted, enabled_at, last_used_step, locked_until, failed_attempts FROM user_two_factor WHERE user_id = $1 FOR UPDATE', [request.session!.userId])
     const factor = result.rows[0]
     if (!factor?.enabled_at) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Two-factor authentication is not enabled.' }); return }
+    if (twoFactorLockIsActive(factor.locked_until)) { await client.query('ROLLBACK'); response.status(429).json({ error: 'Two-factor verification is temporarily locked. Try again shortly.' }); return }
     const secret = decryptTwoFactorSecret(String(factor.secret_encrypted))
-    const validTotp = verifyTotpCode(secret, input.data.code) !== null
-    const recovery = validTotp ? null : await client.query('SELECT id FROM user_recovery_codes WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL', [request.session!.userId, hashRecoveryCode(input.data.code)])
-    if (!validTotp && !recovery?.rowCount) { await client.query('ROLLBACK'); response.status(401).json({ error: 'That code is not valid. Two-factor authentication was not changed.' }); return }
+    const totpStep = verifyTotpCode(secret, input.data.code)
+    const lastUsedStep = factor.last_used_step === null || factor.last_used_step === undefined ? null : Number(factor.last_used_step)
+    if (totpStep !== null && lastUsedStep !== null && totpStep <= lastUsedStep) {
+      await client.query('ROLLBACK')
+      response.status(409).json({ error: 'That authenticator code was already used. Wait for the next code.' }); return
+    }
+    const validTotp = totpStep !== null
+    const recovery = validTotp ? null : await client.query('SELECT id FROM user_recovery_codes WHERE user_id = $1 AND hash_version = 2 AND code_hash = $2 AND used_at IS NULL', [request.session!.userId, hashRecoveryCode(input.data.code)])
+    if (!validTotp && !recovery?.rowCount) {
+      await recordTwoFactorFailure(client, request.session!.userId, factor.failed_attempts)
+      await client.query('COMMIT')
+      response.status(401).json({ error: 'That code is not valid. Two-factor authentication was not changed.' }); return
+    }
     if (recovery?.rowCount) await client.query('UPDATE user_recovery_codes SET used_at = now() WHERE id = $1', [recovery.rows[0].id])
+    if (totpStep !== null) await client.query('UPDATE user_two_factor SET last_used_step = $1 WHERE user_id = $2', [totpStep, request.session!.userId])
     await client.query('DELETE FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
     await client.query('DELETE FROM user_recovery_codes WHERE user_id = $1', [request.session!.userId])
     await client.query('DELETE FROM pending_two_factor_logins WHERE user_id = $1', [request.session!.userId])
-    await client.query('COMMIT')
     await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'auth.two_factor_disabled', entityType: 'user', entityId: request.session!.userId, eventData: {} })
+    await client.query('COMMIT')
     response.json({ enabled: false, notice: 'Two-factor authentication has been disabled for your account.' })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
 
 // Issue a fresh set of recovery codes (invalidates the old ones).
-app.post('/v1/auth/two-factor/recovery-codes', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
+app.post('/v1/auth/two-factor/recovery-codes', requirePool, verifyOrigin, requireSession, twoFactorActionLimit, async (request: AuthedRequest, response, next) => {
   const input = z.object({ code: z.string().trim().min(6).max(20) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a current authenticator or recovery code first.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const result = await client.query('SELECT secret_encrypted, enabled_at FROM user_two_factor WHERE user_id = $1', [request.session!.userId])
+    const result = await client.query('SELECT secret_encrypted, enabled_at, last_used_step, locked_until, failed_attempts FROM user_two_factor WHERE user_id = $1 FOR UPDATE', [request.session!.userId])
     const factor = result.rows[0]
     if (!factor?.enabled_at) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Two-factor authentication is not enabled.' }); return }
+    if (twoFactorLockIsActive(factor.locked_until)) { await client.query('ROLLBACK'); response.status(429).json({ error: 'Two-factor verification is temporarily locked. Try again shortly.' }); return }
     const secret = decryptTwoFactorSecret(String(factor.secret_encrypted))
-    const validTotp = verifyTotpCode(secret, input.data.code) !== null
-    const recovery = validTotp ? null : await client.query('SELECT id FROM user_recovery_codes WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL', [request.session!.userId, hashRecoveryCode(input.data.code)])
-    if (!validTotp && !recovery?.rowCount) { await client.query('ROLLBACK'); response.status(401).json({ error: 'That code is not valid. Recovery codes were not changed.' }); return }
+    const totpStep = verifyTotpCode(secret, input.data.code)
+    const lastUsedStep = factor.last_used_step === null || factor.last_used_step === undefined ? null : Number(factor.last_used_step)
+    if (totpStep !== null && lastUsedStep !== null && totpStep <= lastUsedStep) {
+      await client.query('ROLLBACK')
+      response.status(409).json({ error: 'That authenticator code was already used. Wait for the next code.' }); return
+    }
+    const validTotp = totpStep !== null
+    const recovery = validTotp ? null : await client.query('SELECT id FROM user_recovery_codes WHERE user_id = $1 AND hash_version = 2 AND code_hash = $2 AND used_at IS NULL', [request.session!.userId, hashRecoveryCode(input.data.code)])
+    if (!validTotp && !recovery?.rowCount) {
+      await recordTwoFactorFailure(client, request.session!.userId, factor.failed_attempts)
+      await client.query('COMMIT')
+      response.status(401).json({ error: 'That code is not valid. Recovery codes were not changed.' }); return
+    }
     await client.query('DELETE FROM user_recovery_codes WHERE user_id = $1', [request.session!.userId])
     const codes = generateRecoveryCodes()
-    for (const code of codes) await client.query('INSERT INTO user_recovery_codes (user_id, code_hash) VALUES ($1, $2)', [request.session!.userId, hashRecoveryCode(code)])
+    for (const code of codes) await client.query('INSERT INTO user_recovery_codes (id, user_id, code_hash, hash_version) VALUES ($1, $2, $3, 2)', [randomUUID(), request.session!.userId, hashRecoveryCode(code)])
+    await client.query('UPDATE user_two_factor SET last_used_step = COALESCE($1, last_used_step), failed_attempts = 0, locked_until = NULL, updated_at = now() WHERE user_id = $2', [totpStep, request.session!.userId])
     await client.query('COMMIT')
     response.json({ recoveryCodes: codes, notice: 'Store these recovery codes safely. Each can be used once if you lose your authenticator.' })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
@@ -1082,7 +1165,7 @@ app.post('/v1/auth/reset-password', requirePool, verifyOrigin, rateLimit({ windo
     const resetRow = found.rows[0]
     if (!resetRow) { await client.query('ROLLBACK'); response.status(400).json({ error: 'This reset link is invalid or has expired. Request a new one.' }); return }
     if (Number(resetRow.attempts) >= 5) { await client.query('ROLLBACK'); response.status(429).json({ error: 'This reset link has been used too many times. Request a new one.' }); return }
-    await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [await hashPassword(input.data.password), resetRow.user_id])
+    await client.query('UPDATE users SET password_hash = $1, session_version = session_version + 1 WHERE id = $2', [await hashPassword(input.data.password), resetRow.user_id])
     await client.query('UPDATE password_reset_requests SET consumed_at = now() WHERE id = $1', [resetRow.id])
     // A password change revokes every other pending sign-in for safety.
     await client.query('DELETE FROM pending_two_factor_logins WHERE user_id = $1', [resetRow.user_id])
@@ -1243,11 +1326,12 @@ app.post('/v1/auth/change-password', requirePool, verifyOrigin, rateLimit({ wind
       await client.query('ROLLBACK')
       response.status(400).json({ error: 'Choose a new password that is different from your current password.' }); return
     }
-    await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [await hashPassword(input.data.newPassword), request.session!.userId])
+    await client.query('UPDATE users SET password_hash = $1, session_version = session_version + 1 WHERE id = $2', [await hashPassword(input.data.newPassword), request.session!.userId])
     await client.query('UPDATE password_reset_requests SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL', [request.session!.userId])
     await client.query('UPDATE pending_two_factor_logins SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL', [request.session!.userId])
     await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'auth.password_changed', entityType: 'user', entityId: request.session!.userId, eventData: {} })
     await client.query('COMMIT')
+    response.clearCookie(cookieName, { httpOnly: true, secure: env.NODE_ENV === 'production', sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax', path: '/' })
     response.json({ changed: true })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
@@ -2986,7 +3070,7 @@ app.get('/v1/workspaces/:workspaceId/members', requirePool, requireSession, requ
   try {
     const result = await pool!.query(`SELECT wm.user_id, wm.role, wm.permissions, wm.created_at AS member_since, u.email, u.phone, u.created_at AS user_created,
         tf.enabled_at AS two_factor_enabled,
-        (SELECT count(*)::int FROM user_recovery_codes c WHERE c.user_id = u.id AND c.used_at IS NULL) AS recovery_codes,
+        (SELECT count(*)::int FROM user_recovery_codes c WHERE c.user_id = u.id AND c.hash_version = 2 AND c.used_at IS NULL) AS recovery_codes,
         (SELECT max(created_at) FROM audit_events a WHERE a.actor_user_id = u.id AND a.workspace_id = wm.workspace_id) AS last_active
       FROM workspace_members wm JOIN users u ON u.id = wm.user_id
       LEFT JOIN user_two_factor tf ON tf.user_id = u.id
@@ -3103,7 +3187,11 @@ app.post('/v1/invitations/accept', requirePool, verifyOrigin, rateLimit({ window
     const session = readSession(cookies(request.headers.cookie)[cookieName])
     let userId = session?.userId
     if (session) {
-      const user = await client.query('SELECT email, phone FROM users WHERE id = $1 FOR UPDATE', [session.userId])
+      const user = await client.query('SELECT email, phone, session_version FROM users WHERE id = $1 FOR UPDATE', [session.userId])
+      if (!user.rowCount || Number(user.rows[0].session_version ?? 0) !== (session.sessionVersion ?? 0)) {
+        await client.query('ROLLBACK')
+        response.status(401).json({ error: 'Your session expired after a password change. Sign in again to accept this invitation.' }); return
+      }
       const emailMatches = invite.email && String(user.rows[0]?.email ?? '').toLowerCase() === String(invite.email).toLowerCase()
       const phoneMatches = invite.phone && String(user.rows[0]?.phone ?? '') === String(invite.phone)
       if (!emailMatches && !phoneMatches) {
@@ -3146,7 +3234,7 @@ app.post('/v1/invitations/accept', requirePool, verifyOrigin, rateLimit({ window
     await client.query("UPDATE workspace_invitations SET status = 'accepted', accepted_at = now(), token_hash = NULL WHERE id = $1", [invite.id])
     await client.query('COMMIT')
     const workspaceId = String(targets.rows[0].workspace_id)
-    setSessionCookie(response, { userId: userId!, workspaceId, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
+    setSessionCookie(response, { userId: userId!, workspaceId, sessionVersion: session?.sessionVersion ?? 0, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
     response.json({ accepted: true, workspaceId, role: invite.role })
   } catch (error) {
     await client.query('ROLLBACK')
@@ -5693,7 +5781,22 @@ async function start() {
     const files = (await readdir(migrationDir)).filter((file) => file.endsWith('.sql')).sort()
     for (const file of files) {
       const migration = await readFile(fileURLToPath(new URL(`../migrations/${file}`, import.meta.url)), 'utf8')
-      await pool.query(migration)
+      if (migration.split(/\r?\n/).some((line) => line.trim() && !line.trim().startsWith('--'))) await pool.query(migration)
+    }
+    if (env.DATABASE_URL) {
+      // PostgreSQL supports this legacy service/invoice backfill; pg-mem does not support
+      // correlated UPDATE ... FROM expressions, and its seed database has no old invoices.
+      await pool.query(`UPDATE invoices i SET service_subscription_id = s.id
+        FROM service_subscriptions s
+        WHERE i.service_subscription_id IS NULL
+          AND i.workspace_id = s.workspace_id
+          AND lower(i.customer) = lower(s.customer_name)
+          AND EXISTS (SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id AND l.item_id = s.service_id)`)
+      // Older invitation rows stored phone numbers in the email column. PostgreSQL's
+      // case-insensitive regex operator is also unavailable in the pg-mem fallback.
+      await pool.query(`UPDATE workspace_invitations
+        SET phone = email, email = NULL
+        WHERE phone IS NULL AND email IS NOT NULL AND email !~* '^[^@]+@[^@]+$'`)
     }
     const workspaces = await pool.query('SELECT id FROM workspaces')
     for (const workspace of workspaces.rows) await ensureDefaultAccounts(String(workspace.id))

@@ -1,12 +1,6 @@
 -- Service supplier coverage and customer-specific service payments.
 ALTER TABLE invoices
   ADD COLUMN IF NOT EXISTS service_subscription_id uuid REFERENCES service_subscriptions(id) ON DELETE SET NULL;
-UPDATE invoices i SET service_subscription_id = s.id
-FROM service_subscriptions s
-WHERE i.service_subscription_id IS NULL
-  AND i.workspace_id = s.workspace_id
-  AND lower(i.customer) = lower(s.customer_name)
-  AND EXISTS (SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id AND l.item_id = s.service_id);
 CREATE INDEX IF NOT EXISTS invoices_service_subscription_idx
   ON invoices (workspace_id, service_subscription_id, due_date DESC);
 
