@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { SupplierBillEmailSection } from './SupplierBillEmailSection'
+import { DailyPerformanceReport } from './DailyPerformanceReport'
 import './App.css'
 import './Sidebar.css'
 
@@ -45,12 +46,27 @@ function overviewPeriod(range: OverviewRange, from: string, to: string) {
   const thisWeekMonday = shiftDate(today, -daysSinceMonday)
   return { from: shiftDate(thisWeekMonday, -7), to: shiftDate(thisWeekMonday, -1) }
 }
+// Each navigation entry may declare the permission area it belongs to. The sidebar hides an
+// entry when the signed-in member does not hold that area, so people never see modules they
+// cannot use. Entries with no permission are always visible (read-only screens).
 const groups = [
-  { title: 'WORKSPACE', items: [['Overview', LayoutDashboard], ['Banking', Landmark], ['Expenses', ArrowDownLeft], ['Payroll', Users]] },
-  { title: 'Point of sale', items: [['Point of sale', ShoppingBag], ['Networking', ArrowUpRight]] },
-  { title: 'MANAGE', items: [['Customers', Users], ['Suppliers', ShoppingBag], ['Inventory', Package], ['Projects', BriefcaseBusiness], ['Accounting', BookOpen]] },
-  { title: 'INSIGHTS', items: [['Reports', Activity], ['Kenya compliance', ShieldCheck], ['Documents', FileText]] },
+  { title: 'WORKSPACE', items: [['Overview', LayoutDashboard, null], ['Banking', Landmark, 'banking.write'], ['Expenses', ArrowDownLeft, 'accounting.write'], ['Payroll', Users, 'payroll.manage']] },
+  { title: 'Point of sale', items: [['Point of sale', ShoppingBag, 'sales.write'], ['Networking', ArrowUpRight, 'sales.write']] },
+  { title: 'MANAGE', items: [['Customers', Users, 'operations.write'], ['Suppliers', ShoppingBag, 'inventory.write'], ['Inventory', Package, 'inventory.write'], ['Services', Sparkles, 'inventory.write'], ['Projects', BriefcaseBusiness, 'operations.write'], ['Accounting', BookOpen, 'accounting.write']] },
+  { title: 'INSIGHTS', items: [['Reports', Activity, null], ['Kenya compliance', ShieldCheck, 'integrations.manage'], ['Documents', FileText, 'operations.write']] },
 ] as const
+
+// Services are sellable, non-stock lines. The billing unit controls how the counter and invoice
+// screens describe the charge (per hour, per month, per session, and so on).
+const SERVICE_BILLING_UNITS: Array<{ code: string; label: string }> = [
+  { code: 'fixed', label: 'Fixed charge' },
+  { code: 'per_hour', label: 'Per hour' },
+  { code: 'per_day', label: 'Per day' },
+  { code: 'per_month', label: 'Per month' },
+  { code: 'per_session', label: 'Per session' },
+  { code: 'per_unit', label: 'Per unit' },
+]
+const serviceBillingLabel = (code: string) => SERVICE_BILLING_UNITS.find((unit) => unit.code === code)?.label ?? 'Fixed charge'
 const descriptions: Record<string, string> = {
   Banking: 'Bank feeds are not configured. Manually entered records remain available in the workspace ledger.',
   'Point of sale': 'Serve quick retail transactions and cash/M-Pesa tills with the counter checkout.',
@@ -59,7 +75,8 @@ const descriptions: Record<string, string> = {
   Payroll: 'Manage encrypted employee records, prepare reviewed monthly payroll drafts, view payslips, post journals, and estimate Kenyan PAYE, NSSF, SHIF and Housing Levy. Track remittance references in one place.',
   Customers: 'Customer details are recorded as part of invoices.',
   Suppliers: 'Create, edit, and maintain workspace supplier contact records.',
-  Inventory: 'Maintain item and service records, quantities, unit costs, and selling prices.',
+  Inventory: 'Maintain item records, quantities, unit costs, and selling prices.',
+  Services: 'Record sellable services such as wifi, security, cleaning, and shoe shining, with the charge, billing unit, and provider details.',
   Projects: 'Track project status, dates, customer, notes, and budget.',
   Accounting: 'View the chart of accounts, double-entry journals, trial balance, and manage monthly period close.',
   Reports: 'Overview values are calculated from the records saved in this workspace.',
@@ -78,6 +95,9 @@ type Dashboard = {
   cashflow: Array<{ date: string; income: string; expense: string }>
   invoices: { count: number; unpaid_amount: string }
 }
+type WorkspaceRecordTypeName = 'customers' | 'suppliers' | 'inventory' | 'services' | 'projects'
+// Optional system-wide split-payment capture for an invoice or a counter sale.
+type PaymentSplit = { method: 'cash' | 'mpesa'; amount: string; phone: string; reference: string }
 type Account = { user: { email: string }; workspace: { id: string; name: string; permissions?: MemberPermission[] }; workspaces?: Array<{ id: string; name: string; role: string }> }
 type IntegrationReadiness = { integrations: Array<{ id: string; status: string }> }
 type PayrollEstimate = {
@@ -91,7 +111,7 @@ type PayrollRun = { id: string; period: string; status: 'draft' | 'posted' | 'pa
 type Remittance = { id: string; remittance_type: string; amount: string; status: string; payment_reference?: string; payroll_run_id: string }
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
 type InvoiceMpesaPayment = { id: string; status: string; amount: string; result_description?: string | null; mpesa_receipt_number?: string | null; created_at: string }
-type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number }
+type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number; kind: 'item' | 'service' }
 type PosReceipt = { invoiceId: string; customer: string; amount: number; paymentMethod: 'cash' | 'mpesa'; status: string; lines: PosCartLine[] }
 type PosCustomerSale = { id: string; description: string; amount: string; amount_paid: string; due_date: string; status: string; created_at: string }
 type PosCustomerHistory = { sales: PosCustomerSale[]; summary: { sale_count: number; lifetime_sales: string } }
@@ -718,7 +738,7 @@ function App() {
   const [showSetupFlow, setShowSetupFlow] = useState(false)
   const [authPanelOpen, setAuthPanelOpen] = useState(false)
   const [businessName, setBusinessName] = useState('')
-  const [invite, setInvite] = useState({ email: '', role: 'viewer' })
+  const [invite, setInvite] = useState({ email: '', phone: '', channel: 'email' as 'email' | 'phone', role: 'viewer' })
   const [inviteLink, setInviteLink] = useState('')
   const [inviteScope, setInviteScope] = useState<'single' | 'all_owned'>('single')
   const [starting, setStarting] = useState(true)
@@ -868,9 +888,12 @@ function App() {
   const [payrollBonuses, setPayrollBonuses] = useState<Record<string, string>>({})
   const [payrollPaymentInputs, setPayrollPaymentInputs] = useState<Record<string, { amount: string; paymentReference: string }>>({})
   const [payslips, setPayslips] = useState<Array<{ id: string; period: string; employee: Omit<Employee, 'active'>; bonusAmount?: number; estimate: PayrollEstimate }>>([])
-  const [records, setRecords] = useState<Record<string, WorkspaceRecord[]>>({ customers: [], suppliers: [], inventory: [], projects: [] })
+  const [records, setRecords] = useState<Record<string, WorkspaceRecord[]>>({ customers: [], suppliers: [], inventory: [], services: [], projects: [] })
   const [recordForm, setRecordForm] = useState<Record<string, string>>({})
   const [editingRecordId, setEditingRecordId] = useState('')
+  // Optional split/multiple payment methods for one invoice or counter sale. Only shown when the
+  // business has switched the preference on; each line is recorded and verified separately.
+  const [paymentSplits, setPaymentSplits] = useState<Record<string, PaymentSplit[]>>({})
   const [storedDocuments, setStoredDocuments] = useState<StoredDocument[]>([])
   const [bankImportRows, setBankImportRows] = useState<Array<{ date: string; description: string; amount: string; direction: 'income' | 'expense' }>>([])
   const [invoicePreview, setInvoicePreview] = useState<InvoiceRecord | null>(null)
@@ -914,6 +937,7 @@ function App() {
     shifEnabled: false,
     nssfEnabled: false,
     ahlEnabled: false,
+    multiMethodPayments: false,
   })
 
   // A reset link lands on the homepage with ?reset=<token>, so open the reset form automatically.
@@ -1157,7 +1181,7 @@ function App() {
         request<KraEtimsConfig>('/v1/integrations/etims/config').then((result) => setKraEtimsConfig(result)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load integration preparation records.'))
     }
-    const recordType = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Projects: 'projects' } as Record<string, string>)[page]
+    const recordType = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Services: 'services', Projects: 'projects' } as Record<string, string>)[page]
     if (recordType) void request<{ records: WorkspaceRecord[] }>(`/v1/records/${recordType}`).then((result) => setRecords((current) => ({ ...current, [recordType]: result.records }))).catch((reason) => setError(reason instanceof Error ? reason.message : `Could not load ${page.toLowerCase()}.`))
     if (page === 'Suppliers') void request<{ bills: VendorBill[] }>('/v1/bills').then((result) => setBills(result.bills)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load supplier bills.'))
     if (page === 'Documents' || page === 'Overview') void request<{ documents: StoredDocument[] }>('/v1/documents').then((result) => setStoredDocuments(result.documents)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load stored documents.'))
@@ -1629,16 +1653,17 @@ function App() {
   async function inviteUser(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
-      const result = await request<{ delivery: string; invitationUrl?: string }>(`/v1/workspaces/${account?.workspace.id}/invitations`, { method: 'POST', body: JSON.stringify({ email: invite.email, role: invite.role, scope: inviteScope }) })
-      setInvite({ email: '', role: 'viewer' })
-      if (result.delivery === 'manual_link' && result.invitationUrl) {
+      const payload = invite.channel === 'phone' ? { phone: invite.phone, role: invite.role, scope: inviteScope } : { email: invite.email, role: invite.role, scope: inviteScope }
+      const result = await request<{ delivery: string; invitationUrl?: string }>(`/v1/workspaces/${account?.workspace.id}/invitations`, { method: 'POST', body: JSON.stringify(payload) })
+      setInvite({ email: '', phone: '', channel: invite.channel, role: 'viewer' })
+      if (result.invitationUrl) {
         setInviteLink(result.invitationUrl)
       } else {
         setModal(null)
         setInviteLink('')
       }
       setInviteScope('single')
-      notify(result.delivery === 'manual_link' ? 'Invitation created. Copy and send the secure link manually.' : 'Invitation email accepted by the configured provider.')
+      notify(result.delivery === 'manual_link' ? 'Invitation created. Copy and send the secure link manually.' : result.delivery === 'accepted_by_provider_sms' ? 'Invitation SMS accepted by Brevo.' : 'Invitation email accepted by Brevo.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not create invitation.')
     } finally { setBusy(false) }
@@ -1655,19 +1680,21 @@ function App() {
     } finally { setBusy(false) }
   }
 
-  function addPosItem(item: WorkspaceRecord) {
-    const onHand = Number(inventoryLocationStock.find((stock) => stock.location_id === posLocationId && stock.item_id === item.id)?.quantity ?? 0)
-    const existing = posCart.find((line) => line.itemId === item.id)
-    if (onHand <= 0 || (existing && existing.quantity >= onHand)) return
-    const itemName = String(item.data.name ?? 'Inventory item')
-    const unitPrice = Number(item.data.price ?? 0)
+  function addPosItem(entry: { id: string; kind: 'item' | 'service'; name: string; price: number; onHand: number }) {
+    const existing = posCart.find((line) => line.itemId === entry.id)
+    // Stock items are limited by on-hand quantity; services are unlimited lines.
+    if (entry.kind === 'item' && (entry.onHand <= 0 || (existing && existing.quantity >= entry.onHand))) return
     setError('')
     setPosReceipt(null)
     setPosCart((cart) => {
-      const line = cart.find((entry) => entry.itemId === item.id)
-      if (line) return cart.map((entry) => entry.itemId === item.id ? { ...entry, quantity: entry.quantity + 1 } : entry)
-      return [...cart, { itemId: item.id, description: itemName, quantity: 1, unitPrice, onHand }]
+      const line = cart.find((item) => item.itemId === entry.id)
+      if (line) return cart.map((item) => item.itemId === entry.id ? { ...item, quantity: item.quantity + 1 } : item)
+      return [...cart, { itemId: entry.id, description: entry.name, quantity: 1, unitPrice: entry.price, onHand: entry.onHand, kind: entry.kind }]
     })
+  }
+  // Counter line for a saved service; usable even when there is no matching catalog entry.
+  function addServiceLine(service: WorkspaceRecord) {
+    addPosItem({ id: service.id, kind: 'service', name: String(service.data.name ?? 'Service'), price: Number(service.data.charge ?? 0), onHand: Number.POSITIVE_INFINITY })
   }
 
   async function loadPosCustomerHistory(customerId: string) {
@@ -1728,7 +1755,13 @@ function App() {
     const item = records.inventory.find((record) => [record.data.barcode, record.data.sku].some((value) => String(value ?? '').trim().toLowerCase() === code))
     flashScanResult(code, Boolean(item), item ? `Added ${String(item.data.name ?? 'item')}` : `No item matches “${rawCode.trim()}”`)
     if (!item) return false
-    addPosItem(item)
+    addPosItem({
+      id: item.id,
+      kind: 'item',
+      name: String(item.data.name ?? 'Inventory item'),
+      price: Number(item.data.price ?? 0),
+      onHand: Number(inventoryLocationStock.find((stock) => stock.location_id === posLocationId && stock.item_id === item.id)?.quantity ?? 0),
+    })
     setPosSearch('')
     notify(`${source}: ${String(item.data.name ?? 'Item')} added to the sale.`)
     return true
@@ -1873,11 +1906,14 @@ function App() {
   function changePosQuantity(itemId: string, quantity: number) {
     setPosCart((cart) => quantity <= 0
       ? cart.filter((line) => line.itemId !== itemId)
-      : cart.map((line) => line.itemId === itemId ? { ...line, quantity: Math.min(quantity, line.onHand) } : line))
+      : cart.map((line) => line.itemId === itemId ? { ...line, quantity: Math.max(1, Math.min(quantity, line.onHand)) } : line))
   }
 
   function queueOfflinePosSale() {
-    if (!account || !posCart.length || posPaymentMethod !== 'cash') return
+    if (!account || !posCart.length) return
+    // Offline drafts are only ever saved for cash sales: no payment provider can be
+    // reached offline, so an M-Pesa request must wait until the device is back online.
+    if (posPaymentMethod !== 'cash') return
     const savedCustomer = records.customers.find((record) => record.id === posSavedCustomerId)
     const customer = savedCustomer
       ? String(savedCustomer.data.name ?? 'Saved customer')
@@ -1966,6 +2002,17 @@ function App() {
       : posCustomerType === 'walk_in' ? 'Walk-in customer' : posCustomer.trim()
     const saleLines = posCart.map((line) => ({ ...line }))
     const total = saleLines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
+    // Optional split payment: several methods captured against one invoice.
+    const splits = multiMethodEnabled ? (paymentSplits.pos ?? []).filter((split) => Number(split.amount) > 0) : []
+    const splitsTotal = splits.reduce((sum, split) => sum + Number(split.amount), 0)
+    if (splits.length && Math.abs(splitsTotal - total) > 0.009) {
+      setError(`Split payments total ${money(splitsTotal)} but the sale is ${money(total)}. Adjust the amounts so they match.`)
+      return
+    }
+    if (splits.some((split) => split.method === 'mpesa' && !split.phone.trim())) {
+      setError('Enter the M-Pesa phone number for each M-Pesa split.')
+      return
+    }
     if (total <= 0) {
       setError('The sale total must be greater than zero. Check the item selling prices in Inventory.')
       return
@@ -1974,8 +2021,9 @@ function App() {
       setError('M-Pesa STK Push requires a whole-KSh total. Adjust item prices or quantities before checkout.')
       return
     }
+    const pendingSplits = multiMethodEnabled ? (paymentSplits.pos ?? []).filter((split) => Number(split.amount) > 0) : []
     if (!navigator.onLine) {
-      if (posPaymentMethod !== 'cash') { setError('M-Pesa requests require an active connection. No offline M-Pesa payment can be requested.'); return }
+      if (posPaymentMethod !== 'cash' || pendingSplits.some((split) => split.method === 'mpesa')) { setError('M-Pesa requests require an active connection. No offline M-Pesa payment can be requested.'); return }
       queueOfflinePosSale()
       return
     }
@@ -2006,7 +2054,26 @@ function App() {
       setPosCustomerHistoryForId('')
       setPosPaymentPhone('')
 
-      if (posPaymentMethod === 'cash') {
+      if (posPaymentMethod === 'cash' && splits.length) {
+        // Record each captured method against the same invoice, then report exactly
+        // which ones succeeded so the counter never assumes money was received.
+        const failures: string[] = []
+        for (const split of splits) {
+          try {
+            if (split.method === 'cash') {
+              await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today }) })
+            } else {
+              await request<{ customerMessage: string }>(`/v1/invoices/${created.invoice.id}/payments/mpesa`, { method: 'POST', body: JSON.stringify({ phone: split.phone.trim() }) })
+            }
+          } catch (reason) {
+            failures.push(`${split.method === 'cash' ? 'Cash' : 'M-Pesa'} ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
+          }
+        }
+        setPaymentSplits((current) => ({ ...current, pos: [] }))
+        receipt.status = failures.length ? `Partially recorded · ${failures.join(' · ')}` : 'Paid · all methods recorded'
+        if (failures.length) setError(`Sale saved as invoice ${created.invoice.id.slice(0, 8)}, but some split payments were not recorded: ${failures.join('; ')}`)
+        else notify('Sale completed. Stock and split payments recorded.')
+      } else if (posPaymentMethod === 'cash') {
         try {
           await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: total, paymentDate: today }) })
           receipt.status = 'Paid · cash recorded'
@@ -2234,6 +2301,40 @@ function App() {
       setInvoicesList(result.invoices); setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: '' })); await refresh(); notify('Invoice payment recorded in the ledger.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not record invoice payment.') }
     finally { setBusy(false) }
+  }
+
+  // Record several payment methods against one invoice. Each method is posted and verified
+  // separately, and the screen reports exactly which ones failed rather than assuming success.
+  async function payInvoiceSplit(invoiceRow: InvoiceRecord) {
+    const splits = (paymentSplits[invoiceRow.id] ?? []).filter((split) => Number(split.amount) > 0)
+    if (!splits.length) { setError('Enter an amount for at least one payment method.'); return }
+    const outstanding = Number(invoiceRow.amount_due ?? invoiceRow.amount)
+    const total = splits.reduce((sum, split) => sum + Number(split.amount), 0)
+    if (total - outstanding > 0.009) { setError(`Split payments total ${money(total)} but only ${money(outstanding)} is outstanding on this invoice.`); return }
+    if (splits.some((split) => split.method === 'mpesa' && !split.phone.trim())) { setError('Enter the M-Pesa phone number for each M-Pesa split.'); return }
+    setBusy(true); setError('')
+    const failures: string[] = []
+    try {
+      for (const split of splits) {
+        try {
+          if (split.method === 'cash') {
+            await request(`/v1/invoices/${invoiceRow.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today }) })
+          } else {
+            await requestInvoiceMpesaPayment(invoiceRow.id, split.phone.trim())
+          }
+        } catch (reason) {
+          failures.push(`${split.method === 'cash' ? 'Cash' : 'M-Pesa'} ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
+        }
+      }
+      const result = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+      setInvoicesList(result.invoices)
+      setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: [] }))
+      await refresh()
+      if (failures.length) setError(`Some split payments were not recorded: ${failures.join('; ')}`)
+      else notify(splits.some((split) => split.method === 'mpesa') ? 'Split payments started. The invoice stays unpaid until Daraja confirms the M-Pesa amount.' : 'Split cash payments recorded in the ledger.')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not record the split payment.')
+    } finally { setBusy(false) }
   }
 
   async function loadInvoiceMpesaPayments(invoiceId: string) {
@@ -2717,9 +2818,10 @@ function App() {
           statutoryFilingsEnabled: settings.statutoryFilingsEnabled,
           shifEnabled: settings.shifEnabled,
           nssfEnabled: settings.nssfEnabled,
-          ahlEnabled: settings.ahlEnabled,
-        }) })
-        setSettings((current) => ({ ...current, kraEtimsLiveEnabled: true }))
+            ahlEnabled: settings.ahlEnabled,
+            multiMethodPayments: settings.multiMethodPayments,
+          }) })
+            setSettings((current) => ({ ...current, kraEtimsLiveEnabled: true }))
       }
       setKraSetupMessage('Saving your KRA details securely…')
       await request('/v1/integrations/etims/device', { method: 'PUT', body: JSON.stringify(kraDeviceInput) })
@@ -2825,7 +2927,7 @@ function App() {
     finally { setBusy(false) }
   }
 
-  async function saveWorkspaceRecord(event: FormEvent<HTMLFormElement>, type: 'customers' | 'suppliers' | 'inventory' | 'projects') {
+  async function saveWorkspaceRecord(event: FormEvent<HTMLFormElement>, type: WorkspaceRecordTypeName) {
     event.preventDefault()
     const body: Record<string, unknown> = { ...recordForm }
     if (type === 'suppliers') body.supplyItemIds = supplierItemIds.filter(Boolean)
@@ -2848,7 +2950,7 @@ function App() {
     finally { setBusy(false) }
   }
 
-  async function deleteWorkspaceRecord(type: 'customers' | 'suppliers' | 'inventory' | 'projects', id: string) {
+  async function deleteWorkspaceRecord(type: WorkspaceRecordTypeName, id: string) {
     try {
       await request(`/v1/records/${type}/${id}`, { method: 'DELETE' })
       setRecords((current) => ({ ...current, [type]: current[type].filter((record) => record.id !== id) })); notify('Record deleted')
@@ -3072,7 +3174,28 @@ function App() {
   async function saveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
-      await request('/v1/settings', { method: 'PUT', body: JSON.stringify({ ...settings, businessName: settings.businessName || dashboard?.workspaceName }) })
+      // Send an explicitly typed copy: the settings endpoint validates every field strictly,
+      // so spreading an unexpected server response would fail the whole save.
+      await request('/v1/settings', { method: 'PUT', body: JSON.stringify({
+        businessName: settings.businessName || dashboard?.workspaceName || 'This business',
+        currency: settings.currency,
+        timezone: settings.timezone,
+        invoiceTerms: settings.invoiceTerms,
+        emailAlerts: settings.emailAlerts,
+        auditTrail: settings.auditTrail,
+        twoFactor: settings.twoFactor,
+        backupSchedule: settings.backupSchedule,
+        inventoryLowStockThreshold: Number(settings.inventoryLowStockThreshold),
+        inventoryMediumStockThreshold: Number(settings.inventoryMediumStockThreshold),
+        monoEnabled: settings.monoEnabled,
+        darajaEnabled: settings.darajaEnabled,
+        kraEtimsLiveEnabled: settings.kraEtimsLiveEnabled,
+        statutoryFilingsEnabled: settings.statutoryFilingsEnabled,
+        shifEnabled: settings.shifEnabled,
+        nssfEnabled: settings.nssfEnabled,
+        ahlEnabled: settings.ahlEnabled,
+        multiMethodPayments: settings.multiMethodPayments,
+      }) })
       await refresh()
       notify('Settings saved successfully')
     } catch (reason) {
@@ -3286,13 +3409,60 @@ function App() {
     return helpResources.filter((item) => `${item.title} ${item.category} ${item.keywords.join(' ')}`.toLowerCase().includes(query))
   }, [helpResources, helpSearch])
 
+  // Effective access for the signed-in member. Administrators always keep full access; every
+  // other member uses their saved override, or the defaults of their assigned role.
+  const currentMember = useMemo(() => account ? teamMembers.find((member) => member.userId === account.user.email) ?? null : null, [teamMembers, account])
+  const isWorkspaceAdmin = useMemo(() => {
+    if (!account) return false
+    const membership = account.workspaces?.find((workspace) => workspace.id === account.workspace.id)
+    if (membership?.role === 'admin') return true
+    return teamMembers.some((member) => member.role === 'admin' && (member.userId === account.user.email || member.isAdmin === true)) || teamMembers.length === 0
+  }, [account, teamMembers])
+  const effectivePermissions = useMemo<MemberPermission[]>(() => {
+    if (isWorkspaceAdmin) return ROLE_PERMISSION_GROUPS.flatMap((group) => group.permissions.map(([permission]) => permission))
+    if (currentMember) return currentMember.permissions ?? currentMember.defaultPermissions
+    if (account?.workspace.permissions?.length) return account.workspace.permissions
+    return []
+  }, [isWorkspaceAdmin, account, currentMember])
+  const canUse = useCallback((permission: MemberPermission | null) => !permission || effectivePermissions.includes(permission), [effectivePermissions])
+  const multiMethodEnabled = Boolean(settings.multiMethodPayments)
+
   const filtered = useMemo(() => (dashboard?.transactions ?? []).filter((row) =>
     `${row.description} ${row.account} ${row.direction}`.toLowerCase().includes(search.toLowerCase())), [dashboard, search])
-  const posItems = useMemo(() => records.inventory.filter((item) => {
+  // Sellable lines at the counter: stock items deduct inventory, services do not.
+  const posCatalog = useMemo(() => [
+    ...records.inventory.map((item) => ({
+      id: item.id,
+      kind: 'item' as const,
+      name: String(item.data.name ?? 'Inventory item'),
+      reference: String(item.data.sku ?? '') || String(item.data.barcode ?? ''),
+      barcode: String(item.data.barcode ?? ''),
+      sku: String(item.data.sku ?? ''),
+      price: Number(item.data.price ?? 0),
+      onHand: Number(inventoryLocationStock.find((stock) => stock.location_id === posLocationId && stock.item_id === item.id)?.quantity ?? 0),
+      unitLabel: 'in stock',
+    })),
+    ...records.services.map((service) => ({
+      id: service.id,
+      kind: 'service' as const,
+      name: String(service.data.name ?? 'Service'),
+      reference: String(service.data.category ?? ''),
+      barcode: '',
+      sku: '',
+      price: Number(service.data.charge ?? 0),
+      // Services are never stock limited, so the counter always offers them.
+      onHand: Number.POSITIVE_INFINITY,
+      unitLabel: serviceBillingLabel(String(service.data.billingUnit ?? 'fixed')),
+    })),
+  ], [records.inventory, records.services, inventoryLocationStock, posLocationId])
+  const posItems = useMemo(() => {
     const query = posSearch.trim().toLowerCase()
-    const stock = Number(inventoryLocationStock.find((row) => row.location_id === posLocationId && row.item_id === item.id)?.quantity ?? 0)
-    return stock > 0 && (!query || `${item.data.name ?? ''} ${item.data.sku ?? ''} ${item.data.barcode ?? ''} ${item.data.notes ?? ''}`.toLowerCase().includes(query))
-  }), [records.inventory, inventoryLocationStock, posLocationId, posSearch])
+    return posCatalog.filter((entry) => {
+      if (entry.kind === 'item' && entry.onHand <= 0) return false
+      if (!query) return true
+      return `${entry.name} ${entry.sku} ${entry.barcode} ${entry.reference}`.toLowerCase().includes(query)
+    })
+  }, [posCatalog, posSearch])
   const posTotal = posCart.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
   const chart = useMemo(() => (dashboard?.cashflow ?? []).map((row) => ({
     date: new Date(`${row.date}T00:00:00`).toLocaleDateString('en-KE', { day: 'numeric', month: 'short' }),
@@ -3406,17 +3576,21 @@ function App() {
       </div>
       <button className="nav-link bottom-link" onClick={() => { setModal('business'); setSidebarOpen(false) }}><Plus size={18} /> {t('Add business')}</button>
       <nav className="side-nav" aria-label="Main navigation">
-        {groups.map((group) => <div className="nav-group" key={group.title}><p className="nav-heading">{t(group.title)}</p>
-          {group.items.map(([name, Icon]) => <button key={name} className={`nav-link ${page === name ? 'active' : ''}`} onClick={() => { navigateTo(name); setSidebarOpen(false) }}>
+        {groups.map((group) => {
+        const visibleItems = group.items.filter(([, , permission]) => canUse(permission as MemberPermission | null))
+        if (!visibleItems.length) return null
+        return <div className="nav-group" key={group.title}><p className="nav-heading">{t(group.title)}</p>
+          {visibleItems.map(([name, Icon]) => <button key={name} className={`nav-link ${page === name ? 'active' : ''}`} onClick={() => { navigateTo(name); setSidebarOpen(false) }}>
             <Icon size={18} strokeWidth={1.8} /><span>{t(name)}</span>
           </button>)}
-        </div>)}
+        </div>
+      })}
       </nav>
       <div className="sidebar-bottom">
         <div className="help-card"><div className="help-icon"><ShieldCheck size={16} /></div><strong>{t('Private workspace')}</strong><p>{t('Records you enter are saved to your account database.')}</p></div>
         <div className="sidebar-utility-links" aria-label="Account and support">
-          <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { teamPermissionsScrollPending.current = false; navigateTo('Settings'); setSidebarOpen(false) }}><Settings2 size={18} /> {t('Settings')}</button>
-          <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { setSidebarOpen(false); if (page === 'Settings') document.getElementById('team-permissions')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); else { teamPermissionsScrollPending.current = true; navigateTo('Settings') } }}><Users size={18} /> Team &amp; Permissions</button>
+          {canUse('workspace.manage') && <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { teamPermissionsScrollPending.current = false; navigateTo('Settings'); setSidebarOpen(false) }}><Settings2 size={18} /> {t('Settings')}</button>}
+          {canUse('team.manage') && <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { setSidebarOpen(false); if (page === 'Settings') document.getElementById('team-permissions')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); else { teamPermissionsScrollPending.current = true; navigateTo('Settings') } }}><Users size={18} /> Team &amp; Permissions</button>}
           <button className={`nav-link bottom-link ${page === 'Help' ? 'active' : ''}`} onClick={() => { navigateTo('Help'); setSidebarOpen(false) }}><LifeBuoy size={18} /> {t('Help & support')}</button>
         </div>
         <div className="profile-row"><div className="profile-avatar">{account.user.email.slice(0, 1).toUpperCase()}</div>
@@ -3673,12 +3847,13 @@ function App() {
           <button className="button button-primary" onClick={() => { setTransaction({ description: '', amount: '', direction: 'expense', account: 'Operating expenses', date: today }); setModal('transaction') }}><Plus size={16} /> Add expense</button>
           <article className="module-card">{(dashboard?.transactions ?? []).filter((row) => row.direction === 'expense').map((row) => <div className="transaction-row" key={row.id}><span><strong>{row.description}</strong><small>{row.transaction_date} · {row.account}</small></span><strong>{money(row.amount)}</strong></div>)}{!(dashboard?.transactions ?? []).some((row) => row.direction === 'expense') && <div className="empty-state">No expenses saved yet.</div>}</article>
         </section> : ['Customers', 'Suppliers', 'Inventory', 'Projects'].includes(page) ? (() => {
-          const type = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Projects: 'projects' } as Record<string, 'customers' | 'suppliers' | 'inventory' | 'projects'>)[page]
-          const recordLabel = type === 'inventory' ? 'inventory' : page.slice(0, -1).toLowerCase()
+          const type = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Services: 'services', Projects: 'projects' } as Record<string, 'customers' | 'suppliers' | 'inventory' | 'services' | 'projects'>)[page]
+          const recordLabel = type === 'inventory' ? 'inventory item' : type === 'services' ? 'service' : page.slice(0, -1).toLowerCase()
           const fields: Record<string, Array<{ name: string; label: string; kind?: string }>> = {
             customers: [{ name: 'name', label: 'Customer name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
             suppliers: [{ name: 'name', label: 'Supplier name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
-            inventory: [{ name: 'name', label: 'Item or service name' }, { name: 'sku', label: 'SKU' }, { name: 'barcode', label: 'Barcode (scanner input)' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
+            inventory: [{ name: 'name', label: 'Item name' }, { name: 'sku', label: 'SKU' }, { name: 'barcode', label: 'Barcode (scanner input)' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
+            services: [{ name: 'name', label: 'Service name (e.g. Wifi installation)' }, { name: 'category', label: 'Category (e.g. Wifi, Security, Cleaning)' }, { name: 'charge', label: 'Charge (KSh)', kind: 'number' }, { name: 'description', label: 'What the service includes' }, { name: 'providerName', label: 'Service provider name' }, { name: 'providerContact', label: 'Provider contact person' }, { name: 'providerPhone', label: 'Provider phone' }, { name: 'providerEmail', label: 'Provider email', kind: 'email' }, { name: 'providerPin', label: 'Provider KRA PIN (optional)' }, { name: 'serviceLevel', label: 'Service level / SLA (e.g. 24hr response)' }, { name: 'duration', label: 'Typical duration (e.g. 3 hours, 1 month)' }, { name: 'notes', label: 'Notes' }],
             projects: [{ name: 'name', label: 'Project name' }, { name: 'customer', label: 'Customer' }, { name: 'status', label: 'Status', kind: 'status' }, { name: 'startDate', label: 'Start date', kind: 'date' }, { name: 'endDate', label: 'End date', kind: 'date' }, { name: 'budget', label: 'Budget (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
           }
           const inventoryHealth = type === 'inventory' ? records.inventory.map((record) => {
@@ -3700,7 +3875,14 @@ function App() {
           ]
           return <section className="module-page"><div className="eyebrow"><span className="live-dot" /> {page.toUpperCase()} · WORKSPACE DATABASE</div><h1>{page}</h1><p className="welcome-subtitle">Create and maintain records for {dashboard?.workspaceName}. Data is private to this business.</p>
             {error && <p className="form-error" role="alert">{error}</p>}
-            <form className="module-card" onSubmit={(event) => void saveWorkspaceRecord(event, type)}><h2>{editingRecordId ? 'Edit' : 'Add'} {recordLabel}</h2><div className="record-form-grid">{fields[type].map((field) => <label className="field-label" key={field.name}>{field.label}{field.kind === 'status' ? <select value={recordForm[field.name] ?? 'planned'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="planned">Planned</option><option value="active">Active</option><option value="on_hold">On hold</option><option value="completed">Completed</option></select> : <input required={field.name === 'name'} type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : field.kind ?? 'text'} min={field.kind === 'number' ? '0' : undefined} step={field.kind === 'number' ? '0.01' : undefined} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} />}</label>)}</div>{type === 'suppliers' && <fieldset className="module-card supplier-items-fieldset"><legend>Inventory items supplied (optional)</legend><p className="dialog-note">Link one or more items this supplier provides. These are reference links only; they do not change stock or purchase orders.</p>{supplierItemIds.map((itemId, index) => <div className="field-row" key={`supplier-item-${index}`}><label className="field-label">Inventory item<select aria-label={`Supplier inventory item ${index + 1}`} value={itemId} onChange={(event) => setSupplierItemIds((current) => current.map((value, row) => row === index ? event.target.value : value))}><option value="">Choose item (optional)</option>{records.inventory.filter((item) => !supplierItemIds.includes(item.id) || item.id === itemId).map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')}{item.data.sku ? ` · ${item.data.sku}` : ''}</option>)}</select></label>{supplierItemIds.length > 1 && <button type="button" className="button button-small" aria-label="Remove supplier item row" onClick={() => setSupplierItemIds((current) => current.filter((_, row) => row !== index))}>Remove</button>}</div>)}<button type="button" className="button button-secondary" onClick={() => setSupplierItemIds((current) => [...current, ''])}>Add another item</button></fieldset>}<div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : `${editingRecordId ? 'Update' : 'Save'} ${recordLabel}`}</button>{editingRecordId && <button type="button" className="button button-secondary" onClick={() => { setEditingRecordId(''); setRecordForm({}); setSupplierItemIds(['']) }}>Cancel edit</button>}</div></form>
+            <form className="module-card" onSubmit={(event) => void saveWorkspaceRecord(event, type)}><h2>{editingRecordId ? 'Edit' : 'Add'} {recordLabel}</h2><div className="record-form-grid">{fields[type].map((field) => <label className="field-label" key={field.name}>{field.label}{type === 'services' && field.name === 'category' ? <input required list="service-category-list" maxLength={80} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} placeholder="Wifi, Security, Shoe shining, Cleaning…" /> : field.kind === 'status' ? <select value={recordForm[field.name] ?? 'planned'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="planned">Planned</option><option value="active">Active</option><option value="on_hold">On hold</option><option value="completed">Completed</option></select> : <input required={field.name === 'name'} type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : field.kind ?? 'text'} min={field.kind === 'number' ? '0' : undefined} step={field.kind === 'number' ? '0.01' : undefined} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} />}</label>)}</div>
+              {type === 'services' && <>
+                <datalist id="service-category-list"><option value="Wifi" /><option value="Security" /><option value="Shoe shining" /><option value="Cleaning" /><option value="Laundry" /><option value="Plumbing" /><option value="Electrical" /><option value="Catering" /><option value="Transport" /><option value="Consulting" /></datalist>
+                <label className="field-label">Billing unit<select value={recordForm.billingUnit ?? 'fixed'} onChange={(event) => setRecordForm({ ...recordForm, billingUnit: event.target.value })}>{SERVICE_BILLING_UNITS.map((unit) => <option key={unit.code} value={unit.code}>{unit.label}</option>)}</select></label>
+                  <label className="field-label">VAT treatment note (Kenya, optional)<input maxLength={40} value={recordForm.taxTreatment ?? ''} onChange={(event) => setRecordForm({ ...recordForm, taxTreatment: event.target.value })} placeholder="e.g. B16 or exempt" /></label>
+                <p className="dialog-note">Services are billed as their own invoice or counter line. They never move stock, so no quantity or unit cost is required.</p>
+              </>}
+              {type === 'suppliers' && <fieldset className="module-card supplier-items-fieldset"><legend>Inventory items supplied (optional)</legend><p className="dialog-note">Link one or more items this supplier provides. These are reference links only; they do not change stock or purchase orders.</p>{supplierItemIds.map((itemId, index) => <div className="field-row" key={`supplier-item-${index}`}><label className="field-label">Inventory item<select aria-label={`Supplier inventory item ${index + 1}`} value={itemId} onChange={(event) => setSupplierItemIds((current) => current.map((value, row) => row === index ? event.target.value : value))}><option value="">Choose item (optional)</option>{records.inventory.filter((item) => !supplierItemIds.includes(item.id) || item.id === itemId).map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')}{item.data.sku ? ` · ${item.data.sku}` : ''}</option>)}</select></label>{supplierItemIds.length > 1 && <button type="button" className="button button-small" aria-label="Remove supplier item row" onClick={() => setSupplierItemIds((current) => current.filter((_, row) => row !== index))}>Remove</button>}</div>)}<button type="button" className="button button-secondary" onClick={() => setSupplierItemIds((current) => [...current, ''])}>Add another item</button></fieldset>}<div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : `${editingRecordId ? 'Update' : 'Save'} ${recordLabel}`}</button>{editingRecordId && <button type="button" className="button button-secondary" onClick={() => { setEditingRecordId(''); setRecordForm({}); setSupplierItemIds(['']) }}>Cancel edit</button>}</div></form>
             {type === 'inventory' && <article className="module-card stock-health-panel">
               <div className="panel-header"><div><h2>Stock health &amp; reorder reminders</h2><p>Health uses each item’s saved reorder point; location quantities are combined for the business total.</p></div><span className="task-count">{inventoryHealth.filter((item) => item.status === 'low').length} low</span></div>
               <div className="stock-health-grid">{healthGroups.map((group) => <section className={`stock-health-card stock-health-${group.status}`} key={group.status}>
@@ -3731,7 +3913,9 @@ function App() {
                     <small>
                       {type === 'inventory'
                         ? `SKU ${record.data.sku || '—'} · Price ${money(Number(record.data.price ?? 0))} · Qty ${record.data.quantity} ${record.data.unit}`
-                        : type === 'projects'
+                        : type === 'services'
+                          ? `${record.data.category || 'General service'} · ${money(Number(record.data.charge ?? 0))} · ${serviceBillingLabel(String(record.data.billingUnit ?? 'fixed'))}${record.data.providerName ? ` · Provider: ${record.data.providerName}` : ''}`
+                          : type === 'projects'
                           ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}`
                           : type === 'suppliers'
                             ? `${record.data.email || 'No email'} · ${record.data.phone || 'No phone'} · ${(Array.isArray(record.data.supplyItemIds) ? record.data.supplyItemIds : []).map((itemId) => String(records.inventory.find((item) => item.id === itemId)?.data.name ?? '')).filter(Boolean).join(', ') || 'No linked inventory items'}`
@@ -3756,6 +3940,16 @@ function App() {
                     )}
                     {type === 'customers' && (
                       <button className="button button-small" onClick={() => beginInvoiceForCustomer(record)}>Create invoice</button>
+                    )}
+                    {type === 'services' && (
+                      <button className="button button-small" disabled={!canUse('sales.write')} title="Add this service to the counter sale" onClick={() => { addServiceLine(record); notify(`${String(record.data.name ?? 'Service')} added to the current sale.`) }}>Add to counter sale</button>
+                    )}
+                    {type === 'services' && (
+                      <button className="button button-small" disabled={!canUse('sales.write')} onClick={() => {
+                        setInvoice({ customer: '', customerEmail: '', description: String(record.data.name ?? 'Service'), amount: '', dueDate: today })
+                        setInvoiceLines([{ description: String(record.data.name ?? 'Service'), quantity: '1', unitPrice: String(record.data.charge ?? ''), discountAmount: '0', taxAmount: '0' }])
+                        setInvoiceLocationId(''); setInvoicePreview(null); setError(''); setModal('invoice')
+                      }}>Bill this service</button>
                     )}
                     {type !== 'inventory' && (
                       <button
@@ -3827,7 +4021,38 @@ function App() {
                 <label className="field-label">Notes (optional)<input maxLength={160} value={inventoryWriteOffInput.notes} onChange={(event) => setInventoryWriteOffInput({ ...inventoryWriteOffInput, notes: event.target.value })} placeholder="e.g. damaged in storage" /></label>
                 <button className="button button-primary" disabled={busy || !inventoryWriteOffInput.itemId || !inventoryWriteOffInput.locationId}>{busy ? 'Posting…' : 'Deduct damaged / expired stock'}</button>
               </form>}
-              <div className="transaction-row"><span><strong>Stock by location</strong><small>{inventoryLocationStock.map((stock) => `${records.inventory.find((item) => item.id === stock.item_id)?.data.name ?? 'Item'} · ${stock.location_name}: ${stock.quantity}`).join(' | ') || 'No location stock saved yet'}</small></span></div>
+              <div className="stock-location-wrap">
+                <div className="panel-header"><div><h2>Stock by location</h2><p>On-hand quantity and recorded value for every branch, warehouse, or shop.</p></div><span className="task-count">{inventoryLocations.filter((location) => location.active).length} locations</span></div>
+                <div className="stock-location-grid">
+                  {inventoryLocations.filter((location) => location.active).map((location) => {
+                    const lines = inventoryLocationStock
+                      .filter((stock) => stock.location_id === location.id)
+                      .map((stock) => {
+                        const item = records.inventory.find((record) => record.id === stock.item_id)
+                        const quantity = Number(stock.quantity)
+                        const unitCost = Number(item?.data.cost ?? 0)
+                        return { id: stock.item_id, name: String(item?.data.name ?? 'Item removed from inventory'), unit: String(item?.data.unit ?? 'unit'), quantity, value: quantity * unitCost }
+                      })
+                      .filter((line) => line.quantity !== 0)
+                      .sort((left, right) => right.value - left.value || left.name.localeCompare(right.name))
+                    const totalUnits = lines.reduce((sum, line) => sum + line.quantity, 0)
+                    const totalValue = lines.reduce((sum, line) => sum + line.value, 0)
+                    return <section className={`stock-location-card ${location.is_default ? 'is-default' : ''}`} key={location.id}>
+                      <div className="stock-location-head"><h3>{location.name}</h3><span className="status-pill">{location.is_default ? 'Default' : location.code}</span></div>
+                      <p>{lines.length} {lines.length === 1 ? 'item' : 'items'} on hand</p>
+                      <div className="stock-location-total"><strong>{totalUnits.toLocaleString('en-KE')} units</strong><small>{money(totalValue)} at cost</small></div>
+                      <div className="stock-location-lines">
+                        {lines.length ? lines.map((line) => <div className="stock-location-line" key={line.id}>
+                          <span><strong>{line.name}</strong><small>{money(line.value)} at cost</small></span>
+                          <span className="stock-location-qty"><b>{line.quantity.toLocaleString('en-KE')}</b><small>{line.unit}</small></span>
+                        </div>) : <div className="empty-state stock-health-empty">No stock recorded at this location yet.</div>}
+                      </div>
+                    </section>
+                  })}
+                  {!inventoryLocations.filter((location) => location.active).length && <div className="empty-state">Add a shop or warehouse above to start tracking stock by location.</div>}
+                </div>
+                <p className="dialog-note">Quantities come from the last transfer, count, or stock movement. Values use each item’s recorded unit cost and are management estimates.</p>
+              </div>
               <form className="record-form-grid" onSubmit={recordStockMovement}><label className="field-label">Inventory item<select required value={stockMovementInput.itemId} onChange={(event) => { const item = records.inventory.find((record) => record.id === event.target.value); setStockMovementInput({ ...stockMovementInput, itemId: event.target.value, unitCost: String(item?.data.cost ?? stockMovementInput.unitCost) }) }}><option value="">Select item</option>{records.inventory.map((item) => <option value={item.id} key={item.id}>{String(item.data.name)} · total {item.data.quantity}</option>)}</select></label><label className="field-label">Location<select required value={stockMovementInput.locationId} onChange={(event) => setStockMovementInput({ ...stockMovementInput, locationId: event.target.value })}><option value="">Select location</option>{inventoryLocations.filter((location) => location.active).map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label className="field-label">Movement<select value={stockMovementInput.movementType} onChange={(event) => setStockMovementInput({ ...stockMovementInput, movementType: event.target.value as typeof stockMovementInput.movementType })}><option value="purchase">Receive stock</option><option value="sale">Issue stock (COGS only)</option><option value="adjustment">Stock count adjustment</option></select></label>{stockMovementInput.movementType === 'adjustment' && <label className="field-label">Adjustment direction<select value={stockMovementInput.adjustmentDirection} onChange={(event) => setStockMovementInput({ ...stockMovementInput, adjustmentDirection: event.target.value as typeof stockMovementInput.adjustmentDirection })}><option value="increase">Increase stock</option><option value="decrease">Decrease stock</option></select></label>}<label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={stockMovementInput.quantity} onChange={(event) => setStockMovementInput({ ...stockMovementInput, quantity: event.target.value })} /></label><label className="field-label">Unit cost (KSh)<input required min="0" step="0.01" type="number" disabled={stockMovementInput.movementType === 'sale'} value={stockMovementInput.unitCost} onChange={(event) => setStockMovementInput({ ...stockMovementInput, unitCost: event.target.value })} /></label><label className="field-label">Reference<input maxLength={200} value={stockMovementInput.reference} onChange={(event) => setStockMovementInput({ ...stockMovementInput, reference: event.target.value })} /></label><label className="field-label">Date<input required type="date" value={stockMovementInput.date} onChange={(event) => setStockMovementInput({ ...stockMovementInput, date: event.target.value })} /></label><button className="button button-primary" disabled={busy || !records.inventory.length}>Post movement</button></form>
               <h3>Purchase orders</h3>
               <form className="record-form-grid" onSubmit={createPurchaseOrder}>
@@ -3977,6 +4202,7 @@ function App() {
             {storedDocuments.map((item) => <div className="transaction-row" key={item.id}><span><strong>{item.file_name}</strong><small>{item.mime_type} · {formatAttachmentSize(item.file_size)} · {new Date(item.created_at).toLocaleDateString('en-KE')}</small></span><div className="button-row"><button className="button button-small" onClick={() => void downloadDocument(item.id)}>Download</button><button className="button button-small" onClick={() => void deleteDocument(item.id)}>Delete</button></div></div>)}{!storedDocuments.length && <div className="empty-state">No stored documents yet.</div>}</article>
         </section> : page === 'Reports' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> REPORTS · WORKSPACE RECORDS</div><h1>Business reports</h1><p className="welcome-subtitle">Visual summaries from saved transactions and invoices. These are management views, not audited financial statements.</p>
+          <DailyPerformanceReport apiBase={API_BASE} search={search} />
           <div className="dashboard-grid"><article className="module-card report-chart"><h2>Income vs expenses this month</h2><ResponsiveContainer width="100%" height={260}><BarChart data={chart}><CartesianGrid vertical={false} stroke="#eff0f4" /><XAxis dataKey="date" /><YAxis /><Tooltip formatter={(value) => money(Number(value))} /><Legend /><Bar dataKey="income" fill="#7256df" radius={[5, 5, 0, 0]} /><Bar dataKey="expense" fill="#48b99e" radius={[5, 5, 0, 0]} /></BarChart></ResponsiveContainer></article>
             <article className="module-card report-chart"><h2>Recorded cash flow mix</h2><ResponsiveContainer width="100%" height={260}><PieChart><Pie data={[{ name: 'Income', value: Number(dashboard?.totals.monthIncome ?? 0) }, { name: 'Expenses', value: Number(dashboard?.totals.monthExpenses ?? 0) }].filter((item) => item.value > 0)} dataKey="value" nameKey="name" outerRadius={85} label>{['#7256df', '#48b99e'].map((color) => <Cell key={color} fill={color} />)}</Pie><Tooltip formatter={(value) => money(Number(value))} /><Legend /></PieChart></ResponsiveContainer>{Number(dashboard?.totals.monthIncome ?? 0) + Number(dashboard?.totals.monthExpenses ?? 0) === 0 && <div className="empty-state">Add transactions to populate this chart.</div>}</article></div>
           <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income this month</span><strong>{money(dashboard?.totals.monthIncome ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses this month</span><strong>{money(dashboard?.totals.monthExpenses ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
@@ -4018,18 +4244,15 @@ function App() {
                 </div>}
                 {scanFlash && <p className={`pos-scan-flash ${scanFlash.ok ? 'ok' : 'miss'}`} role="status">{scanFlash.ok ? <Check size={14} /> : <X size={14} />}{scanFlash.message}<small>{scanFlash.code.toUpperCase()}</small></p>}
               </div>
-              {!records.inventory.length ? <div className="empty-state">No inventory items yet. Add items with a selling price in Inventory to start a sale.<button className="button button-secondary" onClick={() => navigateTo('Inventory')}>Open inventory</button></div> :
-                <div className="pos-item-grid">{posItems.map((item) => {
-                  const onHand = Number(inventoryLocationStock.find((stock) => stock.location_id === posLocationId && stock.item_id === item.id)?.quantity ?? 0)
-                  const itemName = String(item.data.name ?? 'Inventory item')
-                  const sku = String(item.data.sku ?? '')
-                  const line = posCart.find((entry) => entry.itemId === item.id)
-                  const disabled = onHand <= 0 || Boolean(line && line.quantity >= onHand)
-                  return <button type="button" className="pos-item" key={item.id} disabled={disabled} onClick={() => addPosItem(item)}>
-                    <span className="pos-item-icon"><Package size={19} /></span><strong>{itemName}</strong>{(sku || item.data.barcode) && <small>{sku}{item.data.barcode ? ` · ${item.data.barcode}` : ''}</small>}
-                    <span className={`pos-stock ${onHand <= 5 ? 'low' : ''}`}>{onHand > 0 ? `${onHand} in stock` : 'Out of stock'}</span><b>{money(Number(item.data.price ?? 0))}</b>
+              {!records.inventory.length && !records.services.length ? <div className="empty-state">No sellable items or services yet. Add an item in Inventory or a service in Services to start a sale.<button className="button button-secondary" onClick={() => navigateTo('Inventory')}>Open inventory</button></div> :
+                <div className="pos-item-grid">{posItems.map((entry) => {
+                  const line = posCart.find((item) => item.itemId === entry.id)
+                  const disabled = entry.kind === 'item' && (entry.onHand <= 0 || Boolean(line && line.quantity >= entry.onHand))
+                  return <button type="button" className="pos-item" key={entry.id} disabled={disabled} onClick={() => addPosItem(entry)}>
+                    <span className="pos-item-icon">{entry.kind === 'service' ? <Sparkles size={19} /> : <Package size={19} />}</span><strong>{entry.name}</strong>{entry.reference && <small>{entry.kind === 'service' ? entry.reference : `${entry.sku}${entry.barcode ? ` · ${entry.barcode}` : ''}`}</small>}
+                    <span className={`pos-stock ${entry.kind === 'item' && entry.onHand <= 5 ? 'low' : ''}`}>{entry.kind === 'service' ? entry.unitLabel : entry.onHand > 0 ? `${entry.onHand} in stock` : 'Out of stock'}</span><b>{money(entry.price)}</b>
                   </button>
-                })}{!posItems.length && <div className="empty-state">No items match “{posSearch}”.</div>}</div>
+                })}{!posItems.length && <div className="empty-state">No items or services match “{posSearch}”.</div>}</div>
               }
             </section>
             <aside className="module-card pos-checkout" aria-label="Current sale">
@@ -4053,24 +4276,35 @@ function App() {
                     {!posCustomerHistory.sales.length && <div className="empty-state">No previous sales found for this customer.</div>}
                   </div></>}</article>}
               <div className="pos-cart-lines">{posCart.map((line) => <div className="pos-cart-line" key={line.itemId}>
-                <div className="pos-line-main"><strong>{line.description}</strong><small>{money(line.unitPrice)} each · {line.onHand} available</small></div>
-                <div className="pos-quantity"><button type="button" aria-label={`Remove one ${line.description}`} onClick={() => changePosQuantity(line.itemId, line.quantity - 1)}><Minus size={14} /></button><input key={`${line.itemId}-${line.quantity}`} aria-label={`Quantity for ${line.description}`} type="number" min="1" max={line.onHand} step="1" defaultValue={line.quantity} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur() } }} onBlur={(event) => {
+                <div className="pos-line-main"><strong>{line.description}</strong><small>{money(line.unitPrice)} each · {line.kind === 'service' ? 'service' : `${line.onHand} available`}</small></div>
+                <div className="pos-quantity"><button type="button" aria-label={`Remove one ${line.description}`} onClick={() => changePosQuantity(line.itemId, line.quantity - 1)}><Minus size={14} /></button><input key={`${line.itemId}-${line.quantity}`} aria-label={`Quantity for ${line.description}`} type="number" min="1" max={Number.isFinite(line.onHand) ? line.onHand : undefined} step="1" defaultValue={line.quantity} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur() } }} onBlur={(event) => {
                   const nextQuantity = Number(event.currentTarget.value)
                   if (!Number.isInteger(nextQuantity) || nextQuantity < 1) {
                     event.currentTarget.value = String(line.quantity)
                     return
                   }
                   changePosQuantity(line.itemId, nextQuantity)
-                }} /><button type="button" aria-label={`Add one ${line.description}`} disabled={line.quantity >= line.onHand} onClick={() => changePosQuantity(line.itemId, line.quantity + 1)}><Plus size={14} /></button></div>
+                }} /><button type="button" aria-label={`Add one ${line.description}`} disabled={Number.isFinite(line.onHand) && line.quantity >= line.onHand} onClick={() => changePosQuantity(line.itemId, line.quantity + 1)}><Plus size={14} /></button></div>
                 <strong className="pos-line-total">{money(line.quantity * line.unitPrice)}</strong>
                 <button type="button" className="icon-button pos-remove" aria-label={`Remove ${line.description} from sale`} onClick={() => changePosQuantity(line.itemId, 0)}><Trash2 size={15} /></button>
-              </div>)}{!posCart.length && <div className="pos-cart-empty"><ShoppingBag size={22} /><strong>Your sale is empty</strong><span>Select an item to add it to the cart.</span></div>}</div>
+              </div>)}{!posCart.length && <div className="pos-cart-empty"><ShoppingBag size={22} /><strong>Your sale is empty</strong><span>Select an item or service to add it to the cart.</span></div>}</div>
               <div className="pos-total-row"><span>Total due</span><strong>{money(posTotal)}</strong></div>
               <fieldset className="pos-payment-choice"><legend>Payment method</legend>
                 <button type="button" className={posPaymentMethod === 'cash' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'cash'} onClick={() => setPosPaymentMethod('cash')}><Banknote size={17} />Cash / manual</button>
                 <button type="button" className={posPaymentMethod === 'mpesa' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'mpesa'} disabled={!mpesaConfigured} title={mpesaConfigured ? 'Request an M-Pesa STK push' : 'Configure Daraja before requesting M-Pesa'} onClick={() => setPosPaymentMethod('mpesa')}><Smartphone size={17} />M-Pesa{!mpesaConfigured && <small>Setup needed</small>}</button>
               </fieldset>
               {posPaymentMethod === 'mpesa' && <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="07XX XXX XXX" value={posPaymentPhone} onChange={(event) => setPosPaymentPhone(event.target.value)} /></label>}
+              {multiMethodEnabled && <div className="payment-split-editor">
+                <div className="panel-header"><div><h3>Split payment (optional)</h3><p>Part cash, part M-Pesa, or any mix. Amounts must add up to the sale total of {money(posTotal)}.</p></div><button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, pos: [...(current.pos ?? []), { method: 'cash', amount: '', phone: '', reference: '' }] }))}><Plus size={14} /> Add method</button></div>
+                {(paymentSplits.pos ?? []).map((split, index) => <div className="field-row payment-split-row" key={index}>
+                  <label className="field-label">Method<select value={split.method} onChange={(event) => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).map((item, row) => row === index ? { ...item, method: event.target.value as 'cash' | 'mpesa' } : item) }))}><option value="cash">Cash / manual</option><option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option></select></label>
+                  <label className="field-label">Amount (KSh)<input type="number" min="0" step="0.01" value={split.amount} onChange={(event) => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).map((item, row) => row === index ? { ...item, amount: event.target.value } : item) }))} /></label>
+                  {split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="07XX XXX XXX" value={split.phone} onChange={(event) => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).map((item, row) => row === index ? { ...item, phone: event.target.value } : item) }))} /></label>}
+                  <button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).filter((_, row) => row !== index) }))}>Remove</button>
+                </div>)}
+                {Boolean((paymentSplits.pos ?? []).length) && <p className="dialog-note">Split total {money((paymentSplits.pos ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0))} of {money(posTotal)}. When splits are set, the button below records each method instead of one payment.</p>}
+                {Boolean((paymentSplits.pos ?? []).filter((split) => split.method === 'mpesa').length) && !mpesaConfigured && <p className="form-error" role="alert">Daraja M-Pesa is not configured, so M-Pesa splits cannot be requested. Remove them or ask the operator to configure Daraja.</p>}
+              </div>}
               <button type="button" className="button button-primary pos-complete" disabled={busy || !posCart.length || posTotal <= 0} onClick={() => void checkoutPos()}>{busy ? 'Processing sale…' : posPaymentMethod === 'mpesa' ? 'Request M-Pesa payment' : 'Complete cash sale'}</button>
               <p className="pos-disclaimer"><ShieldCheck size={14} />Internal invoice only—not a KRA/eTIMS fiscal receipt. M-Pesa requests require configured Daraja; verify payment before releasing goods.</p>
             </aside>
@@ -4167,6 +4401,7 @@ function App() {
                     {invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <>
                       <label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
                       <button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button>
+                      {multiMethodEnabled && <button className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: current[invoiceRow.id]?.length ? [] : [{ method: 'cash', amount: '', phone: '', reference: '' }] }))}>{paymentSplits[invoiceRow.id]?.length ? 'Hide split payment' : 'Split payment'}</button>}
                       <button className="button button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting} title={!mpesaConfigured ? 'Daraja M-Pesa is not configured for this business.' : undefined} onClick={() => {
                         if (promptOpen) { setMpesaPromptInvoiceId(null); return }
                         setMpesaPromptInvoiceId(invoiceRow.id)
@@ -4175,6 +4410,17 @@ function App() {
                     </>}
                     {latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}</span>}
                   </div>
+                  {Boolean(paymentSplits[invoiceRow.id]?.length) && <div className="payment-split-editor">
+                    <div className="panel-header"><div><h3>Split payment for {invoiceRow.customer}</h3><p>Record part cash and part M-Pesa against invoice {invoiceRow.id.slice(0, 8)}. Amounts are recorded and verified separately.</p></div><button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: [...(current[invoiceRow.id] ?? []), { method: 'cash', amount: '', phone: '', reference: '' }] }))}><Plus size={14} /> Add method</button></div>
+                    {(paymentSplits[invoiceRow.id] ?? []).map((split, index) => <div className="field-row payment-split-row" key={index}>
+                      <label className="field-label">Method<select value={split.method} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, method: event.target.value as 'cash' | 'mpesa' } : item) }))}><option value="cash">Cash / manual</option><option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option></select></label>
+                      <label className="field-label">Amount (KSh)<input type="number" min="0" step="0.01" value={split.amount} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, amount: event.target.value } : item) }))} /></label>
+                      {split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="0712345678" value={split.phone} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, phone: event.target.value } : item) }))} /></label>}
+                      <button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).filter((_, row) => row !== index) }))}>Remove</button>
+                    </div>)}
+                    <p className="dialog-note">Split total {money((paymentSplits[invoiceRow.id] ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0))} · outstanding {money(invoiceRow.amount_due ?? invoiceRow.amount)}.</p>
+                    <button className="button button-primary button-small" disabled={busy} onClick={() => void payInvoiceSplit(invoiceRow)}>Record split payment</button>
+                  </div>}
                   {promptOpen && invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <div className="invoice-mpesa-prompt">
                     <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="0712345678" value={invoiceMpesaPhones[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaPhones((current) => ({ ...current, [invoiceRow.id]: event.target.value }))} /></label>
                     <button className="button button-primary button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting || !invoiceMpesaPhones[invoiceRow.id]?.trim() || ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment?.status ?? '')} onClick={() => void sendInvoiceMpesaPrompt(invoiceRow)}>{mpesaPromptSubmitting ? 'Sending…' : 'Send prompt'}</button>
@@ -4199,12 +4445,15 @@ function App() {
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.monoEnabled} onChange={(event) => setSettings({ ...settings, monoEnabled: event.target.checked })} /> Allow Mono bank-feed connections for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.darajaEnabled} onChange={(event) => setSettings({ ...settings, darajaEnabled: event.target.checked })} /> Allow Daraja / M-Pesa for this business</label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.kraEtimsLiveEnabled} onChange={(event) => setSettings({ ...settings, kraEtimsLiveEnabled: event.target.checked })} /> Permit live KRA eTIMS usage for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.statutoryFilingsEnabled} onChange={(event) => setSettings({ ...settings, statutoryFilingsEnabled: event.target.checked })} /> Permit statutory filing routes for this business</label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.shifEnabled} onChange={(event) => setSettings({ ...settings, shifEnabled: event.target.checked })} /> Enable SHIF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.nssfEnabled} onChange={(event) => setSettings({ ...settings, nssfEnabled: event.target.checked })} /> Enable NSSF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.ahlEnabled} onChange={(event) => setSettings({ ...settings, ahlEnabled: event.target.checked })} /> Enable AHL route</label></div>
+            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.multiMethodPayments} onChange={(event) => setSettings({ ...settings, multiMethodPayments: event.target.checked })} /> Allow customers to pay one invoice with more than one method (part cash, part M-Pesa)</label></div>
+            <p className="dialog-note">Split payments only change how a payment is captured: each method is still recorded and verified on its own, and an M-Pesa request still needs a live connection. Total must match the invoice or sale.</p>
             {error && <p className="form-error" role="alert">{error}</p>}
             <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
           </form>
             <section className="module-card security-card">
               <div className="panel-header"><div><h2>Account security · two-factor authentication</h2><p>Protect your business with an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, or any TOTP app). No paid service is required.</p></div><span className={`status-pill ${twoFactorStatus?.enabled ? 'green' : 'amber'}`}>{twoFactorStatus?.enabled ? 'Enabled' : 'Not enabled'}</span></div>
-              {twoFactorStatus && !twoFactorStatus.available && <p className="form-error">The API operator must set TWO_FACTOR_ENCRYPTION_KEY (32+ characters) before two-factor authentication can be enabled.</p>}
+              {twoFactorStatus && !twoFactorStatus.available && <p className="form-error">Two-factor authentication is unavailable because the API service is missing <code>TWO_FACTOR_ENCRYPTION_KEY</code>. This is an operator environment setting, not a code fault: set it to a stable random secret of at least 32 characters in the API service environment and redeploy, then reload this page.</p>}
+              {twoFactorStatus?.available && <p className="dialog-note">Server encryption key detected, so two-factor setup is available.</p>}
               {error && <p className="form-error" role="alert">{error}</p>}
 
               {twoFactorStatus?.enabled && !twoFactorSetup && <div className="two-factor-enabled">
@@ -4445,7 +4694,10 @@ function App() {
         </form> : null}
         {modal === 'invite' ? <form onSubmit={inviteUser}>
           <p className="dialog-note">This invitation adds a user to this business workspace. It does not create an employee or payroll record.</p>
-          <label className="field-label">Email<input type="email" required value={invite.email} onChange={(event) => setInvite({ ...invite, email: event.target.value })} /></label>
+          <label className="field-label">Invite by<select value={invite.channel} onChange={(event) => setInvite({ ...invite, channel: event.target.value as 'email' | 'phone' })}><option value="email">Email address (Brevo)</option><option value="phone">Phone number (Brevo SMS)</option></select></label>
+          {invite.channel === 'email'
+            ? <label className="field-label">Email<input type="email" required value={invite.email} onChange={(event) => setInvite({ ...invite, email: event.target.value })} /></label>
+            : <label className="field-label">Phone number<input type="tel" required maxLength={30} placeholder="0712345678" value={invite.phone} onChange={(event) => setInvite({ ...invite, phone: event.target.value })} /><small>SMS invitations need BREVO_SMS_SENDER configured on the API service. If it is not set you can still copy the secure link below.</small></label>}
           <label className="field-label">Role<select value={invite.role} onChange={(event) => { const role = event.target.value; setInvite({ ...invite, role }); if (customRoles.some((item) => item.roleKey === role)) setInviteScope('single') }}>
             <option value="accountant">Accountant</option>
             <option value="staff">Staff</option>

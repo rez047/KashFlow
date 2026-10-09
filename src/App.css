@@ -566,3 +566,88 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .cta-forgot{margin:0;text-align:center}
 .cta-forgot .auth-link{color:#d9c8ff;font-size:12.5px}
 .cta-forgot .auth-link:hover{color:#fff}
+
+/* ---------------------------------------------------------------------------
+   Mobile-width containment.
+   The app-shell is a flex row (fixed sidebar + main). Without an explicit
+   min-width:0 on the flex child the main area refuses to shrink below its
+   content width, so phones render a desktop-wide page that has to be pinched.
+   These rules keep every layout inside the viewport on a phone fit ratio,
+   while leaving the desktop (>=901px) layout untouched.
+   --------------------------------------------------------------------------- */
+.app-shell{max-width:100%;overflow-x:hidden}
+.main-area{flex:1;min-width:0;max-width:100%;overflow-x:hidden}
+.content-wrap{max-width:100%;min-width:0}
+.sidebar{overscroll-behavior:contain}
+
+@media(max-width:900px){
+  .app-shell{display:block}
+  .main-area{width:100%}
+  .content-wrap{padding-left:14px;padding-right:14px}
+  /* Long words, SKUs and barcodes must wrap instead of forcing the page wide. */
+  .transaction-name strong,.transaction-row span,.module-card p,.module-card h2,.module-card h3{overflow-wrap:anywhere}
+  .payroll-table-scroll,.pos-cart-lines,.attachment-list{max-width:100%}
+}
+
+@media(max-width:600px){
+  .metric-grid{grid-template-columns:1fr 1fr;gap:9px}
+  .metric-value{font-size:16px}
+  .hero-grid,.pricing-grid,.feature-grid,.segment-grid,.included-grid,.testimonial-grid,.cta-card,.compliance-hero,.landing-nav-inner,.landing-footer-inner{grid-template-columns:1fr!important;display:grid}
+  .landing-links{flex-wrap:wrap;justify-content:center}
+}
+
+@media(max-width:420px){
+  .metric-grid{grid-template-columns:1fr}
+  .content-wrap{padding-left:11px;padding-right:11px}
+}
+
+/* ---------------------------------------------------------------------------
+   Stock by location — replaces the old single cramped transaction row with a
+   readable per-location card and table view.
+   --------------------------------------------------------------------------- */
+.stock-location-wrap{margin:14px 0 18px}
+.stock-location-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin-bottom:12px}
+.stock-location-toolbar .field-label{margin:0;min-width:170px}
+.stock-location-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:12px}
+.stock-location-card{min-width:0;padding:14px;border:1px solid #e9eaf0;border-radius:12px;background:#fff}
+.stock-location-card.is-default{border-color:#cfc5f3;background:linear-gradient(180deg,#faf8ff,#fff 60%)}
+.stock-location-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+.stock-location-head h3{margin:0;font-size:13px}
+.stock-location-card>p{margin:0 0 10px;color:#7a7c8c;font-size:11px}
+.stock-location-total{display:flex;align-items:baseline;justify-content:space-between;gap:8px;padding:8px 10px;margin-bottom:10px;border-radius:8px;background:#f6f5fb}
+.stock-location-total strong{font-size:14px}
+.stock-location-total small{color:#727386;font-size:10px}
+.stock-location-lines{display:flex;flex-direction:column;gap:1px;max-height:230px;overflow:auto}
+.stock-location-line{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;border-top:1px solid #f1f1f6;font-size:11px}
+.stock-location-line>span:first-child{min-width:0;display:flex;flex-direction:column;gap:2px}
+.stock-location-line strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stock-location-line small{color:#86879a;font-size:10px}
+.stock-location-line b{white-space:nowrap}
+.stock-location-qty{display:flex;align-items:center;gap:6px}
+
+/* Today's performance replication for the Reports section. */
+.report-performance{display:grid;grid-template-columns:minmax(220px,.9fr) minmax(0,1.6fr);gap:16px;align-items:stretch}
+.report-performance-stat{padding:16px;border:1px solid #ececf2;border-radius:12px;background:linear-gradient(140deg,#fff,#f8f7ff)}
+.report-performance-stat small{display:block;color:#7a7c8c;font-size:11px}
+.report-performance-stat strong{display:block;margin:7px 0 8px;font-size:24px;letter-spacing:-.6px;color:#26263a}
+.report-performance-bars{display:flex;align-items:flex-end;gap:8px;height:150px;padding:12px;border:1px solid #ececf2;border-radius:12px;background:#fff}
+.report-performance-bars>div{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:6px;height:100%}
+.report-performance-bars i{width:100%;min-height:3px;border-radius:5px 5px 2px 2px;background:linear-gradient(180deg,#8065e9,#6d54d6)}
+.report-performance-bars i.is-today{background:linear-gradient(180deg,#37b58c,#268a68)}
+.report-performance-bars span{font-size:9px;color:#86879a;white-space:nowrap}
+@media(max-width:760px){.report-performance{grid-template-columns:1fr}.stock-location-grid{grid-template-columns:1fr}}
+
+/* Split payment capture (optional, enabled per business in Settings). */
+.payment-split-editor{margin:12px 0;padding:13px;border:1px solid #e9e6f5;border-radius:10px;background:#fbfaff}
+.payment-split-editor .panel-header{margin-bottom:10px}
+.payment-split-editor h3{margin:0 0 4px;font-size:12px}
+.payment-split-row{align-items:end;gap:9px;margin-bottom:9px;flex-wrap:wrap}
+.payment-split-row .field-label{flex:1;min-width:130px;margin:0}
+@media(max-width:680px){.payment-split-row{display:grid;grid-template-columns:1fr}.payment-split-row .field-label{min-width:0}}
+
+/* Services sit alongside inventory as sellable records. */
+.pos-item-icon .lucide-sparkles{color:#7c5ce0}
+.report-trend{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:700}
+.report-trend-up{color:#21865d}
+.report-trend-down{color:#b4462b}
+.report-trend-flat{color:#807f92;font-weight:600}

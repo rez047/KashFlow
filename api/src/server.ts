@@ -149,6 +149,10 @@ const defaultWorkspaceSettings = {
   shifEnabled: false,
   nssfEnabled: false,
   ahlEnabled: false,
+  // Optional system-wide flag: allow a customer/invoice payment to be split across
+  // more than one method (for example part cash + part M-Pesa). This only changes the
+  // capture/UI flow; each recorded amount is still posted and verified on its own.
+  multiMethodPayments: false,
 } as const
 function nairobiToday() {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date())
@@ -432,6 +436,19 @@ async function sendBrevoEmail(input: { to: string; subject: string; html: string
     return { ok: true, messageId }
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message.slice(0, 300) : 'Brevo email failed.' }
+  }
+}
+// Shared transactional-SMS sender, mirroring sendBrevoEmail so invitations and notifications
+// have one delivery helper. Brevo's free tier includes limited SMS credits.
+async function sendBrevoSms(input: { to: string; content: string }): Promise<{ ok: boolean; messageId?: string; recipient?: string; error?: string }> {
+  if (!env.BREVO_API_KEY) return { ok: false, error: 'Brevo is not configured. Set BREVO_API_KEY on the API service.' }
+  if (!env.BREVO_SMS_SENDER) return { ok: false, error: 'Set BREVO_SMS_SENDER (max 11 characters) on the API service.' }
+  const recipient = normalizeKenyanPhone(input.to) ?? input.to
+  try {
+    const result = await brevoSend('sms', { sender: env.BREVO_SMS_SENDER, recipient, content: input.content.slice(0, 300), type: 'transactional', unicodeEnabled: true })
+    return { ok: true, messageId: result.messageId ? String(result.messageId) : undefined, recipient }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message.slice(0, 300) : 'Brevo SMS failed.' }
   }
 }
 async function recordMessageDelivery(input: { workspaceId: string; channel: 'email' | 'sms' | 'whatsapp'; recipient: string; subject?: string; status: string; providerMessageId?: string; errorMessage?: string; createdBy?: string }) {
@@ -1129,11 +1146,33 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
   } catch (error) { next(error) }
 })
 
-const workspaceRecordTypes = ['customers', 'suppliers', 'inventory', 'projects'] as const
+const workspaceRecordTypes = ['customers', 'suppliers', 'inventory', 'services', 'projects'] as const
+// Services are sellable, non-stock lines (wifi, security guarding, shoe shining, cleaning...).
+// They deliberately carry no quantity/cost fields: a service is billed as its own line on an
+// invoice or used at the counter, and it never moves inventory or posts an inventory journal.
+const SERVICE_BILLING_UNITS = ['per_hour', 'per_day', 'per_month', 'per_session', 'per_unit', 'fixed'] as const
 const workspaceRecordSchemas = {
   customers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default('') }),
   suppliers: z.object({ name: z.string().trim().min(1).max(160), email: z.string().trim().email().max(254).or(z.literal('')).default(''), phone: z.string().trim().max(30).default(''), address: z.string().trim().max(500).default(''), taxPin: z.string().trim().max(30).default(''), notes: z.string().trim().max(2000).default(''), supplyItemIds: z.array(z.string().uuid()).max(100).default([]) }),
   inventory: z.object({ name: z.string().trim().min(1).max(160), sku: z.string().trim().max(80).default(''), barcode: z.string().trim().max(80).default(''), reorderPoint: z.coerce.number().finite().min(0).default(0), quantity: z.coerce.number().finite().min(0).default(0), unit: z.string().trim().max(30).default('unit'), cost: z.coerce.number().finite().min(0).default(0), price: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default(''), addToExpenses: z.boolean().default(false) }),
+  services: z.object({
+    name: z.string().trim().min(1).max(160),
+    category: z.string().trim().max(80).default('General service'),
+    description: z.string().trim().max(2000).default(''),
+    billingUnit: z.enum(SERVICE_BILLING_UNITS).default('fixed'),
+    charge: z.coerce.number().finite().min(0).default(0),
+    taxTreatment: z.string().trim().max(40).default(''),
+    // Optional service-provider details so a business can record who delivers the service.
+    providerName: z.string().trim().max(160).default(''),
+    providerContact: z.string().trim().max(120).default(''),
+    providerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''),
+    providerPhone: z.string().trim().max(30).default(''),
+    providerPin: z.string().trim().max(30).default(''),
+    // Optional SLA-style fields; kept as plain text so any provider detail can be recorded.
+    serviceLevel: z.string().trim().max(200).default(''),
+    duration: z.string().trim().max(80).default(''),
+    notes: z.string().trim().max(2000).default(''),
+  }),
   projects: z.object({ name: z.string().trim().min(1).max(160), customer: z.string().trim().max(160).default(''), status: z.enum(['planned', 'active', 'on_hold', 'completed']).default('planned'), startDate: z.string().date().or(z.literal('')).default(''), endDate: z.string().date().or(z.literal('')).default(''), budget: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default('') }),
 }
 type WorkspaceRecordType = typeof workspaceRecordTypes[number]
@@ -1141,6 +1180,7 @@ const workspaceRecordDatabaseTypes: Record<WorkspaceRecordType, string> = {
   customers: 'customer',
   suppliers: 'supplier',
   inventory: 'inventory',
+  services: 'service',
   projects: 'project',
 }
 function parseRecordType(value: string): WorkspaceRecordType | null {
@@ -1310,7 +1350,7 @@ app.post('/v1/inventory/counts', requirePool, verifyOrigin, requireSession, requ
 })
 app.post('/v1/imports/records/:type', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   const type = parseRecordType(String(request.params.type ?? ''))
-  if (!type) { response.status(404).json({ error: 'Choose customers, suppliers, inventory, or projects.' }); return }
+  if (!type) { response.status(404).json({ error: 'Choose customers, suppliers, inventory, services, or projects.' }); return }
   const input = z.object({ rows: z.array(z.record(z.string(), z.unknown())).min(1).max(500), commit: z.boolean().default(false) }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Provide between 1 and 500 CSV rows.' }); return }
   const parsedRows: Array<{ index: number; data: Record<string, unknown> }> = []
@@ -2452,6 +2492,7 @@ app.put('/v1/settings', requirePool, verifyOrigin, requireSession, requireWorksp
     shifEnabled: z.boolean().default(false),
     nssfEnabled: z.boolean().default(false),
     ahlEnabled: z.boolean().default(false),
+    multiMethodPayments: z.boolean().default(false),
   }).safeParse(request.body)
   if (!input.success || input.data.inventoryMediumStockThreshold <= input.data.inventoryLowStockThreshold) { response.status(400).json({ error: 'Settings are invalid. Medium stock threshold must be higher than the low stock threshold.' }); return }
   const client = await pool!.connect()
@@ -2502,18 +2543,67 @@ function csvValue(value: unknown) {
   const safe = /^[\t\r\n ]*[=+\-@]/.test(text) && !/^-?\d+(?:\.\d+)?$/.test(text) ? `'${text}` : text
   return `"${safe.replace(/"/g, '""')}"`
 }
+app.get('/v1/reports/daily-performance', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  // Powers the Reports replica of the landing page "Today's performance" card.
+  // Today and yesterday are compared on recorded ledger income, so the figure
+  // matches the cash-flow chart instead of the hero card's marketing sample.
+  try {
+    const today = nairobiToday()
+    const yesterday = new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 1, Number(today.slice(8, 10)) - 1)).toISOString().slice(0, 10)
+    const workspaceId = request.session!.workspaceId
+    const [dayTotals, week, stock] = await Promise.all([
+      pool!.query(`SELECT
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date = $2), 0)::text AS today_income,
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date = $2), 0)::text AS today_expense,
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date = $3), 0)::text AS yesterday_income,
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date = $3), 0)::text AS yesterday_expense
+        FROM ledger_transactions WHERE workspace_id = $1`, [workspaceId, today, yesterday]),
+      pool!.query(`SELECT transaction_date AS date,
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS income,
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS expense
+        FROM ledger_transactions WHERE workspace_id = $1 AND transaction_date >= $2 AND transaction_date <= $3
+        GROUP BY transaction_date ORDER BY transaction_date`, [workspaceId, new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 1, Number(today.slice(8, 10)) - 6)).toISOString().slice(0, 10), today]),
+      pool!.query(`SELECT COALESCE(SUM(s.quantity * COALESCE(NULLIF(i.data->>'cost', '')::numeric, 0)), 0)::text AS valuation
+        FROM inventory_location_stock s JOIN workspace_records i ON i.id = s.item_id
+        WHERE s.workspace_id = $1 AND i.record_type = 'inventory'`, [workspaceId]),
+    ])
+    const asDateString = (value: unknown) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
+    const row = dayTotals.rows[0]
+    const todayIncome = Number(row.today_income)
+    const yesterdayIncome = Number(row.yesterday_income)
+    const todayExpense = Number(row.today_expense)
+    const yesterdayExpense = Number(row.yesterday_expense)
+    // Percentage change versus yesterday; null when there is no comparable base.
+    const percentChange = yesterdayIncome > 0 ? Math.round(((todayIncome - yesterdayIncome) / yesterdayIncome) * 100) : null
+    response.json({
+      today,
+      yesterday,
+      todayIncome: todayIncome.toFixed(2),
+      todayExpense: todayExpense.toFixed(2),
+      yesterdayIncome: yesterdayIncome.toFixed(2),
+      yesterdayExpense: yesterdayExpense.toFixed(2),
+      todayNet: (todayIncome - todayExpense).toFixed(2),
+      percentChange,
+      weekIncome: week.rows.reduce((sum: number, line: Record<string, unknown>) => sum + Number(line.income), 0).toFixed(2),
+      stockValue: stock.rows[0].valuation,
+      days: week.rows.map((line: Record<string, unknown>) => ({ date: asDateString(line.date), income: line.income, expense: line.expense })),
+    })
+  } catch (error) { next(error) }
+})
+
 app.get('/v1/exports/:type', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
-  const type = z.enum(['customers', 'suppliers', 'inventory', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit']).safeParse(request.params.type)
-  if (!type.success) { response.status(404).json({ error: 'Choose customers, suppliers, inventory, projects, invoices, bills, transactions, journals, or audit.' }); return }
+  const type = z.enum(['customers', 'suppliers', 'inventory', 'services', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit']).safeParse(request.params.type)
+  if (!type.success) { response.status(404).json({ error: 'Choose customers, suppliers, inventory, services, projects, invoices, bills, transactions, journals, or audit.' }); return }
   try {
     const workspaceId = request.session!.workspaceId
     let headers: string[]
     let rows: Record<string, unknown>[]
-    if (['customers', 'suppliers', 'inventory', 'projects'].includes(type.data)) {
+    if (['customers', 'suppliers', 'inventory', 'services', 'projects'].includes(type.data)) {
       const columnsByType: Record<string, string[]> = {
         customers: ['name', 'email', 'phone', 'address', 'taxPin', 'notes'],
         suppliers: ['name', 'email', 'phone', 'address', 'taxPin', 'notes'],
         inventory: ['name', 'sku', 'barcode', 'quantity', 'unit', 'cost', 'price', 'reorderPoint', 'notes'],
+        services: ['name', 'category', 'description', 'billingUnit', 'charge', 'taxTreatment', 'providerName', 'providerContact', 'providerEmail', 'providerPhone', 'providerPin', 'serviceLevel', 'duration', 'notes'],
         projects: ['name', 'customer', 'status', 'startDate', 'endDate', 'budget', 'notes'],
       }
       const columns = columnsByType[type.data] ?? []
@@ -2583,11 +2673,16 @@ app.post('/v1/workspaces', requirePool, verifyOrigin, requireSession, async (req
 
 app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
   const input = z.object({
-    email: z.string().trim().email().max(254).transform((value) => value.toLowerCase()),
+    email: z.string().trim().email().max(254).transform((value) => value.toLowerCase()).optional(),
+    phone: z.string().trim().min(7).max(30).transform((value) => value.replace(/[\s().-]/g, '')).optional(),
     role: z.string().trim().min(1).max(60),
     scope: z.enum(['single', 'all_owned']).default('single'),
-  }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Provide a valid email and workspace role.' }); return }
+  }).refine((value) => Boolean(value.email || value.phone), { message: 'Provide an email address or a phone number.' }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a valid email address or phone number, and a workspace role.' }); return }
+  if (!input.data.email && !brevoSmsConfigured) {
+    response.status(409).json({ error: 'Phone invitations need BREVO_SMS_SENDER configured on the API service. Invite by email, or ask the operator to set the SMS sender.' })
+    return
+  }
   if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Invitations can only be created for the active business.' }); return }
 
   const client = await pool!.connect()
@@ -2620,7 +2715,7 @@ app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, r
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
     const invite = await client.query(`INSERT INTO workspace_invitations (workspace_id, email, role, scope, invited_by, token_hash, expires_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, email, role, scope, status, expires_at`,
-    [request.session!.workspaceId, input.data.email, input.data.role, input.data.scope, request.session!.userId, tokenHash, expiresAt])
+    [request.session!.workspaceId, input.data.email ?? input.data.phone ?? '', input.data.role, input.data.scope, request.session!.userId, tokenHash, expiresAt])
     for (const target of targets) {
       await client.query('INSERT INTO invitation_workspaces (id, invitation_id, workspace_id) VALUES ($1, $2, $3)', [randomUUID(), invite.rows[0].id, target.workspace_id])
     }
@@ -2631,11 +2726,26 @@ app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, r
       response.status(201).json({ invitation: { ...invite.rows[0], businesses: targets.map((target) => target.name) }, delivery: 'manual_link', invitationUrl: invitationUrl.toString() })
       return
     }
+    const businessNames = targets.map((target) => target.name).join(', ')
+    // Phone invitations go out by Brevo SMS; email invitations by Brevo email.
+    if (!input.data.email) {
+      const inviteSms = await sendBrevoSms({
+        to: String(input.data.phone),
+        content: `KashFlow: you are invited as ${input.data.role} to ${businessNames}. Sign in or create an account to accept within 7 days: ${invitationUrl.toString()}`,
+      })
+      if (!inviteSms.ok) {
+        await pool!.query("UPDATE workspace_invitations SET status = 'declined' WHERE id = $1 AND status = 'pending'", [invite.rows[0].id])
+        response.status(502).json({ error: `Invitation SMS was not accepted by Brevo: ${String(inviteSms.error ?? 'provider error').slice(0, 300)}` })
+        return
+      }
+      response.status(201).json({ invitation: { ...invite.rows[0], businesses: targets.map((target) => target.name) }, delivery: 'accepted_by_provider_sms' })
+      return
+    }
     const inviteEmail = await sendBrevoEmail({
       to: input.data.email,
-      subject: `You are invited to ${targets.map((target) => target.name).join(', ')}`,
-      html: `<main style="font-family:Arial,sans-serif;color:#242537"><h1>KashFlow workspace invitation</h1><p>You have been invited as ${escapeHtml(input.data.role)} to ${escapeHtml(targets.map((target) => target.name).join(', '))}.</p><p>This invitation expires in seven days. Sign in or create an account using this email, then accept the invitation:</p><p><a href="${escapeHtml(invitationUrl.toString())}">Review invitation</a></p></main>`,
-      text: `You have been invited as ${input.data.role} to ${targets.map((target) => target.name).join(', ')}. Sign in or create an account using this email, then accept within seven days: ${invitationUrl.toString()}`,
+      subject: `You are invited to ${businessNames}`,
+      html: `<main style="font-family:Arial,sans-serif;color:#242537"><h1>KashFlow workspace invitation</h1><p>You have been invited as ${escapeHtml(input.data.role)} to ${escapeHtml(businessNames)}.</p><p>This invitation expires in seven days. Sign in or create an account using this email, then accept the invitation:</p><p><a href="${escapeHtml(invitationUrl.toString())}">Review invitation</a></p></main>`,
+      text: `You have been invited as ${input.data.role} to ${businessNames}. Sign in or create an account using this email, then accept within seven days: ${invitationUrl.toString()}`,
     })
     if (!inviteEmail.ok) {
       await pool!.query("UPDATE workspace_invitations SET status = 'declined' WHERE id = $1 AND status = 'pending'", [invite.rows[0].id])
@@ -5029,6 +5139,7 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
       { id: 'email', status: emailConfigured ? 'brevo_configured' : 'brevo_api_key_and_verified_sender_required' },
       { id: 'payroll', status: `encrypted_internal_runs_${env.PAYROLL_DATA_ENCRYPTION_KEY ? 'configured' : 'encryption_key_required'}_statutory_filing_not_implemented` },
       { id: 'paye_shif_nssf_ahl_filing', status: 'statutory_filing_not_implemented' },
+      { id: 'multi_method_payments', status: settings.multiMethodPayments ? 'workspace_enabled_split_capture' : 'workspace_disabled' },
     ], note: `Workspace preferences are enforced on Daraja payment initiation, Mono linking/sync, and production KRA OSCU operations. Render provider credentials remain shared across businesses. KRA readiness here only reports that operator/workspace switches and encryption config are present; KRA approval, certification, initialized production device, fiscal mapping review, and reconciliation are still required. Statutory filing adapters are not implemented, regardless of saved preferences. Payroll estimates remain internal and are not certified.` })
   } catch (error) { next(error) }
 })
