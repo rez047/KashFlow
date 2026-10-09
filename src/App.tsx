@@ -2978,9 +2978,15 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
   async function convertEstimate(estimate: EstimateRecord) {
     setBusy(true); setError('')
     try {
-      await request(`/v1/estimates/${estimate.id}/convert`, { method: 'POST', body: JSON.stringify({ dueDate: today }) })
-      const [updatedEstimates, updatedInvoices, updatedInventory] = await Promise.all([request<{ estimates: EstimateRecord[] }>('/v1/estimates'), request<{ invoices: InvoiceRecord[] }>('/v1/invoices'), request<{ records: WorkspaceRecord[] }>('/v1/records/inventory')])
-      setEstimates(updatedEstimates.estimates); setInvoicesList(updatedInvoices.invoices); setRecords((current) => ({ ...current, inventory: updatedInventory.records })); await refresh(); notify('Accepted estimate converted to an invoice.')
+      const converted = await request<{ invoice: InvoiceRecord }>(`/v1/estimates/${estimate.id}/convert`, { method: 'POST', body: JSON.stringify({ dueDate: today }) })
+      setSalesOrders((current) => current.map((order) => order.estimate_id === estimate.id ? { ...order, invoice_id: converted.invoice.id } : order))
+      const [orders, updatedEstimates, updatedInvoices, updatedInventory] = await Promise.all([
+        request<{ orders: SalesOrder[] }>('/v1/sales-orders'),
+        request<{ estimates: EstimateRecord[] }>('/v1/estimates'),
+        request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
+        request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
+      ])
+      setSalesOrders(orders.orders); setEstimates(updatedEstimates.estimates); setInvoicesList(updatedInvoices.invoices); setRecords((current) => ({ ...current, inventory: updatedInventory.records })); await refresh(); notify('Accepted estimate converted to an invoice.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not convert estimate.') }
     finally { setBusy(false) }
   }
@@ -4770,7 +4776,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                 </form>}
               </div>)}</div> : <div className="empty-state">No estimates yet. Save a quote to start the commercial flow.</div>}
               <h3>Sales order lifecycle</h3>
-              {salesOrders.length ? salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>) : <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
+              {salesOrders.length ? salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && !order.invoice_id && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>) : <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
             </article>
           </section>
         ) : page === 'Networking' && networkingTab === 'transactions' ? (
