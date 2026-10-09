@@ -651,3 +651,34 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .report-trend-up{color:#21865d}
 .report-trend-down{color:#b4462b}
 .report-trend-flat{color:#807f92;font-weight:600}
+
+/* Service detail: rates, margin, and the customers subscribed to a service. */
+.service-detail{border:1px solid #ececf2;border-radius:11px;margin-bottom:10px;overflow:hidden;background:#fff}
+.service-detail-toggle{width:100%;display:flex;align-items:center;gap:12px;padding:13px 14px;border:0;background:transparent;text-align:left;cursor:pointer;color:inherit;font:inherit;flex-wrap:wrap}
+.service-detail-toggle:hover{background:#faf9ff}
+.service-detail-name{display:flex;flex-direction:column;gap:3px;min-width:150px;flex:1}
+.service-detail-name strong{font-size:13px}
+.service-detail-name small{color:#86879a;font-size:10px}
+.service-detail-rates{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.service-detail-rates small{color:#6d6e80;font-size:10px;white-space:nowrap}
+.service-detail-caret{transition:transform .15s ease;color:#9a9aad;flex:none}
+.service-detail-caret.open{transform:rotate(90deg)}
+.service-detail-desc{padding:0 14px 12px;margin:0;color:#7a7c8c;font-size:11px;line-height:1.5}
+.service-detail-body{border-top:1px solid #f0f0f5;padding:14px;background:#fcfcff}
+.service-subscribe-bar{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:12px}
+.service-subscribe-form{margin:0 0 14px;padding:14px;background:#fff}
+.service-subscribe-form h3{margin:0 0 4px;font-size:13px;grid-column:1/-1}
+.service-subscriber-row{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;padding:12px 0;border-top:1px solid #eeeef4;flex-wrap:wrap}
+.service-subscriber-row:first-of-type{border-top:0}
+.service-subscriber-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:6px}
+.service-subscriber-main>strong{font-size:12px}
+.service-subscriber-main>small{color:#86879a;font-size:10px}
+.service-subscriber-meta{display:flex;gap:6px;flex-wrap:wrap}
+.service-subscriber-history{color:#6d6e80;font-size:10px;line-height:1.5}
+.service-subscriber-actions{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.service-subscriber-actions .field-label{margin:0;min-width:140px}
+@media(max-width:700px){
+  .service-detail-toggle{gap:8px}
+  .service-subscriber-actions{width:100%;justify-content:flex-start}
+  .service-subscriber-actions .field-label{min-width:0;width:100%}
+}

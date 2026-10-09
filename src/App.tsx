@@ -96,6 +96,25 @@ type Dashboard = {
   invoices: { count: number; unpaid_amount: string }
 }
 type WorkspaceRecordTypeName = 'customers' | 'suppliers' | 'inventory' | 'services' | 'projects'
+// A customer's subscription to a service, including the rate that applies to them.
+type ServiceSubscription = {
+  id: string
+  customer_id: string | null
+  customer_name: string
+  customer_email: string
+  customer_phone: string
+  rate_source: 'consumer' | 'renewal' | 'custom'
+  custom_rate: string
+  billing_cycle: 'none' | 'monthly' | 'quarterly' | 'annually'
+  status: 'active' | 'paused' | 'cancelled'
+  payment_preference: 'cash' | 'mpesa' | 'either'
+  start_date: string
+  next_invoice_date: string | null
+  notes: string
+  created_at: string
+  invoice_count: number
+  last_invoiced_at: string | null
+}
 // Optional system-wide split-payment capture for an invoice or a counter sale.
 type PaymentSplit = { method: 'cash' | 'mpesa'; amount: string; phone: string; reference: string }
 type Account = { user: { email: string }; workspace: { id: string; name: string; permissions?: MemberPermission[] }; workspaces?: Array<{ id: string; name: string; role: string }> }
@@ -825,6 +844,12 @@ function App() {
   const [countInput, setCountInput] = useState({ itemId: '', locationId: '', countedQuantity: '0' })
   const [inventoryWriteOffInput, setInventoryWriteOffInput] = useState({ itemId: '', locationId: '', reason: 'damaged' as 'damaged' | 'expired' | 'custom', customReason: '', quantity: '1', date: today, notes: '' })
   const [inventoryPriceDrafts, setInventoryPriceDrafts] = useState<Record<string, string>>({})
+  // Service subscriptions: which customers subscribe to the selected service, on what cycle,
+  // at what rate, and how they prefer to pay.
+  const [serviceSubscriptions, setServiceSubscriptions] = useState<Record<string, ServiceSubscription[]>>({})
+  const [serviceDetailId, setServiceDetailId] = useState('')
+  const [subscriptionInput, setSubscriptionInput] = useState({ customerMode: 'saved' as 'saved' | 'new', customerId: '', newCustomerName: '', newCustomerEmail: '', newCustomerPhone: '', rateSource: 'consumer' as 'consumer' | 'renewal' | 'custom', customRate: '', billingCycle: 'monthly' as 'none' | 'monthly' | 'quarterly' | 'annually', paymentPreference: 'either' as 'cash' | 'mpesa' | 'either', startDate: today, notes: '', createRecurringSchedule: false })
+  const [subscriptionInvoiceDates, setSubscriptionInvoiceDates] = useState<Record<string, string>>({})
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
   const [storeConfig, setStoreConfig] = useState<OnlineStoreConfig>({ slug: '', title: '', description: '', enabled: false })
@@ -2584,6 +2609,86 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
     } finally { setBusy(false) }
   }
 
+  // ---- Service subscriptions ----
+  async function loadServiceSubscriptions(serviceId: string) {
+    setServiceDetailId(serviceId)
+    if (!serviceId) return
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ subscriptions: ServiceSubscription[] }>(`/v1/services/${serviceId}/subscriptions`)
+      setServiceSubscriptions((current) => ({ ...current, [serviceId]: result.subscriptions }))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not load subscribers for this service.')
+    } finally { setBusy(false) }
+  }
+
+  function beginSubscription(serviceId: string) {
+    setServiceDetailId(serviceId)
+    setSubscriptionInput({ customerMode: 'saved', customerId: '', newCustomerName: '', newCustomerEmail: '', newCustomerPhone: '', rateSource: 'consumer', customRate: '', billingCycle: 'monthly', paymentPreference: 'either', startDate: today, notes: '', createRecurringSchedule: false })
+  }
+
+  async function subscribeCustomer(event: FormEvent<HTMLFormElement>, serviceId: string) {
+    event.preventDefault()
+    if (subscriptionInput.customerMode === 'saved' && !subscriptionInput.customerId) { setError('Choose a saved customer, or switch to creating a new one.'); return }
+    if (subscriptionInput.customerMode === 'new' && !subscriptionInput.newCustomerName.trim()) { setError('Enter the new customer name.'); return }
+    if (subscriptionInput.rateSource === 'custom' && !(Number(subscriptionInput.customRate) > 0)) { setError('Enter the agreed custom rate for this customer.'); return }
+    setBusy(true); setError('')
+    try {
+      const payload = subscriptionInput.customerMode === 'saved'
+        ? { customerId: subscriptionInput.customerId, rateSource: subscriptionInput.rateSource, customRate: Number(subscriptionInput.customRate || 0), billingCycle: subscriptionInput.billingCycle, paymentPreference: subscriptionInput.paymentPreference, startDate: subscriptionInput.startDate, notes: subscriptionInput.notes, createRecurringSchedule: subscriptionInput.createRecurringSchedule }
+        : { customerName: subscriptionInput.newCustomerName.trim(), customerEmail: subscriptionInput.newCustomerEmail.trim(), customerPhone: subscriptionInput.newCustomerPhone.trim(), rateSource: subscriptionInput.rateSource, customRate: Number(subscriptionInput.customRate || 0), billingCycle: subscriptionInput.billingCycle, paymentPreference: subscriptionInput.paymentPreference, startDate: subscriptionInput.startDate, notes: subscriptionInput.notes, createRecurringSchedule: subscriptionInput.createRecurringSchedule }
+      const result = await request<{ recurringTemplateId: string | null }>(`/v1/services/${serviceId}/subscriptions`, { method: 'POST', body: JSON.stringify(payload) })
+      // A customer created here must appear in the customer list too.
+      if (subscriptionInput.customerMode === 'new') {
+        void request<{ records: WorkspaceRecord[] }>('/v1/records/customers').then((records) => setRecords((current) => ({ ...current, customers: records.records }))).catch(() => undefined)
+      }
+      setSubscriptionInput((current) => ({ ...current, customerId: '', newCustomerName: '', newCustomerEmail: '', newCustomerPhone: '', customRate: '', notes: '' }))
+      await loadServiceSubscriptions(serviceId)
+      notify(result.recurringTemplateId ? 'Customer subscribed and a recurring invoice schedule was prepared. Run each due item from Networking when it falls due.' : 'Customer subscribed to this service.')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not subscribe this customer.')
+    } finally { setBusy(false) }
+  }
+
+  async function updateSubscription(subscription: ServiceSubscription, changes: Partial<Pick<ServiceSubscription, 'status'>>) {
+    setBusy(true); setError('')
+    try {
+      await request(`/v1/service-subscriptions/${subscription.id}`, { method: 'PATCH', body: JSON.stringify(changes) })
+      await loadServiceSubscriptions(serviceDetailId)
+      notify(changes.status ? `Subscription marked ${changes.status}.` : 'Subscription updated.')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not update the subscription.')
+    } finally { setBusy(false) }
+  }
+
+  // Create and email an invoice for one subscribed customer, carrying the service details and
+  // the rate that applies to them. The invoice is emailed separately so the ledger entry is
+  // never lost if the email provider is unavailable.
+  async function invoiceSubscription(subscription: ServiceSubscription, dueDate: string) {
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ invoice: InvoiceRecord; nextInvoiceDate: string | null }>(`/v1/service-subscriptions/${subscription.id}/invoice`, { method: 'POST', body: JSON.stringify({ dueDate: dueDate || today }) })
+      let emailed = false
+      if (result.invoice.customer_email) {
+        try {
+          await request(`/v1/invoices/${result.invoice.id}/email`, { method: 'POST', body: JSON.stringify({ message: defaultInvoiceEmailMessage(result.invoice, dashboard?.workspaceName ?? 'your business') }) })
+          emailed = true
+        } catch { /* the invoice exists; sending can be retried from Networking */ }
+      }
+      const invoices = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+      setInvoicesList(invoices.invoices)
+      await loadServiceSubscriptions(serviceDetailId)
+      await refresh()
+      notify(emailed
+        ? `Invoice ${result.invoice.id.slice(0, 8)} created and emailed to ${subscription.customer_name}. Next billing date ${result.nextInvoiceDate ?? 'not scheduled'}.`
+        : result.invoice.customer_email
+          ? `Invoice ${result.invoice.id.slice(0, 8)} created, but the email was not accepted. Send it from Networking. Next billing ${result.nextInvoiceDate ?? 'not scheduled'}.`
+          : `Invoice ${result.invoice.id.slice(0, 8)} created for ${subscription.customer_name}. No customer email is saved, so share or print it from Networking. Next billing ${result.nextInvoiceDate ?? 'not scheduled'}.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not invoice this subscriber.')
+    } finally { setBusy(false) }
+  }
+
   async function saveInventoryPrice(event: FormEvent<HTMLFormElement>, item: WorkspaceRecord) {
     event.preventDefault()
     const price = Number(inventoryPriceDrafts[item.id] ?? item.data.price ?? 0)
@@ -4129,6 +4234,79 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                 {!bills.length && <div className="empty-state">No bills yet.</div>}
               </article>
             </>}
+            {type === 'services' && <article className="module-card">
+              <div className="panel-header"><div><h2>Service subscribers</h2><p>Every customer subscribed to a service, the rate that applies to them, their billing cycle, and how they prefer to pay.</p></div><span className="task-count">{records.services.length} services</span></div>
+              {!records.services.length && <div className="empty-state">Add a service above, then subscribe customers to it here.</div>}
+              {records.services.map((service) => {
+                const subscribers = serviceSubscriptions[service.id] ?? []
+                const open = serviceDetailId === service.id
+                const consumerRate = Number(service.data.consumerRate ?? service.data.charge ?? 0)
+                const supplierRate = Number(service.data.supplierRate ?? 0)
+                const renewalRate = Number(service.data.renewalRate ?? 0)
+                // Margin per billing cycle at the standard consumer rate.
+                const margin = consumerRate - supplierRate
+                return <div className="service-detail" key={service.id}>
+                  <button type="button" className="service-detail-toggle" aria-expanded={open} onClick={() => open ? setServiceDetailId('') : void loadServiceSubscriptions(service.id)}>
+                    <span className="service-detail-name"><strong>{String(service.data.name ?? 'Service')}</strong><small>{String(service.data.category ?? 'General service')}{service.data.sku ? ` · SKU ${service.data.sku}` : ''}</small></span>
+                    <span className="service-detail-rates">
+                      <small>Supplier {money(supplierRate)}</small>
+                      <small>Consumer {money(consumerRate)}</small>
+                      <small>Renewal {money(renewalRate)}</small>
+                      {supplierRate > 0 && <span className={`status-pill ${margin > 0 ? 'green' : 'amber'}`}>Margin {money(margin)}</span>}
+                    </span>
+                    <span className="status-pill">{subscribers.length} subscriber{subscribers.length === 1 ? '' : 's'}</span>
+                    <ChevronRight size={15} className={open ? 'service-detail-caret open' : 'service-detail-caret'} />
+                  </button>
+                  {service.data.description ? <p className="service-detail-desc">{String(service.data.description)}</p> : null}
+                  {open && <div className="service-detail-body">
+                    <div className="service-subscribe-bar">
+                      <button type="button" className="button button-primary button-small" disabled={busy || !canUse('sales.write')} onClick={() => beginSubscription(service.id)}><Plus size={14} /> Subscribe a customer</button>
+                      <button type="button" className="button button-small" disabled={busy} onClick={() => void loadServiceSubscriptions(service.id)}>Refresh subscribers</button>
+                    </div>
+
+                    {serviceDetailId === service.id && <form className="record-form-grid module-card service-subscribe-form" onSubmit={(event) => void subscribeCustomer(event, service.id)}>
+                      <h3>Subscribe a customer to {String(service.data.name ?? 'this service')}</h3>
+                      <label className="field-label">Customer source<select value={subscriptionInput.customerMode} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, customerMode: event.target.value as 'saved' | 'new', customerId: '' })}><option value="saved">Existing saved customer</option><option value="new">New customer</option></select></label>
+                      {subscriptionInput.customerMode === 'saved'
+                        ? <label className="field-label">Saved customer<select required value={subscriptionInput.customerId} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, customerId: event.target.value })}><option value="">Select customer</option>{records.customers.map((customer) => <option key={customer.id} value={customer.id}>{String(customer.data.name ?? 'Customer')}{customer.data.phone ? ` · ${customer.data.phone}` : ''}</option>)}</select></label>
+                        : <><label className="field-label">New customer name<input required maxLength={160} value={subscriptionInput.newCustomerName} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, newCustomerName: event.target.value })} /></label><label className="field-label">Customer email<input type="email" maxLength={254} value={subscriptionInput.newCustomerEmail} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, newCustomerEmail: event.target.value })} placeholder="Needed to email the invoice" /></label><label className="field-label">Customer phone<input type="tel" maxLength={30} value={subscriptionInput.newCustomerPhone} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, newCustomerPhone: event.target.value })} placeholder="0712345678" /></label></>}
+                      <label className="field-label">Rate that applies<select value={subscriptionInput.rateSource} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, rateSource: event.target.value as 'consumer' | 'renewal' | 'custom' })}><option value="consumer">Consumer rate · {money(consumerRate)}</option><option value="renewal">Renewal rate · {money(renewalRate || consumerRate)}</option><option value="custom">Custom rate for this customer</option></select></label>
+                      {subscriptionInput.rateSource === 'custom' && <label className="field-label">Agreed custom rate (KSh)<input required type="number" min="0.01" step="0.01" value={subscriptionInput.customRate} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, customRate: event.target.value })} /></label>}
+                      <label className="field-label">Billing cycle<select value={subscriptionInput.billingCycle} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, billingCycle: event.target.value as 'none' | 'monthly' | 'quarterly' | 'annually' })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option><option value="none">One-off (no cycle)</option></select></label>
+                      <label className="field-label">Customer prefers to pay<select value={subscriptionInput.paymentPreference} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, paymentPreference: event.target.value as 'cash' | 'mpesa' | 'either' })}><option value="either">Either cash or M-Pesa</option><option value="cash">Cash / manual</option><option value="mpesa">M-Pesa</option></select></label>
+                      <label className="field-label">Start date<input required type="date" value={subscriptionInput.startDate} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, startDate: event.target.value })} /></label>
+                      <label className="field-label checkbox-row"><input type="checkbox" checked={subscriptionInput.createRecurringSchedule} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, createRecurringSchedule: event.target.checked })} /> Prepare a recurring invoice schedule for this cycle</label>
+                      <label className="field-label">Notes<input maxLength={2000} value={subscriptionInput.notes} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, notes: event.target.value })} placeholder="e.g. router included, installed 4th floor" /></label>
+                      <p className="dialog-note">A recurring schedule is never posted on its own: you run each due item from Networking. Payment preference is recorded for the counter and reminders; it does not move money.</p>
+                      <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Subscribe customer'}</button></div>
+                    </form>}
+
+                    {subscribers.length ? subscribers.map((subscription) => <div className="service-subscriber-row" key={subscription.id}>
+                      <div className="service-subscriber-main">
+                        <strong>{subscription.customer_name}</strong>
+                        <small>{subscription.customer_email || (subscription.customer_phone ? subscription.customer_phone : 'No email or phone saved')}</small>
+                        <span className="service-subscriber-meta">
+                          <span className="status-pill">{subscription.rate_source === 'custom' ? `Custom ${money(subscription.custom_rate)}` : subscription.rate_source === 'renewal' ? `Renewal ${money(renewalRate || consumerRate)}` : `Consumer ${money(consumerRate)}`}</span>
+                          <span className="status-pill">{subscription.billing_cycle === 'none' ? 'One-off' : subscription.billing_cycle}</span>
+                          <span className="status-pill">Prefers {subscription.payment_preference === 'either' ? 'cash or M-Pesa' : subscription.payment_preference}</span>
+                          <span className={`status-pill ${subscription.status === 'active' ? 'green' : subscription.status === 'paused' ? 'amber' : ''}`}>{subscription.status}</span>
+                          {subscription.next_invoice_date && <span className="status-pill">Next {subscription.next_invoice_date}</span>}
+                        </span>
+                        <small className="service-subscriber-history">{subscription.invoice_count} invoice{subscription.invoice_count === 1 ? '' : 's'} recorded{subscription.last_invoiced_at ? ` · last ${new Date(String(subscription.last_invoiced_at)).toLocaleDateString('en-KE')}` : ''}{subscription.notes ? ` · ${subscription.notes}` : ''}</small>
+                      </div>
+                      <div className="service-subscriber-actions">
+                        <label className="field-label">Due date<input type="date" value={subscriptionInvoiceDates[subscription.id] ?? subscription.next_invoice_date ?? today} onChange={(event) => setSubscriptionInvoiceDates((current) => ({ ...current, [subscription.id]: event.target.value }))} /></label>
+                        <button type="button" className="button button-primary button-small" disabled={busy || subscription.status === 'cancelled' || !canUse('sales.write')} onClick={() => void invoiceSubscription(subscription, subscriptionInvoiceDates[subscription.id] ?? subscription.next_invoice_date ?? today)}><FileText size={14} /> {subscription.customer_email ? 'Send invoice to customer' : 'Create invoice'}</button>
+                        {subscription.status === 'active'
+                          ? <button type="button" className="button button-small" disabled={busy} onClick={() => void updateSubscription(subscription, { status: 'paused' })}>Pause</button>
+                          : <button type="button" className="button button-small" disabled={busy} onClick={() => void updateSubscription(subscription, { status: 'active' })}>Reactivate</button>}
+                        {subscription.status !== 'cancelled' && <button type="button" className="button button-small" disabled={busy} onClick={() => void updateSubscription(subscription, { status: 'cancelled' })}>Cancel</button>}
+                      </div>
+                    </div>) : <div className="empty-state">No customers subscribed to this service yet.</div>}
+                  </div>}
+                </div>
+              })}
+            </article>}
             {type === 'inventory' && <article className="module-card"><h2>Stock control and locations</h2><p>Receipts and issues update on-hand quantities and post inventory/COGS journals. Location transfers and counts are tracked separately; negative stock is blocked.</p>
               <form className="record-form-grid" onSubmit={createInventoryLocation}><label className="field-label">New shop or warehouse<input required maxLength={120} value={locationInput.name} onChange={(event) => setLocationInput({ ...locationInput, name: event.target.value })} /></label><label className="field-label">Location code<input required maxLength={40} value={locationInput.code} onChange={(event) => setLocationInput({ ...locationInput, code: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Add location</button></form>
               <div className="transaction-row"><span><strong>Active locations</strong><small>{inventoryLocations.map((location) => `${location.name}${location.is_default ? ' (default)' : ''}`).join(' · ')}</small></span><span>{inventoryLocations.length} locations</span></div>
