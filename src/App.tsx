@@ -986,6 +986,7 @@ function App() {
   const [monoCustomerName, setMonoCustomerName] = useState('')
   const [monoCustomerEmail, setMonoCustomerEmail] = useState('')
   const [helpSearch, setHelpSearch] = useState('')
+  const [helpCategory, setHelpCategory] = useState('All topics')
   const [settings, setSettings] = useState({
     businessName: '',
     currency: 'KES',
@@ -3966,19 +3967,84 @@ async function createCameraReader(): Promise<CameraReader> {
   const payrollMoney = (value: number) => `KSh ${value.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 
   const helpResources = useMemo(() => [
-    { title: 'Create an admin account', category: 'Setup', keywords: ['admin', 'create account', 'business name', 'signup', 'register', 'sign up'] },
-    { title: 'Add a transaction', category: 'Accounting', keywords: ['transaction', 'income', 'expense', 'ledger', 'money', 'bookkeeping'] },
-    { title: 'Create an invoice', category: 'Networking', keywords: ['invoice', 'customer', 'payment', 'sales', 'bill', 'receipt'] },
-    { title: 'Manage payroll', category: 'Payroll', keywords: ['payroll', 'employee', 'salary', 'payslip', 'nhif', 'nssf', 'shif', 'tax'] },
-    { title: 'Business settings', category: 'Settings', keywords: ['settings', 'business name', 'currency', 'timezone', 'notifications', 'audit trail', 'security'] },
-    { title: 'Upload receipts and bank statements', category: 'Documents', keywords: ['receipt', 'bank statement', 'attachment', 'file upload', 'document', 'csv', 'upload'] },
+    {
+      title: 'Get a business ready for its first sale', category: 'Getting started', destination: 'Settings', action: 'Open settings',
+      summary: 'Set the defaults for this business, add the items or services you sell, then record your first sale.',
+      keywords: ['setup', 'business', 'first day', 'start', 'profile', 'currency', 'item', 'service'],
+      steps: ['Open Settings and check the business name, currency, and invoice defaults.', 'Add stock items in Inventory or non-stock services in Services.', 'Create an invoice in Networking or ring up a counter sale in Point of sale.'],
+    },
+    {
+      title: 'Switch between your businesses', category: 'Workspace & security', destination: 'Overview', action: 'Back to overview',
+      summary: 'Move between businesses from the switcher at the top of the left sidebar. Each business keeps its own records and settings.',
+      keywords: ['workspace', 'company', 'business switcher', 'multiple businesses', 'separate', 'change business'],
+      steps: ['Open the business switcher at the top of the sidebar.', 'Choose the business you want to work in and wait for its records to load.', 'Check the business name in the sidebar before creating or editing records.'],
+      tip: 'Daraja credentials are configured separately for each business and stored encrypted.',
+    },
+    {
+      title: 'Create and follow up an invoice', category: 'Sales & payments', destination: 'Networking', action: 'Open sales',
+      summary: 'Build an invoice from customer details and saved items or services, then review its payment status in the sales workspace.',
+      keywords: ['invoice', 'customer', 'estimate', 'sales order', 'payment', 'credit note', 'recurring'],
+      steps: ['Open Networking and choose the sales area.', 'Start an invoice, select or add the customer, then add the items or services.', 'Review totals and save. Return to Networking to find the invoice and record payments or a return.'],
+    },
+    {
+      title: 'Record a counter sale', category: 'Sales & payments', destination: 'Point of sale', action: 'Open point of sale',
+      summary: 'Use Point of sale for a quick checkout. Stock items update inventory when the sale is recorded.',
+      keywords: ['pos', 'counter', 'checkout', 'cash', 'mpesa', 'receipt', 'barcode', 'sale'],
+      steps: ['Open Point of sale and add the items or services sold.', 'Enter the amount received and select the payment method.', 'Complete the sale and print or download the receipt if needed.'],
+      tip: 'Recording an M-Pesa payment is available at checkout. Automatic Daraja requests depend on that business having its connection configured.',
+    },
+    {
+      title: 'Set up M-Pesa Daraja for this business', category: 'Kenya compliance', destination: 'Kenya compliance', action: 'Open compliance',
+      summary: 'Connect a business’s own Safaricom Daraja account in its Kenya compliance settings. Another business can use different credentials.',
+      keywords: ['daraja', 'safaricom', 'mpesa', 'm-pesa', 'consumer key', 'passkey', 'shortcode', 'credentials', 'encryption'],
+      steps: ['Use the sidebar switcher to select the business you are configuring.', 'Open Kenya compliance, enter that business’s credentials, choose its environment, and save.', 'Open Settings and turn on “Allow Daraja / M-Pesa for this business” to enable payment requests.'],
+      tip: 'Credentials are encrypted when saved and are not shared with other businesses in your workspace.',
+    },
+    {
+      title: 'Check Kenya compliance setup', category: 'Kenya compliance', destination: 'Kenya compliance', action: 'Open compliance',
+      summary: 'Review the integration status and setup notes for the current business before relying on an external tax or payment connection.',
+      keywords: ['kra', 'etims', 'e-tims', 'tax', 'compliance', 'integration', 'readiness', 'connection'],
+      steps: ['Open Kenya compliance for the active business.', 'Review each integration’s status and any setup requirements shown.', 'Use Payroll for reviewed payroll calculations and keep supporting documents with the business records.'],
+      tip: 'eTIMS submissions and other external services require a working, approved provider connection; a saved draft is not a filed return.',
+    },
+    {
+      title: 'Review payroll and statutory estimates', category: 'Kenya compliance', destination: 'Payroll', action: 'Open payroll',
+      summary: 'Prepare payroll drafts, review employee deductions, and check the Kenyan statutory estimates before posting.',
+      keywords: ['payroll', 'employee', 'salary', 'payslip', 'paye', 'nssf', 'shif', 'housing levy', 'ahl', 'tax'],
+      steps: ['Open Payroll and add or review employee details.', 'Prepare the period’s payroll draft and inspect gross pay, deductions, and net pay.', 'Resolve any differences before posting the payroll and its journal.'],
+      tip: 'Payroll estimates help with preparation; review the current rules and remittance obligations before paying or filing.',
+    },
+    {
+      title: 'Import a bank statement or save receipts', category: 'Imports & records', destination: 'Banking', action: 'Open banking',
+      summary: 'Bring statement rows in for review and keep supporting files with the workspace. CSV imports are reviewed before they affect your books.',
+      keywords: ['bank', 'statement', 'csv', 'receipt', 'document', 'upload', 'expense', 'import'],
+      steps: ['Use Banking to import and review a supported bank statement CSV.', 'Check dates, descriptions, amounts, and income or expense direction before confirming.', 'Use Documents to store receipts and other supporting files for this business.'],
+      tip: 'Automatic bank feeds depend on a supported provider being enabled for the workspace; importing a CSV is the manual option.',
+    },
+    {
+      title: 'Understand reports and accounting records', category: 'Books & reports', destination: 'Reports', action: 'Open reports',
+      summary: 'Review performance from saved business records, then use Accounting to inspect journals, balances, and period close.',
+      keywords: ['reports', 'profit', 'loss', 'cash flow', 'trial balance', 'journal', 'ledger', 'accounting', 'period close'],
+      steps: ['Open Reports and choose the report or date range you need.', 'For the underlying balances and posted journals, open Accounting.', 'Check that the selected business and reporting period are correct before sharing figures.'],
+    },
+    {
+      title: 'Import or export business records', category: 'Imports & records', destination: 'Settings', action: 'Open settings',
+      summary: 'Move supported records with workspace-scoped CSV tools and keep an export for review or migration.',
+      keywords: ['csv', 'import', 'export', 'customers', 'suppliers', 'inventory', 'projects', 'backup', 'data'],
+      steps: ['Open Settings and choose the import or export section.', 'CSV import supports customers, suppliers, inventory, and projects; preview rows before confirming.', 'Export supported workspace records for an accountant or migration. Invoices, payroll, and attachments are not restored by CSV import.'],
+    },
   ], [])
+
+  const helpCategories = useMemo(() => ['All topics', ...new Set(helpResources.map((item) => item.category))], [helpResources])
 
   const helpResults = useMemo(() => {
     const query = helpSearch.trim().toLowerCase()
-    if (!query) return helpResources.slice(0, 6)
-    return helpResources.filter((item) => `${item.title} ${item.category} ${item.keywords.join(' ')}`.toLowerCase().includes(query))
-  }, [helpResources, helpSearch])
+    return helpResources.filter((item) => {
+      const matchesCategory = helpCategory === 'All topics' || item.category === helpCategory
+      const matchesSearch = !query || `${item.title} ${item.category} ${item.summary} ${item.keywords.join(' ')} ${item.steps.join(' ')}`.toLowerCase().includes(query)
+      return matchesCategory && matchesSearch
+    })
+  }, [helpResources, helpSearch, helpCategory])
 
   // Effective access for the signed-in member. Administrators always keep full access; every
   // other member uses their saved override, or the defaults of their assigned role.
@@ -5410,48 +5476,57 @@ async function createCameraReader(): Promise<CameraReader> {
                 })}
               </div>
             </section>
-        </section> : page === 'Help' ? <section className="module-page">
-          <div className="eyebrow"><span className="live-dot" /> HELP & SUPPORT · {dashboard?.workspaceName}</div>
-          <h1>Customer help centre</h1>
-          <p className="welcome-subtitle">Search by setting, feature, or item across the system and review the most common guidance for your team.</p>
-          <div className="module-card">
-            <label className="field-label">Search the system for a setting or feature
-              <input value={helpSearch} onChange={(event) => setHelpSearch(event.target.value)} placeholder="Try: invoice, payroll, bank statement, settings..." />
-            </label>
-            <div className="help-results">
-              {helpResults.map((item) => <div key={item.title} className="help-result"><strong>{item.title}</strong><small>{item.category}</small><p>{item.keywords.join(', ')}</p></div>)}
-              {!helpResults.length && <div className="empty-state">No matching help topics found. Try a broader keyword like invoice, payroll, or settings.</div>}
+        </section> : page === 'Help' ? <section className="module-page help-centre">
+          <div className="help-hero">
+            <div className="eyebrow"><span className="live-dot" /> HELP & SUPPORT</div>
+            <div className="help-hero-heading">
+              <div><h1>How can we help?</h1><p>Find a practical guide, then jump straight into the right part of your workspace.</p></div>
+              <span className="help-workspace-badge"><BriefcaseBusiness size={15} />{dashboard?.workspaceName ?? account?.workspace.name}</span>
+            </div>
+            <div className="help-search-box">
+              <Search size={18} aria-hidden="true" />
+              <label className="visually-hidden" htmlFor="help-centre-search">Search help guides</label>
+              <input id="help-centre-search" type="search" value={helpSearch} onChange={(event) => setHelpSearch(event.target.value)} placeholder="Search invoices, Daraja, payroll, reports…" />
+              {helpSearch && <button type="button" className="help-clear-search" onClick={() => setHelpSearch('')}>Clear</button>}
             </div>
           </div>
-          <div className="module-card">
-            <details open>
-              <summary>FAQ</summary>
-              <ul className="help-list">
-                <li>How do I add a business or switch workspaces? Use Add business from the sidebar or the business switcher.</li>
-                <li>How do I create an invoice? Open Overview and click Create invoice.</li>
-                <li>How do I add a transaction? Use Add transaction from Overview or the Accounting section.</li>
-                <li>How do I manage payroll? Open Payroll and add employees, create a run, then review and post it.</li>
-              </ul>
-            </details>
-            <details>
-              <summary>Search for a specific item or setting</summary>
-              <ul className="help-list">
-                <li>Use the top search box to quickly filter records, settings, and help topics.</li>
-                <li>Common searches: invoice, payroll, bank statement, receipt, settings, business name, customer, employee.</li>
-                <li>Use the sidebar to jump directly to Settings, Payroll, Accounting, Sales, or Overview.</li>
-              </ul>
-            </details>
-            <details>
-              <summary>How to use the software</summary>
-              <ol className="help-list ordered">
-                <li>Set up your business by creating the admin account and business profile.</li>
-                <li>Add employees, suppliers, and your first transactions or invoices.</li>
-                <li>Review accounting entries, payroll runs, and cash flow from the main dashboard.</li>
-                <li>Upload receipts, files, and bank statements into the intake queue for review.</li>
-                <li>Use Settings to keep defaults, user security, and notifications aligned to your current business needs.</li>
-              </ol>
-            </details>
+
+          <div className="help-category-bar" role="toolbar" aria-label="Filter help topics">
+            {helpCategories.map((category) => <button type="button" key={category} className={`help-category-chip ${helpCategory === category ? 'active' : ''}`} aria-pressed={helpCategory === category} onClick={() => setHelpCategory(category)}>{category}</button>)}
           </div>
+
+          <div className="help-results-heading"><div><h2>{helpSearch || helpCategory !== 'All topics' ? 'Matching guides' : 'Popular guides'}</h2><p>Step-by-step help for the features available in this workspace.</p></div><span>{helpResults.length} {helpResults.length === 1 ? 'guide' : 'guides'}</span></div>
+          <div className="help-guide-grid">
+            {helpResults.map((guide) => <article className="help-guide-card" key={guide.title}>
+              <div className="help-guide-meta"><span>{guide.category}</span><small>{guide.steps.length} steps</small></div>
+              <h3>{guide.title}</h3>
+              <p>{guide.summary}</p>
+              <details className="help-guide-details">
+                <summary>Show step-by-step guide</summary>
+                <ol>{guide.steps.map((step) => <li key={step}>{step}</li>)}</ol>
+                {'tip' in guide && guide.tip && <div className="help-guide-tip"><ShieldCheck size={15} /><span>{guide.tip}</span></div>}
+              </details>
+              <button type="button" className="button button-secondary help-guide-action" onClick={() => navigateTo(guide.destination)}>{guide.action}<ArrowRight size={15} /></button>
+            </article>)}
+            {!helpResults.length && <div className="help-empty-state"><CircleHelp size={24} /><strong>No guides found</strong><p>Try another phrase or choose a different topic.</p><button type="button" className="button button-secondary" onClick={() => { setHelpSearch(''); setHelpCategory('All topics') }}>Show all guides</button></div>}
+          </div>
+
+          <section className="help-workspace-section">
+            <div className="help-workspace-copy"><div className="eyebrow"><span className="live-dot" /> BUILT FOR YOUR WORKFLOW</div><h2>Each business keeps its own setup.</h2><p>Switching businesses changes the active workspace. Use that business’s own sales, records, permissions, and Kenya payment settings as you work.</p></div>
+            <div className="help-workspace-highlights">
+              <div><ShieldCheck size={18} /><span><strong>Separate Daraja credentials</strong><small>Save a different encrypted Safaricom connection for each business.</small></span></div>
+              <div><Smartphone size={18} /><span><strong>Useful from your phone</strong><small>Use the sidebar business switcher and move between workspace screens without losing your place.</small></span></div>
+              <div><BookOpen size={18} /><span><strong>Review before posting</strong><small>Preview supported CSV imports and review payroll drafts before they update your books.</small></span></div>
+            </div>
+          </section>
+
+          <section className="help-faq-section">
+            <div className="help-results-heading"><div><h2>Common questions</h2><p>Quick answers about setup and access.</p></div></div>
+            <details><summary>Why can’t I see a menu or action?</summary><p>Workspace roles limit which actions a team member can use. Ask a workspace administrator to review your role in Settings.</p></details>
+            <details><summary>Does importing a bank CSV connect my bank?</summary><p>No. CSV import is a manual review flow. Automatic bank feeds need a supported provider to be separately configured for the workspace.</p></details>
+            <details><summary>Are Daraja credentials shared between my businesses?</summary><p>No. Select the business first, then save its own credentials on the Kenya compliance page. Credentials are encrypted when saved; use Settings to enable payment requests for that business.</p></details>
+            <details><summary>Why does a Kenya integration show that setup is needed?</summary><p>Some services need provider approval, credentials, or device details before they can connect. Check the requirements shown for the active business before relying on that integration.</p></details>
+          </section>
         </section> : <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> WORKSPACE</div><h1>{page}</h1><p className="welcome-subtitle">{descriptions[page] ?? 'This module is not configured yet.'}</p>
           <div className="module-card"><div className="module-icon"><ShieldCheck size={23} /></div>

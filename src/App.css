@@ -839,3 +839,63 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .business-menu-add:hover{background:#f5f3ff;color:#5441b8}
 .workspace-switching-overlay{position:fixed;inset:0;z-index:30;display:grid;place-items:center;background:#f7f8fbe8;backdrop-filter:blur(2px);color:#51439b;font-size:14px;font-weight:650}
 .workspace-switching-overlay span{padding:15px 20px;background:#fff;border:1px solid #ececf2;border-radius:10px;box-shadow:0 12px 32px #25234212}
+
+/* Searchable, task-oriented customer help centre */
+.help-centre{max-width:1200px;margin:0 auto;padding-bottom:34px}
+.help-hero{padding:25px 28px 24px;border:1px solid #e9e5fa;border-radius:18px;background:radial-gradient(ellipse at 95% 0%,#ece8ff 0,transparent 38%),linear-gradient(130deg,#fff 0%,#faf9ff 100%);box-shadow:0 8px 28px #28233a08}
+.help-hero-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-top:13px}
+.help-hero-heading h1{font-size:30px;letter-spacing:-1.1px;margin:0 0 6px;color:#29273c}
+.help-hero-heading p{font-size:13px;color:#818192;line-height:1.6;margin:0;max-width:600px}
+.help-workspace-badge{display:flex;align-items:center;gap:7px;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:9px 12px;border:1px solid #e9e6f5;border-radius:10px;background:#fff;color:#5c4bb0;font-size:11px;font-weight:650}
+.help-search-box{height:48px;display:flex;align-items:center;gap:11px;margin-top:22px;padding:0 14px;border:1px solid #e3e0ee;border-radius:11px;background:#fff;color:#7e73b5;box-shadow:0 3px 12px #27233a08}
+.help-search-box:focus-within{border-color:#8d7be5;box-shadow:0 0 0 3px #8c78df20}
+.help-search-box input{width:100%;min-width:0;height:100%;border:0;outline:0;background:transparent;color:#353448;font:inherit;font-size:13px}
+.help-search-box input::placeholder{color:#a0a0ad}
+.help-search-box .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.help-clear-search{border:0;background:transparent;color:#6b55c8;font:inherit;font-size:11px;font-weight:600;padding:7px;cursor:pointer}
+.help-category-bar{display:flex;gap:8px;overflow-x:auto;padding:18px 1px 8px;scrollbar-width:thin}
+.help-category-chip{flex:0 0 auto;padding:8px 12px;border:1px solid #e8e7ef;border-radius:999px;background:#fff;color:#737384;font:inherit;font-size:10px;font-weight:600;cursor:pointer;transition:background .15s,border-color .15s,color .15s}
+.help-category-chip:hover{border-color:#cfc7ef;color:#5d4bb8}
+.help-category-chip.active{border-color:#6f5ad0;background:#6f5ad0;color:#fff}
+.help-results-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:17px 0 12px}
+.help-results-heading h2{font-size:18px;letter-spacing:-.4px;color:#303044;margin:0 0 4px}
+.help-results-heading p{font-size:11px;color:#898998;margin:0}
+.help-results-heading>span{white-space:nowrap;font-size:10px;color:#777789;padding:5px 8px;border-radius:7px;background:#f0eef9}
+.help-guide-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px}
+.help-guide-card{min-width:0;display:flex;flex-direction:column;align-items:flex-start;padding:17px;border:1px solid #ececf2;border-radius:13px;background:#fff;box-shadow:0 3px 12px #28233a05;transition:transform .15s,border-color .15s,box-shadow .15s}
+.help-guide-card:hover{transform:translateY(-2px);border-color:#ddd7f3;box-shadow:0 8px 22px #34265b0c}
+.help-guide-meta{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:11px}
+.help-guide-meta>span{font-size:9px;font-weight:700;color:#6451bb;background:#f2efff;padding:5px 7px;border-radius:6px}
+.help-guide-meta small{font-size:9px;color:#9a9aa7}
+.help-guide-card h3{font-size:14px;line-height:1.4;color:#333247;margin:0 0 7px}
+.help-guide-card>p{font-size:11px;line-height:1.65;color:#818192;margin:0 0 13px}
+.help-guide-details{width:100%;border-top:1px solid #f0eff4;border-bottom:1px solid #f0eff4;padding:10px 0;margin:auto 0 12px;color:#535366}
+.help-guide-details summary,.help-faq-section summary{position:relative;cursor:pointer;list-style:none;font-size:10px;font-weight:650;color:#5e4db1;padding-right:16px}
+.help-guide-details summary::-webkit-details-marker,.help-faq-section summary::-webkit-details-marker{display:none}
+.help-guide-details summary::after,.help-faq-section summary::after{content:'+';position:absolute;right:1px;top:-2px;color:#7866d0;font-size:16px;font-weight:400}
+.help-guide-details[open] summary::after,.help-faq-section details[open] summary::after{content:'−'}
+.help-guide-details ol{padding-left:18px;margin:10px 0;color:#696979;font-size:10px;line-height:1.65}
+.help-guide-details li+li{margin-top:6px}
+.help-guide-tip{display:flex;align-items:flex-start;gap:7px;padding:9px;border-radius:8px;background:#f3f8f6;color:#518273;font-size:9px;line-height:1.55}
+.help-guide-tip svg{flex:0 0 auto;margin-top:1px}
+.help-guide-action{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;margin-top:0;color:#5e4bb8;font-size:10px}
+.help-empty-state{grid-column:1/-1;display:flex;flex-direction:column;align-items:center;gap:8px;padding:36px 20px;border:1px dashed #d8d5e5;border-radius:14px;background:#fff;color:#81769e;text-align:center}
+.help-empty-state strong{font-size:14px;color:#39384b}
+.help-empty-state p{margin:0 0 5px;color:#898998;font-size:11px}
+.help-workspace-section{display:grid;grid-template-columns:minmax(220px,.8fr) minmax(0,1.5fr);gap:22px;margin-top:25px;padding:22px;border:1px solid #e9e6f4;border-radius:15px;background:linear-gradient(120deg,#fbfaff,#fff)}
+.help-workspace-copy h2{font-size:19px;line-height:1.35;letter-spacing:-.5px;color:#333247;margin:11px 0 8px}
+.help-workspace-copy>p{font-size:11px;line-height:1.7;color:#818192;margin:0}
+.help-workspace-highlights{display:grid;gap:9px}
+.help-workspace-highlights>div{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border:1px solid #eeedf3;border-radius:10px;background:#fff;color:#6d59c2}
+.help-workspace-highlights>div>svg{flex:0 0 auto;margin-top:1px}
+.help-workspace-highlights span{display:flex;flex-direction:column;gap:3px}
+.help-workspace-highlights strong{font-size:10px;color:#424155}
+.help-workspace-highlights small{font-size:9px;line-height:1.5;color:#858594}
+.help-faq-section{margin-top:24px;padding:0 3px}
+.help-faq-section .help-results-heading{margin-bottom:8px}
+.help-faq-section details{padding:13px 2px;border-bottom:1px solid #eae9f0}
+.help-faq-section summary{font-size:11px;color:#414155}
+.help-faq-section details>p{max-width:800px;margin:10px 0 0;color:#7a7a8a;font-size:10px;line-height:1.7}
+.help-centre button:focus-visible,.help-centre summary:focus-visible{outline:3px solid #8e7be8;outline-offset:3px}
+@media(max-width:1100px){.help-guide-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:650px){.help-centre{padding:2px 0 24px}.help-hero{padding:19px 16px 17px;border-radius:14px}.help-hero-heading{display:block}.help-hero-heading h1{font-size:25px}.help-hero-heading p{font-size:11px}.help-workspace-badge{display:inline-flex;margin-top:13px;max-width:100%}.help-search-box{height:46px;margin-top:17px;padding:0 11px}.help-guide-grid{grid-template-columns:1fr;gap:10px}.help-guide-card{padding:15px}.help-workspace-section{grid-template-columns:1fr;gap:15px;padding:17px}.help-results-heading h2{font-size:16px}.help-category-bar{margin-right:-2px}}
