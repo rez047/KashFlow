@@ -625,18 +625,7 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .stock-location-line b{white-space:nowrap}
 .stock-location-qty{display:flex;align-items:center;gap:6px}
 
-/* Today's performance replication for the Reports section. */
-.report-performance{display:grid;grid-template-columns:minmax(220px,.9fr) minmax(0,1.6fr);gap:16px;align-items:stretch}
-.report-performance-stat{padding:16px;border:1px solid #ececf2;border-radius:12px;background:linear-gradient(140deg,#fff,#f8f7ff)}
-.report-performance-stat small{display:block;color:#7a7c8c;font-size:11px}
-.report-performance-stat strong{display:block;margin:7px 0 8px;font-size:24px;letter-spacing:-.6px;color:#26263a}
-.report-performance-bars{display:flex;align-items:flex-end;gap:8px;height:150px;padding:12px;border:1px solid #ececf2;border-radius:12px;background:#fff}
-.report-performance-bars>div{flex:1;min-width:0;display:flex;flex-direction:row;align-items:flex-end;justify-content:center;gap:3px;height:100%;position:relative;padding-bottom:16px}
-.report-performance-bars i{width:38%;max-width:14px;min-height:2px;border-radius:4px 4px 2px 2px}
-.report-performance-bars i.is-income{background:linear-gradient(180deg,#8065e9,#6d54d6)}
-.report-performance-bars i.is-expense{background:linear-gradient(180deg,#48b99e,#359b7c)}
-.report-performance-bars span{position:absolute;bottom:0;left:0;right:0;text-align:center;font-size:9px;color:#86879a;white-space:nowrap}
-@media(max-width:760px){.report-performance{grid-template-columns:1fr}.stock-location-grid{grid-template-columns:1fr}}
+@media(max-width:760px){.stock-location-grid{grid-template-columns:1fr}}
 
 /* Split payment capture (optional, enabled per business in Settings). */
 .payment-split-editor{margin:12px 0;padding:13px;border:1px solid #e9e6f5;border-radius:10px;background:#fbfaff}
@@ -648,11 +637,6 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 
 /* Services sit alongside inventory as sellable records. */
 .pos-item-icon .lucide-sparkles{color:#7c5ce0}
-.report-trend{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:700}
-.report-trend-up{color:#21865d}
-.report-trend-down{color:#b4462b}
-.report-trend-flat{color:#807f92;font-weight:600}
-
 /* Service detail: rates, margin, and the customers subscribed to a service. */
 .service-detail{border:1px solid #ececf2;border-radius:11px;margin-bottom:10px;overflow:hidden;background:#fff}
 .service-detail-toggle{width:100%;display:flex;align-items:center;gap:12px;padding:13px 14px;border:0;background:transparent;text-align:left;cursor:pointer;color:inherit;font:inherit;flex-wrap:wrap}

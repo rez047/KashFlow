@@ -12,7 +12,6 @@ import './App.css'
 import './Sidebar.css'
 
 const OnlineStoreApp = lazy(() => import('./OnlineStore').then((module) => ({ default: module.OnlineStoreApp })))
-const DailyPerformanceReport = lazy(() => import('./DailyPerformanceReport').then((module) => ({ default: module.DailyPerformanceReport })))
 const OverviewCashflowChart = lazy(() => import('./FinanceCharts').then((module) => ({ default: module.OverviewCashflowChart })))
 const ReportCharts = lazy(() => import('./FinanceCharts').then((module) => ({ default: module.ReportCharts })))
 
@@ -831,6 +830,8 @@ function App() {
   const offlinePosWorkspaceLoaded = useRef<string | null>(null)
   const posCatalogWorkspaceLoaded = useRef<string | null>(null)
   const [estimateInput, setEstimateInput] = useState({ customer: '', customerEmail: '', description: '', amount: '', validUntil: today })
+  const [estimateEmailPromptId, setEstimateEmailPromptId] = useState('')
+  const [estimateEmailDraft, setEstimateEmailDraft] = useState('')
   const [billInput, setBillInput] = useState({ supplier: '', description: '', amount: '', billDate: today, dueDate: today })
   const [billSupplierMode, setBillSupplierMode] = useState<'saved' | 'new'>('saved')
   const [billSupplierId, setBillSupplierId] = useState('')
@@ -2961,11 +2962,17 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
     finally { setBusy(false) }
   }
 
-  async function sendEstimate(estimate: EstimateRecord) {
+  async function sendEstimate(estimate: EstimateRecord, customerEmail?: string) {
     setBusy(true); setError('')
     try {
-      const result = await request<{ message: string }>(`/v1/estimates/${estimate.id}/send`, { method: 'POST', body: '{}' })
-      setEstimates((current) => current.map((item) => item.id === estimate.id ? { ...item, status: 'sent' } : item))
+      const result = await request<{ message: string; delivery?: { recipient: string } }>(`/v1/estimates/${estimate.id}/send`, {
+        method: 'POST',
+        body: JSON.stringify(customerEmail ? { customerEmail: customerEmail.trim() } : {}),
+      })
+      const recipient = result.delivery?.recipient ?? customerEmail?.trim() ?? estimate.customer_email
+      setEstimates((current) => current.map((item) => item.id === estimate.id ? { ...item, status: 'sent', customer_email: recipient } : item))
+      setEstimateEmailPromptId('')
+      setEstimateEmailDraft('')
       notify(result.message)
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not send estimate email.') }
     finally { setBusy(false) }
@@ -4619,7 +4626,6 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
             {storedDocuments.map((item) => <div className="transaction-row" key={item.id}><span><strong>{item.file_name}</strong><small>{item.mime_type} · {formatAttachmentSize(item.file_size)} · {new Date(item.created_at).toLocaleDateString('en-KE')}</small></span><div className="button-row"><button className="button button-small" onClick={() => void downloadDocument(item.id)}>Download</button><button className="button button-small" onClick={() => void deleteDocument(item.id)}>Delete</button></div></div>)}{!storedDocuments.length && <div className="empty-state">No stored documents yet.</div>}</article>
         </section> : page === 'Reports' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> REPORTS · WORKSPACE RECORDS</div><h1>Business reports</h1><p className="welcome-subtitle">Visual summaries from saved transactions and invoices. These are management views, not audited financial statements.</p>
-          <Suspense fallback={<div className="module-card chart-loading" style={{ minHeight: 120 }} aria-label="Loading daily performance report" />}><DailyPerformanceReport apiBase={API_BASE} search={search} /></Suspense>
           <Suspense fallback={<div className="dashboard-grid"><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-label="Loading reports charts" /><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-hidden="true" /></div>}>
             <ReportCharts data={chart} monthlyIncome={Number(dashboard?.totals.monthIncome ?? 0)} monthlyExpenses={Number(dashboard?.totals.monthExpenses ?? 0)} rangeLabel={overviewRangeNames[overviewRange]} money={money} />
           </Suspense>
@@ -4752,7 +4758,20 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                 <p className="dialog-note">Estimate total: <strong>{money(draftDocumentTotal(estimateLines))}</strong>. Tax amounts are quote inputs only; use the initialized KRA integration and qualified review for official code mapping.</p>
                 <button className="button button-primary" disabled={busy || draftDocumentTotal(estimateLines) <= 0}>Save estimate</button>
               </form>
-              {estimates.length ? <div className="transaction-list">{estimates.map((estimate) => <div className="transaction-row" key={estimate.id}><span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}{estimate.customer_email ? ` · ${estimate.customer_email}` : ' · no customer email'}</small></span><div className="button-row">{estimate.status === 'draft' && <button className="button button-small" disabled={busy || !estimate.customer_email} title={!estimate.customer_email ? 'Add the customer email before sending this estimate.' : undefined} onClick={() => void sendEstimate(estimate)}>Mark sent &amp; email</button>}{estimate.status === 'sent' && <button className="button button-small" disabled={busy} onClick={() => void sendEstimate(estimate)}>Resend estimate</button>}{['sent', 'accepted'].includes(estimate.status) && !salesOrders.some((order) => order.estimate_id === estimate.id) && <button className="button button-primary" disabled={busy} onClick={() => void createSalesOrder(estimate)}>Create sales order</button>}</div></div>)}</div> : <div className="empty-state">No estimates yet. Save a quote to start the commercial flow.</div>}
+              {estimates.length ? <div className="transaction-list">{estimates.map((estimate) => <div className="transaction-row" key={estimate.id}>
+                <span><strong>{estimate.customer} · {estimate.description}</strong><small>{money(estimate.amount)} · valid until {estimate.valid_until} · {estimate.status}{estimate.customer_email ? ` · ${estimate.customer_email}` : ' · no customer email'}</small></span>
+                <div className="button-row">
+                  {estimate.status === 'draft' && (estimate.customer_email
+                    ? <button className="button button-small" disabled={busy} onClick={() => void sendEstimate(estimate)}>Mark sent &amp; email</button>
+                    : <button className="button button-small" disabled={busy} onClick={() => { setEstimateEmailPromptId(estimate.id); setEstimateEmailDraft(''); setError('') }}>Add email &amp; send</button>)}
+                  {estimate.status === 'sent' && <button className="button button-small" disabled={busy} onClick={() => void sendEstimate(estimate)}>Resend estimate</button>}
+                  {['sent', 'accepted'].includes(estimate.status) && !salesOrders.some((order) => order.estimate_id === estimate.id) && <button className="button button-primary" disabled={busy} onClick={() => void createSalesOrder(estimate)}>Create sales order</button>}
+                </div>
+                {estimateEmailPromptId === estimate.id && estimate.status === 'draft' && <form className="record-form-grid" onSubmit={(event) => { event.preventDefault(); void sendEstimate(estimate, estimateEmailDraft) }}>
+                  <label className="field-label">Customer email<input type="email" required autoComplete="email" maxLength={254} value={estimateEmailDraft} onChange={(event) => setEstimateEmailDraft(event.target.value)} placeholder="customer@example.com" /></label>
+                  <div className="button-row"><button className="button button-primary" disabled={busy || !estimateEmailDraft.trim()}>{busy ? 'Sending…' : 'Save email & send estimate'}</button><button type="button" className="button button-small" disabled={busy} onClick={() => { setEstimateEmailPromptId(''); setEstimateEmailDraft('') }}>Cancel</button></div>
+                </form>}
+              </div>)}</div> : <div className="empty-state">No estimates yet. Save a quote to start the commercial flow.</div>}
               <h3>Sales order lifecycle</h3>
               {salesOrders.length ? salesOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer} · SO {order.id.slice(0, 8)}</strong><small>{order.description} · {money(order.amount)} · {order.status}</small></span><div className="button-row">{order.status === 'confirmed' && <><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'fulfilled')}>Mark fulfilled</button><button className="button button-small" disabled={busy} onClick={() => void updateSalesOrder(order, 'cancelled')}>Cancel order</button></>}{order.status === 'fulfilled' && <button className="button button-primary" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void convertEstimate(estimate) }}>Convert fulfilled order to invoice</button>}{order.status === 'cancelled' && <button className="button button-small" disabled={busy} onClick={() => { const estimate = estimates.find((item) => item.id === order.estimate_id); if (estimate) void createSalesOrder(estimate) }}>Reopen order</button>}</div></div>) : <div className="empty-state">Accepted estimates can become orders before fulfillment and invoicing.</div>}
             </article>

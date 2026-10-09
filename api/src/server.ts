@@ -2661,66 +2661,6 @@ function csvValue(value: unknown) {
   const safe = /^[\t\r\n ]*[=+\-@]/.test(text) && !/^-?\d+(?:\.\d+)?$/.test(text) ? `'${text}` : text
   return `"${safe.replace(/"/g, '""')}"`
 }
-app.get('/v1/reports/daily-performance', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
-  // Powers the Reports replica of the landing page "Today's performance" card, and accepts a
-  // custom range so the same panel serves today, a week, month, year, or explicit dates.
-  const today = nairobiToday()
-  const defaultFrom = `${today.slice(0, 7)}-01`
-  const query = z.object({ from: z.string().date().default(defaultFrom), to: z.string().date().default(today) }).safeParse(request.query)
-  if (!query.success || query.data.from > query.data.to) { response.status(400).json({ error: 'Choose a valid date range with a start date on or before the end date.' }); return }
-  const from = query.data.from
-  const to = query.data.to
-  try {
-    const workspaceId = request.session!.workspaceId
-    // The comparison baseline is the equal-length window immediately before the selected range,
-    // so "vs previous period" stays meaningful for any range the business chooses.
-    const dayCount = Math.max(1, Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000) + 1)
-    const previousTo = new Date(Date.parse(`${from}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10)
-    const previousFrom = new Date(Date.parse(`${previousTo}T00:00:00Z`) - (dayCount - 1) * 86_400_000).toISOString().slice(0, 10)
-    const [dayTotals, series, stock] = await Promise.all([
-      pool!.query(`SELECT
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= $2 AND transaction_date <= $3), 0)::text AS period_income,
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $2 AND transaction_date <= $3), 0)::text AS period_expense,
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= $4 AND transaction_date <= $5), 0)::text AS previous_income,
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $4 AND transaction_date <= $5), 0)::text AS previous_expense
-        FROM ledger_transactions WHERE workspace_id = $1`, [workspaceId, from, to, previousFrom, previousTo]),
-      pool!.query(`SELECT transaction_date AS date,
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS income,
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS expense
-        FROM ledger_transactions WHERE workspace_id = $1 AND transaction_date >= $2 AND transaction_date <= $3
-        GROUP BY transaction_date ORDER BY transaction_date`, [workspaceId, from, to]),
-      pool!.query(`SELECT COALESCE(SUM(s.quantity * COALESCE(NULLIF(i.data->>'cost', '')::numeric, 0)), 0)::text AS valuation
-        FROM inventory_location_stock s JOIN workspace_records i ON i.id = s.item_id
-        WHERE s.workspace_id = $1 AND i.record_type = 'inventory'`, [workspaceId]).catch(() => ({ rows: [{ valuation: '0' }] })),
-    ])
-    const asDateString = (value: unknown) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
-    const row = dayTotals.rows[0]
-    const periodIncome = Number(row.period_income)
-    const previousIncome = Number(row.previous_income)
-    const periodExpense = Number(row.period_expense)
-    const previousExpense = Number(row.previous_expense)
-    const percentChange = previousIncome > 0 ? Math.round(((periodIncome - previousIncome) / previousIncome) * 100) : null
-    response.json({
-      from,
-      to,
-      previousFrom,
-      previousTo,
-      // "today" is kept for the existing Today's performance card; period* reflects the range.
-      today: to,
-      yesterday: previousTo,
-      todayIncome: periodIncome.toFixed(2),
-      todayExpense: periodExpense.toFixed(2),
-      yesterdayIncome: previousIncome.toFixed(2),
-      yesterdayExpense: previousExpense.toFixed(2),
-      todayNet: (periodIncome - periodExpense).toFixed(2),
-      percentChange,
-      weekIncome: periodIncome.toFixed(2),
-      stockValue: stock.rows[0].valuation,
-      days: series.rows.map((line: Record<string, unknown>) => ({ date: asDateString(line.date), income: line.income, expense: line.expense })),
-    })
-  } catch (error) { next(error) }
-})
-
 app.get('/v1/exports/:type', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   const type = z.enum(['customers', 'suppliers', 'inventory', 'services', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit']).safeParse(request.params.type)
   if (!type.success) { response.status(404).json({ error: 'Choose customers, suppliers, inventory, services, projects, invoices, bills, transactions, journals, or audit.' }); return }
@@ -3556,12 +3496,14 @@ app.post('/v1/estimates', requirePool, verifyOrigin, requireSession, requireWork
 })
 app.post('/v1/estimates/:estimateId/send', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
   if (!emailConfigured) { response.status(503).json({ error: 'Outbound email is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL on the API service.' }); return }
+  const input = z.object({ customerEmail: z.string().trim().email().max(254).transform((value) => value.toLowerCase()).optional() }).safeParse(request.body ?? {})
+  if (!input.success) { response.status(400).json({ error: 'Enter a valid customer email address.' }); return }
   try {
     const found = await pool!.query(`SELECT id, customer, customer_email, description, amount::text, valid_until, status
       FROM estimates WHERE id = $1 AND workspace_id = $2`, [request.params.estimateId, request.session!.workspaceId])
     const estimate = found.rows[0]
     if (!estimate) { response.status(404).json({ error: 'Estimate not found in this business.' }); return }
-    const recipient = String(estimate.customer_email ?? '').trim()
+    const recipient = input.data.customerEmail ?? String(estimate.customer_email ?? '').trim()
     if (!recipient) { response.status(409).json({ error: 'Add a customer email to this estimate before sending.' }); return }
     if (!['draft', 'sent'].includes(String(estimate.status))) { response.status(409).json({ error: 'Only draft or sent estimates can be emailed.' }); return }
     const lines = await pool!.query(`SELECT description, quantity::text, unit_price::text, discount_amount::text, tax_amount::text, total_amount::text
@@ -3585,7 +3527,7 @@ app.post('/v1/estimates/:estimateId/send', requirePool, verifyOrigin, requireSes
     const client = await pool!.connect()
     try {
       await client.query('BEGIN')
-      const updated = await client.query("UPDATE estimates SET status = 'sent', updated_at = now() WHERE id = $1 AND workspace_id = $2 AND status IN ('draft', 'sent') RETURNING id", [estimate.id, request.session!.workspaceId])
+      const updated = await client.query("UPDATE estimates SET customer_email = $3, status = 'sent', updated_at = now() WHERE id = $1 AND workspace_id = $2 AND status IN ('draft', 'sent') RETURNING id", [estimate.id, request.session!.workspaceId, recipient])
       if (!updated.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Estimate changed while the email was being sent. Refresh before retrying.' }); return }
       await client.query('INSERT INTO email_delivery_events (id, workspace_id, estimate_id, recipient, provider, status, provider_message_id) VALUES ($1, $2, $3, $4, $5, $6, $7)', [deliveryId, request.session!.workspaceId, estimate.id, recipient, 'brevo', 'accepted', estimateEmail.messageId ?? null])
       await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'estimate.email_sent', entityType: 'estimate', entityId: String(estimate.id), eventData: { recipient, providerMessageId: estimateEmail.messageId ?? null } })
