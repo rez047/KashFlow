@@ -606,7 +606,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
       <div className="section-head">
         <span className="section-eyebrow">PRICING</span>
         <h2>Simple monthly packages in Kenyan Shillings</h2>
-        <p>Both packages include the full suite — the difference is the premium payment and bank-feed connections.</p>
+        <p>Both packages include the full suite — the difference is the premium payment, online shopping and bank-feed connections.</p>
       </div>
       <div className="pricing-grid">
         <article className="price-card">
