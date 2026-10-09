@@ -114,7 +114,13 @@ type ServiceSubscription = {
   created_at: string
   invoice_count: number
   last_invoiced_at: string | null
+  open_invoice_id: string | null
+  amount_due: string
+  last_paid_at: string | null
+  last_paid_amount: string
+  total_paid: string
 }
+type ServiceSupplierPayment = { id: string; amount: string; payment_date: string; billing_cycle: 'none' | 'monthly' | 'quarterly' | 'annually'; covered_until: string | null; expense_recorded: boolean }
 // Optional system-wide split-payment capture for an invoice or a counter sale.
 type PaymentSplit = { method: 'cash' | 'mpesa'; amount: string; phone: string; reference: string }
 type Account = { user: { email: string }; workspace: { id: string; name: string; permissions?: MemberPermission[] }; workspaces?: Array<{ id: string; name: string; role: string }> }
@@ -236,6 +242,12 @@ function requestInvoiceMpesaPayment(invoiceId: string, phone: string) {
 function money(value: string | number) {
   const amount = Number(value)
   return `KSh ${amount.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+function daysUntilDate(date: string | null | undefined) {
+  if (!date) return null
+  const target = Date.parse(`${date.slice(0, 10)}T00:00:00Z`)
+  const current = Date.parse(`${today}T00:00:00Z`)
+  return Number.isFinite(target) ? Math.round((target - current) / 86_400_000) : null
 }
 
 // Extract the KRA fiscal receipt evidence from a stored accepted response.
@@ -847,9 +859,12 @@ function App() {
   // Service subscriptions: which customers subscribe to the selected service, on what cycle,
   // at what rate, and how they prefer to pay.
   const [serviceSubscriptions, setServiceSubscriptions] = useState<Record<string, ServiceSubscription[]>>({})
+  const [serviceSupplierPayments, setServiceSupplierPayments] = useState<Record<string, ServiceSupplierPayment[]>>({})
   const [serviceDetailId, setServiceDetailId] = useState('')
   const [subscriptionInput, setSubscriptionInput] = useState({ customerMode: 'saved' as 'saved' | 'new', customerId: '', newCustomerName: '', newCustomerEmail: '', newCustomerPhone: '', rateSource: 'consumer' as 'consumer' | 'renewal' | 'custom', customRate: '', billingCycle: 'monthly' as 'none' | 'monthly' | 'quarterly' | 'annually', paymentPreference: 'either' as 'cash' | 'mpesa' | 'either', startDate: today, notes: '', createRecurringSchedule: false })
-  const [subscriptionInvoiceDates, setSubscriptionInvoiceDates] = useState<Record<string, string>>({})
+  const [subscriptionBillingId, setSubscriptionBillingId] = useState('')
+  const [subscriptionBillingInput, setSubscriptionBillingInput] = useState({ dueDate: today, paymentDate: today, cashAmount: '', mpesaAmount: '', mpesaReference: '' })
+  const [supplierPaymentInput, setSupplierPaymentInput] = useState({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' as 'none' | 'monthly' | 'quarterly' | 'annually' })
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
   const [storeConfig, setStoreConfig] = useState<OnlineStoreConfig>({ slug: '', title: '', description: '', enabled: false })
@@ -1209,7 +1224,14 @@ function App() {
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load integration preparation records.'))
     }
     const recordType = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Services: 'services', Projects: 'projects' } as Record<string, string>)[page]
-    if (recordType) void request<{ records: WorkspaceRecord[] }>(`/v1/records/${recordType}`).then((result) => setRecords((current) => ({ ...current, [recordType]: result.records }))).catch((reason) => setError(reason instanceof Error ? reason.message : `Could not load ${page.toLowerCase()}.`))
+    if (page === 'Services') {
+      void Promise.all([
+        request<{ records: WorkspaceRecord[] }>('/v1/records/services'),
+        request<{ records: WorkspaceRecord[] }>('/v1/records/customers'),
+        request<{ records: WorkspaceRecord[] }>('/v1/records/suppliers'),
+      ]).then(([services, customers, suppliers]) => setRecords((current) => ({ ...current, services: services.records, customers: customers.records, suppliers: suppliers.records })))
+        .catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load services, saved customers, and suppliers.'))
+    } else if (recordType) void request<{ records: WorkspaceRecord[] }>(`/v1/records/${recordType}`).then((result) => setRecords((current) => ({ ...current, [recordType]: result.records }))).catch((reason) => setError(reason instanceof Error ? reason.message : `Could not load ${page.toLowerCase()}.`))
     if (page === 'Suppliers') void request<{ bills: VendorBill[] }>('/v1/bills').then((result) => setBills(result.bills)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load supplier bills.'))
     if (page === 'Documents' || page === 'Overview') void request<{ documents: StoredDocument[] }>('/v1/documents').then((result) => setStoredDocuments(result.documents)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load stored documents.'))
     if (page === 'Settings') {
@@ -2617,8 +2639,9 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
     if (!serviceId) return
     setBusy(true); setError('')
     try {
-      const result = await request<{ subscriptions: ServiceSubscription[] }>(`/v1/services/${serviceId}/subscriptions`)
+      const result = await request<{ subscriptions: ServiceSubscription[]; supplierPayments: ServiceSupplierPayment[] }>(`/v1/services/${serviceId}/subscriptions`)
       setServiceSubscriptions((current) => ({ ...current, [serviceId]: result.subscriptions }))
+      setServiceSupplierPayments((current) => ({ ...current, [serviceId]: result.supplierPayments }))
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not load subscribers for this service.')
     } finally { setBusy(false) }
@@ -2663,31 +2686,59 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
     } finally { setBusy(false) }
   }
 
-  // Create and email an invoice for one subscribed customer, carrying the service details and
-  // the rate that applies to them. The invoice is emailed separately so the ledger entry is
-  // never lost if the email provider is unavailable.
-  async function invoiceSubscription(subscription: ServiceSubscription, dueDate: string) {
+  async function recordServiceSupplierPayment(service: WorkspaceRecord) {
+    const serviceId = service.id
+    const addToExpenses = window.confirm(`Send this supplier payment to the expense ledger? Choose Cancel to record the payment without posting an expense.`)
     setBusy(true); setError('')
     try {
-      const result = await request<{ invoice: InvoiceRecord; nextInvoiceDate: string | null }>(`/v1/service-subscriptions/${subscription.id}/invoice`, { method: 'POST', body: JSON.stringify({ dueDate: dueDate || today }) })
+      const result = await request<{ payment: ServiceSupplierPayment }>('/v1/services/' + serviceId + '/supplier-payments', { method: 'POST', body: JSON.stringify({
+        amount: Number(supplierPaymentInput.amount), paymentDate: supplierPaymentInput.paymentDate,
+        billingCycle: supplierPaymentInput.billingCycle, addToExpenses,
+      }) })
+      const refreshed = await request<{ subscriptions: ServiceSubscription[]; supplierPayments: ServiceSupplierPayment[] }>(`/v1/services/${serviceId}/subscriptions`)
+      setServiceSubscriptions((current) => ({ ...current, [serviceId]: refreshed.subscriptions }))
+      setServiceSupplierPayments((current) => ({ ...current, [serviceId]: refreshed.supplierPayments }))
+      setSupplierPaymentInput({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' })
+      await refresh()
+      notify(addToExpenses ? 'Supplier payment recorded and posted to expenses.' : `Supplier payment of ${money(result.payment.amount)} recorded. It was not posted to expenses.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not record supplier payment.')
+    } finally { setBusy(false) }
+  }
+
+  async function billSubscription(subscription: ServiceSubscription) {
+    const serviceId = serviceDetailId
+    const isNewBill = !subscription.open_invoice_id
+    setBusy(true); setError('')
+    try {
+      const result = await request<{ invoice: InvoiceRecord & { amount_paid?: string; status: string }; payment: { received: string; applied: string; overpayment: string }; nextInvoiceDate: string | null }>(`/v1/service-subscriptions/${subscription.id}/billing`, { method: 'POST', body: JSON.stringify({
+        ...(subscription.open_invoice_id ? { invoiceId: subscription.open_invoice_id } : { dueDate: subscriptionBillingInput.dueDate }),
+        paymentDate: subscriptionBillingInput.paymentDate,
+        cashAmount: Number(subscriptionBillingInput.cashAmount || 0),
+        mpesaAmount: Number(subscriptionBillingInput.mpesaAmount || 0),
+        mpesaReference: subscriptionBillingInput.mpesaReference,
+      }) })
       let emailed = false
-      if (result.invoice.customer_email) {
+      if (isNewBill && result.invoice.customer_email) {
         try {
           await request(`/v1/invoices/${result.invoice.id}/email`, { method: 'POST', body: JSON.stringify({ message: defaultInvoiceEmailMessage(result.invoice, dashboard?.workspaceName ?? 'your business') }) })
           emailed = true
-        } catch { /* the invoice exists; sending can be retried from Networking */ }
+        } catch { /* the bill exists; sending can be retried from Networking */ }
       }
-      const invoices = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+      const [subscribers, invoices] = await Promise.all([
+        request<{ subscriptions: ServiceSubscription[]; supplierPayments: ServiceSupplierPayment[] }>(`/v1/services/${serviceId}/subscriptions`),
+        request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
+      ])
+      setServiceSubscriptions((current) => ({ ...current, [serviceId]: subscribers.subscriptions }))
+      setServiceSupplierPayments((current) => ({ ...current, [serviceId]: subscribers.supplierPayments }))
       setInvoicesList(invoices.invoices)
-      await loadServiceSubscriptions(serviceDetailId)
+      setSubscriptionBillingId('')
+      setSubscriptionBillingInput({ dueDate: result.nextInvoiceDate ?? today, paymentDate: today, cashAmount: '', mpesaAmount: '', mpesaReference: '' })
       await refresh()
-      notify(emailed
-        ? `Invoice ${result.invoice.id.slice(0, 8)} created and emailed to ${subscription.customer_name}. Next billing date ${result.nextInvoiceDate ?? 'not scheduled'}.`
-        : result.invoice.customer_email
-          ? `Invoice ${result.invoice.id.slice(0, 8)} created, but the email was not accepted. Send it from Networking. Next billing ${result.nextInvoiceDate ?? 'not scheduled'}.`
-          : `Invoice ${result.invoice.id.slice(0, 8)} created for ${subscription.customer_name}. No customer email is saved, so share or print it from Networking. Next billing ${result.nextInvoiceDate ?? 'not scheduled'}.`)
+      const due = Math.max(0, Number(result.invoice.amount) - Number(result.invoice.amount_paid ?? 0))
+      notify(`${isNewBill ? 'Bill created' : 'Payment recorded'} for ${subscription.customer_name}. Received ${money(result.payment.received)}${due ? `; ${money(due)} remains due` : ''}${Number(result.payment.overpayment) > 0 ? `; ${money(result.payment.overpayment)} held as customer credit` : ''}${emailed ? '; invoice emailed' : ''}.`)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not invoice this subscriber.')
+      setError(reason instanceof Error ? reason.message : 'Could not bill or record payment for this subscriber.')
     } finally { setBusy(false) }
   }
 
@@ -3164,6 +3215,15 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
     const body: Record<string, unknown> = { ...recordForm }
     if (type === 'suppliers') body.supplyItemIds = supplierItemIds.filter(Boolean)
     if (type === 'inventory' || type === 'projects') for (const key of type === 'inventory' ? ['quantity', 'cost', 'price', 'reorderPoint'] : ['budget']) body[key] = Number(body[key] || 0)
+    if (type === 'services') {
+      body.charge = Number(body.charge || 0)
+      body.consumerRate = body.charge
+      body.supplierRate = Number(body.supplierRate || 0)
+      body.renewalRate = Number(body.renewalRate || 0)
+      body.supplierId = String(body.supplierId || '')
+      body.supplierRecurring = body.supplierRecurring === 'true'
+      body.supplierBillingCycle = String(body.supplierBillingCycle || 'monthly')
+    }
     const openingStockValue = type === 'inventory' && !editingRecordId
       ? Number((Number(body.quantity) * Number(body.cost)).toFixed(2))
       : 0
@@ -3171,13 +3231,17 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
       ? window.confirm(`Add ${money(openingStockValue)} for this item’s opening stock to expenses? Choose Cancel to keep it recorded as inventory only.`)
       : false
     if (type === 'inventory') body.addToExpenses = addToExpenses
+    const recordSupplierCost = type === 'services' && Number(body.supplierRate) > 0
+      ? window.confirm(`Record the supplier payment of ${money(Number(body.supplierRate))} for this service as an expense dated today? Choose Cancel to save the service details without posting a supplier payment.`)
+      : false
+    if (type === 'services') body.addToExpenses = recordSupplierCost
     setBusy(true); setError('')
     try {
       await request(editingRecordId ? `/v1/records/${type}/${editingRecordId}` : `/v1/records/${type}`, { method: editingRecordId ? 'PUT' : 'POST', body: JSON.stringify(body) })
       const result = await request<{ records: WorkspaceRecord[] }>(`/v1/records/${type}`)
       setRecords((current) => ({ ...current, [type]: result.records })); setRecordForm({}); setEditingRecordId(''); setSupplierItemIds([''])
-      if (addToExpenses) await refresh()
-      notify(addToExpenses ? 'Inventory saved and opening stock added to expenses.' : `${type.slice(0, -1)} saved`)
+      if (addToExpenses || recordSupplierCost) await refresh()
+      notify(recordSupplierCost ? 'Service saved and supplier cost posted to expenses.' : addToExpenses ? 'Inventory saved and opening stock added to expenses.' : `${type.slice(0, -1)} saved`)
     } catch (reason) { setError(reason instanceof Error ? reason.message : `Could not save ${type.slice(0, -1)}.`) }
     finally { setBusy(false) }
   }
@@ -4090,7 +4154,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
             customers: [{ name: 'name', label: 'Customer name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
             suppliers: [{ name: 'name', label: 'Supplier name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
             inventory: [{ name: 'name', label: 'Item name' }, { name: 'sku', label: 'SKU' }, { name: 'barcode', label: 'Barcode (scanner input)' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
-            services: [{ name: 'name', label: 'Service name (e.g. Wifi installation)' }, { name: 'category', label: 'Category (e.g. Wifi, Security, Cleaning)' }, { name: 'charge', label: 'Charge (KSh)', kind: 'number' }, { name: 'description', label: 'What the service includes' }, { name: 'providerName', label: 'Service provider name' }, { name: 'providerContact', label: 'Provider contact person' }, { name: 'providerPhone', label: 'Provider phone' }, { name: 'providerEmail', label: 'Provider email', kind: 'email' }, { name: 'providerPin', label: 'Provider KRA PIN (optional)' }, { name: 'serviceLevel', label: 'Service level / SLA (e.g. 24hr response)' }, { name: 'duration', label: 'Typical duration (e.g. 3 hours, 1 month)' }, { name: 'notes', label: 'Notes' }],
+            services: [{ name: 'name', label: 'Service name (e.g. Wifi installation)' }, { name: 'category', label: 'Category (e.g. Wifi, Security, Cleaning)' }, { name: 'charge', label: 'Customer charge (KSh)', kind: 'number' }, { name: 'description', label: 'What the service includes' }, { name: 'providerName', label: 'Service provider name' }, { name: 'providerContact', label: 'Provider contact person' }, { name: 'providerPhone', label: 'Provider phone' }, { name: 'providerEmail', label: 'Provider email', kind: 'email' }, { name: 'providerPin', label: 'Provider KRA PIN (optional)' }, { name: 'serviceLevel', label: 'Service level / SLA (e.g. 24hr response)' }, { name: 'duration', label: 'Typical duration (e.g. 3 hours, 1 month)' }, { name: 'notes', label: 'Notes' }],
             projects: [{ name: 'name', label: 'Project name' }, { name: 'customer', label: 'Customer' }, { name: 'status', label: 'Status', kind: 'status' }, { name: 'startDate', label: 'Start date', kind: 'date' }, { name: 'endDate', label: 'End date', kind: 'date' }, { name: 'budget', label: 'Budget (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
           }
           const inventoryHealth = type === 'inventory' ? records.inventory.map((record) => {
@@ -4116,8 +4180,13 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
               {type === 'services' && <>
                 <datalist id="service-category-list"><option value="Wifi" /><option value="Security" /><option value="Shoe shining" /><option value="Cleaning" /><option value="Laundry" /><option value="Plumbing" /><option value="Electrical" /><option value="Catering" /><option value="Transport" /><option value="Consulting" /></datalist>
                 <label className="field-label">Billing unit<select value={recordForm.billingUnit ?? 'fixed'} onChange={(event) => setRecordForm({ ...recordForm, billingUnit: event.target.value })}>{SERVICE_BILLING_UNITS.map((unit) => <option key={unit.code} value={unit.code}>{unit.label}</option>)}</select></label>
-                  <label className="field-label">VAT treatment note (Kenya, optional)<input maxLength={40} value={recordForm.taxTreatment ?? ''} onChange={(event) => setRecordForm({ ...recordForm, taxTreatment: event.target.value })} placeholder="e.g. B16 or exempt" /></label>
-                <p className="dialog-note">Services are billed as their own invoice or counter line. They never move stock, so no quantity or unit cost is required.</p>
+                <label className="field-label">Supplier cost (KSh, optional)<input type="number" min="0" step="0.01" value={recordForm.supplierRate ?? ''} onChange={(event) => setRecordForm({ ...recordForm, supplierRate: event.target.value })} /></label>
+                <label className="field-label">Renewal charge (KSh, optional)<input type="number" min="0" step="0.01" value={recordForm.renewalRate ?? ''} onChange={(event) => setRecordForm({ ...recordForm, renewalRate: event.target.value })} /></label>
+                <label className="field-label">Supplier<select value={recordForm.supplierId ?? ''} onChange={(event) => setRecordForm({ ...recordForm, supplierId: event.target.value })}><option value="">No saved supplier</option>{records.suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{String(supplier.data.name ?? 'Supplier')}</option>)}</select></label>
+                <label className="field-label checkbox-row"><input type="checkbox" checked={recordForm.supplierRecurring === 'true'} onChange={(event) => setRecordForm({ ...recordForm, supplierRecurring: String(event.target.checked) })} /> Supplier payment renews</label>
+                {recordForm.supplierRecurring === 'true' && <label className="field-label">Supplier renewal cycle<select value={recordForm.supplierBillingCycle ?? 'monthly'} onChange={(event) => setRecordForm({ ...recordForm, supplierBillingCycle: event.target.value })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option></select></label>}
+                <label className="field-label">VAT treatment note (Kenya, optional)<input maxLength={40} value={recordForm.taxTreatment ?? ''} onChange={(event) => setRecordForm({ ...recordForm, taxTreatment: event.target.value })} placeholder="e.g. B16 or exempt" /></label>
+                <p className="dialog-note">The customer charge is billed through subscriber records. Supplier cost is optional; saving it can also record a supplier payment and post it to expenses.</p>
               </>}
               {type === 'suppliers' && <fieldset className="module-card supplier-items-fieldset"><legend>Inventory items supplied (optional)</legend><p className="dialog-note">Link one or more items this supplier provides. These are reference links only; they do not change stock or purchase orders.</p>{supplierItemIds.map((itemId, index) => <div className="field-row" key={`supplier-item-${index}`}><label className="field-label">Inventory item<select aria-label={`Supplier inventory item ${index + 1}`} value={itemId} onChange={(event) => setSupplierItemIds((current) => current.map((value, row) => row === index ? event.target.value : value))}><option value="">Choose item (optional)</option>{records.inventory.filter((item) => !supplierItemIds.includes(item.id) || item.id === itemId).map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')}{item.data.sku ? ` · ${item.data.sku}` : ''}</option>)}</select></label>{supplierItemIds.length > 1 && <button type="button" className="button button-small" aria-label="Remove supplier item row" onClick={() => setSupplierItemIds((current) => current.filter((_, row) => row !== index))}>Remove</button>}</div>)}<button type="button" className="button button-secondary" onClick={() => setSupplierItemIds((current) => [...current, ''])}>Add another item</button></fieldset>}<div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : `${editingRecordId ? 'Update' : 'Save'} ${recordLabel}`}</button>{editingRecordId && <button type="button" className="button button-secondary" onClick={() => { setEditingRecordId(''); setRecordForm({}); setSupplierItemIds(['']) }}>Cancel edit</button>}</div></form>
             {type === 'inventory' && <article className="module-card stock-health-panel">
@@ -4151,7 +4220,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                       {type === 'inventory'
                         ? `SKU ${record.data.sku || '—'} · Price ${money(Number(record.data.price ?? 0))} · Qty ${record.data.quantity} ${record.data.unit}`
                         : type === 'services'
-                          ? `${record.data.category || 'General service'} · ${money(Number(record.data.charge ?? 0))} · ${serviceBillingLabel(String(record.data.billingUnit ?? 'fixed'))}${record.data.providerName ? ` · Provider: ${record.data.providerName}` : ''}`
+                          ? `${record.data.category || 'General service'} · Customer charge ${money(Number(record.data.charge ?? 0))} · Supplier cost ${money(Number(record.data.supplierRate ?? 0))} · ${serviceBillingLabel(String(record.data.billingUnit ?? 'fixed'))}${record.data.providerName ? ` · Provider: ${record.data.providerName}` : ''}`
                           : type === 'projects'
                           ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}`
                           : type === 'suppliers'
@@ -4180,13 +4249,6 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                     )}
                     {type === 'services' && (
                       <button className="button button-small" disabled={!canUse('sales.write')} title="Add this service to the counter sale" onClick={() => { addServiceLine(record); notify(`${String(record.data.name ?? 'Service')} added to the current sale.`) }}>Add to counter sale</button>
-                    )}
-                    {type === 'services' && (
-                      <button className="button button-small" disabled={!canUse('sales.write')} onClick={() => {
-                        setInvoice({ customer: '', customerEmail: '', description: String(record.data.name ?? 'Service'), amount: '', dueDate: today })
-                        setInvoiceLines([{ description: String(record.data.name ?? 'Service'), quantity: '1', unitPrice: String(record.data.charge ?? ''), discountAmount: '0', taxAmount: '0' }])
-                        setInvoiceLocationId(''); setInvoicePreview(null); setError(''); setModal('invoice')
-                      }}>Bill this service</button>
                     )}
                     {type !== 'inventory' && (
                       <button
@@ -4250,6 +4312,11 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                 const consumerRate = Number(service.data.consumerRate ?? service.data.charge ?? 0)
                 const supplierRate = Number(service.data.supplierRate ?? 0)
                 const renewalRate = Number(service.data.renewalRate ?? 0)
+                const supplierPayments = serviceSupplierPayments[service.id] ?? []
+                const lastSupplierPayment = supplierPayments[0]
+                const supplierDays = daysUntilDate(lastSupplierPayment?.covered_until)
+                const savedSupplier = records.suppliers.find((record) => record.id === String(service.data.supplierId ?? ''))
+                const supplierName = String(savedSupplier?.data.name ?? service.data.providerName ?? 'No supplier')
                 // Margin per billing cycle at the standard consumer rate.
                 const margin = consumerRate - supplierRate
                 return <div className="service-detail" key={service.id}>
@@ -4266,8 +4333,22 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                   </button>
                   {service.data.description ? <p className="service-detail-desc">{String(service.data.description)}</p> : null}
                   {open && <div className="service-detail-body">
+                    <div className="service-supplier-summary">
+                      <span><strong>Supplier</strong><small>{supplierName} · Cost {money(supplierRate)}{service.data.supplierRecurring ? ` · ${String(service.data.supplierBillingCycle ?? 'monthly')} renewal` : ''}</small></span>
+                      <span><strong>Last supplier payment</strong><small>{lastSupplierPayment ? `${lastSupplierPayment.payment_date} · ${money(lastSupplierPayment.amount)}` : 'No supplier payment recorded'}</small></span>
+                      {service.data.supplierRecurring && lastSupplierPayment?.covered_until && <span><strong>Supplier renewal</strong><small>{supplierDays !== null && supplierDays > 0 ? `${supplierDays} days left · renew by ${lastSupplierPayment.covered_until}` : supplierDays === 0 ? `Due today · renew supplier subscription` : `Overdue · renew supplier subscription (covered through ${lastSupplierPayment.covered_until})`}</small></span>}
+                      {(service.data.supplierId || service.data.providerName || supplierRate > 0) && <button type="button" className="button button-small" disabled={busy || !canUse('inventory.write')} onClick={() => setSupplierPaymentInput({ serviceId: service.id, amount: String(supplierRate || ''), paymentDate: today, billingCycle: service.data.supplierRecurring ? String(service.data.supplierBillingCycle ?? 'monthly') as 'monthly' | 'quarterly' | 'annually' : 'none' })}>Record supplier payment</button>}
+                    </div>
+                    {supplierPaymentInput.serviceId === service.id && <form className="record-form-grid module-card" onSubmit={(event) => { event.preventDefault(); void recordServiceSupplierPayment(service) }}>
+                      <h3>Supplier payment · {supplierName}</h3>
+                      <label className="field-label">Amount paid (KSh)<input required type="number" min="0.01" step="0.01" value={supplierPaymentInput.amount} onChange={(event) => setSupplierPaymentInput({ ...supplierPaymentInput, amount: event.target.value })} /></label>
+                      <label className="field-label">Payment date<input required type="date" value={supplierPaymentInput.paymentDate} onChange={(event) => setSupplierPaymentInput({ ...supplierPaymentInput, paymentDate: event.target.value })} /></label>
+                      <label className="field-label">Coverage cycle<select value={supplierPaymentInput.billingCycle} onChange={(event) => setSupplierPaymentInput({ ...supplierPaymentInput, billingCycle: event.target.value as 'none' | 'monthly' | 'quarterly' | 'annually' })}><option value="none">No recurring coverage</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option></select></label>
+                      <p className="dialog-note">You will be asked whether this supplier payment should also be posted to the expense ledger.</p>
+                      <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save supplier payment'}</button><button type="button" className="button button-small" onClick={() => setSupplierPaymentInput({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' })}>Cancel</button></div>
+                    </form>}
                     <div className="service-subscribe-bar">
-                      <button type="button" className="button button-primary button-small" disabled={busy || !canUse('sales.write')} onClick={() => beginSubscription(service.id)}><Plus size={14} /> Subscribe a customer</button>
+                      <button type="button" className="button button-primary button-small" disabled={busy || !canUse('sales.write')} onClick={() => beginSubscription(service.id)}><Plus size={14} /> Add subscriber</button>
                       <button type="button" className="button button-small" disabled={busy} onClick={() => void loadServiceSubscriptions(service.id)}>Refresh subscribers</button>
                     </div>
 
@@ -4282,13 +4363,15 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                       <label className="field-label">Billing cycle<select value={subscriptionInput.billingCycle} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, billingCycle: event.target.value as 'none' | 'monthly' | 'quarterly' | 'annually' })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option><option value="none">One-off (no cycle)</option></select></label>
                       <label className="field-label">Customer prefers to pay<select value={subscriptionInput.paymentPreference} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, paymentPreference: event.target.value as 'cash' | 'mpesa' | 'either' })}><option value="either">Either cash or M-Pesa</option><option value="cash">Cash / manual</option><option value="mpesa">M-Pesa</option></select></label>
                       <label className="field-label">Start date<input required type="date" value={subscriptionInput.startDate} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, startDate: event.target.value })} /></label>
-                      <label className="field-label checkbox-row"><input type="checkbox" checked={subscriptionInput.createRecurringSchedule} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, createRecurringSchedule: event.target.checked })} /> Prepare a recurring invoice schedule for this cycle</label>
                       <label className="field-label">Notes<input maxLength={2000} value={subscriptionInput.notes} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, notes: event.target.value })} placeholder="e.g. router included, installed 4th floor" /></label>
-                      <p className="dialog-note">A recurring schedule is never posted on its own: you run each due item from Networking. Payment preference is recorded for the counter and reminders; it does not move money.</p>
+                      <p className="dialog-note">Bill this customer from their subscriber row. Their charge, payments, next due date, and balance stay linked to this service.</p>
                       <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Subscribe customer'}</button></div>
                     </form>}
 
-                    {subscribers.length ? subscribers.map((subscription) => <div className="service-subscriber-row" key={subscription.id}>
+                    {subscribers.length ? subscribers.map((subscription) => {
+                      const subscriberCharge = subscription.rate_source === 'custom' ? Number(subscription.custom_rate) : subscription.rate_source === 'renewal' ? renewalRate || consumerRate : consumerRate
+                      const billingOpen = subscriptionBillingId === subscription.id
+                      return <div className="service-subscriber-row" key={subscription.id}>
                       <div className="service-subscriber-main">
                         <strong>{subscription.customer_name}</strong>
                         <small>{subscription.customer_email || (subscription.customer_phone ? subscription.customer_phone : 'No email or phone saved')}</small>
@@ -4297,19 +4380,33 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                           <span className="status-pill">{subscription.billing_cycle === 'none' ? 'One-off' : subscription.billing_cycle}</span>
                           <span className="status-pill">Prefers {subscription.payment_preference === 'either' ? 'cash or M-Pesa' : subscription.payment_preference}</span>
                           <span className={`status-pill ${subscription.status === 'active' ? 'green' : subscription.status === 'paused' ? 'amber' : ''}`}>{subscription.status}</span>
-                          {subscription.next_invoice_date && <span className="status-pill">Next {subscription.next_invoice_date}</span>}
+                          <span className="status-pill">Charge {money(subscriberCharge)}</span>
+                          {subscription.billing_cycle !== 'none' && subscription.next_invoice_date && <span className="status-pill">Next due {subscription.next_invoice_date}</span>}
+                          {subscription.open_invoice_id && <span className="status-pill amber">Due {money(subscription.amount_due)}</span>}
                         </span>
-                        <small className="service-subscriber-history">{subscription.invoice_count} invoice{subscription.invoice_count === 1 ? '' : 's'} recorded{subscription.last_invoiced_at ? ` · last ${new Date(String(subscription.last_invoiced_at)).toLocaleDateString('en-KE')}` : ''}{subscription.notes ? ` · ${subscription.notes}` : ''}</small>
+                        <small className="service-subscriber-history">Last paid {subscription.last_paid_at ? `${String(subscription.last_paid_at).slice(0, 10)} · ${money(subscription.last_paid_amount)}` : 'never'} · {subscription.invoice_count} bill{subscription.invoice_count === 1 ? '' : 's'} recorded{subscription.notes ? ` · ${subscription.notes}` : ''}</small>
                       </div>
                       <div className="service-subscriber-actions">
-                        <label className="field-label">Due date<input type="date" value={subscriptionInvoiceDates[subscription.id] ?? subscription.next_invoice_date ?? today} onChange={(event) => setSubscriptionInvoiceDates((current) => ({ ...current, [subscription.id]: event.target.value }))} /></label>
-                        <button type="button" className="button button-primary button-small" disabled={busy || subscription.status === 'cancelled' || !canUse('sales.write')} onClick={() => void invoiceSubscription(subscription, subscriptionInvoiceDates[subscription.id] ?? subscription.next_invoice_date ?? today)}><FileText size={14} /> {subscription.customer_email ? 'Send invoice to customer' : 'Create invoice'}</button>
+                        <button type="button" className="button button-primary button-small" disabled={busy || subscription.status !== 'active' || !canUse('sales.write')} onClick={() => {
+                          setSubscriptionBillingId(billingOpen ? '' : subscription.id)
+                          setSubscriptionBillingInput({ dueDate: subscription.next_invoice_date ?? today, paymentDate: today, cashAmount: '', mpesaAmount: '', mpesaReference: '' })
+                        }}><FileText size={14} /> {subscription.open_invoice_id ? 'Record payment' : 'Bill subscriber'}</button>
                         {subscription.status === 'active'
                           ? <button type="button" className="button button-small" disabled={busy} onClick={() => void updateSubscription(subscription, { status: 'paused' })}>Pause</button>
                           : <button type="button" className="button button-small" disabled={busy} onClick={() => void updateSubscription(subscription, { status: 'active' })}>Reactivate</button>}
                         {subscription.status !== 'cancelled' && <button type="button" className="button button-small" disabled={busy} onClick={() => void updateSubscription(subscription, { status: 'cancelled' })}>Cancel</button>}
                       </div>
-                    </div>) : <div className="empty-state">No customers subscribed to this service yet.</div>}
+                      {billingOpen && <form className="service-billing-form" onSubmit={(event) => { event.preventDefault(); void billSubscription(subscription) }}>
+                        <h4>{subscription.open_invoice_id ? `Collect payment · ${money(subscription.amount_due)} due` : `Bill subscriber · ${money(subscriberCharge)}`}</h4>
+                        {!subscription.open_invoice_id && <label className="field-label">Next due date<input required type="date" value={subscriptionBillingInput.dueDate} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, dueDate: event.target.value })} /></label>}
+                        <label className="field-label">Payment date<input required type="date" value={subscriptionBillingInput.paymentDate} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, paymentDate: event.target.value })} /></label>
+                        <label className="field-label">Cash received (KSh)<input type="number" min="0" step="0.01" value={subscriptionBillingInput.cashAmount} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, cashAmount: event.target.value })} /></label>
+                        <label className="field-label">M-Pesa received (KSh)<input type="number" min="0" step="0.01" value={subscriptionBillingInput.mpesaAmount} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, mpesaAmount: event.target.value })} /></label>
+                        {Number(subscriptionBillingInput.mpesaAmount) > 0 && <label className="field-label">M-Pesa reference<input maxLength={100} value={subscriptionBillingInput.mpesaReference} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, mpesaReference: event.target.value })} /></label>}
+                        <p className="dialog-note">You can collect part or all of the charge using cash, M-Pesa, or both. Any extra is saved as customer credit.</p>
+                        <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : subscription.open_invoice_id ? 'Record payment' : 'Create bill and record payment'}</button><button type="button" className="button button-small" onClick={() => setSubscriptionBillingId('')}>Cancel</button></div>
+                      </form>}
+                    </div>}) : <div className="empty-state">No customers subscribed to this service yet.</div>}
                   </div>}
                 </div>
               })}

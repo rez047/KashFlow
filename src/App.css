@@ -666,9 +666,18 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .service-detail-caret.open{transform:rotate(90deg)}
 .service-detail-desc{padding:0 14px 12px;margin:0;color:#7a7c8c;font-size:11px;line-height:1.5}
 .service-detail-body{border-top:1px solid #f0f0f5;padding:14px;background:#fcfcff}
+.service-supplier-summary{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:0 0 12px;padding:11px 12px;border:1px solid #e9e8f2;border-radius:9px;background:#fff}
+.service-supplier-summary>span{display:flex;flex-direction:column;gap:3px;min-width:145px}
+.service-supplier-summary strong{font-size:11px}
+.service-supplier-summary small{color:#737487;font-size:10px;line-height:1.4}
+.service-supplier-summary .button{margin-left:auto}
 .service-subscribe-bar{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:12px}
 .service-subscribe-form{margin:0 0 14px;padding:14px;background:#fff}
 .service-subscribe-form h3{margin:0 0 4px;font-size:13px;grid-column:1/-1}
+.service-billing-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;width:100%;padding:12px;border:1px solid #e9e8f2;border-radius:9px;background:#fff}
+.service-billing-form h4,.service-billing-form p,.service-billing-form .button-row{grid-column:1/-1;margin:0}
+.service-billing-form h4{font-size:12px}
+.service-billing-form .field-label{margin:0}
 .service-subscriber-row{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;padding:12px 0;border-top:1px solid #eeeef4;flex-wrap:wrap}
 .service-subscriber-row:first-of-type{border-top:0}
 .service-subscriber-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:6px}
@@ -680,6 +689,8 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .service-subscriber-actions .field-label{margin:0;min-width:140px}
 @media(max-width:700px){
   .service-detail-toggle{gap:8px}
+  .service-supplier-summary>span{width:100%}
+  .service-supplier-summary .button{margin-left:0}
   .service-subscriber-actions{width:100%;justify-content:flex-start}
   .service-subscriber-actions .field-label{min-width:0;width:100%}
 }
