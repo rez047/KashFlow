@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
-import { OnlineStoreApp } from './OnlineStore'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { languages, useTranslation, type LanguageCode } from './i18n'
 import {
   Activity, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
@@ -8,11 +7,14 @@ import {
   LifeBuoy, LogOut, Mail, Menu, MessageCircle, Minus, Package, Phone, Plus, Printer, QrCode,
   ScanBarcode, Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Sparkles, Star, Trash2, Users, Volume2, Wallet, X,
 } from 'lucide-react'
-import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { SupplierBillEmailSection } from './SupplierBillEmailSection'
-import { DailyPerformanceReport } from './DailyPerformanceReport'
 import './App.css'
 import './Sidebar.css'
+
+const OnlineStoreApp = lazy(() => import('./OnlineStore').then((module) => ({ default: module.OnlineStoreApp })))
+const DailyPerformanceReport = lazy(() => import('./DailyPerformanceReport').then((module) => ({ default: module.DailyPerformanceReport })))
+const OverviewCashflowChart = lazy(() => import('./FinanceCharts').then((module) => ({ default: module.OverviewCashflowChart })))
+const ReportCharts = lazy(() => import('./FinanceCharts').then((module) => ({ default: module.ReportCharts })))
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001').replace(/\/$/, '')
 function nairobiDate() {
@@ -3864,7 +3866,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
   ]
 
   if (window.location.pathname.startsWith('/store/') || window.location.pathname.startsWith('/portal/') || window.location.pathname.startsWith('/invoice/')) {
-    return <OnlineStoreApp apiBase={API_BASE} pathname={window.location.pathname} />
+    return <Suspense fallback={<div className="auth-screen landing-loading"><Brand /><p>Loading your store…</p></div>}><OnlineStoreApp apiBase={API_BASE} pathname={window.location.pathname} /></Suspense>
   }
 
   return <div className="app-shell">
@@ -3974,19 +3976,9 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                 <span className="period-select"><CalendarDays size={14} /> {overviewRangeNames[overviewRange]}</span>
               </div>
               <div className="chart-legend"><span><i className="legend-income" /> Income</span><span><i className="legend-expense" /> Expenses</span></div>
-              {chart.length ? <div className="chart-wrap"><ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={chart} margin={{ top: 10, right: 5, left: -24, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="incomeFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#7256df" stopOpacity={0.17} /><stop offset="100%" stopColor="#7256df" stopOpacity={0} /></linearGradient>
-                    <linearGradient id="expenseFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38b99a" stopOpacity={0.13} /><stop offset="100%" stopColor="#38b99a" stopOpacity={0} /></linearGradient>
-                  </defs>
-                  <CartesianGrid vertical={false} stroke="#eff0f4" strokeDasharray="4 5" />
-                  <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fill: '#9699a5', fontSize: 10 }} dy={9} />
-                  <Tooltip formatter={(value) => [money(Number(value)), '']} contentStyle={{ border: '1px solid #eeedf2', borderRadius: 10, fontSize: 12 }} />
-                  <Area type="monotone" dataKey="income" stroke="#7256df" strokeWidth={2.5} fill="url(#incomeFill)" />
-                  <Area type="monotone" dataKey="expense" stroke="#48b99e" strokeWidth={2.5} fill="url(#expenseFill)" />
-                </AreaChart>
-              </ResponsiveContainer></div> : <div className="empty-chart">No transactions recorded this month. Add one to see cash flow.</div>}
+              {chart.length ? <div className="chart-wrap"><Suspense fallback={<div className="chart-loading" style={{ minHeight: 150 }} aria-label="Loading cash flow chart" />}>
+                <OverviewCashflowChart data={chart} money={money} />
+              </Suspense></div> : <div className="empty-chart">No transactions recorded this month. Add one to see cash flow.</div>}
               <div className="chart-footer"><span><span className="status-dot" /> Database-backed records</span><button onClick={() => navigateTo('Reports')}>View reports <ArrowRight size={14} /></button></div>
             </article>
 
@@ -4609,9 +4601,10 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
             {storedDocuments.map((item) => <div className="transaction-row" key={item.id}><span><strong>{item.file_name}</strong><small>{item.mime_type} · {formatAttachmentSize(item.file_size)} · {new Date(item.created_at).toLocaleDateString('en-KE')}</small></span><div className="button-row"><button className="button button-small" onClick={() => void downloadDocument(item.id)}>Download</button><button className="button button-small" onClick={() => void deleteDocument(item.id)}>Delete</button></div></div>)}{!storedDocuments.length && <div className="empty-state">No stored documents yet.</div>}</article>
         </section> : page === 'Reports' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> REPORTS · WORKSPACE RECORDS</div><h1>Business reports</h1><p className="welcome-subtitle">Visual summaries from saved transactions and invoices. These are management views, not audited financial statements.</p>
-          <DailyPerformanceReport apiBase={API_BASE} search={search} />
-          <div className="dashboard-grid"><article className="module-card report-chart"><h2>Income vs expenses · {overviewRangeNames[overviewRange]}</h2><ResponsiveContainer width="100%" height={260}><BarChart data={chart}><CartesianGrid vertical={false} stroke="#eff0f4" /><XAxis dataKey="date" /><YAxis /><Tooltip formatter={(value) => money(Number(value))} /><Legend /><Bar dataKey="income" fill="#7256df" radius={[5, 5, 0, 0]} /><Bar dataKey="expense" fill="#48b99e" radius={[5, 5, 0, 0]} /></BarChart></ResponsiveContainer></article>
-            <article className="module-card report-chart"><h2>Recorded cash flow mix</h2><ResponsiveContainer width="100%" height={260}><PieChart><Pie data={[{ name: 'Income', value: Number(dashboard?.totals.monthIncome ?? 0) }, { name: 'Expenses', value: Number(dashboard?.totals.monthExpenses ?? 0) }].filter((item) => item.value > 0)} dataKey="value" nameKey="name" outerRadius={85} label>{['#7256df', '#48b99e'].map((color) => <Cell key={color} fill={color} />)}</Pie><Tooltip formatter={(value) => money(Number(value))} /><Legend /></PieChart></ResponsiveContainer>{Number(dashboard?.totals.monthIncome ?? 0) + Number(dashboard?.totals.monthExpenses ?? 0) === 0 && <div className="empty-state">Add transactions to populate this chart.</div>}</article></div>
+          <Suspense fallback={<div className="module-card chart-loading" style={{ minHeight: 120 }} aria-label="Loading daily performance report" />}><DailyPerformanceReport apiBase={API_BASE} search={search} /></Suspense>
+          <Suspense fallback={<div className="dashboard-grid"><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-label="Loading reports charts" /><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-hidden="true" /></div>}>
+            <ReportCharts data={chart} monthlyIncome={Number(dashboard?.totals.monthIncome ?? 0)} monthlyExpenses={Number(dashboard?.totals.monthExpenses ?? 0)} rangeLabel={overviewRangeNames[overviewRange]} money={money} />
+          </Suspense>
           <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.income ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.expenses ?? 0)}</strong></div><div className="transaction-row"><span>Net movement · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.net ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices, for the period chosen in the Overview toolbar. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
           {retailReport && <article className="module-card"><h2>Retail and inventory insights</h2><div className="transaction-row"><span>Inventory valuation at recorded unit cost</span><strong>{money(retailReport.totalValuation)}</strong></div><h3>Reorder alerts</h3>{retailReport.reorderAlerts.map((item) => <div className="transaction-row" key={`${item.itemId}-${item.locationId}`}><span><strong>{item.name} · {item.location}</strong><small>{item.quantity} {item.unit} on hand · alert at {item.reorderPoint}</small></span><span className="status-pill amber">Reorder</span></div>)}{!retailReport.reorderAlerts.length && <p>No items are at or below their configured reorder points.</p>}<h3>Best sellers</h3>{retailReport.bestSellers.map((item) => <div className="transaction-row" key={item.itemId}><span><strong>{item.name}</strong><small>{item.quantitySold.toLocaleString('en-KE')} sold · revenue {money(item.revenue)} · cost estimate {money(item.cost)}</small></span><strong>Gross profit est. {money(item.grossProfit)}</strong></div>)}{!retailReport.bestSellers.length && <div className="empty-state">Post product sales to see best sellers and gross profit estimates.</div>}<p className="dialog-note">Inventory value uses current average item cost; product margins are management estimates and do not replace reviewed accounting valuation.</p></article>}
           <article className="module-card"><h2>Cash-flow outlook</h2><p>Three-month estimate based on the average monthly posted ledger activity available over the last six months; not a cash guarantee.</p>{forecast.map((row) => <div className="transaction-row" key={row.period}><span><strong>{row.period}</strong><small>Historical-average estimate</small></span><span>Income {money(row.income)} · Expenses {money(row.expenses)}</span><strong>Net {money(row.income - row.expenses)}</strong></div>)}</article>
