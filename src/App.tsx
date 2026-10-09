@@ -301,33 +301,30 @@ function Brand() {
   </div>
 }
 
-// Deterministic QR-style matrix rendered from the KRA QR code string so the fiscal receipt
-// carries a scannable block of the exact KRA-supplied receipt payload.
-function KraQrBlock({ value }: { value: string }) {
-  const size = 21
-  const seed = Array.from(value).reduce((sum, character) => (sum * 31 + character.charCodeAt(0)) % 2147483647, 7)
-  const cells: boolean[] = []
-  let state = seed || 1
-  for (let index = 0; index < size * size; index += 1) {
-    state = (state * 1103515245 + 12345) % 2147483648
-    cells.push(state % 100 < 47)
-  }
-  const isFinder = (row: number, column: number) =>
-    (row < 7 && column < 7) || (row < 7 && column >= size - 7) || (row >= size - 7 && column < 7)
-  const finderOn = (row: number, column: number) => {
-    const localRow = row < 7 ? row : row - (size - 7)
-    const localColumn = column < 7 ? column : column - (size - 7)
-    if (localRow === 0 || localRow === 6 || localColumn === 0 || localColumn === 6) return true
-    return localRow >= 2 && localRow <= 4 && localColumn >= 2 && localColumn <= 4
-  }
-  return <div className="kra-qr" role="img" aria-label={`KRA fiscal QR code: ${value}`}>
-    {Array.from({ length: size * size }).map((_, index) => {
-      const row = Math.floor(index / size)
-      const column = index % size
-      const on = isFinder(row, column) ? finderOn(row, column) : cells[index]
-      return <i key={index} className={on ? 'on' : ''} />
-    })}
-  </div>
+// Encode the exact supplied text as a real QR code. The same component is used for the
+// authenticator otpauth URI and KRA receipt payloads.
+function KraQrBlock({ value, label = 'QR code' }: { value: string; label?: string }) {
+  const container = useRef<HTMLDivElement>(null)
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  useEffect(() => {
+    let active = true
+    setStatus('loading')
+    container.current?.replaceChildren()
+    void import('@zxing/browser').then(({ BrowserQRCodeSvgWriter }) => {
+      const svg = new BrowserQRCodeSvgWriter().write(value, 256, 256)
+      svg.setAttribute('aria-hidden', 'true')
+      if (active) {
+        container.current?.replaceChildren(svg)
+        setStatus('ready')
+      }
+    }).catch(() => { if (active) setStatus('error') })
+    return () => {
+      active = false
+      container.current?.replaceChildren()
+    }
+  }, [value])
+  if (status === 'error') return <div className="kra-qr kra-qr-error" role="alert">Could not generate this QR code.</div>
+  return <div className="kra-qr" ref={container} role="img" aria-label={label} aria-busy={status === 'loading'} />
 }
 
 // Printable KRA eTIMS fiscal tax invoice built from the stored accepted KRA response.
@@ -359,7 +356,7 @@ function KraFiscalReceipt({ draft, businessName }: { draft: ComplianceDraft; bus
     <div className="kra-receipt-total"><span>Total tax</span><strong>{money(Number(fiscalPayload.totTaxAmt ?? 0))}</strong></div>
     <div className="kra-receipt-total"><span>Total amount</span><strong>{money(Number(fiscalPayload.totAmt ?? 0))}</strong></div>
     <div className="kra-receipt-foot">
-      <KraQrBlock value={qrValue} />
+      <KraQrBlock value={qrValue} label="KRA fiscal receipt QR code" />
       <div className="kra-receipt-codes">
         <span><small>Receipt signature</small><strong className="kra-mono">{evidence.signature || '-'}</strong></span>
         {evidence.internalData && <span><small>Internal data</small><strong className="kra-mono">{evidence.internalData}</strong></span>}
@@ -4928,7 +4925,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                     <li>Enter the 6-digit code the app shows to finish.</li>
                   </ol>
                   <div className="two-factor-qr-row">
-                    <KraQrBlock value={twoFactorSetup.otpauthUri} />
+                    <KraQrBlock value={twoFactorSetup.otpauthUri} label="Authenticator setup QR code" />
                     <div><small>Setup key</small><strong className="kra-mono">{twoFactorSetup.secret.match(/.{1,4}/g)?.join(' ') ?? twoFactorSetup.secret}</strong></div>
                   </div>
                 </>}
