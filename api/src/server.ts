@@ -1157,9 +1157,19 @@ const workspaceRecordSchemas = {
   inventory: z.object({ name: z.string().trim().min(1).max(160), sku: z.string().trim().max(80).default(''), barcode: z.string().trim().max(80).default(''), reorderPoint: z.coerce.number().finite().min(0).default(0), quantity: z.coerce.number().finite().min(0).default(0), unit: z.string().trim().max(30).default('unit'), cost: z.coerce.number().finite().min(0).default(0), price: z.coerce.number().finite().min(0).default(0), notes: z.string().trim().max(2000).default(''), addToExpenses: z.boolean().default(false) }),
   services: z.object({
     name: z.string().trim().min(1).max(160),
+    sku: z.string().trim().max(80).default(''),
     category: z.string().trim().max(80).default('General service'),
     description: z.string().trim().max(2000).default(''),
     billingUnit: z.enum(SERVICE_BILLING_UNITS).default('fixed'),
+    // Three rates, mirroring how Kenyan service businesses actually price:
+    // supplierRate is what the business pays to deliver the service (for example the ISP),
+    // consumerRate is the standard price a customer pays,
+    // renewalRate is the discounted continuing price when a customer re-subscribes.
+    supplierRate: z.coerce.number().finite().min(0).default(0),
+    consumerRate: z.coerce.number().finite().min(0).default(0),
+    renewalRate: z.coerce.number().finite().min(0).default(0),
+    // Legacy single-charge field kept so existing saved services keep working; when
+    // consumerRate is left at zero the charge is used instead.
     charge: z.coerce.number().finite().min(0).default(0),
     taxTreatment: z.string().trim().max(40).default(''),
     // Optional service-provider details so a business can record who delivers the service.
@@ -2994,6 +3004,7 @@ app.get('/v1/invoices', requirePool, requireSession, async (request: AuthedReque
     response.json({ invoices: result.rows })
   } catch (error) { next(error) }
 })
+
 app.get('/v1/invoices/:invoiceId/lines', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
     const result = await pool!.query(`SELECT il.id, il.item_id, il.description, il.quantity::text, il.returned_quantity::text,
@@ -3348,9 +3359,17 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
     let costOfGoodsSold = 0
     for (const [index, line] of financials.lines.entries()) {
       if (line.itemId) {
-        const item = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'inventory' FOR UPDATE", [line.itemId, request.session!.workspaceId])
-        const itemData = item.rows[0]?.data as Record<string, unknown> | undefined
-        if (!itemData) { await client.query('ROLLBACK'); response.status(400).json({ error: 'A sales line references an inventory item that is not in this business.' }); return }
+        // A line may reference an inventory item (which deducts stock) or a service
+        // (which is simply billed: services hold no stock and post no COGS).
+        const item = await client.query("SELECT data, record_type FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type IN ('inventory', 'service') FOR UPDATE", [line.itemId, request.session!.workspaceId])
+        const itemRow = item.rows[0] as { data: Record<string, unknown>; record_type: string } | undefined
+        const itemData = itemRow?.data
+        if (!itemData) { await client.query('ROLLBACK'); response.status(400).json({ error: 'A sales line references an item or service that is not in this business.' }); return }
+        if (itemRow!.record_type === 'service') {
+          // Services are not stock: fall through to the shared invoice_lines insert below
+          // without touching quantities or cost of goods sold.
+          costOfGoodsSold += 0
+        } else {
         const onHand = Number(itemData.quantity ?? 0)
         const locationStock = await client.query('SELECT quantity::text FROM inventory_location_stock WHERE workspace_id = $1 AND location_id = $2 AND item_id = $3 FOR UPDATE', [request.session!.workspaceId, locationId, line.itemId])
         const localOnHand = Number(locationStock.rows[0]?.quantity ?? 0)
@@ -3362,6 +3381,7 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
         const movementId = randomUUID()
         await client.query("INSERT INTO inventory_movements (id, workspace_id, item_id, location_id, movement_type, quantity_delta, unit_cost, reference, moved_at, created_by) VALUES ($1, $2, $3, $4, 'sale', $5, $6, $7, $8, $9)", [movementId, request.session!.workspaceId, line.itemId, locationId, (-line.quantity).toFixed(3), itemCost.toFixed(2), `Invoice ${id.slice(0, 8)}`, nairobiToday(), request.session!.userId])
         costOfGoodsSold += line.quantity * itemCost
+        }
       }
       await client.query('INSERT INTO invoice_lines (id, invoice_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [randomUUID(), id, index + 1, line.itemId ?? null, line.description, line.quantity.toFixed(3), line.unitPrice.toFixed(2), line.discountAmount, line.taxAmount, line.totalAmount])
     }
@@ -5143,6 +5163,211 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
     ], note: `Workspace preferences are enforced on Daraja payment initiation, Mono linking/sync, and production KRA OSCU operations. Render provider credentials remain shared across businesses. KRA readiness here only reports that operator/workspace switches and encryption config are present; KRA approval, certification, initialized production device, fiscal mapping review, and reconciliation are still required. Statutory filing adapters are not implemented, regardless of saved preferences. Payroll estimates remain internal and are not certified.` })
   } catch (error) { next(error) }
 })
+// ---------------------------------------------------------------------------
+// Service subscriptions
+//
+// A service (wifi, security guarding, cleaning...) is subscribed to by customers. Each
+// subscription records the billing cycle, the rate that applies to that customer, and how
+// the customer prefers to pay. Invoicing a subscription reuses the same internal invoice
+// path as everything else, so the ledger stays consistent.
+// ---------------------------------------------------------------------------
+const subscriptionRateSources = ['consumer', 'renewal', 'custom'] as const
+const subscriptionCycles = ['none', 'monthly', 'quarterly', 'annually'] as const
+
+// Resolve the amount to bill for a subscription from the service's saved rates. A customer
+// on a custom rate always uses that agreed figure; otherwise the chosen rate source is used,
+// falling back to the legacy single charge only when no consumer rate was ever saved.
+function subscriptionAmount(serviceData: Record<string, unknown>, rateSource: string, customRate: number) {
+  if (rateSource === 'custom') return Number(customRate.toFixed(2))
+  const consumerRate = Number(serviceData.consumerRate ?? 0)
+  const renewalRate = Number(serviceData.renewalRate ?? 0)
+  const legacyCharge = Number(serviceData.charge ?? 0)
+  if (rateSource === 'renewal') return Number((renewalRate || consumerRate || legacyCharge).toFixed(2))
+  return Number((consumerRate || legacyCharge).toFixed(2))
+}
+
+// Advance a YYYY-MM-DD date by the subscription cycle. `month` in Date.UTC is 0-based and
+// rolls over automatically, which is what we want for month/quarter/year arithmetic.
+function nextInvoiceDateFor(cycle: string, from: string) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(from)
+  if (!match) return null
+  const year = Number(match[1]); const month = Number(match[2]); const day = Number(match[3])
+  if (cycle === 'monthly') return new Date(Date.UTC(year, month, day)).toISOString().slice(0, 10)
+  if (cycle === 'quarterly') return new Date(Date.UTC(year, month + 2, day)).toISOString().slice(0, 10)
+  if (cycle === 'annually') return new Date(Date.UTC(year + 1, month - 1, day)).toISOString().slice(0, 10)
+  return null
+}
+
+app.get('/v1/services/:serviceId/subscriptions', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const service = await pool!.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'service'", [request.params.serviceId, request.session!.workspaceId])
+    if (!service.rowCount) { response.status(404).json({ error: 'Saved service not found in this business.' }); return }
+    const result = await pool!.query(`SELECT s.id, s.customer_id, s.customer_name, s.customer_email, s.customer_phone, s.rate_source,
+        s.custom_rate::text, s.billing_cycle, s.status, s.payment_preference, s.start_date, s.next_invoice_date, s.notes, s.created_at,
+        (SELECT COUNT(*)::int FROM invoices i WHERE i.workspace_id = s.workspace_id AND i.customer = s.customer_name) AS invoice_count,
+        (SELECT MAX(i.created_at) FROM invoices i WHERE i.workspace_id = s.workspace_id AND i.customer = s.customer_name) AS last_invoiced_at
+      FROM service_subscriptions s
+      WHERE s.workspace_id = $1 AND s.service_id = $2 ORDER BY s.created_at DESC`, [request.session!.workspaceId, request.params.serviceId])
+    response.json({ service: service.rows[0].data, subscriptions: result.rows })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/services/:serviceId/subscriptions', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    customerId: z.string().uuid().optional(),
+    customerName: z.string().trim().min(1).max(160).optional(),
+    customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''),
+    customerPhone: z.string().trim().max(30).default(''),
+    rateSource: z.enum(subscriptionRateSources).default('consumer'),
+    customRate: z.coerce.number().finite().min(0).default(0),
+    billingCycle: z.enum(subscriptionCycles).default('monthly'),
+    paymentPreference: z.enum(['cash', 'mpesa', 'either']).default('either'),
+    startDate: z.string().date(),
+    notes: z.string().trim().max(2000).default(''),
+    createRecurringSchedule: z.boolean().default(false),
+  }).refine((value) => Boolean(value.customerId || value.customerName), { message: 'Choose a saved customer or enter a new customer name.' }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Choose a saved customer or enter a new customer name, and a valid start date.' }); return }
+  if (input.data.rateSource === 'custom' && input.data.customRate <= 0) { response.status(400).json({ error: 'Enter the agreed custom rate for this customer.' }); return }
+
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const service = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'service' FOR UPDATE", [request.params.serviceId, request.session!.workspaceId])
+    const serviceData = service.rows[0]?.data as Record<string, unknown> | undefined
+    if (!serviceData) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Saved service not found in this business.' }); return }
+
+    // Resolve the subscribing customer: an existing saved customer, or a new one created here.
+    let customerId = input.data.customerId ?? null
+    let customerName = input.data.customerName?.trim() ?? ''
+    let customerEmail = input.data.customerEmail
+    let customerPhone = input.data.customerPhone
+    if (customerId) {
+      const saved = await client.query("SELECT data FROM workspace_records WHERE id = $1 AND workspace_id = $2 AND record_type = 'customer'", [customerId, request.session!.workspaceId])
+      const savedData = saved.rows[0]?.data as Record<string, unknown> | undefined
+      if (!savedData) { await client.query('ROLLBACK'); response.status(404).json({ error: 'That saved customer is not in this business.' }); return }
+      customerName = String(savedData.name ?? customerName)
+      customerEmail = customerEmail || String(savedData.email ?? '')
+      customerPhone = customerPhone || String(savedData.phone ?? '')
+    } else {
+      customerId = randomUUID()
+      await client.query('INSERT INTO workspace_records (id, workspace_id, record_type, data) VALUES ($1, $2, $3, $4::jsonb)',
+      [customerId, request.session!.workspaceId, 'customer', JSON.stringify({ name: customerName, email: customerEmail, phone: customerPhone, address: '', taxPin: '', notes: `Created from ${String(serviceData.name ?? 'service')} subscription` })])
+    }
+
+    const subscriptionId = randomUUID()
+    const nextInvoiceDate = nextInvoiceDateFor(input.data.billingCycle, input.data.startDate)
+    await client.query(`INSERT INTO service_subscriptions (id, workspace_id, service_id, customer_id, customer_name, customer_email, customer_phone,
+        rate_source, custom_rate, billing_cycle, status, payment_preference, start_date, next_invoice_date, notes, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11, $12, $13, $14, $15)`,
+    [subscriptionId, request.session!.workspaceId, request.params.serviceId, customerId, customerName, customerEmail, customerPhone,
+      input.data.rateSource, input.data.customRate.toFixed(2), input.data.billingCycle, input.data.paymentPreference,
+      input.data.startDate, nextInvoiceDate, input.data.notes, request.session!.userId])
+
+    // Optionally prepare a recurring invoice schedule so the subscription can be billed on
+    // its cycle. Recurring schedules are never posted automatically; an admin runs each due
+    // item, which keeps a human in control of what reaches the ledger.
+    let recurringTemplateId: string | null = null
+    if (input.data.createRecurringSchedule && input.data.billingCycle !== 'none') {
+      const amount = subscriptionAmount(serviceData, input.data.rateSource, input.data.customRate)
+      if (amount > 0) {
+        recurringTemplateId = randomUUID()
+        await client.query(`INSERT INTO recurring_templates (id, workspace_id, template_type, description, counterparty, amount, frequency, next_date, active, created_by, customer_email, customer_phone)
+          VALUES ($1, $2, 'invoice', $3, $4, $5, $6, $7, true, $8, $9, $10)`,
+        [recurringTemplateId, request.session!.workspaceId, `${String(serviceData.name ?? 'Service')} subscription`, customerName, amount.toFixed(2),
+          input.data.billingCycle === 'annually' ? 'annually' : input.data.billingCycle, nextInvoiceDate ?? input.data.startDate,
+          request.session!.userId, customerEmail, customerPhone])
+      }
+    }
+    await client.query('COMMIT')
+    response.status(201).json({ subscription: { id: subscriptionId, customerId, customerName, customerEmail, customerPhone, rateSource: input.data.rateSource, customRate: input.data.customRate, billingCycle: input.data.billingCycle, status: 'active', paymentPreference: input.data.paymentPreference, startDate: input.data.startDate, nextInvoiceDate, notes: input.data.notes }, recurringTemplateId })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if ((error as { code?: string }).code === '23505') { response.status(409).json({ error: 'This customer already subscribes to this service.' }); return }
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+
+app.patch('/v1/service-subscriptions/:subscriptionId', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    rateSource: z.enum(subscriptionRateSources).optional(),
+    customRate: z.coerce.number().finite().min(0).optional(),
+    billingCycle: z.enum(subscriptionCycles).optional(),
+    status: z.enum(['active', 'paused', 'cancelled']).optional(),
+    paymentPreference: z.enum(['cash', 'mpesa', 'either']).optional(),
+    notes: z.string().trim().max(2000).optional(),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Subscription changes are invalid.' }); return }
+  try {
+    const result = await pool!.query(`UPDATE service_subscriptions SET
+        rate_source = COALESCE($1, rate_source),
+        custom_rate = COALESCE($2, custom_rate),
+        billing_cycle = COALESCE($3, billing_cycle),
+        status = COALESCE($4, status),
+        payment_preference = COALESCE($5, payment_preference),
+        notes = COALESCE($6, notes),
+        next_invoice_date = CASE WHEN $3::text IS NULL THEN next_invoice_date
+          WHEN $3 = 'none' THEN NULL
+          ELSE COALESCE(next_invoice_date, start_date) END,
+        updated_at = now()
+      WHERE id = $7 AND workspace_id = $8
+      RETURNING id, customer_name, rate_source, custom_rate::text, billing_cycle, status, payment_preference, next_invoice_date, notes`,
+    [input.data.rateSource ?? null, input.data.customRate === undefined ? null : input.data.customRate.toFixed(2),
+      input.data.billingCycle ?? null, input.data.status ?? null, input.data.paymentPreference ?? null,
+      input.data.notes ?? null, request.params.subscriptionId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Subscription not found in this business.' }); return }
+    response.json({ subscription: result.rows[0] })
+  } catch (error) { next(error) }
+})
+
+// Create an internal invoice for one subscribed customer, carrying the service details and
+// the rate that applies to them. This is the "send invoice to customer" action in the UI.
+app.post('/v1/service-subscriptions/:subscriptionId/invoice', requirePool, verifyOrigin, requireSession, requireWorkspaceWriter, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    dueDate: z.string().date(),
+    amountOverride: z.coerce.number().finite().positive().max(999999999999).optional(),
+  }).safeParse(request.body ?? {})
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query(`SELECT s.*, r.data AS service_data FROM service_subscriptions s
+      JOIN workspace_records r ON r.id = s.service_id
+      WHERE s.id = $1 AND s.workspace_id = $2 FOR UPDATE`, [request.params.subscriptionId, request.session!.workspaceId])
+    const subscription = found.rows[0]
+    if (!subscription) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Subscription not found in this business.' }); return }
+    if (subscription.status === 'cancelled') { await client.query('ROLLBACK'); response.status(409).json({ error: 'This subscription is cancelled. Reactivate it before invoicing.' }); return }
+
+    const serviceData = subscription.service_data as Record<string, unknown>
+    const amount = input.success && input.data.amountOverride !== undefined
+      ? Number(input.data.amountOverride.toFixed(2))
+      : subscriptionAmount(serviceData, String(subscription.rate_source), Number(subscription.custom_rate))
+    if (amount <= 0) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This subscription has no billable rate. Set a consumer, renewal, or custom rate first.' }); return }
+    const dueDate = input.success ? input.data.dueDate : nextInvoiceDateFor('monthly', nairobiToday()) ?? nairobiToday()
+    const serviceName = String(serviceData.name ?? 'Service')
+    const invoiceId = randomUUID()
+    const cycleLabel = String(subscription.billing_cycle ?? 'none')
+    const description = `${serviceName}${cycleLabel && cycleLabel !== 'none' ? ` · ${cycleLabel} subscription` : ''}`.slice(0, 240)
+    await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+    [invoiceId, request.session!.workspaceId, subscription.customer_name, subscription.customer_email ?? '', description, amount.toFixed(2), dueDate])
+    await client.query(`INSERT INTO invoice_lines (id, invoice_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount)
+      VALUES ($1, $2, 1, $3, $4, 1, $5, 0, 0, $5)`,
+    [randomUUID(), invoiceId, subscription.service_id, description, amount.toFixed(2)])
+    await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${subscription.customer_name} — ${description}`, sourceType: 'invoice', sourceId: invoiceId, lines: [{ accountCode: '1100', debit: amount, credit: 0 }, { accountCode: '4000', debit: 0, credit: amount }] })
+    // Advance the next billing date on the subscription's cycle.
+    const nextDate = subscription.billing_cycle && subscription.billing_cycle !== 'none'
+      ? nextInvoiceDateFor(String(subscription.billing_cycle), String(subscription.next_invoice_date ?? nairobiToday()))
+      : null
+    if (nextDate) await client.query('UPDATE service_subscriptions SET next_invoice_date = $1, updated_at = now() WHERE id = $2', [nextDate, subscription.id])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId,     eventType: 'service_subscription.invoiced', entityType: 'service_subscription', entityId: String(subscription.id), eventData: { invoiceId, amount: amount.toFixed(2), customer: subscription.customer_name } })
+    await client.query('COMMIT')
+    response.status(201).json({ invoice: { id: invoiceId, customer: subscription.customer_name, customer_email: subscription.customer_email, description, amount: amount.toFixed(2), due_date: dueDate, status: 'unpaid' }, nextInvoiceDate: nextDate, paymentPreference: subscription.payment_preference })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+  } finally { client.release() }
+})
+
 app.use((_request, response) => response.status(404).json({ error: 'Not found' }))
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   if (error instanceof SyntaxError) { response.status(400).json({ error: 'Invalid JSON request body' }); return }
