@@ -549,7 +549,11 @@ async function requireSession(request: AuthedRequest, response: express.Response
         ? overrides.filter((permission: unknown): permission is WorkspacePermission => workspacePermissionNames.includes(permission as WorkspacePermission))
         : rolePermissionDefaults[request.workspaceRole] ?? (await pool!.query('SELECT permissions FROM custom_workspace_roles WHERE workspace_id = $1 AND role_key = $2', [request.session!.workspaceId, request.workspaceRole])).rows[0]?.permissions ?? []
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
-      const permission = permissionForRequest(request) ?? 'operations.write'
+      const routePath = String(request.route?.path ?? '')
+      const selfServiceRoute = routePath === '/v1/workspaces/:workspaceId/activate' || routePath === '/v1/auth/change-password' || routePath.startsWith('/v1/auth/two-factor/')
+      const permission = selfServiceRoute
+        ? null
+        : permissionForRequest(request) ?? 'operations.write'
       if (permission && !(request.workspacePermissions ?? []).includes(permission)) {
         response.status(403).json({ error: `Your workspace role does not have the ${permission} permission.` })
         return
@@ -561,6 +565,8 @@ async function requireSession(request: AuthedRequest, response: express.Response
 function permissionForRequest(request: AuthedRequest): WorkspacePermission | null {
   const routePath = String(request.route?.path ?? '')
   if (routePath === '/v1/workspaces/:workspaceId/activate') return null
+  if (routePath === '/v1/auth/change-password') return null
+  if (routePath.startsWith('/v1/auth/two-factor/')) return null
   if (routePath.includes('/invitations') || routePath.includes('/members') || routePath.includes('/roles')) return 'team.manage'
   if (routePath.startsWith('/v1/payroll') || routePath.startsWith('/v1/integrations/statutory')) return 'payroll.manage'
   if (routePath.startsWith('/v1/integrations')) return 'integrations.manage'
@@ -1216,6 +1222,105 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
     const income = Number(totals.rows[0].income) + Number(invoiceIncome.rows[0].income)
     const monthIncome = Number(totals.rows[0].month_income) + Number(invoiceIncome.rows[0].month_income)
     response.json({ workspaceName: workspace.rows[0]?.name ?? '', period: query.data, totals: { income: income.toFixed(2), expenses: totals.rows[0].expenses, net: (income - Number(totals.rows[0].expenses)).toFixed(2), monthIncome: monthIncome.toFixed(2), monthExpenses: totals.rows[0].month_expenses }, transactions: transactions.rows.map((row: Record<string, unknown>) => ({ ...row, transaction_date: asDateString(row.transaction_date) })), cashflow: cashflow.rows.map((row: Record<string, unknown>) => ({ ...row, date: asDateString(row.date) })), invoices: invoices.rows[0] })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/auth/change-password', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 8, standardHeaders: 'draft-8', legacyHeaders: false }), requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ currentPassword: z.string().min(1).max(200), newPassword: passwordSchema }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter your current password and a new password with at least 12 characters.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const user = await client.query('SELECT password_hash FROM users WHERE id = $1 FOR UPDATE', [request.session!.userId])
+    if (!user.rowCount || !(await verifyPassword(input.data.currentPassword, String(user.rows[0].password_hash)))) {
+      await client.query('ROLLBACK')
+      response.status(401).json({ error: 'The current password is incorrect.' }); return
+    }
+    if (await verifyPassword(input.data.newPassword, String(user.rows[0].password_hash))) {
+      await client.query('ROLLBACK')
+      response.status(400).json({ error: 'Choose a new password that is different from your current password.' }); return
+    }
+    await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [await hashPassword(input.data.newPassword), request.session!.userId])
+    await client.query('UPDATE password_reset_requests SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL', [request.session!.userId])
+    await client.query('UPDATE pending_two_factor_logins SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL', [request.session!.userId])
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'auth.password_changed', entityType: 'user', entityId: request.session!.userId, eventData: {} })
+    await client.query('COMMIT')
+    response.json({ changed: true })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
+// Search all business records through the active workspace session. The term is treated as a
+// literal substring, so SQL wildcard characters in a customer's query have no special meaning.
+app.get('/v1/search', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  const parsed = z.object({ q: z.string().trim().min(2).max(120), offset: z.coerce.number().int().min(0).max(100_000).default(0) }).safeParse(request.query)
+  if (!parsed.success) { response.status(400).json({ error: 'Enter at least two characters to search.' }); return }
+  const workspaceId = request.session!.workspaceId
+  const term = parsed.data.q.toLocaleLowerCase()
+  try {
+    const result = await pool!.query(`
+      SELECT * FROM (
+        SELECT id::text AS id, 'record'::text AS type, COALESCE(data->>'name', data->>'description', record_type) AS title,
+          concat_ws(' ', record_type, data->>'sku', data->>'description', data->>'category') AS details, NULL::text AS amount, updated_at::date::text AS date,
+          ''::text AS status, CASE record_type WHEN 'inventory' THEN 'Inventory' WHEN 'supplier' THEN 'Suppliers' WHEN 'project' THEN 'Projects' WHEN 'service' THEN 'Services' ELSE 'Networking' END AS page, updated_at AS sort_date
+        FROM workspace_records WHERE workspace_id = $1 AND position($2 in lower(concat_ws(' ', id::text, record_type, data::text))) > 0
+        UNION ALL
+        SELECT id::text, 'transaction', description, concat_ws(' ', account, direction), amount::text, transaction_date::text, direction, CASE WHEN direction = 'expense' THEN 'Expenses' ELSE 'Accounting' END, transaction_date::timestamptz
+        FROM ledger_transactions WHERE workspace_id = $1 AND position($2 in lower(concat_ws(' ', id::text, description, account, direction, amount::text, transaction_date::text))) > 0
+        UNION ALL
+        SELECT e.id::text, 'journal entry', e.description, concat_ws(' ', e.source_type, string_agg(DISTINCT a.name, ', ')), COALESCE(SUM(l.debit), 0)::text, e.entry_date::text, 'posted', 'Accounting', e.created_at
+        FROM journal_entries e LEFT JOIN journal_lines l ON l.journal_entry_id = e.id LEFT JOIN workspace_accounts a ON a.id = l.account_id
+        WHERE e.workspace_id = $1 GROUP BY e.id
+        HAVING position($2 in lower(concat_ws(' ', e.id::text, e.description, e.source_type, e.source_id::text, string_agg(DISTINCT a.name, ' '), string_agg(DISTINCT l.description, ' '), COALESCE(SUM(l.debit), 0)::text))) > 0
+        UNION ALL
+        SELECT id::text, 'invoice', customer, description, amount::text, due_date::text, status, 'Networking', created_at
+        FROM invoices WHERE workspace_id = $1 AND (position($2 in lower(concat_ws(' ', id::text, customer, customer_email, description, status, amount::text, due_date::text))) > 0 OR EXISTS (SELECT 1 FROM invoice_lines il WHERE il.invoice_id = invoices.id AND position($2 in lower(concat_ws(' ', il.description, il.quantity::text, il.unit_price::text))) > 0))
+        UNION ALL
+        SELECT id::text, 'estimate', customer, description, amount::text, valid_until::text, status, 'Networking', created_at
+        FROM estimates WHERE workspace_id = $1 AND (position($2 in lower(concat_ws(' ', id::text, customer, customer_email, description, status, amount::text, valid_until::text))) > 0 OR EXISTS (SELECT 1 FROM estimate_lines el WHERE el.estimate_id = estimates.id AND position($2 in lower(concat_ws(' ', el.description, el.quantity::text, el.unit_price::text))) > 0))
+        UNION ALL
+        SELECT id::text, 'supplier bill', supplier, description, amount::text, due_date::text, status, 'Expenses', created_at
+        FROM vendor_bills WHERE workspace_id = $1 AND (position($2 in lower(concat_ws(' ', id::text, supplier, description, status, amount::text, due_date::text))) > 0 OR EXISTS (SELECT 1 FROM vendor_bill_lines vl WHERE vl.bill_id = vendor_bills.id AND position($2 in lower(concat_ws(' ', vl.description, vl.quantity::text, vl.unit_price::text))) > 0))
+        UNION ALL
+        SELECT so.id::text, 'sales order', e.customer, e.description, e.amount::text, so.created_at::date::text, so.status, 'Networking', so.created_at
+        FROM sales_orders so JOIN estimates e ON e.id = so.estimate_id AND e.workspace_id = so.workspace_id
+        WHERE so.workspace_id = $1 AND position($2 in lower(concat_ws(' ', so.id::text, e.customer, e.description, so.status, e.amount::text))) > 0
+        UNION ALL
+        SELECT po.id::text, 'purchase order', po.supplier, concat_ws(' ', po.notes, lines.items), NULL::text, po.order_date::text, po.status, 'Inventory', po.created_at
+        FROM purchase_orders po LEFT JOIN LATERAL (SELECT string_agg(r.data->>'name', ' ') AS items FROM purchase_order_lines pol JOIN workspace_records r ON r.id = pol.item_id WHERE pol.purchase_order_id = po.id) lines ON true
+        WHERE po.workspace_id = $1 AND position($2 in lower(concat_ws(' ', po.id::text, po.supplier, po.notes, lines.items, po.status))) > 0
+        UNION ALL
+        SELECT bft.id::text, 'bank transaction', bft.narration, concat_ws(' ', bft.direction, bft.review_status, bft.currency), bft.amount::text, bft.transaction_date::text, bft.review_status, 'Banking', bft.created_at
+        FROM bank_feed_transactions bft WHERE bft.workspace_id = $1 AND position($2 in lower(concat_ws(' ', bft.id::text, bft.narration, bft.direction, bft.review_status, bft.amount::text, bft.transaction_date::text))) > 0
+        UNION ALL
+        SELECT oo.id::text, 'online order', oo.customer_name, concat_ws(' ', oo.source, oo.status), oo.total::text, oo.created_at::date::text, oo.status, 'Networking', oo.created_at
+        FROM online_store_orders oo WHERE oo.workspace_id = $1 AND position($2 in lower(concat_ws(' ', oo.id::text, oo.external_order_id, oo.customer_name, oo.customer_email, oo.customer_phone, oo.source, oo.status, oo.total::text))) > 0
+        UNION ALL
+        SELECT mr.id::text, 'M-Pesa payment', i.customer, concat_ws(' ', 'receipt', mr.mpesa_receipt_number, mr.result_description), mr.amount::text, mr.created_at::date::text, mr.status, 'Networking', mr.created_at
+        FROM mpesa_payment_requests mr JOIN invoices i ON i.id = mr.invoice_id AND i.workspace_id = mr.workspace_id
+        WHERE mr.workspace_id = $1 AND position($2 in lower(concat_ws(' ', mr.id::text, mr.mpesa_receipt_number, mr.result_description, mr.status, i.customer, i.description, mr.amount::text))) > 0
+        UNION ALL
+        SELECT ssp.id::text, 'supplier service payment', service.data->>'name', concat_ws(' ', 'supplier payment', ssp.billing_cycle, ssp.expense_recorded::text), ssp.amount::text, ssp.payment_date::text, CASE WHEN ssp.expense_recorded THEN 'expense recorded' ELSE 'not in ledger' END, 'Expenses', ssp.created_at
+        FROM service_supplier_payments ssp JOIN workspace_records service ON service.id = ssp.service_id AND service.workspace_id = ssp.workspace_id
+        WHERE ssp.workspace_id = $1 AND position($2 in lower(concat_ws(' ', ssp.id::text, service.data::text, ssp.amount::text, ssp.payment_date::text, ssp.billing_cycle, ssp.expense_recorded::text))) > 0
+        UNION ALL
+        SELECT im.id::text, 'inventory movement', item.data->>'name', concat_ws(' ', im.movement_type, im.reference), abs(im.quantity_delta)::text, im.moved_at::text, im.movement_type, 'Inventory', im.created_at
+        FROM inventory_movements im JOIN workspace_records item ON item.id = im.item_id AND item.workspace_id = im.workspace_id
+        WHERE im.workspace_id = $1 AND position($2 in lower(concat_ws(' ', im.id::text, item.data::text, im.movement_type, im.reference, im.quantity_delta::text, im.unit_cost::text))) > 0
+        UNION ALL
+        SELECT ip.id::text, 'invoice payment', i.customer, concat_ws(' ', i.description, 'payment', ip.payment_method, ip.payment_reference), ip.amount::text, ip.payment_date::text, 'recorded', 'Networking', ip.created_at
+        FROM invoice_payments ip JOIN invoices i ON i.id = ip.invoice_id AND i.workspace_id = ip.workspace_id
+        WHERE ip.workspace_id = $1 AND position($2 in lower(concat_ws(' ', ip.id::text, i.customer, i.description, ip.amount::text, ip.payment_date::text, ip.payment_method, ip.payment_reference))) > 0
+        UNION ALL
+        SELECT bp.id::text, 'bill payment', vb.supplier, concat_ws(' ', vb.description, 'payment'), bp.amount::text, bp.payment_date::text, 'recorded', 'Expenses', bp.created_at
+        FROM bill_payments bp JOIN vendor_bills vb ON vb.id = bp.bill_id AND vb.workspace_id = bp.workspace_id
+        WHERE bp.workspace_id = $1 AND position($2 in lower(concat_ws(' ', bp.id::text, vb.supplier, vb.description, bp.amount::text, bp.payment_date::text))) > 0
+      ) matches ORDER BY sort_date DESC NULLS LAST, id DESC LIMIT 100 OFFSET $3`, [workspaceId, term, parsed.data.offset])
+    const results = result.rows.map((row: Record<string, unknown>) => {
+      const { sort_date: _sortDate, ...publicResult } = row
+      return publicResult
+    })
+    response.json({ results, hasMore: results.length === 100 })
   } catch (error) { next(error) }
 })
 
@@ -2783,9 +2888,9 @@ app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, r
     const inviteToken = randomBytes(32).toString('base64url')
     const tokenHash = createHash('sha256').update(inviteToken).digest('hex')
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
-    const invite = await client.query(`INSERT INTO workspace_invitations (workspace_id, email, role, scope, invited_by, token_hash, expires_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, email, role, scope, status, expires_at`,
-    [request.session!.workspaceId, input.data.email ?? input.data.phone ?? '', input.data.role, input.data.scope, request.session!.userId, tokenHash, expiresAt])
+    const invite = await client.query(`INSERT INTO workspace_invitations (workspace_id, email, phone, role, scope, invited_by, token_hash, expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, email, phone, role, scope, status, expires_at`,
+    [request.session!.workspaceId, input.data.email ?? null, input.data.phone ?? null, input.data.role, input.data.scope, request.session!.userId, tokenHash, expiresAt])
     for (const target of targets) {
       await client.query('INSERT INTO invitation_workspaces (id, invitation_id, workspace_id) VALUES ($1, $2, $3)', [randomUUID(), invite.rows[0].id, target.workspace_id])
     }
@@ -2829,7 +2934,7 @@ app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, r
 app.get('/v1/workspaces/:workspaceId/invitations', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   if (request.params.workspaceId !== request.session!.workspaceId) { response.status(403).json({ error: 'Invitations can only be viewed for the active business.' }); return }
   try {
-    const result = await pool!.query('SELECT id, email, role, scope, status, expires_at, accepted_at, created_at FROM workspace_invitations WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
+    const result = await pool!.query('SELECT id, email, phone, role, scope, status, expires_at, accepted_at, created_at FROM workspace_invitations WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 100', [request.session!.workspaceId])
     response.json({ invitations: result.rows })
   } catch (error) { next(error) }
 })
@@ -2962,14 +3067,31 @@ app.delete('/v1/workspaces/:workspaceId/members/:userId', requirePool, verifyOri
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
-app.post('/v1/invitations/accept', requirePool, verifyOrigin, async (request, response, next) => {
-  const input = z.object({ token: z.string().min(32).max(200), email: emailSchema.optional(), password: passwordSchema.optional() }).safeParse(request.body)
+app.post('/v1/invitations/preview', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false }), async (request, response, next) => {
+  const input = z.object({ token: z.string().min(32).max(200) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Provide a valid invitation link.' }); return }
+  try {
+    const tokenHash = createHash('sha256').update(input.data.token).digest('hex')
+    const result = await pool!.query(`SELECT i.email, i.phone, i.role, i.expires_at,
+      COALESCE(json_agg(DISTINCT w.name) FILTER (WHERE w.name IS NOT NULL), '[]'::json) AS businesses
+      FROM workspace_invitations i
+      LEFT JOIN invitation_workspaces iw ON iw.invitation_id = i.id
+      LEFT JOIN workspaces w ON w.id = iw.workspace_id
+      WHERE i.token_hash = $1 AND i.status = 'pending' AND i.expires_at > now()
+      GROUP BY i.id`, [tokenHash])
+    if (!result.rowCount) { response.status(404).json({ error: 'Invitation is invalid, expired, or already used.' }); return }
+    response.json({ invitation: result.rows[0] })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/invitations/accept', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 12, standardHeaders: 'draft-8', legacyHeaders: false }), async (request, response, next) => {
+  const input = z.object({ token: z.string().min(32).max(200), email: emailSchema.optional(), phone: phoneSchema.optional(), password: passwordSchema.optional() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Provide a valid invitation token.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
     const tokenHash = createHash('sha256').update(input.data.token).digest('hex')
-    const inviteResult = await client.query(`SELECT i.id, i.email, i.role FROM workspace_invitations i
+    const inviteResult = await client.query(`SELECT i.id, i.email, i.phone, i.role FROM workspace_invitations i
       WHERE i.token_hash = $1 AND i.status = 'pending' AND i.expires_at > now() FOR UPDATE`, [tokenHash])
     const invite = inviteResult.rows[0]
     if (!invite) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invitation is invalid, expired, or already used.' }); return }
@@ -2978,26 +3100,42 @@ app.post('/v1/invitations/accept', requirePool, verifyOrigin, async (request, re
     const session = readSession(cookies(request.headers.cookie)[cookieName])
     let userId = session?.userId
     if (session) {
-      const user = await client.query('SELECT email FROM users WHERE id = $1', [session.userId])
-      if (String(user.rows[0]?.email ?? '').toLowerCase() !== String(invite.email).toLowerCase()) {
+      const user = await client.query('SELECT email, phone FROM users WHERE id = $1 FOR UPDATE', [session.userId])
+      const emailMatches = invite.email && String(user.rows[0]?.email ?? '').toLowerCase() === String(invite.email).toLowerCase()
+      const phoneMatches = invite.phone && String(user.rows[0]?.phone ?? '') === String(invite.phone)
+      if (!emailMatches && !phoneMatches) {
         await client.query('ROLLBACK')
-        response.status(403).json({ error: 'Sign in using the email address that received this invitation.' })
+        response.status(403).json({ error: 'Sign in using the email address or phone number that received this invitation.' })
         return
       }
+      const nextEmail = input.data.email ?? (user.rows[0]?.email ? null : invite.email)
+      const nextPhone = input.data.phone ?? (user.rows[0]?.phone ? null : invite.phone)
+      const duplicateContact = await client.query('SELECT id FROM users WHERE id <> $1 AND (($2::text IS NOT NULL AND email = $2) OR ($3::text IS NOT NULL AND phone = $3)) LIMIT 1', [session.userId, nextEmail, nextPhone])
+      if (duplicateContact.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'That email or phone number is already linked to another account.' }); return }
+      if (nextEmail || nextPhone) await client.query('UPDATE users SET email = COALESCE(email, $1), phone = COALESCE(phone, $2) WHERE id = $3', [nextEmail, nextPhone, session.userId])
     } else {
-      const existing = await client.query('SELECT id FROM users WHERE email = $1', [invite.email])
+      const email = input.data.email ?? (invite.email ? String(invite.email) : undefined)
+      const phone = input.data.phone ?? (invite.phone ? String(invite.phone) : undefined)
+      const invitedContactMatches = (!invite.email || email?.toLowerCase() === String(invite.email).toLowerCase()) && (!invite.phone || phone === String(invite.phone))
+      if (!invitedContactMatches) {
+        await client.query('ROLLBACK')
+        response.status(400).json({ error: 'Keep the invited email address or phone number unchanged.' })
+        return
+      }
+      if (!email && !phone) { await client.query('ROLLBACK'); response.status(400).json({ error: 'Add an email address or phone number for this account.' }); return }
+      const existing = await client.query('SELECT id FROM users WHERE ($1::text IS NOT NULL AND email = $1) OR ($2::text IS NOT NULL AND phone = $2) LIMIT 1', [email ?? null, phone ?? null])
       if (existing.rowCount) {
         await client.query('ROLLBACK')
-        response.status(401).json({ error: 'This email already has an account. Sign in with it, then accept the invitation.' })
+        response.status(401).json({ error: 'That email or phone already has an account. Sign in with it, then accept the invitation.' })
         return
       }
-      if (!input.data.password || !input.data.email || input.data.email.toLowerCase() !== String(invite.email).toLowerCase()) {
+      if (!input.data.password) {
         await client.query('ROLLBACK')
-        response.status(400).json({ error: 'For a new account, use the invited email address and choose a password of at least 12 characters.' })
+        response.status(400).json({ error: 'Choose a password with at least 12 characters to create this account.' })
         return
       }
       userId = randomUUID()
-      await client.query('INSERT INTO users (id, workspace_id, email, password_hash) VALUES ($1, $2, $3, $4)', [userId, targets.rows[0].workspace_id, invite.email, await hashPassword(input.data.password)])
+      await client.query('INSERT INTO users (id, workspace_id, email, phone, password_hash) VALUES ($1, $2, $3, $4, $5)', [userId, targets.rows[0].workspace_id, email ?? null, phone ?? null, await hashPassword(input.data.password)])
     }
     for (const target of targets.rows) {
       await client.query('INSERT INTO workspace_members (user_id, workspace_id, role) VALUES ($1, $2, $3) ON CONFLICT (user_id, workspace_id) DO NOTHING', [userId, target.workspace_id, invite.role])
@@ -3007,7 +3145,11 @@ app.post('/v1/invitations/accept', requirePool, verifyOrigin, async (request, re
     const workspaceId = String(targets.rows[0].workspace_id)
     setSessionCookie(response, { userId: userId!, workspaceId, expiresAt: Date.now() + sessionTtlSeconds * 1000 })
     response.json({ accepted: true, workspaceId, role: invite.role })
-  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if ((error as { code?: string }).code === '23505') { response.status(409).json({ error: 'That email or phone number is already linked to another account.' }); return }
+    next(error)
+  }
   finally { client.release() }
 })
 app.post('/v1/workspaces/:workspaceId/activate', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {

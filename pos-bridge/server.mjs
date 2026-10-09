@@ -32,6 +32,7 @@ function buildReceipt(input) {
   if (!input || typeof input !== 'object' || !Array.isArray(input.lines) || input.lines.length > 100) throw new Error('Receipt must contain up to 100 sale lines.')
   const invoiceId = clean(input.invoiceId, 80)
   const customer = clean(input.customer || 'Walk-in customer', 80)
+  const receiptBusinessName = clean(input.businessName || businessName, 80)
   const lines = input.lines.map((line) => {
     const description = clean(line.description, 100)
     const quantity = Number(line.quantity)
@@ -42,12 +43,22 @@ function buildReceipt(input) {
   const expected = lines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
   const amount = Number(input.amount)
   if (!Number.isFinite(amount) || amount < 0 || Math.abs(expected - amount) > 0.02) throw new Error('Receipt total does not match its lines.')
+  const amountPaid = Number(input.amountPaid ?? 0)
+  const balanceDue = Number(input.balanceDue ?? Math.max(0, amount - amountPaid))
+  if (!Number.isFinite(amountPaid) || amountPaid < 0 || amountPaid > amount + 0.02 || !Number.isFinite(balanceDue) || balanceDue < 0 || Math.abs(amountPaid + balanceDue - amount) > 0.02) throw new Error('Receipt payment totals are invalid.')
+  const paymentMethod = clean(input.paymentMethod || 'unrecorded', 40)
+  const paymentStatus = clean(input.status || 'Payment not recorded', 120)
+  const date = clean(input.createdAt ? new Date(input.createdAt).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }) : new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }), 60)
+  const email = clean(input.customerEmail, 100)
+  const phone = clean(input.customerPhone, 40)
 
   const chunks = [esc(0x1b, 0x40), esc(0x1b, 0x61, 1)]
-  chunks.push(Buffer.from(`${businessName}\n`, 'ascii'))
+  chunks.push(Buffer.from(`${receiptBusinessName}\n`, 'ascii'))
   chunks.push(Buffer.from('INTERNAL SALES RECEIPT\n', 'ascii'))
   chunks.push(esc(0x1b, 0x61, 0))
-  chunks.push(Buffer.from(`Invoice: ${invoiceId}\nCustomer: ${customer}\n`, 'ascii'))
+  chunks.push(Buffer.from(`Receipt date: ${date}\nInvoice: ${invoiceId}\nCustomer: ${customer}\n`, 'ascii'))
+  if (email) chunks.push(Buffer.from(`Email: ${email}\n`, 'ascii'))
+  if (phone) chunks.push(Buffer.from(`Phone: ${phone}\n`, 'ascii'))
   chunks.push(Buffer.from('--------------------------------\n', 'ascii'))
   for (const line of lines) {
     const total = (line.quantity * line.unitPrice).toFixed(2)
@@ -58,7 +69,8 @@ function buildReceipt(input) {
   chunks.push(esc(0x1b, 0x61, 2))
   chunks.push(Buffer.from(`TOTAL  KSh ${amount.toFixed(2)}\n`, 'ascii'))
   chunks.push(esc(0x1b, 0x61, 0))
-  chunks.push(Buffer.from('\nInternal receipt only; not an eTIMS tax invoice.\n\n\n', 'ascii'))
+  chunks.push(Buffer.from(`Payment: ${paymentMethod}\nPaid: KSh ${amountPaid.toFixed(2)}\nBalance due: KSh ${balanceDue.toFixed(2)}\nStatus: ${paymentStatus}\n`, 'ascii'))
+  chunks.push(Buffer.from('\nCustomer receipt. Internal record only; not an eTIMS tax invoice.\n\n\n', 'ascii'))
   chunks.push(esc(0x1d, 0x56, 0))
   return Buffer.concat(chunks)
 }

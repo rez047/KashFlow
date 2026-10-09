@@ -138,7 +138,7 @@ type Remittance = { id: string; remittance_type: string; amount: string; status:
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
 type InvoiceMpesaPayment = { id: string; status: string; amount: string; result_description?: string | null; mpesa_receipt_number?: string | null; created_at: string }
 type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number; kind: 'item' | 'service' }
-type PosReceipt = { invoiceId: string; customer: string; amount: number; paymentMethod: 'cash' | 'mpesa'; status: string; lines: PosCartLine[] }
+type PosReceipt = { invoiceId: string; businessName?: string; customer: string; customerEmail?: string; customerPhone?: string; amount: number; amountPaid: number; balanceDue: number; paymentMethod: string; status: string; createdAt: string; lines: PosCartLine[] }
 type PosCustomerSale = { id: string; description: string; amount: string; amount_paid: string; due_date: string; status: string; created_at: string }
 type PosCustomerHistory = { sales: PosCustomerSale[]; summary: { sale_count: number; lifetime_sales: string } }
 type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[] }
@@ -191,6 +191,8 @@ type RecurringTemplate = { id: string; template_type: 'invoice' | 'expense'; des
 type Reconciliation = { id: string; account_label: string; period_start: string; period_end: string; opening_balance: string; statement_ending_balance: string; status: string; matched_count: number }
 type ReconciliationDetail = { reconciliation: Reconciliation; transactions: Array<{ id: string; description: string; amount: string; direction: 'income' | 'expense'; account: string; transaction_date: string; matched: boolean }>; matchedNet: string; calculatedEndingBalance: string; difference: string }
 type WorkspaceRecord = { id: string; data: Record<string, string | number>; created_at: string; updated_at: string }
+type GlobalSearchResult = { id: string; type: string; title: string; details: string; amount: string | null; date: string | null; status: string; page: string }
+type InvitationPreview = { email: string | null; phone: string | null; role: string; expires_at: string; businesses: string[] }
 type StoredDocument = { id: string; file_name: string; mime_type: string; file_size: number; created_at: string }
 type ComplianceDraft = { id: string; integration_type: 'kra_etims' | 'statutory_filing'; source_type: 'invoice' | 'payroll_run'; source_id: string; payload_version: string; draft_payload: Record<string, unknown>; workflow_status: 'draft' | 'reviewed' | 'cancelled'; provider_status: string; external_invoice_number?: string; fiscal_receipt_signature?: string; reviewer_name?: string; reviewer_qualification?: string; reviewer_registration?: string; reviewer_reference?: string; provider_result?: Record<string, unknown> | null; created_at: string }
 type OnboardingMilestone = { integration_type: 'kra_etims' | 'bank_feeds' | 'statutory_filing'; milestone: string; self_reported_note: string; details?: Record<string, string | boolean>; updated_at: string }
@@ -757,6 +759,12 @@ function App() {
   const [overviewTo, setOverviewTo] = useState(today)
   const [overviewLoading, setOverviewLoading] = useState(false)
   const [search, setSearch] = useState('')
+  const [searchResults, setSearchResults] = useState<GlobalSearchResult[]>([])
+  const [searchLoading, setSearchLoading] = useState(false)
+  const [searchHasMore, setSearchHasMore] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const searchSequenceRef = useRef(0)
   const [modal, setModal] = useState<Modal>(null)
   const [toast, setToast] = useState('')
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -780,7 +788,13 @@ function App() {
   const [twoFactorCode, setTwoFactorCode] = useState('')
   const [twoFactorBusy, setTwoFactorBusy] = useState(false)
   const [twoFactorDisablePending, setTwoFactorDisablePending] = useState(false)
-  const [authMode, setAuthMode] = useState<'signin' | 'forgot' | 'reset'>('signin')
+  const [authMode, setAuthMode] = useState<'signin' | 'forgot' | 'reset' | 'invite'>('signin')
+  const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null)
+  const [invitationContact, setInvitationContact] = useState({ email: '', phone: '' })
+  const [invitationPasswordConfirm, setInvitationPasswordConfirm] = useState('')
+  const [passwordChange, setPasswordChange] = useState({ current: '', next: '', confirm: '' })
+  const [passwordChangeStatus, setPasswordChangeStatus] = useState('')
+  const [passwordChangeError, setPasswordChangeError] = useState('')
   const [authChannel, setAuthChannel] = useState<'email' | 'sms'>('email')
   const [newPassword, setNewPassword] = useState('')
   const [resetToken, setResetToken] = useState('')
@@ -986,16 +1000,36 @@ function App() {
   // A reset link lands on the homepage with ?reset=<token>, so open the reset form automatically.
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get('reset')
-    if (!token) return
-    setResetToken(token)
-    setAuthMode('reset')
+    if (token) {
+      setResetToken(token)
+      setAuthMode('reset')
+      setAuthPanelOpen(true)
+      return
+    }
+    const inviteToken = new URLSearchParams(window.location.search).get('invite')
+    if (!inviteToken) return
+    setAuthMode('invite')
     setAuthPanelOpen(true)
+    void request<{ invitation: InvitationPreview }>('/v1/invitations/preview', { method: 'POST', body: JSON.stringify({ token: inviteToken }) })
+      .then(({ invitation }) => {
+        setInvitationPreview(invitation)
+        setInvitationContact({ email: invitation.email ?? '', phone: invitation.phone ?? '' })
+        setCredentials((current) => ({ ...current, identifier: invitation.email ?? invitation.phone ?? '' }))
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load this invitation.'))
   }, [])
 
   function navigateTo(nextPage: string) {
     if (nextPage === page) return
     setPageHistory((history) => [...history, page])
     setPage(nextPage)
+  }
+
+  function openSearchResult(result: GlobalSearchResult) {
+    if (result.page === 'Networking') setNetworkingTab(['sales order', 'estimate'].includes(result.type) ? 'sales' : 'transactions')
+    navigateTo(result.page)
+    setSearchOpen(false)
+    setSearch('')
   }
 
   function navigateBack() {
@@ -1016,6 +1050,62 @@ function App() {
     const query = new URLSearchParams(period)
     setDashboard(await request<Dashboard>(`/v1/dashboard?${query}`))
   }, [overviewFrom, overviewRange, overviewTo])
+
+  const loadGlobalSearch = useCallback(async (term: string, sequence?: number) => {
+    const query = term.trim()
+    const requestSequence = sequence ?? ++searchSequenceRef.current
+    if (requestSequence !== searchSequenceRef.current) return
+    if (query.length < 2) { setSearchResults([]); setSearchHasMore(false); setSearchError('Enter at least two characters to search.'); setSearchOpen(true); return }
+    setSearchLoading(true)
+    setSearchError('')
+    setSearchOpen(true)
+    try {
+      const result = await request<{ results: GlobalSearchResult[]; hasMore: boolean }>(`/v1/search?q=${encodeURIComponent(query)}`)
+      if (requestSequence === searchSequenceRef.current) { setSearchResults(result.results); setSearchHasMore(result.hasMore) }
+    } catch (reason) {
+      if (requestSequence === searchSequenceRef.current) {
+        setSearchResults([])
+        setSearchHasMore(false)
+        setSearchError(reason instanceof Error ? reason.message : 'Could not search workspace records.')
+      }
+    } finally { if (requestSequence === searchSequenceRef.current) setSearchLoading(false) }
+  }, [])
+
+  async function loadMoreGlobalSearch() {
+    const query = search.trim()
+    if (query.length < 2 || !searchHasMore || searchLoading) return
+    const requestSequence = searchSequenceRef.current
+    setSearchLoading(true)
+    try {
+      const result = await request<{ results: GlobalSearchResult[]; hasMore: boolean }>(`/v1/search?q=${encodeURIComponent(query)}&offset=${searchResults.length}`)
+      if (requestSequence === searchSequenceRef.current) {
+        setSearchResults((current) => [...current, ...result.results])
+        setSearchHasMore(result.hasMore)
+      }
+    } catch (reason) {
+      if (requestSequence === searchSequenceRef.current) setSearchError(reason instanceof Error ? reason.message : 'Could not load more search results.')
+    } finally { if (requestSequence === searchSequenceRef.current) setSearchLoading(false) }
+  }
+
+  useEffect(() => {
+    const query = search.trim()
+    if (!account || query.length < 2) {
+      searchSequenceRef.current += 1
+      setSearchResults([])
+      setSearchHasMore(false)
+      setSearchError('')
+      setSearchLoading(false)
+      return
+    }
+    const requestSequence = ++searchSequenceRef.current
+    setSearchResults([])
+    setSearchHasMore(false)
+    setSearchError('')
+    setSearchLoading(true)
+    setSearchOpen(true)
+    const timer = window.setTimeout(() => { void loadGlobalSearch(query, requestSequence) }, 280)
+    return () => window.clearTimeout(timer)
+  }, [search, account?.workspace.id, loadGlobalSearch])
 
   // Load the two-factor status once a signed-in workspace is available.
   useEffect(() => {
@@ -1493,23 +1583,15 @@ function App() {
     event.preventDefault(); setBusy(true); setError('')
     try {
       const inviteToken = new URLSearchParams(window.location.search).get('invite')
-      if (inviteToken) {
-        let existingAccount: Account | null = null
-        try {
-          existingAccount = await request<Account>('/v1/auth/login', { method: 'POST', body: JSON.stringify({ identifier: credentials.identifier, password: credentials.password }) })
-        } catch {
-          existingAccount = null
-        }
-        if (existingAccount) {
-          setAccount(existingAccount)
-          await acceptPendingInvitation()
-        } else {
-          await request('/v1/invitations/accept', { method: 'POST', body: JSON.stringify({ token: inviteToken, email: credentials.identifier, password: credentials.password }) })
-          const acceptedAccount = await request<Account>('/v1/auth/me')
-          setAccount(acceptedAccount)
-          clearInvitationFromUrl()
-          notify('Account created and invitation accepted.')
-        }
+      if (inviteToken && authMode === 'invite') {
+        if (!invitationPreview) throw new Error('This invitation could not be loaded. Reopen the invitation link and try again.')
+        if (credentials.password.length < 12) throw new Error('Choose a password with at least 12 characters.')
+        if (credentials.password !== invitationPasswordConfirm) throw new Error('The passwords do not match.')
+        await request('/v1/invitations/accept', { method: 'POST', body: JSON.stringify({ token: inviteToken, email: invitationContact.email || undefined, phone: invitationContact.phone || undefined, password: credentials.password }) })
+        const acceptedAccount = await request<Account>('/v1/auth/me')
+        setAccount(acceptedAccount)
+        clearInvitationFromUrl()
+        notify('Account created and invitation accepted.')
         setShowSetupFlow(false); await refresh()
         return
       }
@@ -1681,7 +1763,7 @@ function App() {
     const token = parameters.get('invite')
     if (!token) return
     try {
-      await request('/v1/invitations/accept', { method: 'POST', body: JSON.stringify({ token }) })
+      await request('/v1/invitations/accept', { method: 'POST', body: JSON.stringify({ token, email: invitationContact.email || undefined, phone: invitationContact.phone || undefined }) })
       clearInvitationFromUrl()
       const signedIn = await request<Account>('/v1/auth/me')
       setAccount(signedIn)
@@ -1936,7 +2018,7 @@ type ZxingReader = {
   decodeFromCanvas: (canvas: HTMLCanvasElement) => { getText: () => string }
   reset: () => void
 }
-type CameraReader = { name: 'native' | 'zxing'; detect: (video: HTMLVideoElement) => Promise<string> }
+type CameraReader = { name: 'native' | 'hybrid' | 'zxing'; detect: (video: HTMLVideoElement) => Promise<string> }
 
 // ZXing is loaded on demand so the POS page stays light for keyboard-wedge registers that
 // never open the camera.
@@ -1976,22 +2058,32 @@ function createNativeDetector(): NativeBarcodeDetector | null {
   }
 }
 
-async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader> {
+async function createCameraReader(): Promise<CameraReader> {
   const nativeDetector = createNativeDetector()
-  if (nativeDetector) {
-    try {
-      // Probe once so a constructor that succeeds but cannot decode still falls through.
-      await nativeDetector.detect(video).catch(() => undefined)
-      return { name: 'native', detect: async (source) => (await nativeDetector.detect(source))[0]?.rawValue?.trim() ?? '' }
-    } catch { /* fall through to the ZXing engine below */ }
-  }
   const canvas = document.createElement('canvas')
   const context = canvas.getContext('2d', { willReadFrequently: true })
   if (!context) throw new Error('This browser cannot create a canvas for barcode reading.')
-  const reader = await createZxingReader()
+  let readerPromise: Promise<ZxingReader> | null = null
+  let nativeMisses = 0
+  let lastFallbackAttempt = 0
+  const getReader = () => readerPromise ??= createZxingReader()
   return {
-    name: 'zxing',
+    name: nativeDetector ? 'hybrid' : 'zxing',
     detect: async (source) => {
+      if (nativeDetector && nativeMisses < 12) {
+        try {
+          const value = (await nativeDetector.detect(source))[0]?.rawValue?.trim() ?? ''
+          if (value) return value
+          // Some browsers construct BarcodeDetector successfully but never decode a
+          // supported format. Switch to ZXing after a short grace period of real frames.
+          nativeMisses += 1
+          if (nativeMisses < 12) return ''
+        } catch { nativeMisses = 12 }
+      }
+      const now = Date.now()
+      if (now - lastFallbackAttempt < 90) return ''
+      lastFallbackAttempt = now
+      const reader = await getReader()
       // Downscale wide frames: decoding stays fast and small barcodes still resolve.
       const maxWidth = 1280
       const scale = source.videoWidth > maxWidth ? maxWidth / source.videoWidth : 1
@@ -2029,11 +2121,11 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
       if (!video) { stopCameraScan(); return }
       video.srcObject = stream
       video.setAttribute('playsinline', 'true')
-      await video.play().catch(() => undefined)
+      await video.play()
 
       let reader: CameraReader
       try {
-        reader = await createCameraReader(video)
+        reader = await createCameraReader()
       } catch (engineError) {
         stopCameraScan()
         setError(engineError instanceof Error
@@ -2155,7 +2247,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
         }),
       })
       setOfflinePosDrafts((current) => current.filter((item) => item.id !== draft.id))
-      setPosReceipt({ invoiceId: created.invoice.id, customer: draft.customer, amount: draft.amount, paymentMethod: 'cash', status: 'Created after reconnect · payment not recorded', lines: draft.lines })
+      setPosReceipt({ invoiceId: created.invoice.id, businessName: dashboard?.workspaceName, customer: draft.customer, amount: draft.amount, amountPaid: 0, balanceDue: draft.amount, paymentMethod: 'cash', status: 'Created after reconnect · payment not recorded', createdAt: new Date().toISOString(), lines: draft.lines })
       notify(`Offline draft synced as invoice ${created.invoice.id.slice(0, 8)}. Review payment and stock before releasing goods.`)
       const [inventory, listedInvoices, locationStock] = await Promise.all([
         request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
@@ -2234,7 +2326,9 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
         }),
       })
       setPosIdempotencyKey(crypto.randomUUID())
-      const receipt: PosReceipt = { invoiceId: created.invoice.id, customer, amount: total, paymentMethod: posPaymentMethod, status: 'Payment not yet recorded', lines: saleLines }
+      const customerEmail = savedCustomer ? String(savedCustomer.data.email ?? '') : posCustomerType === 'remote' ? posCustomerEmail.trim() : ''
+      const customerPhone = savedCustomer ? String(savedCustomer.data.phone ?? '') : posCustomerType === 'remote' ? posPaymentPhone.trim() : ''
+      const receipt: PosReceipt = { invoiceId: created.invoice.id, businessName: dashboard?.workspaceName, customer, customerEmail, customerPhone, amount: total, amountPaid: 0, balanceDue: total, paymentMethod: posPaymentMethod, status: 'Payment not yet recorded', createdAt: new Date().toISOString(), lines: saleLines }
       setPosReceipt(receipt)
       setPosCart([])
       setPosCustomer('')
@@ -2254,6 +2348,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
           try {
             if (split.method === 'cash') {
               await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today }) })
+              receipt.amountPaid += Number(split.amount)
             } else {
               await request<{ customerMessage: string }>(`/v1/invoices/${created.invoice.id}/payments/mpesa`, { method: 'POST', body: JSON.stringify({ phone: split.phone.trim() }) })
             }
@@ -2261,13 +2356,17 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
             failures.push(`${split.method === 'cash' ? 'Cash' : 'M-Pesa'} ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
           }
         }
+        receipt.balanceDue = Math.max(0, total - receipt.amountPaid)
+        receipt.paymentMethod = [...new Set(splits.map((split) => split.method))].join(' + ')
         setPaymentSplits((current) => ({ ...current, pos: [] }))
-        receipt.status = failures.length ? `Partially recorded · ${failures.join(' · ')}` : 'Paid · all methods recorded'
+        receipt.status = failures.length ? `Partially recorded · ${failures.join(' · ')}` : splits.some((split) => split.method === 'mpesa') ? `M-Pesa request started · ${money(receipt.amountPaid)} collected in cash; confirm M-Pesa before releasing goods` : 'Paid · cash recorded'
         if (failures.length) setError(`Sale saved as invoice ${created.invoice.id.slice(0, 8)}, but some split payments were not recorded: ${failures.join('; ')}`)
         else notify('Sale completed. Stock and split payments recorded.')
       } else if (posPaymentMethod === 'cash') {
         try {
           await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: total, paymentDate: today }) })
+          receipt.amountPaid = total
+          receipt.balanceDue = 0
           receipt.status = 'Paid · cash recorded'
           notify('Sale completed. Stock and cash payment recorded.')
         } catch (reason) {
@@ -2314,7 +2413,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
     setError('')
     try {
       await request(`/v1/invoices/${posReceipt.invoiceId}/payments`, { method: 'POST', body: JSON.stringify({ amount: posReceipt.amount, paymentDate: today }) })
-      setPosReceipt({ ...posReceipt, status: 'Paid · cash recorded' })
+      setPosReceipt({ ...posReceipt, amountPaid: posReceipt.amount, balanceDue: 0, status: 'Paid · cash recorded' })
       notify('Cash payment recorded against the saved POS invoice.')
       const listedInvoices = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
       setInvoicesList(listedInvoices.invoices)
@@ -3497,6 +3596,23 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
     finally { setBusy(false) }
   }
 
+  async function changeAccountPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setPasswordChangeError('')
+    setPasswordChangeStatus('')
+    if (passwordChange.next.length < 12) { setPasswordChangeError('Use at least 12 characters for the new password.'); return }
+    if (passwordChange.next !== passwordChange.confirm) { setPasswordChangeError('The new passwords do not match.'); return }
+    setBusy(true)
+    try {
+      await request('/v1/auth/change-password', { method: 'POST', body: JSON.stringify({ currentPassword: passwordChange.current, newPassword: passwordChange.next }) })
+      setPasswordChange({ current: '', next: '', confirm: '' })
+      setPasswordChangeStatus('Password changed successfully.')
+      notify('Account password changed.')
+    } catch (reason) {
+      setPasswordChangeError(reason instanceof Error ? reason.message : 'Could not change the password.')
+    } finally { setBusy(false) }
+  }
+
   async function saveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
@@ -3825,6 +3941,23 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
           <button type="button" className="auth-link" disabled={busy} onClick={() => { setTwoFactorChallenge(null); setError('') }}>Use a different account</button>
         </p>
         <p className="auth-note">Lost your device? Enter one of your saved recovery codes above. Each recovery code works only once.</p>
+      </form> : authMode === 'invite' ? <form className="auth-card auth-card-elevated" onSubmit={submitAuth}>
+        <button type="button" className="auth-close" onClick={() => { setAuthPanelOpen(false); setError('') }} aria-label="Close invitation"><X size={18} /></button>
+        <Brand />
+        <p className="auth-intro">Accept your business invitation</p>
+        {invitationPreview ? <p className="dialog-note">Invited as <strong>{invitationPreview.role}</strong> to {invitationPreview.businesses.join(', ') || 'a business workspace'}. Add your contact details and create a secure account.</p> : <p className="auth-note">Loading invitation details…</p>}
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <label className="field-label">Email address{invitationPreview?.email && <small> This address received the invitation and cannot be changed.</small>}
+          <input type="email" autoComplete="email" maxLength={254} required={Boolean(invitationPreview?.email)} readOnly={Boolean(invitationPreview?.email)} value={invitationContact.email} onChange={(event) => setInvitationContact((current) => ({ ...current, email: event.target.value }))} />
+        </label>
+        <label className="field-label">Phone number{invitationPreview?.phone && <small> This number received the invitation and cannot be changed.</small>}
+          <input type="tel" autoComplete="tel" maxLength={30} required={Boolean(invitationPreview?.phone)} readOnly={Boolean(invitationPreview?.phone)} value={invitationContact.phone} onChange={(event) => setInvitationContact((current) => ({ ...current, phone: event.target.value }))} />
+        </label>
+        <label className="field-label">Create password<input required type="password" minLength={12} autoComplete="new-password" value={credentials.password} onChange={(event) => setCredentials((current) => ({ ...current, password: event.target.value }))} /></label>
+        <label className="field-label">Confirm password<input required type="password" minLength={12} autoComplete="new-password" value={invitationPasswordConfirm} onChange={(event) => setInvitationPasswordConfirm(event.target.value)} /></label>
+        <button className="button button-primary auth-submit" disabled={busy || !invitationPreview}>{busy ? 'Accepting invitation…' : 'Create account and accept'}</button>
+        <p className="auth-cta-wrap"><button type="button" className="auth-link" disabled={busy} onClick={() => { setAuthMode('signin'); setCredentials((current) => ({ ...current, password: '' })); setError('') }}>Already have an account? Sign in to accept</button></p>
+        <p className="auth-note">Email addresses and phone numbers can each be linked to one KashFlow account.</p>
       </form> : authMode === 'forgot' ? <form className="auth-card auth-card-elevated" onSubmit={(event) => void submitForgotPassword(event)}>
         <button type="button" className="auth-close" onClick={() => { setAuthMode('signin'); setError(''); setResetStatus('') }} aria-label="Back to sign in"><ArrowLeft size={18} /></button>
         <Brand />
@@ -3920,7 +4053,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
       <div className="sidebar-bottom">
         <div className="help-card"><div className="help-icon"><ShieldCheck size={16} /></div><strong>{t('Private workspace')}</strong><p>{t('Records you enter are saved to your account database.')}</p></div>
         <div className="sidebar-utility-links" aria-label="Account and support">
-          {canUse('workspace.manage') && <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { teamPermissionsScrollPending.current = false; navigateTo('Settings'); setSidebarOpen(false) }}><Settings2 size={18} /> {t('Settings')}</button>}
+          <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { teamPermissionsScrollPending.current = false; navigateTo('Settings'); setSidebarOpen(false) }}><Settings2 size={18} /> {t('Settings')}</button>
           {canUse('team.manage') && <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { setSidebarOpen(false); if (page === 'Settings') document.getElementById('team-permissions')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); else { teamPermissionsScrollPending.current = true; navigateTo('Settings') } }}><Users size={18} /> Team &amp; Permissions</button>}
           <button className={`nav-link bottom-link ${page === 'Help' ? 'active' : ''}`} onClick={() => { navigateTo('Help'); setSidebarOpen(false) }}><LifeBuoy size={18} /> {t('Help & support')}</button>
         </div>
@@ -3937,7 +4070,24 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
         <div className="breadcrumbs"><span>{dashboard?.workspaceName}</span><ChevronRight size={14} /><strong>{t(page)}</strong><span className="demo-tag">{t('SAVED WORKSPACE DATA')}</span></div>
         <div className="topbar-actions">
           <label className="language-picker"><span>{t('Language')}</span><select aria-label={t('Language')} value={language} onChange={(event) => setLanguage(event.target.value as LanguageCode)}>{languages.map((item) => <option key={item.code} value={item.code}>{item.name}</option>)}</select></label>
-          <label className="search-box"><Search size={16} /><input aria-label="Search saved transactions" placeholder="Search records, settings, or help..." value={search} onChange={(event) => setSearch(event.target.value)} /><kbd>⌘ K</kbd></label>
+          <div className="global-search-wrap">
+            <form className="search-box" role="search" onSubmit={(event) => { event.preventDefault(); void loadGlobalSearch(search) }}>
+              <Search size={16} aria-hidden="true" />
+              <input aria-label="Search all workspace records and transactions" placeholder="Search records and transactions..." value={search} onFocus={() => setSearchOpen(true)} onKeyDown={(event) => { if (event.key === 'Escape') setSearchOpen(false) }} onChange={(event) => { setSearch(event.target.value); setSearchOpen(true) }} />
+              {searchLoading && <span className="search-loading" aria-label="Searching" />}
+              <button type="submit" className="search-submit">Search</button>
+            </form>
+            {searchOpen && search.trim().length > 0 && <div className="global-search-results" role="listbox" aria-label="Workspace search results" aria-live="polite">
+              {search.trim().length < 2 ? <p className="search-result-message">Enter at least two characters to search saved records.</p> : searchLoading && !searchResults.length ? <p className="search-result-message">Searching saved records…</p> : searchError ? <p className="search-result-message search-result-error">{searchError}</p> : searchResults.length ? <>
+                <p className="search-result-heading">{searchHasMore ? `${searchResults.length} results loaded` : `${searchResults.length} matching records`}</p>
+                {searchResults.map((result) => <button type="button" role="option" className="global-search-result" key={`${result.type}-${result.id}`} onMouseDown={(event) => event.preventDefault()} onClick={() => openSearchResult(result)}>
+                  <span className="global-search-result-main"><strong>{result.title || result.type}</strong><small>{result.type}{result.details ? ` · ${result.details}` : ''}</small></span>
+                  <span className="global-search-result-meta">{result.amount ? money(result.amount) : ''}{result.date ? <small>{result.date}</small> : null}{result.status ? <small>{result.status}</small> : null}</span>
+                </button>)}
+                {searchHasMore && <button type="button" className="search-more-results" disabled={searchLoading} onMouseDown={(event) => event.preventDefault()} onClick={() => void loadMoreGlobalSearch()}>{searchLoading ? 'Loading…' : 'Load more results'}</button>}
+              </> : <p className="search-result-message">No saved records match “{search.trim()}”.</p>}
+            </div>}
+          </div>
           <button className="icon-button notification-button" aria-label="Workspace status" onClick={() => setStatusOpen((open) => !open)}><Bell size={18} /></button>
           <button className="top-help" onClick={() => navigateTo('Help')}><CircleHelp size={17} /><span>Help</span></button>
         </div>
@@ -4662,7 +4812,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                   <button type="button" className={`pos-scanner-mode ${scannerMode === 'camera' ? 'active' : ''}`} aria-pressed={scannerMode === 'camera'} onClick={() => setScannerPreference('camera')}><Camera size={15} /> Phone camera</button>
                   <button type="button" className="pos-scanner-mode" onClick={toggleScannerBeep} aria-pressed={scannerBeep}><Volume2 size={15} /> {scannerBeep ? 'Beep on' : 'Beep off'}</button>
                 </div>
-                <p className="pos-scanner-hint">{scannerMode === 'keyboard' ? 'Keyboard-wedge readers work anywhere on this page — just scan. A USB HID or Bluetooth SPP/2D scanner types the code and presses Enter. You can also type a SKU and press Enter.' : cameraScanning ? 'Point the rear camera at a barcode. Hold it steady, fill most of the frame, and avoid glare or a screen reflection. Codes scan automatically and add to the sale.' : 'Camera scanning works on phones and tablets, including iPhone. Held flat, a barcode printed on paper reads best; a barcode shown on another screen also works but needs good lighting and no glare.'}</p>
+                <p className="pos-scanner-hint">{scannerMode === 'keyboard' ? 'Keyboard-wedge readers work anywhere on this page — just scan. Pair a USB or Bluetooth reader in HID/keyboard mode with an Enter suffix; it types the code and the sale adds the matching item. You can also type a SKU and press Enter.' : cameraScanning ? 'Point the rear camera at a barcode. Hold it steady, fill most of the frame, and avoid glare or a screen reflection. Codes scan automatically and add to the sale.' : 'Camera scanning works on phones and tablets, including iPhone. Hold a printed barcode steady in good light; barcodes shown on another screen also work when the image is clear and free of glare.'}</p>
                 {scannerMode === 'camera' && <div className="pos-camera">
                   <video ref={cameraVideoRef} className="pos-camera-video" muted playsInline aria-label="Barcode camera preview" />
                   <div className="button-row">
@@ -4737,10 +4887,10 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
             </aside>
           </div>
           {posReceipt && <div className="module-card pos-last-sale"><div><div className="eyebrow">LAST SALE · {posReceipt.invoiceId.slice(0, 8).toUpperCase()}</div><h2>{money(posReceipt.amount)}</h2><p>{posReceipt.customer} · {posReceipt.status}</p></div>
-            <div className="button-row"><button className="button button-secondary" onClick={() => window.print()}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod === 'cash' && posReceipt.status.startsWith('Paid') && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}<button className="button button-secondary" onClick={() => { setNetworkingTab('sales'); navigateTo('Networking') }}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
-            <details className="module-footnote"><summary>Receipt printer setup · Windows local bridge</summary><p>Install and run the local bridge on this checkout computer, configured for an ESC/POS network printer. It is separate from the browser print option; compatible printer, network access, and drawer cable are required.</p><div className="field-row"><label className="field-label">Local bridge URL<input value={posBridgeAddress} onChange={(event) => changePosBridgeAddress(event.target.value)} placeholder="http://127.0.0.1:17371" /></label><button className="button button-small" disabled={posBridgeBusy} onClick={() => void testPosBridge()}>{posBridgeBusy ? 'Checking…' : t('Test connection')}</button></div>{posBridgeStatus && <p role="status">{t(posBridgeStatus)}</p>}<small>{t('Internal receipt only; not an eTIMS tax invoice.')} Cash drawer is enabled only after a cash payment is recorded.</small></details>
+            <div className="button-row"><button className="button button-secondary" onClick={() => window.print()}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod.toLowerCase().includes('cash') && posReceipt.amountPaid > 0 && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}<button className="button button-secondary" onClick={() => { setNetworkingTab('sales'); navigateTo('Networking') }}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
+            <details className="module-footnote"><summary>Receipt printer setup</summary><p>Use Print receipt to choose any printer installed on this computer, including a USB printer or network printer. Thermal print uses the optional local bridge and a compatible ESC/POS network printer on port 9100.</p><div className="field-row"><label className="field-label">Local bridge URL<input value={posBridgeAddress} onChange={(event) => changePosBridgeAddress(event.target.value)} placeholder="http://127.0.0.1:17371" /></label><button className="button button-small" disabled={posBridgeBusy} onClick={() => void testPosBridge()}>{posBridgeBusy ? 'Checking…' : t('Test connection')}</button></div>{posBridgeStatus && <p role="status">{t(posBridgeStatus)}</p>}<small>{t('Internal receipt only; not an eTIMS tax invoice.')} Cash drawer is enabled only after a cash payment is recorded.</small></details>
           </div>}
-          {posReceipt && <article className="pos-receipt-print"><div className="pos-receipt-brand"><strong>KashFlow</strong><span>{dashboard?.workspaceName}</span></div><h2>{t('SALE RECEIPT')}</h2><p>{t('Invoice')} {posReceipt.invoiceId.slice(0, 8).toUpperCase()} · {today}</p><p>{t('Customer')}: {posReceipt.customer}</p><hr />{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.quantity} × {line.description}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><strong>{t('Total')}</strong><strong>{money(posReceipt.amount)}</strong></div><p>{posReceipt.status}</p><small>{t('Internal receipt only; not an eTIMS tax invoice.')}</small></article>}
+          {posReceipt && <article className="pos-receipt-print"><div className="pos-receipt-brand"><strong>KashFlow</strong><span>{dashboard?.workspaceName}</span></div><h2>{t('CUSTOMER RECEIPT')}</h2><p>Receipt {posReceipt.invoiceId.slice(0, 8).toUpperCase()} · {new Date(posReceipt.createdAt).toLocaleString('en-KE', { dateStyle: 'medium', timeStyle: 'short' })}</p><p>Invoice: {posReceipt.invoiceId}</p><p>Customer: {posReceipt.customer}</p>{posReceipt.customerEmail && <p>Email: {posReceipt.customerEmail}</p>}{posReceipt.customerPhone && <p>Phone: {posReceipt.customerPhone}</p>}<hr />{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.description}<small>{line.quantity} × {money(line.unitPrice)} each</small></span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><strong>Total</strong><strong>{money(posReceipt.amount)}</strong></div><div className="pos-receipt-line"><span>Payment method</span><span>{posReceipt.paymentMethod.toUpperCase()}</span></div><div className="pos-receipt-line"><span>Amount paid</span><span>{money(posReceipt.amountPaid)}</span></div><div className="pos-receipt-line"><strong>Balance due</strong><strong>{money(posReceipt.balanceDue)}</strong></div><p>Payment status: {posReceipt.status}</p><small>Customer receipt. This is an internal receipt, not an eTIMS tax invoice.</small></article>}
         </section> : page === 'Networking' && networkingTab === 'sales' ? (
           <section className="module-page">
             <div className="eyebrow"><span className="live-dot" /> NETWORKING · {dashboard?.workspaceName}</div>
@@ -4875,9 +5025,9 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
           </section>
         ) : page === 'Settings' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> SETTINGS · {dashboard?.workspaceName}</div>
-          <h1>Business settings</h1>
-          <p className="welcome-subtitle">Update saved workspace defaults and provider preferences for this business. These toggles control whether this workspace allows live integrations and statutory routes.</p>
-          <form onSubmit={saveSettings} className="module-card">
+          <h1>{canUse('workspace.manage') ? 'Business settings' : 'Settings and account security'}</h1>
+          <p className="welcome-subtitle">{canUse('workspace.manage') ? 'Update saved workspace defaults and provider preferences for this business. These toggles control whether this workspace allows live integrations and statutory routes.' : 'Manage your account password and sign-in protection. Workspace defaults are available to business administrators.'}</p>
+          {canUse('workspace.manage') && <form onSubmit={saveSettings} className="module-card">
             <div className="field-row"><label className="field-label">Business name<input value={settings.businessName || dashboard?.workspaceName || ''} onChange={(event) => setSettings({ ...settings, businessName: event.target.value })} /></label><label className="field-label">Currency<select value={settings.currency} onChange={(event) => setSettings({ ...settings, currency: event.target.value })}><option value="KES">KES</option><option value="USD">USD</option><option value="GBP">GBP</option></select></label></div>
             <div className="field-row"><label className="field-label">Timezone<select value={settings.timezone} onChange={(event) => setSettings({ ...settings, timezone: event.target.value })}><option value="Africa/Nairobi">Africa/Nairobi</option><option value="UTC">UTC</option><option value="Africa/Kampala">Africa/Kampala</option></select></label><label className="field-label">Default invoice terms<select value={settings.invoiceTerms} onChange={(event) => setSettings({ ...settings, invoiceTerms: event.target.value })}><option value="Net 7">Net 7</option><option value="Net 14">Net 14</option><option value="Net 30">Net 30</option></select></label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.emailAlerts} onChange={(event) => setSettings({ ...settings, emailAlerts: event.target.checked })} /> Email alert preference (delivery not configured)</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.auditTrail} onChange={(event) => setSettings({ ...settings, auditTrail: event.target.checked })} /> Audit log preference (supported events are recorded)</label></div>
@@ -4890,7 +5040,17 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
             <p className="dialog-note">Split payments only change how a payment is captured: each method is still recorded and verified on its own, and an M-Pesa request still needs a live connection. Total must match the invoice or sale.</p>
             {error && <p className="form-error" role="alert">{error}</p>}
             <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
-          </form>
+          </form>}
+            <section className="module-card security-card password-change-card">
+              <div className="panel-header"><div><h2>Change account password</h2><p>Confirm your current password, then choose a new password of at least 12 characters. Your password is stored as a one-way scrypt hash.</p></div><ShieldCheck size={20} /></div>
+              <form onSubmit={(event) => void changeAccountPassword(event)}>
+                <label className="field-label">Current password<input required type="password" autoComplete="current-password" value={passwordChange.current} onChange={(event) => setPasswordChange((current) => ({ ...current, current: event.target.value }))} /></label>
+                <div className="field-row"><label className="field-label">New password<input required type="password" minLength={12} autoComplete="new-password" value={passwordChange.next} onChange={(event) => setPasswordChange((current) => ({ ...current, next: event.target.value }))} /></label><label className="field-label">Confirm new password<input required type="password" minLength={12} autoComplete="new-password" value={passwordChange.confirm} onChange={(event) => setPasswordChange((current) => ({ ...current, confirm: event.target.value }))} /></label></div>
+                {passwordChangeError && <p className="form-error" role="alert">{passwordChangeError}</p>}
+                {passwordChangeStatus && <p className="dialog-note" role="status">{passwordChangeStatus}</p>}
+                <div className="dialog-actions"><button type="submit" className="button button-primary" disabled={busy || !passwordChange.current || passwordChange.next.length < 12 || !passwordChange.confirm}>{busy ? 'Changing password…' : 'Change password'}</button></div>
+              </form>
+            </section>
             <section className="module-card security-card">
               <div className="panel-header"><div><h2>Account security · two-factor authentication</h2><p>Protect this account's access to your business with an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, or any TOTP app). No paid service is required.</p></div><span className={`status-pill ${twoFactorStatus?.enabled ? 'green' : 'amber'}`}>{twoFactorStatus?.enabled ? 'Enabled' : twoFactorSetup?.otpauthUri ? 'Setup in progress' : 'Not enabled'}</span></div>
               <label className="field-label checkbox-row"><input type="checkbox" checked={Boolean(twoFactorStatus?.enabled || twoFactorSetup?.otpauthUri)} disabled={!twoFactorStatus || twoFactorBusy || (!twoFactorStatus.available && !twoFactorStatus.enabled)} onChange={(event) => toggleTwoFactor(event.target.checked)} /> Enable two-factor authentication for this account</label>
