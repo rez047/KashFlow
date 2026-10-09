@@ -898,6 +898,11 @@ function App() {
   const [accountingPeriods, setAccountingPeriods] = useState<AccountingPeriod[]>([])
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([])
   const [databaseBackups, setDatabaseBackups] = useState<DatabaseBackup[]>([])
+  // Restore is a platform-wide, destructive action: it overwrites every business in the
+  // database, so it requires the operator token AND an exact confirmation phrase.
+  const [backupOperatorToken, setBackupOperatorToken] = useState('')
+  const [restoreBackupKey, setRestoreBackupKey] = useState('')
+  const [restoreConfirmation, setRestoreConfirmation] = useState('')
   const [backupStatus, setBackupStatus] = useState('')
   const [exportBusy, setExportBusy] = useState(false)
   const [recordImportType, setRecordImportType] = useState<ImportType>('customers')
@@ -3514,6 +3519,24 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
     finally { setBusy(false) }
   }
 
+  async function restoreDatabaseBackupNow(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError(''); setBackupStatus('')
+    try {
+      if (!backupOperatorToken) throw new Error('Enter the platform backup operator token.')
+      if (!restoreBackupKey) throw new Error('Choose the backup to restore.')
+      if (restoreConfirmation !== 'RESTORE THE ENTIRE DATABASE') throw new Error('Type the exact restore confirmation phrase.')
+      const result = await request<{ restoredKey: string; safetyBackupKey: string }>('/v1/platform/backups/restore', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${backupOperatorToken}` },
+        body: JSON.stringify({ key: restoreBackupKey, confirmation: restoreConfirmation }),
+      })
+      setRestoreConfirmation('')
+      setBackupStatus(`Restored the database from ${result.restoredKey}. A pre-restore safety snapshot was saved as ${result.safetyBackupKey}. Restart the normal deployment, apply migrations, and verify business data before resuming traffic.`)
+      await loadDatabaseBackups()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not restore the database backup.') }
+    finally { setBusy(false) }
+  }
+
   async function previewRecordImport(file: File) {
     setBusy(true); setError(''); setRecordImportPreview(null); setRecordImportRows([])
     try {
@@ -4796,7 +4819,17 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
               </div>
               {backupStatus && <p role="status" className="dialog-note">{backupStatus}</p>}
               {databaseBackups.length > 0 && <div className="backup-list">{databaseBackups.map((backup) => <div className="transaction-row" key={backup.key}><span><strong>{backup.key}</strong><small>{backup.lastModified ? new Date(backup.lastModified).toLocaleString('en-KE') : 'Timestamp unavailable'} · {(backup.size / (1024 * 1024)).toFixed(1)} MB</small></span></div>)}</div>}
-              <p className="dialog-note"><ShieldCheck size={14} /> Restoring a full snapshot is a platform-level action that overwrites every business, so it deliberately still requires operator authorization and maintenance mode. Ask your KashFlow operator if you ever need a restore. For day-to-day safety, export your business data below and keep it somewhere secure.</p>
+              <details className="backup-restore-form">
+                <summary>Restore the entire database (operator only)</summary>
+                <p className="dialog-note"><ShieldCheck size={14} /> This overwrites <strong>every business</strong> on the platform, not just this one. It needs the platform operator token, an exact confirmation phrase, and the API service started with <code>BACKUP_RESTORE_MAINTENANCE_MODE=true</code>. Take a snapshot first and do it during planned downtime.</p>
+                <form onSubmit={(event) => void restoreDatabaseBackupNow(event)}>
+                  <label className="field-label">Platform backup operator token<input type="password" autoComplete="off" value={backupOperatorToken} onChange={(event) => setBackupOperatorToken(event.target.value)} /></label>
+                  <label className="field-label">Backup to restore<input required placeholder="database-backups/hourly-03.dump" value={restoreBackupKey} onChange={(event) => setRestoreBackupKey(event.target.value)} /><small>Use the exact key listed above. Hourly objects are named hourly-00.dump through hourly-23.dump.</small></label>
+                  <label className="field-label">Type RESTORE THE ENTIRE DATABASE to confirm<input required autoComplete="off" value={restoreConfirmation} onChange={(event) => setRestoreConfirmation(event.target.value)} /></label>
+                  <button className="button button-primary backup-restore-button" disabled={busy || !backupOperatorToken || !restoreBackupKey || restoreConfirmation !== 'RESTORE THE ENTIRE DATABASE'}>{busy ? 'Restoring…' : 'Restore selected backup'}</button>
+                </form>
+              </details>
+              <p className="dialog-note">For day-to-day safety, export your business data under Settings. Exports need no key and contain this business only.</p>
             </section>
             <section className="module-card">
               <h2>Export workspace data</h2>
