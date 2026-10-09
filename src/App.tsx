@@ -4387,7 +4387,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
                         <small className="service-subscriber-history">Last paid {subscription.last_paid_at ? `${String(subscription.last_paid_at).slice(0, 10)} · ${money(subscription.last_paid_amount)}` : 'never'} · {subscription.invoice_count} bill{subscription.invoice_count === 1 ? '' : 's'} recorded{subscription.notes ? ` · ${subscription.notes}` : ''}</small>
                       </div>
                       <div className="service-subscriber-actions">
-                        <button type="button" className="button button-primary button-small" disabled={busy || subscription.status !== 'active' || !canUse('sales.write')} onClick={() => {
+                        <button type="button" className="button button-primary button-small" disabled={busy || subscription.status === 'cancelled' || (subscription.status !== 'active' && !subscription.open_invoice_id) || !canUse('sales.write')} onClick={() => {
                           setSubscriptionBillingId(billingOpen ? '' : subscription.id)
                           setSubscriptionBillingInput({ dueDate: subscription.next_invoice_date ?? today, paymentDate: today, cashAmount: '', mpesaAmount: '', mpesaReference: '' })
                         }}><FileText size={14} /> {subscription.open_invoice_id ? 'Record payment' : 'Bill subscriber'}</button>

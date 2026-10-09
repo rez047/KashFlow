@@ -5490,7 +5490,9 @@ app.post('/v1/service-subscriptions/:subscriptionId/billing', requirePool, verif
     mpesaReference: z.string().trim().max(100).default(''),
   }).safeParse(request.body ?? {})
   if (!input.success) { response.status(400).json({ error: 'Enter a valid due date and non-negative cash or M-Pesa payment amounts.' }); return }
-  const paymentTotal = Number((input.data.cashAmount + input.data.mpesaAmount).toFixed(2))
+  const cashAmount = Number(input.data.cashAmount.toFixed(2))
+  const mpesaAmount = Number(input.data.mpesaAmount.toFixed(2))
+  const paymentTotal = Number((cashAmount + mpesaAmount).toFixed(2))
   if (input.data.invoiceId && paymentTotal <= 0) { response.status(400).json({ error: 'Enter an amount received before recording an additional payment.' }); return }
 
   const client = await pool!.connect()
@@ -5544,19 +5546,19 @@ app.post('/v1/service-subscriptions/:subscriptionId/billing', requirePool, verif
     const applied = Math.min(paymentTotal, outstanding)
     const overpayment = Number((paymentTotal - applied).toFixed(2))
     if (paymentTotal > 0) {
-      if (input.data.cashAmount > 0) await client.query(`INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, created_by, payment_method)
+      if (cashAmount > 0) await client.query(`INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, created_by, payment_method)
         VALUES ($1, $2, $3, $4, $5, $6, 'cash')`,
-      [randomUUID(), request.session!.workspaceId, invoice.id, input.data.cashAmount.toFixed(2), input.data.paymentDate, request.session!.userId])
-      if (input.data.mpesaAmount > 0) await client.query(`INSERT INTO invoice_payments
+      [randomUUID(), request.session!.workspaceId, invoice.id, cashAmount.toFixed(2), input.data.paymentDate, request.session!.userId])
+      if (mpesaAmount > 0) await client.query(`INSERT INTO invoice_payments
         (id, workspace_id, invoice_id, amount, payment_date, created_by, payment_method, payment_reference)
         VALUES ($1, $2, $3, $4, $5, $6, 'mpesa', $7)`,
-      [randomUUID(), request.session!.workspaceId, invoice.id, input.data.mpesaAmount.toFixed(2), input.data.paymentDate, request.session!.userId, input.data.mpesaReference])
+      [randomUUID(), request.session!.workspaceId, invoice.id, mpesaAmount.toFixed(2), input.data.paymentDate, request.session!.userId, input.data.mpesaReference])
       const paidAmount = Math.min(Number(invoice.amount), Number(invoice.amount_paid ?? 0) + applied)
       await client.query(`UPDATE invoices SET amount_paid = $1, status = CASE WHEN $1 >= amount THEN 'paid' ELSE 'unpaid' END
         WHERE id = $2 AND workspace_id = $3`, [paidAmount.toFixed(2), invoice.id, request.session!.workspaceId])
       const lines: JournalLineInput[] = []
-      if (input.data.cashAmount > 0) lines.push({ accountCode: '1000', debit: input.data.cashAmount, credit: 0, description: 'Cash received' })
-      if (input.data.mpesaAmount > 0) lines.push({ accountCode: '1000', debit: input.data.mpesaAmount, credit: 0, description: 'M-Pesa received' })
+      if (cashAmount > 0) lines.push({ accountCode: '1000', debit: cashAmount, credit: 0, description: 'Cash received' })
+      if (mpesaAmount > 0) lines.push({ accountCode: '1000', debit: mpesaAmount, credit: 0, description: 'M-Pesa received' })
       if (applied > 0) lines.push({ accountCode: '1100', debit: 0, credit: applied, description: 'Applied to subscriber bill' })
       if (overpayment > 0) lines.push({ accountCode: '2300', debit: 0, credit: overpayment, description: 'Customer advance' })
       await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId,
@@ -5564,11 +5566,11 @@ app.post('/v1/service-subscriptions/:subscriptionId/billing', requirePool, verif
         sourceType: 'service_subscription_payment', sourceId: String(invoice.id), lines })
       await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId,
         eventType: 'service_subscription.payment_recorded', entityType: 'service_subscription', entityId: String(subscription.id),
-        eventData: { invoiceId: invoice.id, paymentDate: input.data.paymentDate, cashAmount: input.data.cashAmount, mpesaAmount: input.data.mpesaAmount, applied: applied.toFixed(2), overpayment: overpayment.toFixed(2) } })
+        eventData: { invoiceId: invoice.id, paymentDate: input.data.paymentDate, cashAmount, mpesaAmount, applied: applied.toFixed(2), overpayment: overpayment.toFixed(2) } })
     }
     const refreshed = await client.query('SELECT id, customer, customer_email, description, amount::text, amount_paid::text, due_date, status FROM invoices WHERE id = $1', [invoice.id])
     await client.query('COMMIT')
-    response.status(201).json({ invoice: { ...refreshed.rows[0], due_date: dateOnly(refreshed.rows[0].due_date) }, payment: { received: paymentTotal.toFixed(2), applied: applied.toFixed(2), overpayment: overpayment.toFixed(2), cashAmount: input.data.cashAmount.toFixed(2), mpesaAmount: input.data.mpesaAmount.toFixed(2), paymentDate: input.data.paymentDate }, nextInvoiceDate })
+    response.status(201).json({ invoice: { ...refreshed.rows[0], due_date: dateOnly(refreshed.rows[0].due_date) }, payment: { received: paymentTotal.toFixed(2), applied: applied.toFixed(2), overpayment: overpayment.toFixed(2), cashAmount: cashAmount.toFixed(2), mpesaAmount: mpesaAmount.toFixed(2), paymentDate: input.data.paymentDate }, nextInvoiceDate })
   } catch (error) {
     await client.query('ROLLBACK')
     if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
