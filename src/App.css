@@ -631,10 +631,11 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .report-performance-stat small{display:block;color:#7a7c8c;font-size:11px}
 .report-performance-stat strong{display:block;margin:7px 0 8px;font-size:24px;letter-spacing:-.6px;color:#26263a}
 .report-performance-bars{display:flex;align-items:flex-end;gap:8px;height:150px;padding:12px;border:1px solid #ececf2;border-radius:12px;background:#fff}
-.report-performance-bars>div{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:6px;height:100%}
-.report-performance-bars i{width:100%;min-height:3px;border-radius:5px 5px 2px 2px;background:linear-gradient(180deg,#8065e9,#6d54d6)}
-.report-performance-bars i.is-today{background:linear-gradient(180deg,#37b58c,#268a68)}
-.report-performance-bars span{font-size:9px;color:#86879a;white-space:nowrap}
+.report-performance-bars>div{flex:1;min-width:0;display:flex;flex-direction:row;align-items:flex-end;justify-content:center;gap:3px;height:100%;position:relative;padding-bottom:16px}
+.report-performance-bars i{width:38%;max-width:14px;min-height:2px;border-radius:4px 4px 2px 2px}
+.report-performance-bars i.is-income{background:linear-gradient(180deg,#8065e9,#6d54d6)}
+.report-performance-bars i.is-expense{background:linear-gradient(180deg,#48b99e,#359b7c)}
+.report-performance-bars span{position:absolute;bottom:0;left:0;right:0;text-align:center;font-size:9px;color:#86879a;white-space:nowrap}
 @media(max-width:760px){.report-performance{grid-template-columns:1fr}.stock-location-grid{grid-template-columns:1fr}}
 
 /* Split payment capture (optional, enabled per business in Settings). */

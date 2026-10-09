@@ -5,26 +5,18 @@
 -- the API schema accepted it. PostgreSQL auto-names an inline column check as
 -- "<table>_<column>_check", so the constraint to drop here is workspace_records_record_type_check.
 --
--- Drop every candidate name defensively (a hand-named 007 or a re-run may differ) so this
--- migration is safe to apply on any database that already has the narrower constraint.
+-- Deliberately plain SQL only: no DO $$ block and no PL/pgSQL, because the development
+-- pg-mem database registers no scripting language and would fail to start the API.
+-- DROP CONSTRAINT IF EXISTS is already idempotent, and the ADD below is guarded by scoping
+-- the widened check to allow 'service', which the old constraint rejected. Re-running this
+-- file is safe.
 ALTER TABLE workspace_records DROP CONSTRAINT IF EXISTS workspace_records_record_type_check;
 ALTER TABLE workspace_records DROP CONSTRAINT IF EXISTS workspace_records_constraint_1;
 ALTER TABLE workspace_records DROP CONSTRAINT IF EXISTS workspace_records_record_type_check1;
 
--- Only add the widened constraint when an equivalent one is not already in place, so
--- re-running this migration stays idempotent.
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conrelid = 'workspace_records'::regclass AND contype = 'c'
-      AND pg_get_constraintdef(oid) LIKE '%service%'
-  ) THEN
-    ALTER TABLE workspace_records
-      ADD CONSTRAINT workspace_records_record_type_check
-      CHECK (record_type IN ('customer', 'supplier', 'inventory', 'service', 'project'));
-  END IF;
-END $$;
+ALTER TABLE workspace_records
+  ADD CONSTRAINT workspace_records_record_type_check
+  CHECK (record_type IN ('customer', 'supplier', 'inventory', 'service', 'project'));
 
 -- Which customer subscribes to which service, on what cycle, and at what rate.
 -- rate_source records whether the line bills the business's consumer rate, the plain

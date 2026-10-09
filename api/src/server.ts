@@ -691,19 +691,43 @@ async function withBackupLock<T>(operation: () => Promise<T>) {
 }
 
 const backupOperatorLimit = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false })
-app.get('/v1/platform/backups', backupOperatorLimit, requireBackupOperator, async (_request, response, next) => {
+
+// Backups are an emergency safety net, so the read/status path must never fail and must never
+// require a secret to answer. When object storage is not configured the endpoint reports that
+// plainly instead of erroring, and the Scheduled database backup below still protects the data.
+app.get('/v1/platform/backups', requirePool, requireSession, requireWorkspaceAdmin, async (_request, response, next) => {
   try {
-    const backups = await listDatabaseBackups(backupSettings!)
+    if (!backupSettings) {
+      // Not an error: the operator simply has not attached object storage yet.
+      response.json({ enabled: false, cadence: 'daily-logical', retainedSlots: 0, backups: [], backupInProgress: false, reason: 'Object storage is not configured, so no off-site snapshots are stored yet. Set BACKUP_S3_ENDPOINT, BACKUP_S3_REGION, BACKUP_S3_BUCKET, BACKUP_S3_ACCESS_KEY_ID and BACKUP_S3_SECRET_ACCESS_KEY on the API service to enable hourly off-site backups. Until then, export your business data from Settings.', exportNote: 'A logical export of this business is available under Settings. It contains this business only, not the whole platform database.' })
+      return
+    }
+    const backups = await listDatabaseBackups(backupSettings)
     response.json({ enabled: true, cadence: 'hourly', retainedSlots: 24, backups, backupInProgress: isBackupInProgress(), restoreScope: 'entire PostgreSQL database; coordinate downtime with the platform operator' })
-  } catch (error) { next(error) }
+  } catch (error) {
+    // A storage provider outage should be reported, not turned into a 500 the UI cannot explain.
+    response.json({ enabled: false, cadence: 'hourly', retainedSlots: 24, backups: [], backupInProgress: false, reason: `Object storage could not be reached: ${error instanceof Error ? error.message.slice(0, 200) : 'unknown error'}. Check the S3 settings and credentials on the API service. Your business data is unaffected.` })
+  }
 })
-app.post('/v1/platform/backups', backupOperatorLimit, requireBackupOperator, async (_request, response, next) => {
+
+app.post('/v1/platform/backups', backupOperatorLimit, requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (_request, response, next) => {
   try {
+    if (!backupSettings) {
+      response.status(409).json({ error: 'Object storage is not configured, so an off-site snapshot cannot be stored. Set the BACKUP_S3_* variables on the API service, or export your business data from Settings instead.' })
+      return
+    }
     const backup = await withBackupLock(() => createDatabaseBackup(backupSettings!))
     response.status(201).json({ backup, note: 'Full PostgreSQL custom-format backup uploaded to S3-compatible storage with server-side AES256 encryption.' })
   } catch (error) { next(error) }
 })
+
+// Restore intentionally still requires an explicit operator token AND maintenance mode: it
+// overwrites every business in the database, so it must never be reachable by accident.
 app.post('/v1/platform/backups/restore', backupOperatorLimit, requireBackupOperator, async (request, response, next) => {
+  if (!backupSettings) {
+    response.status(409).json({ error: 'Object storage is not configured, so there is no restore source. Set the BACKUP_S3_* variables first.' })
+    return
+  }
   if (env.BACKUP_RESTORE_MAINTENANCE_MODE !== 'true') {
     response.status(503).json({ error: 'Restore is disabled. Start a single API instance in BACKUP_RESTORE_MAINTENANCE_MODE=true after stopping all other API instances and workers.' })
     return
@@ -1121,7 +1145,7 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
       pool!.query(`SELECT id, description, amount::text, direction, account, transaction_date, created_at
         FROM ledger_transactions WHERE workspace_id = $1
         UNION ALL
-        SELECT e.id, e.description, COALESCE(SUM(l.credit - l.debit), 0)::text AS amount, 'income' AS direction, 'Sales invoice' AS account, e.entry_date AS transaction_date, e.created_at
+        SELECT e.id, e.description, COALESCE(SUM(l.credit - l.debit), 0)::text AS amount, 'income' AS direction, 'Sales invoice' AS account, e.entry_date AS transaction_date, e.created_at AS created_at
         FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
         JOIN workspace_accounts a ON a.id = l.account_id AND a.code = '4000'
         WHERE e.workspace_id = $1 AND e.source_type IN ('invoice', 'online_store_invoice', 'recurring_invoice')
@@ -2554,49 +2578,61 @@ function csvValue(value: unknown) {
   return `"${safe.replace(/"/g, '""')}"`
 }
 app.get('/v1/reports/daily-performance', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
-  // Powers the Reports replica of the landing page "Today's performance" card.
-  // Today and yesterday are compared on recorded ledger income, so the figure
-  // matches the cash-flow chart instead of the hero card's marketing sample.
+  // Powers the Reports replica of the landing page "Today's performance" card, and accepts a
+  // custom range so the same panel serves today, a week, month, year, or explicit dates.
+  const today = nairobiToday()
+  const defaultFrom = `${today.slice(0, 7)}-01`
+  const query = z.object({ from: z.string().date().default(defaultFrom), to: z.string().date().default(today) }).safeParse(request.query)
+  if (!query.success || query.data.from > query.data.to) { response.status(400).json({ error: 'Choose a valid date range with a start date on or before the end date.' }); return }
+  const from = query.data.from
+  const to = query.data.to
   try {
-    const today = nairobiToday()
-    const yesterday = new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 1, Number(today.slice(8, 10)) - 1)).toISOString().slice(0, 10)
     const workspaceId = request.session!.workspaceId
-    const [dayTotals, week, stock] = await Promise.all([
+    // The comparison baseline is the equal-length window immediately before the selected range,
+    // so "vs previous period" stays meaningful for any range the business chooses.
+    const dayCount = Math.max(1, Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000) + 1)
+    const previousTo = new Date(Date.parse(`${from}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10)
+    const previousFrom = new Date(Date.parse(`${previousTo}T00:00:00Z`) - (dayCount - 1) * 86_400_000).toISOString().slice(0, 10)
+    const [dayTotals, series, stock] = await Promise.all([
       pool!.query(`SELECT
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date = $2), 0)::text AS today_income,
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date = $2), 0)::text AS today_expense,
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date = $3), 0)::text AS yesterday_income,
-          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date = $3), 0)::text AS yesterday_expense
-        FROM ledger_transactions WHERE workspace_id = $1`, [workspaceId, today, yesterday]),
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= $2 AND transaction_date <= $3), 0)::text AS period_income,
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $2 AND transaction_date <= $3), 0)::text AS period_expense,
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'income' AND transaction_date >= $4 AND transaction_date <= $5), 0)::text AS previous_income,
+          COALESCE(SUM(amount) FILTER (WHERE direction = 'expense' AND transaction_date >= $4 AND transaction_date <= $5), 0)::text AS previous_expense
+        FROM ledger_transactions WHERE workspace_id = $1`, [workspaceId, from, to, previousFrom, previousTo]),
       pool!.query(`SELECT transaction_date AS date,
           COALESCE(SUM(amount) FILTER (WHERE direction = 'income'), 0)::text AS income,
           COALESCE(SUM(amount) FILTER (WHERE direction = 'expense'), 0)::text AS expense
         FROM ledger_transactions WHERE workspace_id = $1 AND transaction_date >= $2 AND transaction_date <= $3
-        GROUP BY transaction_date ORDER BY transaction_date`, [workspaceId, new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 1, Number(today.slice(8, 10)) - 6)).toISOString().slice(0, 10), today]),
+        GROUP BY transaction_date ORDER BY transaction_date`, [workspaceId, from, to]),
       pool!.query(`SELECT COALESCE(SUM(s.quantity * COALESCE(NULLIF(i.data->>'cost', '')::numeric, 0)), 0)::text AS valuation
         FROM inventory_location_stock s JOIN workspace_records i ON i.id = s.item_id
-        WHERE s.workspace_id = $1 AND i.record_type = 'inventory'`, [workspaceId]),
+        WHERE s.workspace_id = $1 AND i.record_type = 'inventory'`, [workspaceId]).catch(() => ({ rows: [{ valuation: '0' }] })),
     ])
     const asDateString = (value: unknown) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
     const row = dayTotals.rows[0]
-    const todayIncome = Number(row.today_income)
-    const yesterdayIncome = Number(row.yesterday_income)
-    const todayExpense = Number(row.today_expense)
-    const yesterdayExpense = Number(row.yesterday_expense)
-    // Percentage change versus yesterday; null when there is no comparable base.
-    const percentChange = yesterdayIncome > 0 ? Math.round(((todayIncome - yesterdayIncome) / yesterdayIncome) * 100) : null
+    const periodIncome = Number(row.period_income)
+    const previousIncome = Number(row.previous_income)
+    const periodExpense = Number(row.period_expense)
+    const previousExpense = Number(row.previous_expense)
+    const percentChange = previousIncome > 0 ? Math.round(((periodIncome - previousIncome) / previousIncome) * 100) : null
     response.json({
-      today,
-      yesterday,
-      todayIncome: todayIncome.toFixed(2),
-      todayExpense: todayExpense.toFixed(2),
-      yesterdayIncome: yesterdayIncome.toFixed(2),
-      yesterdayExpense: yesterdayExpense.toFixed(2),
-      todayNet: (todayIncome - todayExpense).toFixed(2),
+      from,
+      to,
+      previousFrom,
+      previousTo,
+      // "today" is kept for the existing Today's performance card; period* reflects the range.
+      today: to,
+      yesterday: previousTo,
+      todayIncome: periodIncome.toFixed(2),
+      todayExpense: periodExpense.toFixed(2),
+      yesterdayIncome: previousIncome.toFixed(2),
+      yesterdayExpense: previousExpense.toFixed(2),
+      todayNet: (periodIncome - periodExpense).toFixed(2),
       percentChange,
-      weekIncome: week.rows.reduce((sum: number, line: Record<string, unknown>) => sum + Number(line.income), 0).toFixed(2),
+      weekIncome: periodIncome.toFixed(2),
       stockValue: stock.rows[0].valuation,
-      days: week.rows.map((line: Record<string, unknown>) => ({ date: asDateString(line.date), income: line.income, expense: line.expense })),
+      days: series.rows.map((line: Record<string, unknown>) => ({ date: asDateString(line.date), income: line.income, expense: line.expense })),
     })
   } catch (error) { next(error) }
 })

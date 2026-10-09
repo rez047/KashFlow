@@ -897,10 +897,7 @@ function App() {
   const [trialTotals, setTrialTotals] = useState({ debit: '0', credit: '0' })
   const [accountingPeriods, setAccountingPeriods] = useState<AccountingPeriod[]>([])
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([])
-  const [backupOperatorToken, setBackupOperatorToken] = useState('')
   const [databaseBackups, setDatabaseBackups] = useState<DatabaseBackup[]>([])
-  const [restoreBackupKey, setRestoreBackupKey] = useState('')
-  const [restoreConfirmation, setRestoreConfirmation] = useState('')
   const [backupStatus, setBackupStatus] = useState('')
   const [exportBusy, setExportBusy] = useState(false)
   const [recordImportType, setRecordImportType] = useState<ImportType>('customers')
@@ -3494,39 +3491,26 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
   async function loadDatabaseBackups() {
     setBusy(true); setError(''); setBackupStatus('')
     try {
-      if (!backupOperatorToken) throw new Error('Enter the platform backup operator token.')
-      const result = await request<{ backups: DatabaseBackup[] }>('/v1/platform/backups', { headers: { Authorization: `Bearer ${backupOperatorToken}` } })
-      setDatabaseBackups(result.backups)
-      setBackupStatus(`Connected. ${result.backups.length} retained hourly snapshot(s) found.`)
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not load platform backups.') }
+      // No operator token: the status endpoint is safe to read and reports plainly when
+      // off-site storage is not configured rather than failing.
+      const result = await request<{ enabled: boolean; backups: DatabaseBackup[]; reason?: string; exportNote?: string; backupInProgress?: boolean }>('/v1/platform/backups')
+      setDatabaseBackups(result.backups ?? [])
+      if (!result.enabled) {
+        setBackupStatus(result.reason ?? 'Off-site backups are not configured yet.')
+        return
+      }
+      setBackupStatus(`Connected. ${result.backups.length} retained snapshot(s) found.${result.backupInProgress ? ' A backup is currently running.' : ''}`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not load backup status.') }
     finally { setBusy(false) }
   }
 
   async function createDatabaseBackupNow() {
     setBusy(true); setError(''); setBackupStatus('')
     try {
-      if (!backupOperatorToken) throw new Error('Enter the platform backup operator token.')
-      const result = await request<{ backup: { key: string; createdAt: string } }>('/v1/platform/backups', { method: 'POST', headers: { Authorization: `Bearer ${backupOperatorToken}` }, body: '{}' })
+      const result = await request<{ backup: { key: string; createdAt: string } }>('/v1/platform/backups', { method: 'POST', body: '{}' })
       setBackupStatus(`Backup saved: ${result.backup.key} (${new Date(result.backup.createdAt).toLocaleString('en-KE')}).`)
       await loadDatabaseBackups()
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create a database backup.') }
-    finally { setBusy(false) }
-  }
-
-  async function restoreDatabaseBackupNow(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy(true); setError(''); setBackupStatus('')
-    try {
-      if (!backupOperatorToken) throw new Error('Enter the platform backup operator token.')
-      if (restoreConfirmation !== 'RESTORE THE ENTIRE DATABASE') throw new Error('Enter the exact restore confirmation phrase.')
-      const result = await request<{ restoredKey: string; safetyBackupKey: string }>('/v1/platform/backups/restore', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${backupOperatorToken}` },
-        body: JSON.stringify({ key: restoreBackupKey, confirmation: restoreConfirmation }),
-      })
-      setRestoreConfirmation('')
-      setBackupStatus(`Restored archived database objects from ${result.restoredKey}. Pre-restore safety snapshot: ${result.safetyBackupKey}. Restart the normal deployment, apply migrations, and verify business data before resuming traffic.`)
-      await loadDatabaseBackups()
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not restore the database backup.') }
     finally { setBusy(false) }
   }
 
@@ -3900,7 +3884,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
           <section className="dashboard-grid">
             <article className="panel cashflow-panel">
               <div className="panel-header"><div><h2>Recorded cash flow</h2><p>Daily saved income and expenses, including recorded payroll payments</p></div>
-                <span className="period-select"><CalendarDays size={14} /> This month</span>
+                <span className="period-select"><CalendarDays size={14} /> {overviewRangeNames[overviewRange]}</span>
               </div>
               <div className="chart-legend"><span><i className="legend-income" /> Income</span><span><i className="legend-expense" /> Expenses</span></div>
               {chart.length ? <div className="chart-wrap"><ResponsiveContainer width="100%" height="100%">
@@ -4506,9 +4490,9 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
         </section> : page === 'Reports' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> REPORTS · WORKSPACE RECORDS</div><h1>Business reports</h1><p className="welcome-subtitle">Visual summaries from saved transactions and invoices. These are management views, not audited financial statements.</p>
           <DailyPerformanceReport apiBase={API_BASE} search={search} />
-          <div className="dashboard-grid"><article className="module-card report-chart"><h2>Income vs expenses this month</h2><ResponsiveContainer width="100%" height={260}><BarChart data={chart}><CartesianGrid vertical={false} stroke="#eff0f4" /><XAxis dataKey="date" /><YAxis /><Tooltip formatter={(value) => money(Number(value))} /><Legend /><Bar dataKey="income" fill="#7256df" radius={[5, 5, 0, 0]} /><Bar dataKey="expense" fill="#48b99e" radius={[5, 5, 0, 0]} /></BarChart></ResponsiveContainer></article>
+          <div className="dashboard-grid"><article className="module-card report-chart"><h2>Income vs expenses · {overviewRangeNames[overviewRange]}</h2><ResponsiveContainer width="100%" height={260}><BarChart data={chart}><CartesianGrid vertical={false} stroke="#eff0f4" /><XAxis dataKey="date" /><YAxis /><Tooltip formatter={(value) => money(Number(value))} /><Legend /><Bar dataKey="income" fill="#7256df" radius={[5, 5, 0, 0]} /><Bar dataKey="expense" fill="#48b99e" radius={[5, 5, 0, 0]} /></BarChart></ResponsiveContainer></article>
             <article className="module-card report-chart"><h2>Recorded cash flow mix</h2><ResponsiveContainer width="100%" height={260}><PieChart><Pie data={[{ name: 'Income', value: Number(dashboard?.totals.monthIncome ?? 0) }, { name: 'Expenses', value: Number(dashboard?.totals.monthExpenses ?? 0) }].filter((item) => item.value > 0)} dataKey="value" nameKey="name" outerRadius={85} label>{['#7256df', '#48b99e'].map((color) => <Cell key={color} fill={color} />)}</Pie><Tooltip formatter={(value) => money(Number(value))} /><Legend /></PieChart></ResponsiveContainer>{Number(dashboard?.totals.monthIncome ?? 0) + Number(dashboard?.totals.monthExpenses ?? 0) === 0 && <div className="empty-state">Add transactions to populate this chart.</div>}</article></div>
-          <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income this month</span><strong>{money(dashboard?.totals.monthIncome ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses this month</span><strong>{money(dashboard?.totals.monthExpenses ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
+          <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.income ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.expenses ?? 0)}</strong></div><div className="transaction-row"><span>Net movement · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.net ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices, for the period chosen in the Overview toolbar. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
           {retailReport && <article className="module-card"><h2>Retail and inventory insights</h2><div className="transaction-row"><span>Inventory valuation at recorded unit cost</span><strong>{money(retailReport.totalValuation)}</strong></div><h3>Reorder alerts</h3>{retailReport.reorderAlerts.map((item) => <div className="transaction-row" key={`${item.itemId}-${item.locationId}`}><span><strong>{item.name} · {item.location}</strong><small>{item.quantity} {item.unit} on hand · alert at {item.reorderPoint}</small></span><span className="status-pill amber">Reorder</span></div>)}{!retailReport.reorderAlerts.length && <p>No items are at or below their configured reorder points.</p>}<h3>Best sellers</h3>{retailReport.bestSellers.map((item) => <div className="transaction-row" key={item.itemId}><span><strong>{item.name}</strong><small>{item.quantitySold.toLocaleString('en-KE')} sold · revenue {money(item.revenue)} · cost estimate {money(item.cost)}</small></span><strong>Gross profit est. {money(item.grossProfit)}</strong></div>)}{!retailReport.bestSellers.length && <div className="empty-state">Post product sales to see best sellers and gross profit estimates.</div>}<p className="dialog-note">Inventory value uses current average item cost; product margins are management estimates and do not replace reviewed accounting valuation.</p></article>}
           <article className="module-card"><h2>Cash-flow outlook</h2><p>Three-month estimate based on the average monthly posted ledger activity available over the last six months; not a cash guarantee.</p>{forecast.map((row) => <div className="transaction-row" key={row.period}><span><strong>{row.period}</strong><small>Historical-average estimate</small></span><span>Income {money(row.income)} · Expenses {money(row.expenses)}</span><strong>Net {money(row.income - row.expenses)}</strong></div>)}</article>
           <article className="module-card"><h2>Budget by account</h2><form className="record-form-grid" onSubmit={saveBudget}><label className="field-label">Account<select required value={budgetInput.accountCode} onChange={(event) => setBudgetInput({ ...budgetInput, accountCode: event.target.value })}><option value="">Choose account</option>{accounts.map((accountRow) => <option value={accountRow.code} key={accountRow.code}>{accountRow.code} · {accountRow.name}</option>)}</select></label><label className="field-label">Period<input required type="month" value={budgetInput.period} onChange={(event) => setBudgetInput({ ...budgetInput, period: event.target.value })} /></label><label className="field-label">Budget (KSh)<input required min="0" step="0.01" type="number" value={budgetInput.amount} onChange={(event) => setBudgetInput({ ...budgetInput, amount: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Save budget</button></form>
@@ -4804,20 +4788,15 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
               </div>}
             </section>
             <section className="module-card">
-              <h2>Platform database backups</h2>
-              <p>Automatic hourly full-database backups require the API operator to configure S3-compatible storage and `pg_dump`/`pg_restore`. The service rotates 24 UTC hourly slots; a slot is overwritten every 24 hours. Restore affects every business in the database, first creates a safety backup, and should be done during planned downtime.</p>
-              <label className="field-label">Platform backup operator token<input type="password" autoComplete="off" value={backupOperatorToken} onChange={(event) => setBackupOperatorToken(event.target.value)} /></label>
-              <div className="button-row"><button type="button" className="button button-secondary" disabled={busy || !backupOperatorToken} onClick={() => void loadDatabaseBackups()}>Load backup list</button><button type="button" className="button button-primary" disabled={busy || !backupOperatorToken} onClick={() => void createDatabaseBackupNow()}>{busy ? 'Working…' : 'Create backup now'}</button></div>
+              <h2>Backups and safety copies</h2>
+              <p>Two independent safeguards protect this business. A business export is always available below and needs no configuration. Off-site full-database snapshots additionally run automatically every hour when the API operator attaches S3-compatible storage.</p>
+              <div className="button-row">
+                <button type="button" className="button button-secondary" disabled={busy} onClick={() => void loadDatabaseBackups()}>{busy ? 'Checking…' : 'Check backup status'}</button>
+                <button type="button" className="button button-primary" disabled={busy} onClick={() => void createDatabaseBackupNow()}>{busy ? 'Working…' : 'Create a snapshot now'}</button>
+              </div>
               {backupStatus && <p role="status" className="dialog-note">{backupStatus}</p>}
-              {databaseBackups.length > 0 && <><div className="backup-list">{databaseBackups.map((backup) => <div className="transaction-row" key={backup.key}><span><strong>{backup.key}</strong><small>{backup.lastModified ? new Date(backup.lastModified).toLocaleString('en-KE') : 'Timestamp unavailable'} · {(backup.size / (1024 * 1024)).toFixed(1)} MB</small></span></div>)}</div>
-                <form className="module-card backup-restore-form" onSubmit={(event) => void restoreDatabaseBackupNow(event)}>
-                  <h3>Restore full database</h3>
-                  <label className="field-label">Hourly backup<select required value={restoreBackupKey} onChange={(event) => setRestoreBackupKey(event.target.value)}><option value="">Choose a backup</option>{databaseBackups.map((backup) => <option key={backup.key} value={backup.key}>{backup.lastModified ? new Date(backup.lastModified).toLocaleString('en-KE') : backup.key}</option>)}</select></label>
-                  <label className="field-label">Type RESTORE THE ENTIRE DATABASE to confirm<input required autoComplete="off" value={restoreConfirmation} onChange={(event) => setRestoreConfirmation(event.target.value)} /></label>
-                  <button className="button button-primary backup-restore-button" disabled={busy || !restoreBackupKey || restoreConfirmation !== 'RESTORE THE ENTIRE DATABASE'}>Restore selected backup</button>
-                </form>
-              </>}
-              <p className="dialog-note">Backups contain every business and encrypted payroll/integration secrets. S3 server-side AES256 is requested; also enable private-bucket access controls and retention/versioning policies in your provider console. Store the operator token outside the app and rotate it if exposed.</p>
+              {databaseBackups.length > 0 && <div className="backup-list">{databaseBackups.map((backup) => <div className="transaction-row" key={backup.key}><span><strong>{backup.key}</strong><small>{backup.lastModified ? new Date(backup.lastModified).toLocaleString('en-KE') : 'Timestamp unavailable'} · {(backup.size / (1024 * 1024)).toFixed(1)} MB</small></span></div>)}</div>}
+              <p className="dialog-note"><ShieldCheck size={14} /> Restoring a full snapshot is a platform-level action that overwrites every business, so it deliberately still requires operator authorization and maintenance mode. Ask your KashFlow operator if you ever need a restore. For day-to-day safety, export your business data below and keep it somewhere secure.</p>
             </section>
             <section className="module-card">
               <h2>Export workspace data</h2>
