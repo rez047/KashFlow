@@ -715,12 +715,25 @@ async function withBackupLock<T>(operation: () => Promise<T>) {
   } finally { client.release() }
 }
 
+async function automaticBackupsEnabled() {
+  if (!pool) return false
+  const result = await pool.query(`
+    SELECT EXISTS (
+      SELECT 1
+      FROM workspaces w
+      LEFT JOIN workspace_settings s ON s.workspace_id = w.id
+      WHERE COALESCE(s.preferences->>'backupSchedule', 'Daily automatic') <> 'Manual only'
+    ) AS enabled
+  `)
+  return result.rows[0]?.enabled === true
+}
+
 const backupOperatorLimit = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false })
 
-// Backups are an emergency safety net, so the read/status path must never fail and must never
-// require a secret to answer. When object storage is not configured the endpoint reports that
-// plainly instead of erroring, and the Scheduled database backup below still protects the data.
-app.get('/v1/platform/backups', requirePool, requireSession, requireWorkspaceAdmin, async (_request, response, next) => {
+// Backups are an emergency safety net, so the read/status path must never require an operator
+// secret. When object storage is not configured, report that plainly and direct workspace admins
+// to business-scoped exports until S3-compatible storage is attached.
+app.get('/v1/platform/backups', requirePool, requireSession, requireWorkspaceAdmin, async (_request, response, _next) => {
   try {
     if (!backupSettings) {
       // Not an error: the operator simply has not attached object storage yet.
@@ -5602,6 +5615,7 @@ async function start() {
   if (pool && backupSettings && env.BACKUP_RESTORE_MAINTENANCE_MODE !== 'true') {
     const runHourlyBackup = async () => {
       try {
+        if (!await automaticBackupsEnabled()) return
         const result = await withBackupLock(() => createDatabaseBackup(backupSettings))
         console.info(`Hourly full database backup completed: ${result.key}`)
       } catch (error) {

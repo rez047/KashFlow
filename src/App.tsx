@@ -783,6 +783,7 @@ function App() {
   const [twoFactorSetup, setTwoFactorSetup] = useState<{ secret: string; otpauthUri: string; recoveryCodes: string[] } | null>(null)
   const [twoFactorCode, setTwoFactorCode] = useState('')
   const [twoFactorBusy, setTwoFactorBusy] = useState(false)
+  const [twoFactorDisablePending, setTwoFactorDisablePending] = useState(false)
   const [authMode, setAuthMode] = useState<'signin' | 'forgot' | 'reset'>('signin')
   const [authChannel, setAuthChannel] = useState<'email' | 'sms'>('email')
   const [newPassword, setNewPassword] = useState('')
@@ -1565,6 +1566,21 @@ function App() {
     finally { setTwoFactorBusy(false) }
   }
 
+  function toggleTwoFactor(enabled: boolean) {
+    if (twoFactorBusy) return
+    if (enabled) {
+      setTwoFactorDisablePending(false)
+      if (!twoFactorStatus?.enabled && !twoFactorSetup?.otpauthUri && twoFactorStatus?.available) void beginTwoFactorEnrollment()
+      return
+    }
+    if (twoFactorSetup?.otpauthUri && !twoFactorStatus?.enabled) {
+      setTwoFactorSetup(null)
+      setTwoFactorCode('')
+      return
+    }
+    if (twoFactorStatus?.enabled) setTwoFactorDisablePending(true)
+  }
+
   function downloadRecoveryCodes(codes: string[]) {
     const blob = new Blob([`KashFlow recovery codes\nKeep these safe. Each code works once.\n\n${codes.join('\n')}\n`], { type: 'text/plain' })
     const url = URL.createObjectURL(blob)
@@ -1578,6 +1594,7 @@ function App() {
       await request('/v1/auth/two-factor/activate', { method: 'POST', body: JSON.stringify({ code: twoFactorCode }) })
       notify('Two-factor authentication is now active.')
       setTwoFactorSetup(null); setTwoFactorCode('')
+      setTwoFactorDisablePending(false)
       await loadTwoFactorStatus()
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not activate two-factor authentication.') }
     finally { setTwoFactorBusy(false) }
@@ -1589,6 +1606,7 @@ function App() {
       await request('/v1/auth/two-factor/disable', { method: 'POST', body: JSON.stringify({ code: twoFactorCode }) })
       notify('Two-factor authentication has been disabled.')
       setTwoFactorCode(''); setTwoFactorSetup(null)
+      setTwoFactorDisablePending(false)
       await loadTwoFactorStatus()
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not disable two-factor authentication.') }
     finally { setTwoFactorBusy(false) }
@@ -4841,6 +4859,8 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
             <div className="field-row"><label className="field-label">Business name<input value={settings.businessName || dashboard?.workspaceName || ''} onChange={(event) => setSettings({ ...settings, businessName: event.target.value })} /></label><label className="field-label">Currency<select value={settings.currency} onChange={(event) => setSettings({ ...settings, currency: event.target.value })}><option value="KES">KES</option><option value="USD">USD</option><option value="GBP">GBP</option></select></label></div>
             <div className="field-row"><label className="field-label">Timezone<select value={settings.timezone} onChange={(event) => setSettings({ ...settings, timezone: event.target.value })}><option value="Africa/Nairobi">Africa/Nairobi</option><option value="UTC">UTC</option><option value="Africa/Kampala">Africa/Kampala</option></select></label><label className="field-label">Default invoice terms<select value={settings.invoiceTerms} onChange={(event) => setSettings({ ...settings, invoiceTerms: event.target.value })}><option value="Net 7">Net 7</option><option value="Net 14">Net 14</option><option value="Net 30">Net 30</option></select></label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.emailAlerts} onChange={(event) => setSettings({ ...settings, emailAlerts: event.target.checked })} /> Email alert preference (delivery not configured)</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.auditTrail} onChange={(event) => setSettings({ ...settings, auditTrail: event.target.checked })} /> Audit log preference (supported events are recorded)</label></div>
+            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.backupSchedule !== 'Manual only'} onChange={(event) => setSettings({ ...settings, backupSchedule: event.target.checked ? 'Daily automatic' : 'Manual only' })} /> Enable automatic backups and safety copies for this workspace</label></div>
+            <p className="dialog-note">Save settings to apply this choice. Off-site copies also require the API operator to configure S3-compatible storage.</p>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.monoEnabled} onChange={(event) => setSettings({ ...settings, monoEnabled: event.target.checked })} /> Allow Mono bank-feed connections for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.darajaEnabled} onChange={(event) => setSettings({ ...settings, darajaEnabled: event.target.checked })} /> Allow Daraja / M-Pesa for this business</label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.kraEtimsLiveEnabled} onChange={(event) => setSettings({ ...settings, kraEtimsLiveEnabled: event.target.checked })} /> Permit live KRA eTIMS usage for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.statutoryFilingsEnabled} onChange={(event) => setSettings({ ...settings, statutoryFilingsEnabled: event.target.checked })} /> Permit statutory filing routes for this business</label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.shifEnabled} onChange={(event) => setSettings({ ...settings, shifEnabled: event.target.checked })} /> Enable SHIF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.nssfEnabled} onChange={(event) => setSettings({ ...settings, nssfEnabled: event.target.checked })} /> Enable NSSF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.ahlEnabled} onChange={(event) => setSettings({ ...settings, ahlEnabled: event.target.checked })} /> Enable AHL route</label></div>
@@ -4850,29 +4870,38 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
             <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
           </form>
             <section className="module-card security-card">
-              <div className="panel-header"><div><h2>Account security · two-factor authentication</h2><p>Protect your business with an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, or any TOTP app). No paid service is required.</p></div><span className={`status-pill ${twoFactorStatus?.enabled ? 'green' : 'amber'}`}>{twoFactorStatus?.enabled ? 'Enabled' : 'Not enabled'}</span></div>
+              <div className="panel-header"><div><h2>Account security · two-factor authentication</h2><p>Protect this account's access to your business with an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, or any TOTP app). No paid service is required.</p></div><span className={`status-pill ${twoFactorStatus?.enabled ? 'green' : 'amber'}`}>{twoFactorStatus?.enabled ? 'Enabled' : twoFactorSetup?.otpauthUri ? 'Setup in progress' : 'Not enabled'}</span></div>
+              <label className="field-label checkbox-row"><input type="checkbox" checked={Boolean(twoFactorStatus?.enabled || twoFactorSetup?.otpauthUri)} disabled={!twoFactorStatus || twoFactorBusy || (!twoFactorStatus.available && !twoFactorStatus.enabled)} onChange={(event) => toggleTwoFactor(event.target.checked)} /> Enable two-factor authentication for this account</label>
+              {!twoFactorStatus && <div className="button-row"><p className="dialog-note">Could not load your two-factor status.</p><button type="button" className="button button-small" disabled={twoFactorBusy} onClick={() => void loadTwoFactorStatus()}>Retry status</button></div>}
               {twoFactorStatus && !twoFactorStatus.available && <p className="form-error">Two-factor authentication is unavailable because the API service is missing <code>TWO_FACTOR_ENCRYPTION_KEY</code>. This is an operator environment setting, not a code fault: set it to a stable random secret of at least 32 characters in the API service environment and redeploy, then reload this page.</p>}
               {twoFactorStatus?.available && <p className="dialog-note">Server encryption key detected, so two-factor setup is available.</p>}
               {error && <p className="form-error" role="alert">{error}</p>}
 
-              {twoFactorStatus?.enabled && !twoFactorSetup && <div className="two-factor-enabled">
+              {twoFactorStatus?.enabled && <div className="two-factor-enabled">
                 <p><ShieldCheck size={15} /> Two-factor authentication is active on this account.</p>
-                <p className="dialog-note">Recovery codes still available: <strong>{twoFactorStatus.recoveryCodesRemaining}</strong>. Generate a new set if you are running low, or turn two-factor off.</p>
+                <p className="dialog-note">Recovery codes still available: <strong>{twoFactorStatus.recoveryCodesRemaining}</strong>. Generate a new set if you are running low. To turn two-factor off, switch it off above and verify with a code.</p>
+                {twoFactorDisablePending && <p className="dialog-note">Enter your current authenticator or recovery code above, then confirm. Two-factor stays on until that code is accepted.</p>}
                 <label className="field-label">Current authenticator or recovery code
                   <input type="text" inputMode="numeric" autoComplete="one-time-code" maxLength={20} placeholder="123456" value={twoFactorCode} onChange={(event) => setTwoFactorCode(event.target.value)} />
                 </label>
                 <div className="button-row">
                   <button type="button" className="button button-secondary" disabled={twoFactorBusy || twoFactorCode.length < 6} onClick={() => void regenerateRecoveryCodes()}>Generate new recovery codes</button>
-                  <button type="button" className="button button-small" disabled={twoFactorBusy || twoFactorCode.length < 6} onClick={() => void disableTwoFactor()}>Turn off two-factor</button>
+                  {twoFactorDisablePending && <><button type="button" className="button button-small" disabled={twoFactorBusy || twoFactorCode.length < 6} onClick={() => void disableTwoFactor()}>{twoFactorBusy ? 'Verifying…' : 'Confirm turn off'}</button><button type="button" className="button button-small" disabled={twoFactorBusy} onClick={() => setTwoFactorDisablePending(false)}>Keep enabled</button></>}
                 </div>
               </div>}
 
               {!twoFactorStatus?.enabled && !twoFactorSetup && <div className="two-factor-start">
-                <p>Add a second step to every sign-in so a stolen password alone cannot reach your records.</p>
-                <button type="button" className="button button-primary" disabled={twoFactorBusy || !twoFactorStatus?.available} onClick={() => void beginTwoFactorEnrollment()}>{twoFactorBusy ? 'Preparing…' : 'Set up two-factor authentication'}</button>
+                <p>{twoFactorBusy ? 'Preparing your authenticator setup…' : 'Turn on the switch above to add a second step to every sign-in. You will verify an authenticator code before two-factor becomes active.'}</p>
               </div>}
 
-              {twoFactorSetup && <div className="two-factor-setup">
+              {twoFactorStatus?.enabled && twoFactorSetup && !twoFactorSetup.otpauthUri && twoFactorSetup.recoveryCodes.length > 0 && <div className="two-factor-codes">
+                <strong>Save your new recovery codes now</strong>
+                <p className="dialog-note">Each code works once if you lose your phone. The previous codes no longer work.</p>
+                <div className="two-factor-code-grid">{twoFactorSetup.recoveryCodes.map((code) => <code key={code}>{code}</code>)}</div>
+                <button type="button" className="button button-small" onClick={() => downloadRecoveryCodes(twoFactorSetup.recoveryCodes)}>Download recovery codes</button>
+              </div>}
+
+              {twoFactorSetup?.otpauthUri && <div className="two-factor-setup">
                 {twoFactorSetup.otpauthUri && <>
                   <ol className="two-factor-steps">
                     <li>Install a free authenticator app such as Google Authenticator or Authy.</li>
@@ -4901,7 +4930,7 @@ async function createCameraReader(video: HTMLVideoElement): Promise<CameraReader
             </section>
             <section className="module-card">
               <h2>Backups and safety copies</h2>
-              <p>Two independent safeguards protect this business. A business export is always available below and needs no configuration. Off-site full-database snapshots additionally run automatically every hour when the API operator attaches S3-compatible storage.</p>
+              <p>The automatic-backup setting is saved with this workspace. When at least one workspace has enabled it and the API operator has attached S3-compatible storage, full-database snapshots run every hour. Each off-site snapshot includes all workspaces on this API. Business exports below remain available even when automatic backups are off or storage is not configured.</p>
               <div className="button-row">
                 <button type="button" className="button button-secondary" disabled={busy} onClick={() => void loadDatabaseBackups()}>{busy ? 'Checking…' : 'Check backup status'}</button>
                 <button type="button" className="button button-primary" disabled={busy} onClick={() => void createDatabaseBackupNow()}>{busy ? 'Working…' : 'Create a snapshot now'}</button>
