@@ -4036,7 +4036,7 @@ async function createCameraReader(): Promise<CameraReader> {
   }
 
   return <div className="app-shell">
-    <aside className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
+    <aside id="workspace-sidebar" className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
       <div className="brand-row"><div className="brand-mark">K</div><div className="brand-name">Kash<span>Flow</span><small>{t('BUSINESS SUITE')}</small></div>
         <button className="icon-button sidebar-close" onClick={() => setSidebarOpen(false)} aria-label="Close menu"><X size={18} /></button>
       </div>
@@ -4068,10 +4068,11 @@ async function createCameraReader(): Promise<CameraReader> {
         </div>
       </div>
     </aside>
+    {sidebarOpen && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={() => setSidebarOpen(false)} />}
 
     <main className="main-area">
       <header className="topbar">
-        <button className="icon-button mobile-menu" aria-label="Open menu" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button>
+        <button className="icon-button mobile-menu" aria-label="Open menu" aria-expanded={sidebarOpen} aria-controls="workspace-sidebar" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button>
         <div className="breadcrumbs"><span>{dashboard?.workspaceName}</span><ChevronRight size={14} /><strong>{t(page)}</strong><span className="demo-tag">{t('SAVED WORKSPACE DATA')}</span></div>
         <div className="topbar-actions">
           <label className="language-picker"><span>{t('Language')}</span><select aria-label={t('Language')} value={language} onChange={(event) => setLanguage(event.target.value as LanguageCode)}>{languages.map((item) => <option key={item.code} value={item.code}>{item.name}</option>)}</select></label>
