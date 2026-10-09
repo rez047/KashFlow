@@ -1,0 +1,75 @@
+name: Build KashFlow Field installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'field-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: Package ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: windows-latest
+            script: build:win
+          - platform: macos
+            runner: macos-latest
+            script: build:mac
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.13.0
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: apps/desktop
+      - name: Build installer
+        run: npm run ${{ matrix.script }}
+        working-directory: apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ matrix.platform == 'macos' && 'false' || '' }}
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: |
+            apps/desktop/release/KashFlow-Desktop-*-Setup.exe
+            apps/desktop/release/KashFlow-Desktop-*-Setup.exe.blockmap
+            apps/desktop/release/KashFlow-Desktop-*.dmg
+            apps/desktop/release/KashFlow-Desktop-*.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  draft-release:
+    name: Prepare draft release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/field-v')
+    needs: desktop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download desktop installers
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create draft release for signing review
+        run: >-
+          gh release create "$GITHUB_REF_NAME" release-assets/*
+          --verify-tag --draft
+          --title "KashFlow Field ${GITHUB_REF_NAME#field-}"
+          --notes "Draft installers for signing and review. These builds are unsigned; sign and notarize them before publishing to customers."
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

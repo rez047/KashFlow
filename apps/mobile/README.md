@@ -19,8 +19,8 @@ Set `EXPO_PUBLIC_API_BASE_URL` to the API origin, for example `http://localhost:
 
 Install dependencies with `npm ci`, then run `npm start`. Use a native development build or EAS build; Expo Go does not include the SQLCipher native configuration and the app deliberately refuses an unencrypted local database.
 
-- Android sideload APK: `eas build --platform android --profile preview`
-- Android Play Store bundle: `eas build --platform android --profile production`
-- iOS App Store build: `eas build --platform ios --profile production`
+- Android sideload APK: `npx eas-cli build --platform android --profile preview`
+- Android Play Store bundle: `npm run build:android`
+- iOS App Store build: `npm run build:ios`
 
-EAS builds require an Expo project ID and authenticated Expo account. Android release signing requires the EAS Android signing key. iOS distribution requires Apple Developer signing and App Store Connect setup. The iOS build is not available from this Windows workstation because Apple signing and Xcode builds require Apple's toolchain.
+EAS builds require an Expo project linked to this app. Put its ID in `EXPO_PROJECT_ID` (shown in `.env.example`) and authenticate with `EXPO_TOKEN` or `npx eas-cli login`; never commit the token. GitHub Actions can use an `EXPO_TOKEN` repository secret and an `EXPO_PROJECT_ID` repository variable after the project is linked. Android release signing requires the EAS Android signing key. iOS distribution requires Apple Developer signing and App Store Connect setup. EAS can build iOS remotely, but the project still needs Apple signing credentials for device distribution.

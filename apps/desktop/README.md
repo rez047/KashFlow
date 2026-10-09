@@ -19,4 +19,4 @@ Set `KASHFLOW_API_BASE_URL` to the KashFlow API origin if the production URL dif
 - Universal macOS DMG and ZIP: `npm run build:mac` (run on macOS)
 - Linux AppImage and DEB: `npm run build:linux`
 
-Unsigned local installers may show an operating-system warning. Public releases should be code signed with the publisher's Windows certificate and Apple Developer ID, then notarized on macOS.
+The **Build KashFlow Field installers** GitHub Actions workflow can package Windows and universal macOS installers on hosted runners. Run it manually to download 30-day build artifacts, or push a `field-v*` tag to create a draft GitHub release for review. Draft installers are unsigned; code sign Windows builds and sign and notarize macOS builds before publishing to customers.

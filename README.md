@@ -210,9 +210,9 @@ Never commit `.env`, `.env.local`, database URLs, session secrets, passwords, pr
 
 ## Native field apps
 
-The landing page links each platform to the [KashFlow release page](https://github.com/rez047/KashFlow/releases). That page is the release hub; platform packages appear there when the signed builds are published. Desktop and mobile builds have their own page navigation and offline inventory workflow. Offline counts require an initial successful inventory refresh, are saved encrypted on device, and are posted with idempotency protection when the user syncs. A changed server balance pauses the count for review.
+The landing page links each platform to the [KashFlow release page](https://github.com/rez047/KashFlow/releases). The GitHub Actions workflow packages Windows and universal macOS desktop installers; a `field-v*` tag creates a draft release for signing review. Desktop and mobile builds have their own page navigation and offline inventory workflow. Offline counts require an initial successful inventory refresh, are saved encrypted on device, and are posted with idempotency protection when the user syncs. A changed server balance pauses the count for review.
 
-See [`apps/mobile/README.md`](apps/mobile/README.md) for native iOS/Android builds and [`apps/desktop/README.md`](apps/desktop/README.md) for Windows/macOS/Linux installers. iOS distribution needs an Apple Developer account and signing; Android and EAS builds need the release project's Expo credentials. These packages are source-configured here, but this repository does not contain published signed installers yet.
+See [`apps/mobile/README.md`](apps/mobile/README.md) for native iOS/Android builds and [`apps/desktop/README.md`](apps/desktop/README.md) for Windows/macOS/Linux installers. iOS distribution needs an Apple Developer account and signing; Android and EAS builds need the release project's Expo credentials. A Windows installer can be built locally, but the release hub does not yet contain published signed installers.
 
 ## Security and accounting notice
 
