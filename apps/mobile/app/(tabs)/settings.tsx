@@ -3,7 +3,7 @@ import { router } from 'expo-router'
 import { useState } from 'react'
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native'
 import { clearOfflineVault } from '../../src/lib/offline'
-import { useKashFlow } from './_layout'
+import { useKashFlow } from '../../src/components/KashFlowProvider'
 
 export default function SettingsScreen() {
   const { online, snapshot } = useKashFlow()

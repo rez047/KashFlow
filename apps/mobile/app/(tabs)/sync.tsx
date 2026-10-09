@@ -2,15 +2,15 @@ import { Ionicons } from '@expo/vector-icons'
 import { router } from 'expo-router'
 import { useMemo, useState } from 'react'
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native'
-import { useKashFlow } from './_layout'
+import { useKashFlow } from '../../src/components/KashFlowProvider'
 
 type Filter = 'all' | 'pending' | 'review' | 'synced'
-const filters: Array<{ key: Filter; label: string }> = [{ key: 'all', label: 'All activity' }, { key: 'pending', label: 'To sync' }, { key: 'review', label: 'Review' }, { key: 'synced', label: 'Synced' }]
+const filters: { key: Filter; label: string }[] = [{ key: 'all', label: 'All activity' }, { key: 'pending', label: 'To sync' }, { key: 'review', label: 'Review' }, { key: 'synced', label: 'Synced' }]
 
 export default function SyncScreen() {
   const { online, syncing, snapshot, syncNow, refresh } = useKashFlow()
   const [filter, setFilter] = useState<Filter>('all')
-  const counts = snapshot?.counts ?? []
+  const counts = useMemo(() => snapshot?.counts ?? [], [snapshot?.counts])
   const pending = counts.filter((count) => count.state === 'pending').length
   const conflicts = counts.filter((count) => count.state === 'conflict').length
   const synced = counts.filter((count) => count.state === 'synced').length

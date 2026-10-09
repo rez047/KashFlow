@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons'
 import { useMemo, useState } from 'react'
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
-import { useKashFlow } from './_layout'
+import { useKashFlow } from '../../src/components/KashFlowProvider'
 
 export default function StockScreen() {
   const { online, snapshot, loading, syncing, refresh } = useKashFlow()

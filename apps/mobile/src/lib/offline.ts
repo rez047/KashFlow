@@ -7,6 +7,7 @@ export type InventoryLocation = { id: string; name: string; code: string; is_def
 export type LocationStock = { item_id: string; location_id: string; quantity: number }
 export type QueuedCount = {
   idempotencyKey: string
+  workspaceId: string
   itemId: string
   itemName: string
   locationId: string
@@ -67,12 +68,17 @@ async function database() {
         PRIMARY KEY (item_id, location_id)
       );
       CREATE TABLE IF NOT EXISTS count_queue (
-        idempotency_key TEXT PRIMARY KEY, item_id TEXT NOT NULL, location_id TEXT NOT NULL,
+        idempotency_key TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, item_id TEXT NOT NULL, location_id TEXT NOT NULL,
         counted_quantity REAL NOT NULL, expected_quantity REAL NOT NULL, count_date TEXT NOT NULL,
         reference TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'pending', server_quantity REAL,
         message TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, synced_at TEXT
       );
     `)
+    const countColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(count_queue)')
+    if (!countColumns.some((column) => column.name === 'workspace_id')) {
+      await db.execAsync('ALTER TABLE count_queue ADD COLUMN workspace_id TEXT;')
+    }
+    await db.runAsync('UPDATE count_queue SET workspace_id = (SELECT workspace_id FROM workspace_snapshot WHERE singleton = 1) WHERE workspace_id IS NULL')
     return db
   })()
   return databasePromise
@@ -102,7 +108,7 @@ export async function saveSnapshot(input: {
 
 export async function queueCount(input: Omit<QueuedCount, 'itemName' | 'locationName' | 'state' | 'serverQuantity' | 'message' | 'createdAt'>) {
   const db = await database()
-  await db.runAsync('INSERT INTO count_queue (idempotency_key, item_id, location_id, counted_quantity, expected_quantity, count_date, reference, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, \'pending\', ?)', input.idempotencyKey, input.itemId, input.locationId, input.countedQuantity, input.expectedQuantity, input.date, input.reference, new Date().toISOString())
+  await db.runAsync('INSERT INTO count_queue (idempotency_key, workspace_id, item_id, location_id, counted_quantity, expected_quantity, count_date, reference, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, \'pending\', ?)', input.idempotencyKey, input.workspaceId, input.itemId, input.locationId, input.countedQuantity, input.expectedQuantity, input.date, input.reference, new Date().toISOString())
 }
 
 export async function updateCount(key: string, state: QueuedCount['state'], message = '', serverQuantity: number | null = null) {
@@ -124,12 +130,13 @@ export async function getOfflineSnapshot(): Promise<OfflineSnapshot | null> {
     db.getAllAsync<InventoryItem>('SELECT * FROM inventory_items ORDER BY name COLLATE NOCASE'),
     db.getAllAsync<{ id: string; name: string; code: string; is_default: number; active: number }>('SELECT * FROM inventory_locations ORDER BY is_default DESC, name COLLATE NOCASE'),
     db.getAllAsync<LocationStock>('SELECT item_id, location_id, quantity FROM location_stock'),
-    db.getAllAsync<Omit<QueuedCount, 'itemName' | 'locationName'> & { itemId: string; locationId: string; counted_quantity: number; expected_quantity: number; server_quantity: number | null; created_at: string }>('SELECT idempotency_key AS idempotencyKey, item_id AS itemId, location_id AS locationId, counted_quantity, expected_quantity, count_date AS date, reference, state, server_quantity, message, created_at FROM count_queue ORDER BY created_at DESC'),
+    db.getAllAsync<Omit<QueuedCount, 'itemName' | 'locationName'> & { itemId: string; workspaceId: string; locationId: string; counted_quantity: number; expected_quantity: number; server_quantity: number | null; created_at: string }>('SELECT idempotency_key AS idempotencyKey, workspace_id AS workspaceId, item_id AS itemId, location_id AS locationId, counted_quantity, expected_quantity, count_date AS date, reference, state, server_quantity, message, created_at FROM count_queue ORDER BY created_at DESC'),
   ])
   const items = rawItems.map((item) => ({ ...item, cost: Number(item.cost), quantity: Number(item.quantity) }))
   const locations = rawLocations.map((location) => ({ ...location, is_default: Boolean(location.is_default), active: Boolean(location.active) }))
   const counts = rawCounts.map((count) => ({
     idempotencyKey: count.idempotencyKey,
+    workspaceId: count.workspaceId,
     itemId: count.itemId,
     itemName: items.find((item) => item.id === count.itemId)?.name ?? 'Removed item',
     locationId: count.locationId,
@@ -143,12 +150,12 @@ export async function getOfflineSnapshot(): Promise<OfflineSnapshot | null> {
     message: count.message,
     createdAt: count.created_at,
   }))
-  return { workspaceId: workspace.workspace_id, workspaceName: workspace.workspace_name, userEmail: workspace.user_email, refreshedAt: workspace.refreshed_at, items, locations, stock: rawStock.map((row) => ({ ...row, quantity: Number(row.quantity) })), counts }
+  return { workspaceId: workspace.workspace_id, workspaceName: workspace.workspace_name, userEmail: workspace.user_email, refreshedAt: workspace.refreshed_at, items, locations, stock: rawStock.map((row) => ({ ...row, quantity: Number(row.quantity) })), counts: counts.filter((count) => count.workspaceId === workspace.workspace_id) }
 }
 
-export async function getCountsToSync() {
+export async function getCountsToSync(workspaceId: string) {
   const snapshot = await getOfflineSnapshot()
-  return snapshot?.counts.filter((count) => count.state === 'pending') ?? []
+  return snapshot?.workspaceId === workspaceId ? snapshot.counts.filter((count) => count.state === 'pending' && count.workspaceId === workspaceId) : []
 }
 
 export async function clearOfflineVault() {

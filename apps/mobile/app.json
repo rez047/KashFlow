@@ -25,6 +25,7 @@
     },
     "plugins": [
       "expo-router",
+      "expo-font",
       ["expo-sqlite", { "useSQLCipher": true }],
       "expo-secure-store"
     ]

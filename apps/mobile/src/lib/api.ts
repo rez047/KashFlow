@@ -28,9 +28,9 @@ export async function api<T>(path: string, token?: string, options: { method?: s
 export async function refreshCatalog(token: string, userEmail: string) {
   const [me, itemResult, locationResult, stockResult] = await Promise.all([
     api<{ workspace: { id: string; name: string } }>('/v1/auth/me', token),
-    api<{ records: Array<{ id: string; data: Record<string, unknown> }> }>('/v1/records/inventory', token),
+    api<{ records: { id: string; data: Record<string, unknown> }[] }>('/v1/records/inventory', token),
     api<{ locations: InventoryLocation[] }>('/v1/inventory/locations', token),
-    api<{ stock: Array<{ item_id: string; location_id: string; quantity: string }> }>('/v1/inventory/location-stock', token),
+    api<{ stock: { item_id: string; location_id: string; quantity: string }[] }>('/v1/inventory/location-stock', token),
   ])
   const items: InventoryItem[] = itemResult.records.map(({ id, data }) => ({
     id,
@@ -47,8 +47,13 @@ export async function refreshCatalog(token: string, userEmail: string) {
   return { workspace: me.workspace, refreshedAt, itemCount: items.length }
 }
 
-export async function syncQueuedCounts(token: string) {
-  const queued = await getCountsToSync()
+export async function syncQueuedCounts(token: string, workspaceId: string) {
+  if (!workspaceId) throw new Error('Refresh a business inventory before syncing saved counts.')
+  const session = await api<{ workspace: { id: string } }>('/v1/auth/me', token)
+  if (session.workspace.id !== workspaceId) {
+    throw new ApiError(409, { error: 'This sign-in belongs to a different business than the saved counts. Switch back to the original business before syncing them.' })
+  }
+  const queued = await getCountsToSync(workspaceId)
   let synced = 0
   let conflicts = 0
   let failed = 0

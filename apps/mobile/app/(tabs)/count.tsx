@@ -1,9 +1,9 @@
 import { Ionicons } from '@expo/vector-icons'
 import { router, useLocalSearchParams } from 'expo-router'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Alert, Keyboard, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 import { createLocalCountKey, queueCount, updateCount } from '../../src/lib/offline'
-import { useKashFlow } from './_layout'
+import { useKashFlow } from '../../src/components/KashFlowProvider'
 
 function nairobiToday() {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date())
@@ -15,14 +15,19 @@ export default function CountScreen() {
   const { online, snapshot, syncNow, reloadLocal } = useKashFlow()
   const params = useLocalSearchParams<{ itemId?: string; locationId?: string; supersedes?: string }>()
   const [query, setQuery] = useState('')
-  const [itemId, setItemId] = useState('')
-  const [locationId, setLocationId] = useState('')
+  const [itemSelection, setItemSelection] = useState<{ id: string; routeId?: string }>({ id: '' })
+  const [locationSelection, setLocationSelection] = useState<{ id: string; routeId?: string }>({ id: '' })
   const [quantity, setQuantity] = useState('')
   const [reference, setReference] = useState('')
   const [saving, setSaving] = useState(false)
+  const routeItemId = params.itemId && itemSelection.routeId !== params.itemId ? params.itemId : undefined
+  const itemId = routeItemId ? (snapshot?.items.some((item) => item.id === routeItemId) ? routeItemId : '') : itemSelection.id
   const selectedItem = snapshot?.items.find((item) => item.id === itemId)
   const locations = snapshot?.locations.filter((location) => location.active) ?? []
-  const effectiveLocationId = locationId || locations.find((location) => location.is_default)?.id || locations[0]?.id || ''
+  const routeLocationId = params.locationId && locationSelection.routeId !== params.locationId ? params.locationId : undefined
+  const effectiveLocationId = routeLocationId
+    ? (locations.some((location) => location.id === routeLocationId) ? routeLocationId : '')
+    : locationSelection.id || locations.find((location) => location.is_default)?.id || locations[0]?.id || ''
   const currentQuantity = Number(snapshot?.stock.find((stock) => stock.item_id === itemId && stock.location_id === effectiveLocationId)?.quantity ?? 0)
   const matches = useMemo(() => (snapshot?.items ?? []).filter((item) => {
     const q = query.trim().toLowerCase()
@@ -31,24 +36,16 @@ export default function CountScreen() {
   const numericQuantity = Number(quantity)
   const valid = Boolean(snapshot && itemId && effectiveLocationId && quantity.trim() !== '' && Number.isFinite(numericQuantity) && numericQuantity >= 0 && numericQuantity <= 1_000_000)
 
-  useEffect(() => {
-    if (params.itemId && snapshot?.items.some((item) => item.id === params.itemId)) {
-      setItemId(params.itemId)
-      setQuery(snapshot.items.find((item) => item.id === params.itemId)?.name ?? '')
-    }
-    if (params.locationId && snapshot?.locations.some((location) => location.id === params.locationId)) setLocationId(params.locationId)
-  }, [params.itemId, params.locationId, snapshot])
-
   async function saveCount() {
     if (!valid || !snapshot) return
     Keyboard.dismiss()
     setSaving(true)
     try {
-      await queueCount({ idempotencyKey: await createLocalCountKey(), itemId, locationId: effectiveLocationId, countedQuantity: Number(numericQuantity.toFixed(3)), expectedQuantity: currentQuantity, date: nairobiToday(), reference: reference.trim().slice(0, 200) })
+      await queueCount({ idempotencyKey: await createLocalCountKey(), workspaceId: snapshot.workspaceId, itemId, locationId: effectiveLocationId, countedQuantity: Number(numericQuantity.toFixed(3)), expectedQuantity: currentQuantity, date: nairobiToday(), reference: reference.trim().slice(0, 200) })
       if (params.supersedes) await updateCount(params.supersedes, 'superseded', 'Replaced by a new physical count after stock changed.')
       await reloadLocal()
-      setQuantity(''); setReference(''); setQuery(''); setItemId('')
-      if (params.supersedes) router.setParams({ itemId: undefined, locationId: undefined, supersedes: undefined })
+      setQuantity(''); setReference(''); setQuery(''); setItemSelection({ id: '', routeId: params.itemId }); setLocationSelection({ id: '', routeId: params.locationId })
+      if (params.itemId || params.locationId || params.supersedes) router.setParams({ itemId: undefined, locationId: undefined, supersedes: undefined })
       Alert.alert('Count saved', online ? 'It is encrypted on this device and ready to sync.' : 'It is encrypted on this device. It will stay here until you reconnect.', online ? [{ text: 'Later', style: 'cancel' }, { text: 'Sync now', onPress: () => { void syncNow() } }] : [{ text: 'Keep counting' }])
     } catch (error) {
       Alert.alert('Could not save count', error instanceof Error ? error.message : 'Make some space on the device and try again.')
@@ -63,14 +60,14 @@ export default function CountScreen() {
 
     {!snapshot ? <View style={styles.empty}><View style={styles.emptyMark}><Ionicons name="cloud-download-outline" size={22} color="#128b70" /></View><Text style={styles.emptyTitle}>Load your items first</Text><Text style={styles.emptyBody}>Connect once to cache your item list and stock locations. After that, you can count even with no signal.</Text></View> : <>
       <Text style={styles.sectionLabel}>1 · SELECT PRODUCT</Text>
-      {selectedItem ? <View style={styles.selectedCard}><View style={styles.selectedIcon}><Ionicons name="cube-outline" size={20} color="#138b70" /></View><View style={styles.selectedCopy}><Text numberOfLines={1} style={styles.selectedName}>{selectedItem.name}</Text><Text style={styles.selectedMeta}>{selectedItem.sku ? `SKU ${selectedItem.sku}` : selectedItem.category || 'Inventory item'}</Text></View><Pressable accessibilityLabel="Choose a different item" style={styles.changeButton} onPress={() => { setItemId(''); setQuery('') }}><Text style={styles.changeText}>Change</Text></Pressable></View> : <>
+      {selectedItem ? <View style={styles.selectedCard}><View style={styles.selectedIcon}><Ionicons name="cube-outline" size={20} color="#138b70" /></View><View style={styles.selectedCopy}><Text numberOfLines={1} style={styles.selectedName}>{selectedItem.name}</Text><Text style={styles.selectedMeta}>{selectedItem.sku ? `SKU ${selectedItem.sku}` : selectedItem.category || 'Inventory item'}</Text></View><Pressable accessibilityLabel="Choose a different item" style={styles.changeButton} onPress={() => { setItemSelection({ id: '', routeId: params.itemId }); setQuery('') }}><Text style={styles.changeText}>Change</Text></Pressable></View> : <>
         <View style={styles.search}><Ionicons name="search-outline" size={16} color="#929d97" /><TextInput value={query} onChangeText={setQuery} placeholder="Search by name or scan SKU" placeholderTextColor="#a4ada7" style={styles.searchInput} autoCorrect={false} /></View>
-        <View style={styles.matches}>{matches.slice(0, query ? 6 : 3).map((item) => <Pressable key={item.id} onPress={() => { setItemId(item.id); setQuery(item.name) }} style={styles.match}><View style={styles.matchMark}><Text style={styles.matchInitial}>{item.name.slice(0, 1).toUpperCase()}</Text></View><View style={styles.matchCopy}><Text numberOfLines={1} style={styles.matchName}>{item.name}</Text><Text style={styles.matchMeta}>{item.sku ? `SKU ${item.sku}` : item.category || 'Inventory item'}</Text></View><Ionicons name="chevron-forward" size={16} color="#9ba59f" /></Pressable>)}{matches.length === 0 && <Text style={styles.noMatches}>No matching item in the saved catalog.</Text>}</View>
+        <View style={styles.matches}>{matches.slice(0, query ? 6 : 3).map((item) => <Pressable key={item.id} onPress={() => { setItemSelection({ id: item.id, routeId: params.itemId }); setQuery(item.name) }} style={styles.match}><View style={styles.matchMark}><Text style={styles.matchInitial}>{item.name.slice(0, 1).toUpperCase()}</Text></View><View style={styles.matchCopy}><Text numberOfLines={1} style={styles.matchName}>{item.name}</Text><Text style={styles.matchMeta}>{item.sku ? `SKU ${item.sku}` : item.category || 'Inventory item'}</Text></View><Ionicons name="chevron-forward" size={16} color="#9ba59f" /></Pressable>)}{matches.length === 0 && <Text style={styles.noMatches}>No matching item in the saved catalog.</Text>}</View>
       </>}
 
       {itemId && <>
         <Text style={[styles.sectionLabel, styles.sectionGap]}>2 · SELECT LOCATION</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.locationChips}>{locations.map((location) => <Pressable key={location.id} onPress={() => setLocationId(location.id)} style={[styles.locationChip, effectiveLocationId === location.id && styles.locationChipActive]}><Ionicons name={location.is_default ? 'storefront-outline' : 'business-outline'} size={13} color={effectiveLocationId === location.id ? '#fff' : '#71817b'} /><Text style={[styles.locationText, effectiveLocationId === location.id && styles.locationTextActive]}>{location.name}</Text></Pressable>)}</ScrollView>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.locationChips}>{locations.map((location) => <Pressable key={location.id} onPress={() => setLocationSelection({ id: location.id, routeId: params.locationId })} style={[styles.locationChip, effectiveLocationId === location.id && styles.locationChipActive]}><Ionicons name={location.is_default ? 'storefront-outline' : 'business-outline'} size={13} color={effectiveLocationId === location.id ? '#fff' : '#71817b'} /><Text style={[styles.locationText, effectiveLocationId === location.id && styles.locationTextActive]}>{location.name}</Text></Pressable>)}</ScrollView>
         <View style={styles.quantityHeader}><View><Text style={styles.sectionLabel}>3 · ENTER PHYSICAL COUNT</Text><Text style={styles.savedHint}>Last saved here: <Text style={styles.savedValue}>{currentQuantity.toLocaleString(undefined, { maximumFractionDigits: 3 })} {selectedItem?.unit || 'units'}</Text></Text></View><View style={styles.baseline}><Text style={styles.baselineLabel}>BASELINE</Text><Text style={styles.baselineQty}>{currentQuantity.toLocaleString(undefined, { maximumFractionDigits: 3 })}</Text></View></View>
         <View style={styles.quantityCard}><Pressable accessibilityLabel="Decrease count" onPress={() => setQuantity(String(Math.max(0, numericQuantity - 1 || 0)))} style={styles.stepper}><Ionicons name="remove" size={20} color="#38544e" /></Pressable><TextInput value={quantity} onChangeText={(value) => setQuantity(value.replace(/[^0-9.]/g, '').replace(/(\..*)\./g, '$1'))} keyboardType="decimal-pad" placeholder="0" placeholderTextColor="#b7c0ba" style={styles.quantityInput} selectTextOnFocus /><Pressable accessibilityLabel="Increase count" onPress={() => setQuantity(String((Number(quantity) || 0) + 1))} style={styles.stepper}><Ionicons name="add" size={20} color="#38544e" /></Pressable></View>
         <View style={styles.reference}><Text style={styles.referenceLabel}>NOTE <Text style={styles.optional}>OPTIONAL</Text></Text><TextInput value={reference} onChangeText={setReference} maxLength={200} placeholder="e.g. Morning aisle check" placeholderTextColor="#a4ada7" style={styles.referenceInput} returnKeyType="done" /></View>
