@@ -3865,6 +3865,7 @@ async function createCameraReader(): Promise<CameraReader> {
     if (membership?.role === 'admin') return true
     return teamMembers.some((member) => member.role === 'admin' && (member.userId === account.user.email || member.isAdmin === true)) || teamMembers.length === 0
   }, [account, teamMembers])
+  const isActiveWorkspaceAdmin = account?.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin'
   const effectivePermissions = useMemo<MemberPermission[]>(() => {
     if (isWorkspaceAdmin) return ROLE_PERMISSION_GROUPS.flatMap((group) => group.permissions.map(([permission]) => permission))
     if (currentMember) return currentMember.permissions ?? currentMember.defaultPermissions
@@ -5041,8 +5042,8 @@ async function createCameraReader(): Promise<CameraReader> {
             {error && <p className="form-error" role="alert">{error}</p>}
             <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
           </form>}
-            <section className="module-card security-card password-change-card">
-              <div className="panel-header"><div><h2>Change account password</h2><p>Confirm your current password, then choose a new password of at least 12 characters. Your password is stored as a one-way scrypt hash.</p></div><ShieldCheck size={20} /></div>
+            {isActiveWorkspaceAdmin && <section className="module-card security-card password-change-card">
+              <div className="panel-header"><div><h2>Change account password</h2><p>Only workspace administrators can change account passwords. Confirm the current password, then choose a new password of at least 12 characters.</p></div><ShieldCheck size={20} /></div>
               <form onSubmit={(event) => void changeAccountPassword(event)}>
                 <label className="field-label">Current password<input required type="password" autoComplete="current-password" value={passwordChange.current} onChange={(event) => setPasswordChange((current) => ({ ...current, current: event.target.value }))} /></label>
                 <div className="field-row"><label className="field-label">New password<input required type="password" minLength={12} autoComplete="new-password" value={passwordChange.next} onChange={(event) => setPasswordChange((current) => ({ ...current, next: event.target.value }))} /></label><label className="field-label">Confirm new password<input required type="password" minLength={12} autoComplete="new-password" value={passwordChange.confirm} onChange={(event) => setPasswordChange((current) => ({ ...current, confirm: event.target.value }))} /></label></div>
@@ -5050,7 +5051,7 @@ async function createCameraReader(): Promise<CameraReader> {
                 {passwordChangeStatus && <p className="dialog-note" role="status">{passwordChangeStatus}</p>}
                 <div className="dialog-actions"><button type="submit" className="button button-primary" disabled={busy || !passwordChange.current || passwordChange.next.length < 12 || !passwordChange.confirm}>{busy ? 'Changing password…' : 'Change password'}</button></div>
               </form>
-            </section>
+            </section>}
             <section className="module-card security-card">
               <div className="panel-header"><div><h2>Account security · two-factor authentication</h2><p>Protect this account's access to your business with an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, or any TOTP app). No paid service is required.</p></div><span className={`status-pill ${twoFactorStatus?.enabled ? 'green' : 'amber'}`}>{twoFactorStatus?.enabled ? 'Enabled' : twoFactorSetup?.otpauthUri ? 'Setup in progress' : 'Not enabled'}</span></div>
               <label className="field-label checkbox-row"><input type="checkbox" checked={Boolean(twoFactorStatus?.enabled || twoFactorSetup?.otpauthUri)} disabled={!twoFactorStatus || twoFactorBusy || (!twoFactorStatus.available && !twoFactorStatus.enabled)} onChange={(event) => toggleTwoFactor(event.target.checked)} /> Enable two-factor authentication for this account</label>

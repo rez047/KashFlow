@@ -1226,6 +1226,9 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
 })
 
 app.post('/v1/auth/change-password', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 8, standardHeaders: 'draft-8', legacyHeaders: false }), requireSession, async (request: AuthedRequest, response, next) => {
+  if (request.workspaceRole !== 'admin') {
+    response.status(403).json({ error: 'Only workspace administrators can change account passwords.' }); return
+  }
   const input = z.object({ currentPassword: z.string().min(1).max(200), newPassword: passwordSchema }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter your current password and a new password with at least 12 characters.' }); return }
   const client = await pool!.connect()
