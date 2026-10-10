@@ -39,7 +39,6 @@
       "icon": "assets/icon.ico",
       "target": ["nsis"],
       "artifactName": "KashFlow-Desktop-${version}-Setup.${ext}",
-      "publisherName": "KashFlow",
       "signAndEditExecutable": true
     },
     "mac": {
