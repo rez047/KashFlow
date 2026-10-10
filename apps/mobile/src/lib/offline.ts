@@ -36,52 +36,64 @@ let databasePromise: Promise<SQLite.SQLiteDatabase> | undefined
 
 async function database() {
   if (databasePromise) return databasePromise
-  databasePromise = (async () => {
+  const pendingDatabase = (async () => {
     let key = await SecureStore.getItemAsync('kashflow.sqlite.key')
     if (!key) {
       key = Array.from(Crypto.getRandomBytes(32), (byte) => byte.toString(16).padStart(2, '0')).join('')
       await SecureStore.setItemAsync('kashflow.sqlite.key', key, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY })
     }
     const db = await SQLite.openDatabaseAsync('kashflow-inventory.db')
-    await db.execAsync(`PRAGMA key = '${key}';`)
-    const cipher = await db.getFirstAsync<{ cipher_version: string }>('PRAGMA cipher_version')
-    if (!cipher?.cipher_version) {
-      await db.closeAsync()
-      await SQLite.deleteDatabaseAsync('kashflow-inventory.db')
-      throw new Error('Encrypted local storage is unavailable in this build. Install the native KashFlow app instead of using an unencrypted preview.')
+    let cipherAvailable = false
+    try {
+      await db.execAsync(`PRAGMA key = '${key}';`)
+      const cipher = await db.getFirstAsync<{ cipher_version: string }>('PRAGMA cipher_version')
+      if (!cipher?.cipher_version) {
+        throw new Error('Encrypted local storage is unavailable in this build. Install the native KashFlow app instead of using an unencrypted preview.')
+      }
+      cipherAvailable = true
+      await db.execAsync('PRAGMA foreign_keys = ON;')
+      await db.execAsync(`
+        CREATE TABLE IF NOT EXISTS workspace_snapshot (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1), workspace_id TEXT NOT NULL,
+          workspace_name TEXT NOT NULL, user_email TEXT NOT NULL, refreshed_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS inventory_items (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, sku TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '',
+          unit TEXT NOT NULL DEFAULT 'units', cost REAL NOT NULL DEFAULT 0, quantity REAL NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS inventory_locations (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, code TEXT NOT NULL, is_default INTEGER NOT NULL, active INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS location_stock (
+          item_id TEXT NOT NULL, location_id TEXT NOT NULL, quantity REAL NOT NULL DEFAULT 0,
+          PRIMARY KEY (item_id, location_id)
+        );
+        CREATE TABLE IF NOT EXISTS count_queue (
+          idempotency_key TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, item_id TEXT NOT NULL, location_id TEXT NOT NULL,
+          counted_quantity REAL NOT NULL, expected_quantity REAL NOT NULL, count_date TEXT NOT NULL,
+          reference TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'pending', server_quantity REAL,
+          message TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, synced_at TEXT
+        );
+      `)
+      const countColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(count_queue)')
+      if (!countColumns.some((column) => column.name === 'workspace_id')) {
+        await db.execAsync('ALTER TABLE count_queue ADD COLUMN workspace_id TEXT;')
+      }
+      await db.runAsync('UPDATE count_queue SET workspace_id = (SELECT workspace_id FROM workspace_snapshot WHERE singleton = 1) WHERE workspace_id IS NULL')
+      return db
+    } catch (error) {
+      await db.closeAsync().catch(() => undefined)
+      if (!cipherAvailable) await SQLite.deleteDatabaseAsync('kashflow-inventory.db').catch(() => undefined)
+      throw error
     }
-    await db.execAsync('PRAGMA foreign_keys = ON;')
-    await db.execAsync(`
-      CREATE TABLE IF NOT EXISTS workspace_snapshot (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1), workspace_id TEXT NOT NULL,
-        workspace_name TEXT NOT NULL, user_email TEXT NOT NULL, refreshed_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS inventory_items (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, sku TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '',
-        unit TEXT NOT NULL DEFAULT 'units', cost REAL NOT NULL DEFAULT 0, quantity REAL NOT NULL DEFAULT 0
-      );
-      CREATE TABLE IF NOT EXISTS inventory_locations (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, code TEXT NOT NULL, is_default INTEGER NOT NULL, active INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS location_stock (
-        item_id TEXT NOT NULL, location_id TEXT NOT NULL, quantity REAL NOT NULL DEFAULT 0,
-        PRIMARY KEY (item_id, location_id)
-      );
-      CREATE TABLE IF NOT EXISTS count_queue (
-        idempotency_key TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, item_id TEXT NOT NULL, location_id TEXT NOT NULL,
-        counted_quantity REAL NOT NULL, expected_quantity REAL NOT NULL, count_date TEXT NOT NULL,
-        reference TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'pending', server_quantity REAL,
-        message TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, synced_at TEXT
-      );
-    `)
-    const countColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(count_queue)')
-    if (!countColumns.some((column) => column.name === 'workspace_id')) {
-      await db.execAsync('ALTER TABLE count_queue ADD COLUMN workspace_id TEXT;')
-    }
-    await db.runAsync('UPDATE count_queue SET workspace_id = (SELECT workspace_id FROM workspace_snapshot WHERE singleton = 1) WHERE workspace_id IS NULL')
-    return db
   })()
-  return databasePromise
+  databasePromise = pendingDatabase
+  try {
+    return await pendingDatabase
+  } catch (error) {
+    if (databasePromise === pendingDatabase) databasePromise = undefined
+    throw error
+  }
 }
 
 export async function createLocalCountKey() { return Crypto.randomUUID() }
