@@ -46,7 +46,7 @@ jobs:
       # publish step can decide between a public release and a draft.
       - name: Detect signing configuration (Windows)
         if: matrix.platform == 'windows'
-        id: signing
+        id: signing-windows
         shell: pwsh
         env:
           CERT: ${{ secrets.WINDOWS_CSC_LINK }}
@@ -59,7 +59,7 @@ jobs:
           }
       - name: Detect signing configuration (macOS)
         if: matrix.platform == 'macos'
-        id: signing
+        id: signing-macos
         shell: bash
         env:
           CERT: ${{ secrets.MACOS_CSC_LINK }}
@@ -74,7 +74,7 @@ jobs:
           fi
 
       - name: Build installer (signed)
-        if: steps.signing.outputs.available == 'true'
+        if: steps.signing-windows.outputs.available == 'true' || steps.signing-macos.outputs.available == 'true'
         run: npm run ${{ matrix.script }}
         working-directory: apps/desktop
         env:
@@ -86,7 +86,7 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'true'
 
       - name: Build installer (unsigned draft)
-        if: steps.signing.outputs.available != 'true'
+        if: steps.signing-windows.outputs.available != 'true' && steps.signing-macos.outputs.available != 'true'
         run: npm run ${{ matrix.script }}
         working-directory: apps/desktop
         env:
