@@ -25,4 +25,12 @@ Install dependencies with `npm ci`, then run `npm start`. Use a native developme
 
 EAS builds require an Expo project linked to this app. Put its ID in `EXPO_PROJECT_ID` (shown in `.env.example`) and authenticate with `EXPO_TOKEN` or `npx eas-cli login`; never commit the token. GitHub Actions can use an `EXPO_TOKEN` repository secret and an `EXPO_PROJECT_ID` repository variable after the project is linked. Android release signing requires the EAS Android signing key. iOS distribution requires Apple Developer signing and App Store Connect setup. EAS can build iOS remotely, but the project still needs Apple signing credentials for device distribution.
 
-After configuring those GitHub settings, run **Actions → Build KashFlow mobile apps** and choose Android, iOS, or both. The workflow waits for each EAS build, downloads the completed package, and attaches it to the GitHub Actions run for 30 days. The `preview` profile produces an Android installable APK and an iOS ad hoc IPA when the required Apple signing credentials and registered devices are configured. `production` produces an Android app bundle and an iOS App Store IPA. These CI artifacts are for review; the landing page only shows mobile downloads after a stable release asset or public store listing is available.
+## Publishing to the landing page
+
+Push a stable `v*` tag (for example `v1.2.0`) or run **Actions → Attach mobile apps to release** and supply an existing tag. The workflow waits for the EAS `preview` build, downloads the signed installable APK, and attaches it to that GitHub release as `KashFlow-Field-Android-<tag>.apk`. The landing page matches that asset by name and serves it as a direct download button.
+
+Android sideloading always triggers the "install from this source" / Play Protect prompt on the device. That prompt cannot be suppressed for an APK; it only disappears with a Google Play release.
+
+### iOS
+
+An `.ipa` cannot be installed by tapping a link in a browser — Apple permits distribution only through TestFlight or the App Store. The landing page therefore never links an `.ipa`; it shows an Apple button only when `VITE_IOS_DISTRIBUTION_URL` is set to a real TestFlight or App Store listing URL, and otherwise shows "App Store release pending". Set that site environment variable after the app is listed. iOS device distribution also requires a paid Apple Developer account and registered devices for ad hoc builds.

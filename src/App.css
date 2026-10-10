@@ -916,6 +916,7 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .app-download-link svg:last-child{margin-left:auto}
 .app-download-link:hover{background:#eaf5ed;border-color:#c6dfcf;color:#0c735b}
 .app-download-link-disabled{border-color:#e8ebe6;background:#f6f7f4;color:#97a19b;cursor:not-allowed;pointer-events:none}
+.app-download-hint{width:100%;margin:7px 0 0;color:#93a09a;font-size:7.5px;line-height:1.45}
 .app-download-note{max-width:1180px;margin:17px auto 0;display:flex;align-items:center;justify-content:center;gap:7px;color:#89958d;font-size:9px;line-height:1.5;text-align:center}
 .app-download-note svg{color:#618475;flex:none}
 .app-download-note a{display:inline-flex;align-items:center;gap:3px;color:#267b66;font-weight:800;text-decoration:underline;text-underline-offset:2px}

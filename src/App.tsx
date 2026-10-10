@@ -380,6 +380,8 @@ function publicDistributionUrl(value: string | undefined) {
     return url.protocol === 'https:' ? url.href : ''
   } catch { return '' }
 }
+// Optional public store/TestFlight listings. These open a store page; the Apple
+// App Store and Google Play links are never used by the direct-download buttons.
 const IOS_DISTRIBUTION_URL = publicDistributionUrl(import.meta.env.VITE_IOS_DISTRIBUTION_URL)
 const ANDROID_DISTRIBUTION_URL = publicDistributionUrl(import.meta.env.VITE_ANDROID_DISTRIBUTION_URL)
 type LandingAppPlatform = 'windows' | 'macos' | 'android' | 'ios'
@@ -480,7 +482,9 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
         setAppDownloads({
           windows: assetUrl(/^KashFlow-Desktop-.*-Setup\.exe$/i),
           macos: assetUrl(/^KashFlow-Desktop-.*\.dmg$/i),
-          android: ANDROID_DISTRIBUTION_URL || assetUrl(/^KashFlow-Field-Android-.*\.apk$/i),
+          android: assetUrl(/^KashFlow-Field-Android-.*\.apk$/i),
+          // An .ipa cannot be installed from a web page. iOS only shows a link when a real
+          // TestFlight/App Store URL is configured; otherwise it stays in the pending state.
           ios: IOS_DISTRIBUTION_URL || null,
         })
       })
@@ -571,17 +575,24 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
       <div className="section-head">
         <span className="section-eyebrow"><Download size={14} /> KASHFLOW FIELD APPS</span>
         <h2>Made for the way your team <em>works</em></h2>
-        <p>Purpose-built screens for counting and managing inventory, with encrypted offline work and clear sync status. Download links appear when a published release is available for your platform.</p>
+        <p>Purpose-built screens for counting and managing inventory, with encrypted offline work and clear sync status. Windows and macOS installers and the Android APK download straight to your device; iPhone and iPad install through Apple&apos;s own App Store or TestFlight.</p>
       </div>
       <div className="app-download-grid">
-        {appPlatforms.map(({ platform, name, detail, label, icon: Icon, badge }) => (
+        {appPlatforms.map(({ platform, name, detail, label, icon: Icon, badge }) => {
+          const target = appDownloads[platform]
+          const opensStore = platform === 'ios' || (platform === 'android' && Boolean(ANDROID_DISTRIBUTION_URL))
+          return (
           <article className="app-download-card" key={platform}>
           <div className="app-download-head"><span className="app-download-icon"><Icon size={21} /></span><span className="app-download-badge">{badge}</span></div>
           <h3>{name}</h3><p>{detail}</p>
-          {appDownloads[platform] ? <a className="app-download-link" href={appDownloads[platform]!} target={platform === 'ios' || (platform === 'android' && Boolean(ANDROID_DISTRIBUTION_URL)) ? '_blank' : undefined} rel={platform === 'ios' || (platform === 'android' && Boolean(ANDROID_DISTRIBUTION_URL)) ? 'noreferrer' : undefined} aria-label={`${platform === 'ios' || (platform === 'android' && Boolean(ANDROID_DISTRIBUTION_URL)) ? 'Open' : 'Download'} ${label} for ${name}`}><Download size={14} />{platform === 'ios' ? 'Open iOS app' : platform === 'android' && ANDROID_DISTRIBUTION_URL ? 'Open Android app' : `Download ${label}`}<ArrowUpRight size={14} /></a>
+          {target ? <a className="app-download-link" href={target} target={opensStore ? '_blank' : undefined} rel={opensStore ? 'noreferrer' : undefined} aria-label={`${opensStore ? 'Open' : 'Download'} ${label} for ${name}`}><Download size={14} />{platform === 'ios' ? (IOS_DISTRIBUTION_URL ? (IOS_DISTRIBUTION_URL.includes('testflight.apple.com') ? 'Open in TestFlight' : 'Get it on the App Store') : 'Get it on the App Store') : platform === 'android' && ANDROID_DISTRIBUTION_URL ? 'Open Android app' : `Download ${label}`}<ArrowUpRight size={14} /></a>
             : <span className="app-download-link app-download-link-disabled" aria-live="polite">{platform === 'ios' ? 'App Store release pending' : releaseLookupComplete ? 'Release not available yet' : 'Checking releases…'}</span>}
+          {platform === 'android' && target && !ANDROID_DISTRIBUTION_URL && <span className="app-download-hint">Android may ask you to allow installing apps from this source.</span>}
+          {platform === 'ios' && target && <span className="app-download-hint">iOS installs through Apple&apos;s App Store or TestFlight, not a direct file download.</span>}
+          {platform === 'macos' && target && <span className="app-download-hint">Open the DMG, then drag KashFlow Field into Applications.</span>}
           </article>
-        ))}
+          )
+        })}
       </div>
       <p className="app-download-note"><ShieldCheck size={14} /> Only downloads from a published stable release appear here. <a href={APP_RELEASES_URL} target="_blank" rel="noreferrer">View KashFlow release notes <ArrowUpRight size={12} /></a></p>
     </section>

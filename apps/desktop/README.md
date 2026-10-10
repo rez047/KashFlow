@@ -19,4 +19,24 @@ Set `KASHFLOW_API_BASE_URL` to the KashFlow API origin if the production URL dif
 - Universal macOS DMG and ZIP: `npm run build:mac` (run on macOS)
 - Linux AppImage and DEB: `npm run build:linux`
 
-The **Build KashFlow Field installers** GitHub Actions workflow can package Windows and universal macOS installers on hosted runners. Run it manually to download 30-day build artifacts, or push a `field-v*` tag to create a draft GitHub release for review. Draft installers are unsigned; code sign Windows builds and sign and notarize macOS builds before publishing to customers.
+## Publishing to the landing page
+
+The **Build KashFlow Field installers** GitHub Actions workflow packages Windows and universal macOS installers on hosted runners.
+
+The landing page reads the newest published (non-draft, non-prerelease) GitHub release and links any asset whose name matches `KashFlow-Desktop-*-Setup.exe` (Windows) or `KashFlow-Desktop-*.dmg` (macOS). Do not rename those artifacts.
+
+- **Stable release:** push a `v*` tag (for example `v1.2.0`). The workflow publishes a public GitHub release with the installers attached, so the landing page download buttons work immediately.
+- **Draft for manual signing:** push a `field-v*` tag to create a draft release instead, for review before publishing.
+
+### Code signing
+
+The workflow signs automatically when the following repository **secrets** are set, and otherwise builds unsigned:
+
+| Platform | Secrets |
+|---|---|
+| Windows | `WINDOWS_CSC_LINK`, `WINDOWS_CSC_KEY_PASSWORD` |
+| macOS | `MACOS_CSC_LINK`, `MACOS_CSC_KEY_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID` |
+
+The certificate links accept a base64-encoded certificate or a secure download URL, as expected by `electron-builder`. Without them the workflow logs a warning and the installer is unsigned, which triggers SmartScreen on Windows and Gatekeeper on macOS for your customers.
+
+macOS notarization requires a paid Apple Developer account. electron-builder's `notarize` option is deliberately left off because it must be paired with valid App Store Connect credentials; enable it only once those are configured in CI.

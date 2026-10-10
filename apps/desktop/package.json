@@ -33,10 +33,24 @@
     "appId": "ke.kashflow.desktop",
     "productName": "KashFlow Field",
     "directories": { "output": "release" },
+    "asar": true,
     "files": ["dist/**/*", "main.cjs", "preload.cjs", "package.json"],
-    "win": { "icon": "assets/icon.ico", "target": ["nsis"], "artifactName": "KashFlow-Desktop-${version}-Setup.${ext}" },
-    "mac": { "icon": "assets/icon.icns", "target": ["dmg", "zip"], "artifactName": "KashFlow-Desktop-${version}-${arch}.${ext}" },
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": ["nsis"],
+      "artifactName": "KashFlow-Desktop-${version}-Setup.${ext}",
+      "publisherName": "KashFlow",
+      "signAndEditExecutable": true
+    },
+    "mac": {
+      "icon": "assets/icon.icns",
+      "target": ["dmg", "zip"],
+      "artifactName": "KashFlow-Desktop-${version}-${arch}.${ext}",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "notarize": false
+    },
     "linux": { "icon": "assets/icon.png", "target": ["AppImage", "deb"], "artifactName": "KashFlow-Desktop-${version}-${arch}.${ext}" },
-    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true, "createStartMenuShortcut": true }
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true, "createStartMenuShortcut": true, "perMachine": false }
   }
 }

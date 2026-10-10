@@ -210,9 +210,18 @@ Never commit `.env`, `.env.local`, database URLs, session secrets, passwords, pr
 
 ## Native field apps
 
-The landing page checks the latest published stable GitHub release and shows direct links only for Windows `.exe`, macOS `.dmg`, and Android `.apk` assets attached to that release. Optional public `VITE_IOS_DISTRIBUTION_URL` and `VITE_ANDROID_DISTRIBUTION_URL` settings can point to TestFlight/App Store and Google Play listings when available. There are currently no published GitHub releases, so those download controls remain unavailable until release assets or store listings are published. The GitHub Actions workflow packages Windows and universal macOS desktop installers; a `field-v*` tag creates an unsigned draft release for signing and notarization review. Desktop and mobile builds have their own page navigation and offline inventory workflow. Offline counts require an initial successful inventory refresh, are saved encrypted on device, and are posted with idempotency protection when the user syncs. A changed server balance pauses the count for review.
+The landing page checks the latest published stable GitHub release and shows direct links for Windows `.exe`, macOS `.dmg`, and Android `.apk` assets attached to that release. Optional public `VITE_IOS_DISTRIBUTION_URL` and `VITE_ANDROID_DISTRIBUTION_URL` settings can point to TestFlight/App Store and Google Play listings when available.
 
-See [`apps/mobile/README.md`](apps/mobile/README.md) for native iOS/Android builds and [`apps/desktop/README.md`](apps/desktop/README.md) for Windows/macOS/Linux installers. iOS distribution needs an Apple Developer account and signing; Android and EAS builds need the release project's Expo credentials. A Windows installer can be built locally, but the release hub does not yet contain published signed installers.
+Push a stable `v*` tag to publish a release that the download hub can read:
+
+- **`Build KashFlow Field installers`** packages Windows and universal macOS installers. A `v*` tag publishes them to a stable GitHub release; a `field-v*` tag creates an unsigned draft for manual signing review instead.
+- **`Attach mobile apps to release`** builds the signed installable Android APK with EAS and attaches it to the same release. It can also be run manually against an existing tag.
+
+Signing is automatic when the relevant repository secrets are present and otherwise produces an unsigned build; see [`apps/desktop/README.md`](apps/desktop/README.md) for the Windows and macOS secret names. **iOS cannot be downloaded directly from a browser**: Apple permits distribution only through TestFlight or the App Store, so the hub shows an Apple button only when `VITE_IOS_DISTRIBUTION_URL` points at a real listing and otherwise shows a pending state. There are no published releases in this repository yet, so the download buttons stay unavailable until a release is published or a store listing is configured. Android APKs always show the on-device "install from this source" prompt; Windows unsigned installers trigger SmartScreen, and unsigned macOS DMGs trigger Gatekeeper unless the app is signed and notarized with a paid Apple Developer account.
+
+Desktop and mobile builds have their own page navigation and offline inventory workflow. Offline counts require an initial successful inventory refresh, are saved encrypted on device, and are posted with idempotency protection when the user syncs. A changed server balance pauses the count for review.
+
+See [`apps/mobile/README.md`](apps/mobile/README.md) for native iOS/Android builds and [`apps/desktop/README.md`](apps/desktop/README.md) for Windows/macOS/Linux installers. iOS distribution needs an Apple Developer account and signing; Android and EAS builds need the release project's Expo credentials (`EXPO_TOKEN` secret and `EXPO_PROJECT_ID` variable, already wired into the release workflow).
 
 ## Security and accounting notice
 

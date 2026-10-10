@@ -1,10 +1,18 @@
 name: Build KashFlow Field installers
 
+# A stable `v*` tag publishes installers that the landing page can read directly.
+# A `field-v*` tag still produces a draft release for manual signing review.
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Stable release tag to publish (for example v1.2.0). Leave empty for build artifacts only.
+        required: false
+        type: string
   push:
     tags:
       - 'field-v*'
+      - 'v*'
 
 permissions:
   contents: read
@@ -33,11 +41,57 @@ jobs:
       - name: Install desktop dependencies
         run: npm ci
         working-directory: apps/desktop
-      - name: Build installer
+
+      # Report whether the signing material for this platform is present so the
+      # publish step can decide between a public release and a draft.
+      - name: Detect signing configuration (Windows)
+        if: matrix.platform == 'windows'
+        id: signing
+        shell: pwsh
+        env:
+          CERT: ${{ secrets.WINDOWS_CSC_LINK }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERT)) {
+            "available=false" >> $env:GITHUB_OUTPUT
+            "::warning::No Windows code-signing certificate secret (WINDOWS_CSC_LINK) is configured. The installer will be published as unsigned or held as a draft."
+          } else {
+            "available=true" >> $env:GITHUB_OUTPUT
+          }
+      - name: Detect signing configuration (macOS)
+        if: matrix.platform == 'macos'
+        id: signing
+        shell: bash
+        env:
+          CERT: ${{ secrets.MACOS_CSC_LINK }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ -z "$CERT" || -z "$NOTARY_APPLE_ID" || -z "$NOTARY_TEAM_ID" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::macOS signing/notarization secrets (MACOS_CSC_LINK, APPLE_ID, APPLE_TEAM_ID) are not all configured. The DMG will be unsigned or held as a draft."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build installer (signed)
+        if: steps.signing.outputs.available == 'true'
         run: npm run ${{ matrix.script }}
         working-directory: apps/desktop
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: ${{ matrix.platform == 'macos' && 'false' || '' }}
+          CSC_LINK: ${{ matrix.platform == 'windows' && secrets.WINDOWS_CSC_LINK || secrets.MACOS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ matrix.platform == 'windows' && secrets.WINDOWS_CSC_KEY_PASSWORD || secrets.MACOS_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'true'
+
+      - name: Build installer (unsigned draft)
+        if: steps.signing.outputs.available != 'true'
+        run: npm run ${{ matrix.script }}
+        working-directory: apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v7
         with:
@@ -51,6 +105,35 @@ jobs:
           retention-days: 30
           compression-level: 0
 
+  # A stable `v*` tag publishes the installers the landing page links to.
+  publish-release:
+    name: Publish stable release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: desktop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download desktop installers
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish (or update) the GitHub release
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --verify-tag --title "KashFlow ${GITHUB_REF_NAME}" \
+              --notes "KashFlow desktop installers for ${GITHUB_REF_NAME}. Windows (.exe) and macOS (.dmg) builds are attached for direct download."
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+
+  # A `field-v*` tag keeps the original draft-for-signing-review behaviour.
   draft-release:
     name: Prepare draft release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/field-v')
