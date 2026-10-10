@@ -171,12 +171,17 @@ export async function getCountsToSync(workspaceId: string) {
 }
 
 export async function clearOfflineVault() {
-  if (databasePromise) {
-    const db = await databasePromise
-    await db.closeAsync()
-    databasePromise = undefined
+  const activeDatabase = databasePromise
+  databasePromise = undefined
+  const db = await activeDatabase?.catch(() => undefined)
+  if (db) await db.closeAsync().catch(() => undefined)
+
+  const [, keyResult, tokenResult] = await Promise.allSettled([
+    SQLite.deleteDatabaseAsync('kashflow-inventory.db'),
+    SecureStore.deleteItemAsync('kashflow.sqlite.key'),
+    SecureStore.deleteItemAsync('kashflow.access-token'),
+  ])
+  if (keyResult.status === 'rejected' || tokenResult.status === 'rejected') {
+    throw new Error('The secure device keys could not be removed. Retry sign-out before sharing this device.')
   }
-  await SQLite.deleteDatabaseAsync('kashflow-inventory.db')
-  await SecureStore.deleteItemAsync('kashflow.sqlite.key')
-  await SecureStore.deleteItemAsync('kashflow.access-token')
 }
