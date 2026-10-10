@@ -15,9 +15,10 @@ type DesktopVault = {
   userEmail: string
   workspaceId: string
   workspaceName: string
+  workspaces: Array<{ id: string; name: string; role: string }>
   refreshedAt: string
   items: Array<{ id: string; name: string; sku: string; category: string; unit: string; cost: number; quantity: number }>
   locations: Array<{ id: string; name: string; code: string; is_default: boolean; active: boolean }>
   stock: Array<{ item_id: string; location_id: string; quantity: number }>
-  counts: Array<{ idempotencyKey: string; itemId: string; itemName: string; locationId: string; locationName: string; countedQuantity: number; expectedQuantity: number; date: string; reference: string; state: 'pending' | 'conflict' | 'synced' | 'superseded'; serverQuantity: number | null; message: string; createdAt: string }>
+  counts: Array<{ idempotencyKey: string; workspaceId: string; itemId: string; itemName: string; locationId: string; locationName: string; countedQuantity: number; expectedQuantity: number; date: string; reference: string; state: 'pending' | 'conflict' | 'synced' | 'superseded'; serverQuantity: number | null; message: string; createdAt: string }>
 }

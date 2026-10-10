@@ -3347,8 +3347,9 @@ app.post('/v1/workspaces/:workspaceId/activate', requirePool, verifyOrigin, requ
     const result = await pool!.query(`SELECT wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id
       WHERE wm.user_id = $1 AND wm.workspace_id = $2`, [request.session!.userId, request.params.workspaceId])
     if (!result.rowCount) { response.status(404).json({ error: 'You are not a member of that business.' }); return }
-    setSessionCookie(response, { ...request.session!, workspaceId: String(request.params.workspaceId) })
-    response.json({ workspace: { id: String(request.params.workspaceId), name: result.rows[0].name, role: result.rows[0].role } })
+    const session = { ...request.session!, workspaceId: String(request.params.workspaceId) }
+    setSessionCookie(response, session)
+    response.json({ workspace: { id: session.workspaceId, name: result.rows[0].name, role: result.rows[0].role }, ...(isNativeClient(request) ? { accessToken: nativeSessionToken(session) } : {}) })
   } catch (error) { next(error) }
 })
 

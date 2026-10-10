@@ -2,8 +2,8 @@ import * as Network from 'expo-network'
 import * as SecureStore from 'expo-secure-store'
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Alert } from 'react-native'
-import { refreshCatalog, syncQueuedCounts } from '../lib/api'
-import { getOfflineSnapshot, type OfflineSnapshot } from '../lib/offline'
+import { activateBusiness, refreshCatalog, syncQueuedCounts } from '../lib/api'
+import { getOfflineSnapshot, saveSnapshot, type OfflineSnapshot } from '../lib/offline'
 
 type AppState = {
   token: string | null
@@ -14,6 +14,7 @@ type AppState = {
   reloadLocal: () => Promise<void>
   refresh: () => Promise<void>
   syncNow: (showMessage?: boolean) => Promise<void>
+  switchBusiness: (workspaceId: string) => Promise<void>
 }
 
 const AppContext = createContext<AppState | null>(null)
@@ -44,6 +45,40 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
   }, [token])
 
   const reloadLocal = useCallback(async () => { setSnapshot(await getOfflineSnapshot()) }, [])
+
+  const switchBusiness = useCallback(async (workspaceId: string) => {
+    if (!token) throw new Error('Sign in while connected before switching businesses.')
+    if (!online) throw new Error('Connect to the internet before switching businesses.')
+    if (!workspaceId || workspaceId === snapshot?.workspaceId) return
+    const target = snapshot?.workspaces.find((workspace) => workspace.id === workspaceId)
+    if (!target) throw new Error('Refresh your business list while online before switching.')
+    const activated = await activateBusiness(token, workspaceId)
+    if (!activated.accessToken) throw new Error('The server did not return a secure business session. Update the app or sign in again.')
+    const nextToken = activated.accessToken
+    await SecureStore.setItemAsync('kashflow.access-token', nextToken)
+    setToken(nextToken)
+    try {
+      await refreshCatalog(nextToken, snapshot?.userEmail ?? '')
+      setSnapshot(await getOfflineSnapshot())
+    } catch (error) {
+      let rolledBack = false
+      if (snapshot?.workspaceId) {
+        try {
+          const rollback = await activateBusiness(nextToken, snapshot.workspaceId)
+          if (!rollback.accessToken) throw new Error('The original business session could not be restored.')
+          await SecureStore.setItemAsync('kashflow.access-token', rollback.accessToken)
+          setToken(rollback.accessToken)
+          rolledBack = true
+        } catch { /* If the service is unreachable, save a safe empty snapshot for the newly active business below. */ }
+      }
+      if (!rolledBack) {
+        await saveSnapshot({ workspaceId, workspaceName: activated.workspace.name, userEmail: snapshot?.userEmail ?? '', items: [], locations: [], stock: [], workspaces: snapshot?.workspaces ?? [target] })
+        setSnapshot(await getOfflineSnapshot())
+        throw new Error(`Switched to ${activated.workspace.name}, but inventory could not refresh. Your saved counts are safe; try Refresh when the connection returns.`)
+      }
+      throw error
+    }
+  }, [online, snapshot, token])
 
   const syncNow = useCallback(async (showMessage = true) => {
     if (!token) {
@@ -126,6 +161,6 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
     return () => { active = false; subscription.remove() }
   }, [])
 
-  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow }), [token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow])
+  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow, switchBusiness }), [token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow, switchBusiness])
   return <AppContext.Provider value={context}>{children}</AppContext.Provider>
 }

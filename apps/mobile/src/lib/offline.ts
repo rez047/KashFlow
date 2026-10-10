@@ -5,6 +5,7 @@ import * as SQLite from 'expo-sqlite'
 export type InventoryItem = { id: string; name: string; sku: string; category: string; unit: string; cost: number; quantity: number }
 export type InventoryLocation = { id: string; name: string; code: string; is_default: boolean; active: boolean }
 export type LocationStock = { item_id: string; location_id: string; quantity: number }
+export type BusinessWorkspace = { id: string; name: string; role: string }
 export type QueuedCount = {
   idempotencyKey: string
   workspaceId: string
@@ -26,6 +27,7 @@ export type OfflineSnapshot = {
   workspaceName: string
   userEmail: string
   refreshedAt: string
+  workspaces: BusinessWorkspace[]
   items: InventoryItem[]
   locations: InventoryLocation[]
   stock: LocationStock[]
@@ -56,6 +58,9 @@ async function database() {
         CREATE TABLE IF NOT EXISTS workspace_snapshot (
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1), workspace_id TEXT NOT NULL,
           workspace_name TEXT NOT NULL, user_email TEXT NOT NULL, refreshed_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workspace_access (
+          workspace_id TEXT PRIMARY KEY, workspace_name TEXT NOT NULL, role TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS inventory_items (
           id TEXT PRIMARY KEY, name TEXT NOT NULL, sku TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '',
@@ -105,11 +110,14 @@ export async function saveSnapshot(input: {
   items: InventoryItem[]
   locations: InventoryLocation[]
   stock: LocationStock[]
+  workspaces: BusinessWorkspace[]
 }) {
   const db = await database()
   const refreshedAt = new Date().toISOString()
   await db.withTransactionAsync(async () => {
     await db.runAsync('INSERT OR REPLACE INTO workspace_snapshot (singleton, workspace_id, workspace_name, user_email, refreshed_at) VALUES (1, ?, ?, ?, ?)', input.workspaceId, input.workspaceName, input.userEmail, refreshedAt)
+    await db.execAsync('DELETE FROM workspace_access;')
+    for (const workspace of input.workspaces) await db.runAsync('INSERT OR REPLACE INTO workspace_access (workspace_id, workspace_name, role) VALUES (?, ?, ?)', workspace.id, workspace.name, workspace.role)
     await db.execAsync('DELETE FROM inventory_items; DELETE FROM inventory_locations; DELETE FROM location_stock;')
     for (const item of input.items) await db.runAsync('INSERT INTO inventory_items (id, name, sku, category, unit, cost, quantity) VALUES (?, ?, ?, ?, ?, ?, ?)', item.id, item.name, item.sku, item.category, item.unit, item.cost, item.quantity)
     for (const location of input.locations) await db.runAsync('INSERT INTO inventory_locations (id, name, code, is_default, active) VALUES (?, ?, ?, ?, ?)', location.id, location.name, location.code, location.is_default ? 1 : 0, location.active ? 1 : 0)
@@ -138,11 +146,12 @@ export async function getOfflineSnapshot(): Promise<OfflineSnapshot | null> {
   const db = await database()
   const workspace = await db.getFirstAsync<{ workspace_id: string; workspace_name: string; user_email: string; refreshed_at: string }>('SELECT workspace_id, workspace_name, user_email, refreshed_at FROM workspace_snapshot WHERE singleton = 1')
   if (!workspace) return null
-  const [rawItems, rawLocations, rawStock, rawCounts] = await Promise.all([
+  const [rawItems, rawLocations, rawStock, rawCounts, rawWorkspaces] = await Promise.all([
     db.getAllAsync<InventoryItem>('SELECT * FROM inventory_items ORDER BY name COLLATE NOCASE'),
     db.getAllAsync<{ id: string; name: string; code: string; is_default: number; active: number }>('SELECT * FROM inventory_locations ORDER BY is_default DESC, name COLLATE NOCASE'),
     db.getAllAsync<LocationStock>('SELECT item_id, location_id, quantity FROM location_stock'),
     db.getAllAsync<Omit<QueuedCount, 'itemName' | 'locationName'> & { itemId: string; workspaceId: string; locationId: string; counted_quantity: number; expected_quantity: number; server_quantity: number | null; created_at: string }>('SELECT idempotency_key AS idempotencyKey, workspace_id AS workspaceId, item_id AS itemId, location_id AS locationId, counted_quantity, expected_quantity, count_date AS date, reference, state, server_quantity, message, created_at FROM count_queue ORDER BY created_at DESC'),
+    db.getAllAsync<BusinessWorkspace>('SELECT workspace_id AS id, workspace_name AS name, role FROM workspace_access ORDER BY workspace_name COLLATE NOCASE'),
   ])
   const items = rawItems.map((item) => ({ ...item, cost: Number(item.cost), quantity: Number(item.quantity) }))
   const locations = rawLocations.map((location) => ({ ...location, is_default: Boolean(location.is_default), active: Boolean(location.active) }))
@@ -162,7 +171,8 @@ export async function getOfflineSnapshot(): Promise<OfflineSnapshot | null> {
     message: count.message,
     createdAt: count.created_at,
   }))
-  return { workspaceId: workspace.workspace_id, workspaceName: workspace.workspace_name, userEmail: workspace.user_email, refreshedAt: workspace.refreshed_at, items, locations, stock: rawStock.map((row) => ({ ...row, quantity: Number(row.quantity) })), counts: counts.filter((count) => count.workspaceId === workspace.workspace_id) }
+  const workspaces = rawWorkspaces.length ? rawWorkspaces : [{ id: workspace.workspace_id, name: workspace.workspace_name, role: 'admin' }]
+  return { workspaceId: workspace.workspace_id, workspaceName: workspace.workspace_name, userEmail: workspace.user_email, refreshedAt: workspace.refreshed_at, workspaces, items, locations, stock: rawStock.map((row) => ({ ...row, quantity: Number(row.quantity) })), counts: counts.filter((count) => count.workspaceId === workspace.workspace_id) }
 }
 
 export async function getCountsToSync(workspaceId: string) {

@@ -10,7 +10,7 @@ import type { FormEvent, ReactNode } from 'react'
 type Page = 'home' | 'inventory' | 'count' | 'sync' | 'settings'
 type Item = DesktopVault['items'][number]
 type Count = DesktopVault['counts'][number]
-const emptyVault: DesktopVault = { token: '', userEmail: '', workspaceId: '', workspaceName: '', refreshedAt: '', items: [], locations: [], stock: [], counts: [] }
+const emptyVault: DesktopVault = { token: '', userEmail: '', workspaceId: '', workspaceName: '', workspaces: [], refreshedAt: '', items: [], locations: [], stock: [], counts: [] }
 const todayNairobi = () => {
   const values = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date()).map((part) => [part.type, part.value]))
   return `${values.year}-${values.month}-${values.day}`
@@ -41,13 +41,15 @@ export default function App() {
   const [twoFactorCode, setTwoFactorCode] = useState('')
   const [loginError, setLoginError] = useState('')
   const [appVersion, setAppVersion] = useState('1.0.0')
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
+  const activeCounts = vault.counts.filter((count) => count.workspaceId === vault.workspaceId)
 
   const currentItem = vault.items.find((item) => item.id === itemId)
   const activeLocations = vault.locations.filter((location) => location.active)
   const currentLocationId = locationId || activeLocations.find((location) => location.is_default)?.id || activeLocations[0]?.id || ''
   const currentBalance = Number(vault.stock.find((row) => row.item_id === itemId && row.location_id === currentLocationId)?.quantity ?? 0)
-  const pendingCount = vault.counts.filter((count) => count.state === 'pending').length
-  const conflictCount = vault.counts.filter((count) => count.state === 'conflict').length
+  const pendingCount = activeCounts.filter((count) => count.state === 'pending').length
+  const conflictCount = activeCounts.filter((count) => count.state === 'conflict').length
   const itemTotal = (item: Item, filter = 'all') => filter === 'all'
     ? vault.stock.filter((row) => row.item_id === item.id).reduce((sum, row) => sum + row.quantity, 0)
     : Number(vault.stock.find((row) => row.item_id === item.id && row.location_id === filter)?.quantity ?? 0)
@@ -75,7 +77,7 @@ export default function App() {
       return response.data as T
     }
     const [me, recordResult, locationsResult, stockResult] = await Promise.all([
-      call<{ workspace: { id: string; name: string } }>('/v1/auth/me'),
+      call<{ workspace: { id: string; name: string }; workspaces?: DesktopVault['workspaces'] }>('/v1/auth/me'),
       call<{ records: Array<{ id: string; data: Record<string, unknown> }> }>('/v1/records/inventory'),
       call<{ locations: DesktopVault['locations'] }>('/v1/inventory/locations'),
       call<{ stock: Array<{ item_id: string; location_id: string; quantity: string }> }>('/v1/inventory/location-stock'),
@@ -86,6 +88,7 @@ export default function App() {
       userEmail,
       workspaceId: me.workspace.id,
       workspaceName: me.workspace.name,
+      workspaces: me.workspaces ?? [{ id: me.workspace.id, name: me.workspace.name, role: 'admin' }],
       refreshedAt: new Date().toISOString(),
       items: recordResult.records.map(({ id, data }) => ({ id, name: String(data.name ?? data.description ?? 'Untitled item'), sku: String(data.sku ?? ''), category: String(data.category ?? ''), unit: String(data.unit ?? 'units'), cost: Number(data.cost ?? 0), quantity: Number(data.quantity ?? 0) })),
       locations: locationsResult.locations,
@@ -98,7 +101,7 @@ export default function App() {
   const syncCounts = useCallback(async (showToast = true) => {
     if (!vault.token) { notify('Sign in again while connected to sync this device.'); return }
     if (!online) { notify('Still offline. Your counts remain encrypted on this computer.'); return }
-    const queue = vault.counts.filter((count) => count.state === 'pending')
+    const queue = vault.counts.filter((count) => count.workspaceId === vault.workspaceId && count.state === 'pending')
     if (!queue.length) { notify('No counts are waiting to sync.'); return }
     setBusy(true)
     let synced = 0, conflicts = 0, failed = 0
@@ -127,7 +130,11 @@ export default function App() {
     let mounted = true
     void window.kashflowDesktop.loadVault().then((saved) => {
       if (!mounted) return
-      if (saved && typeof saved === 'object') setVault({ ...emptyVault, ...saved })
+      if (saved && typeof saved === 'object') {
+        const restored = { ...emptyVault, ...saved }
+        restored.counts = restored.counts.map((count) => ({ ...count, workspaceId: count.workspaceId || restored.workspaceId }))
+        setVault(restored)
+      }
       setLoaded(true)
     }).catch((error: unknown) => {
       if (mounted) { setVaultError(error instanceof Error ? error.message : 'The encrypted business vault could not be opened.'); setLoaded(true) }
@@ -199,7 +206,7 @@ export default function App() {
     const userEmail = (data.user as { email?: string } | undefined)?.email ?? loginIdentifier.trim()
     const workspace = data.workspace as { id?: string; name?: string } | undefined
     if (!token) throw new Error('The secure sign-in response was incomplete. Try again.')
-    const next = { ...emptyVault, token, userEmail, workspaceId: workspace?.id ?? '', workspaceName: workspace?.name ?? '' }
+    const next = { ...emptyVault, token, userEmail, workspaceId: workspace?.id ?? '', workspaceName: workspace?.name ?? '', workspaces: Array.isArray(data.workspaces) ? data.workspaces as DesktopVault['workspaces'] : [] }
     await persistVault(next)
     try { await refreshCatalog(token, userEmail) } catch (error) { notify(error instanceof Error ? `Signed in, but the first inventory sync failed: ${error.message}` : 'Signed in. Connect to download the inventory snapshot.') }
     navigate('home')
@@ -214,11 +221,34 @@ export default function App() {
     finally { setBusy(false) }
   }
 
+  async function switchBusiness(workspaceId: string) {
+    if (!workspaceId || workspaceId === vault.workspaceId || busy) return
+    if (!online) { notify('Connect to the internet to switch businesses. Your saved counts stay encrypted on this computer.'); return }
+    const target = vault.workspaces.find((workspace) => workspace.id === workspaceId)
+    if (!target) { notify('Refresh your workspace list while online before switching businesses.'); return }
+    if (pendingCount > 0 && !window.confirm(`${pendingCount} unsynced count${pendingCount === 1 ? '' : 's'} for ${vault.workspaceName} will stay saved here. You can switch back to sync them. Continue to ${target.name}?`)) return
+    setBusy(true)
+    try {
+      const response = await window.kashflowDesktop.request(`/v1/workspaces/${encodeURIComponent(workspaceId)}/activate`, vault.token, { method: 'POST', body: {} })
+      if (!response.ok) throw new Error(typeof response.data.error === 'string' ? response.data.error : `Could not switch business (${response.status}).`)
+      const token = typeof response.data.accessToken === 'string' ? response.data.accessToken : ''
+      if (!token) throw new Error('The server did not return a business session token. Sign in again and retry.')
+      const staged = { ...vault, token, workspaceId, workspaceName: target.name, items: [], locations: [], stock: [], refreshedAt: '' }
+      await persistVault(staged)
+      promptedForQueue.current = false
+      await refreshCatalog(token, vault.userEmail, staged)
+      navigate('home')
+      notify(`Now working in ${target.name}.`)
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Could not switch businesses. Your saved counts remain encrypted.')
+    } finally { setBusy(false) }
+  }
+
   async function savePhysicalCount(event: FormEvent) {
     event.preventDefault()
     if (!currentItem || !currentLocationId || countedQuantity.trim() === '' || !Number.isFinite(Number(countedQuantity)) || Number(countedQuantity) < 0) { notify('Choose a product, location, and non-negative physical count.'); return }
     const count: Count = {
-      idempotencyKey: crypto.randomUUID(), itemId: currentItem.id, itemName: currentItem.name,
+      idempotencyKey: crypto.randomUUID(), workspaceId: vault.workspaceId, itemId: currentItem.id, itemName: currentItem.name,
       locationId: currentLocationId, locationName: activeLocations.find((location) => location.id === currentLocationId)?.name ?? 'Location',
       countedQuantity: Number(Number(countedQuantity).toFixed(3)), expectedQuantity: currentBalance,
       date: todayNairobi(), reference: countReference.trim().slice(0, 200), state: 'pending', serverQuantity: null, message: '', createdAt: new Date().toISOString(),
@@ -259,7 +289,7 @@ export default function App() {
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="side-brand"><div className="brand-mark"><Layers3 size={19} strokeWidth={2.3} /></div><div><strong>KashFlow<span>.</span></strong><small>FIELD EDITION</small></div></div>
-      <div className="workspace-switch"><div className="workspace-monogram">{vault.workspaceName.slice(0, 1).toUpperCase() || 'K'}</div><div className="workspace-info"><span>WORKING IN</span><strong title={vault.workspaceName}>{vault.workspaceName || 'Your business'}</strong></div><ChevronDown size={14} /></div>
+      <div className="workspace-picker"><button type="button" className="workspace-switch" aria-haspopup="menu" aria-expanded={workspaceMenuOpen} disabled={vault.workspaces.length < 2 || busy} onClick={() => setWorkspaceMenuOpen((open) => !open)}><div className="workspace-monogram">{vault.workspaceName.slice(0, 1).toUpperCase() || 'K'}</div><div className="workspace-info"><span>WORKING IN</span><strong title={vault.workspaceName}>{vault.workspaceName || 'Your business'}</strong></div><ChevronDown size={14} /></button>{workspaceMenuOpen && vault.workspaces.length > 1 && <div className="workspace-menu" role="menu" aria-label="Switch business">{vault.workspaces.map((workspace) => <button type="button" role="menuitem" key={workspace.id} className={workspace.id === vault.workspaceId ? 'selected' : ''} disabled={busy || workspace.id === vault.workspaceId} onClick={() => { setWorkspaceMenuOpen(false); void switchBusiness(workspace.id) }}><span className="workspace-menu-monogram">{workspace.name.slice(0, 1).toUpperCase()}</span><span>{workspace.name}</span>{workspace.id === vault.workspaceId && <Check size={14} />}</button>)}</div>}</div>
       <div className="side-section-label">WORKSPACE</div>
       <nav className="side-nav" aria-label="Workspace pages">
         <NavButton page="home" active={page === 'home'} icon={<Home size={17} />} label="Overview" onClick={navigate} />
@@ -279,10 +309,10 @@ export default function App() {
       {!online && <div className="offline-ribbon"><CloudOff size={15} /><span>Offline mode</span><span className="offline-ribbon-copy">Counts are encrypted and saved on this computer. Live stock may have changed.</span><button type="button" onClick={() => void refreshAndNotify()}>Try again <ArrowRight size={13} /></button></div>}
 
       <div className="page-content">
-        {page === 'home' && <Dashboard vault={vault} online={online} pending={pendingCount} conflicts={conflictCount} onNavigate={navigate} onSync={() => void syncCounts()} onRefresh={() => void refreshAndNotify()} busy={busy} />}
+        {page === 'home' && <Dashboard vault={{ ...vault, counts: activeCounts }} online={online} pending={pendingCount} conflicts={conflictCount} onNavigate={navigate} onSync={() => void syncCounts()} onRefresh={() => void refreshAndNotify()} busy={busy} />}
         {page === 'inventory' && <InventoryPage items={visibleItems} total={vault.items.length} locations={activeLocations} locationFilter={locationFilter} onLocation={setLocationFilter} query={query} onQuery={setQuery} getQty={(item) => itemTotal(item, locationFilter)} onCount={(item) => { setItemId(item.id); setCountedQuantity(''); setLocationId(''); navigate('count') }} />}
         {page === 'count' && <CountPage items={vault.items} locations={activeLocations} itemId={itemId} setItemId={setItemId} locationId={currentLocationId} setLocationId={setLocationId} quantity={countedQuantity} setQuantity={setCountedQuantity} reference={countReference} setReference={setCountReference} currentBalance={currentBalance} query={query} setQuery={setQuery} selectedItem={currentItem} online={online} busy={busy} onSave={savePhysicalCount} />}
-        {page === 'sync' && <SyncPage counts={vault.counts} online={online} busy={busy} onSync={() => void syncCounts()} onRecount={startRecount} />}
+        {page === 'sync' && <SyncPage counts={activeCounts} online={online} busy={busy} onSync={() => void syncCounts()} onRecount={startRecount} />}
         {page === 'settings' && <SettingsPage vault={vault} online={online} onClear={() => void clearLocalData()} version={appVersion} />}
       </div>
       <footer className="main-footer"><span><LockKeyhole size={12} /> Local inventory vault encrypted by this computer</span><span>KashFlow Field</span></footer>

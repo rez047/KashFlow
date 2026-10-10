@@ -1,4 +1,4 @@
-import { getCountsToSync, saveSnapshot, updateCount, type InventoryItem, type InventoryLocation } from './offline'
+import { getCountsToSync, saveSnapshot, updateCount, type BusinessWorkspace, type InventoryItem, type InventoryLocation } from './offline'
 
 export const API_BASE = (process.env.EXPO_PUBLIC_API_BASE_URL || 'https://kashflow-api.onrender.com').replace(/\/$/, '')
 const nativeHeaders = { 'Content-Type': 'application/json', 'X-Kashflow-Client': 'native' }
@@ -37,7 +37,7 @@ export async function api<T>(path: string, token?: string, options: { method?: s
 
 export async function refreshCatalog(token: string, userEmail: string) {
   const [me, itemResult, locationResult, stockResult] = await Promise.all([
-    api<{ workspace: { id: string; name: string } }>('/v1/auth/me', token),
+    api<{ workspace: { id: string; name: string }; workspaces?: BusinessWorkspace[] }>('/v1/auth/me', token),
     api<{ records: { id: string; data: Record<string, unknown> }[] }>('/v1/records/inventory', token),
     api<{ locations: InventoryLocation[] }>('/v1/inventory/locations', token),
     api<{ stock: { item_id: string; location_id: string; quantity: string }[] }>('/v1/inventory/location-stock', token),
@@ -53,8 +53,13 @@ export async function refreshCatalog(token: string, userEmail: string) {
   }))
   const locations = locationResult.locations.map((location) => ({ ...location, is_default: Boolean(location.is_default), active: Boolean(location.active) }))
   const stock = stockResult.stock.map((row) => ({ ...row, quantity: Number(row.quantity) }))
-  const refreshedAt = await saveSnapshot({ workspaceId: me.workspace.id, workspaceName: me.workspace.name, userEmail, items, locations, stock })
+  const workspaces = me.workspaces?.length ? me.workspaces : [{ ...me.workspace, role: 'admin' }]
+  const refreshedAt = await saveSnapshot({ workspaceId: me.workspace.id, workspaceName: me.workspace.name, userEmail, items, locations, stock, workspaces })
   return { workspace: me.workspace, refreshedAt, itemCount: items.length }
+}
+
+export function activateBusiness(token: string, workspaceId: string) {
+  return api<{ workspace: BusinessWorkspace; accessToken?: string }>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/activate`, token, { method: 'POST', body: {} })
 }
 
 export async function syncQueuedCounts(token: string, workspaceId: string) {
