@@ -10,7 +10,7 @@ export default function TabLayout() {
       tabBarActiveTintColor: '#0c9a79',
       tabBarInactiveTintColor: '#829098',
       tabBarStyle: { height: 69, paddingTop: 8, paddingBottom: 8, backgroundColor: '#fff', borderTopColor: '#e7e8e3', elevation: 0 },
-      tabBarLabelStyle: { fontSize: 10, fontWeight: '700', letterSpacing: 0.2 },
+      tabBarLabelStyle: { fontSize: 13, fontWeight: '700', letterSpacing: 0.2 },
     }}>
       <Tabs.Screen name="home" options={{ title: 'Today', tabBarIcon: ({ color, size }) => <Ionicons name="grid-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="stock" options={{ title: 'Stock', tabBarIcon: ({ color, size }) => <Ionicons name="cube-outline" size={size} color={color} /> }} />
