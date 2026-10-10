@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "KashFlow Inventory",
-    "slug": "kashflow-inventory",
+    "slug": "kashflow",
     "scheme": "kashflow",
     "version": "1.0.0",
     "orientation": "portrait",
