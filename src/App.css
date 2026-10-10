@@ -903,7 +903,7 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 /* ---------- Field app downloads ---------- */
 .app-download-section{position:relative;overflow:hidden;background:linear-gradient(135deg,#f4f8f4,#f8f7ff 78%);border-top:1px solid #ecebf1;border-bottom:1px solid #ecebf1}
 .app-download-section::before{content:"";position:absolute;width:480px;height:480px;right:-210px;top:-240px;border-radius:50%;border:1px solid rgba(24,130,106,.08);box-shadow:0 0 0 35px rgba(24,130,106,.025),0 0 0 70px rgba(24,130,106,.018);pointer-events:none}
-.app-download-section>.section-head,.app-download-grid,.app-download-note{position:relative;z-index:1}
+.app-download-section>.section-head,.app-download-grid{position:relative;z-index:1}
 .app-download-grid{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px}
 .app-download-card{min-height:205px;display:flex;flex-direction:column;align-items:flex-start;padding:18px;border:1px solid #e6e9e2;border-radius:16px;background:rgba(255,255,255,.94);box-shadow:0 8px 24px rgba(33,55,45,.035);transition:transform .18s,border-color .18s,box-shadow .18s}
 .app-download-card:hover{transform:translateY(-3px);border-color:#cfe2d4;box-shadow:0 15px 30px rgba(31,81,61,.09)}
@@ -917,8 +917,5 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .app-download-link:hover{background:#eaf5ed;border-color:#c6dfcf;color:#0c735b}
 .app-download-link-disabled{border-color:#e8ebe6;background:#f6f7f4;color:#97a19b;cursor:not-allowed;pointer-events:none}
 .app-download-hint{width:100%;margin:7px 0 0;color:#93a09a;font-size:7.5px;line-height:1.45}
-.app-download-note{max-width:1180px;margin:17px auto 0;display:flex;align-items:center;justify-content:center;gap:7px;color:#89958d;font-size:9px;line-height:1.5;text-align:center}
-.app-download-note svg{color:#618475;flex:none}
-.app-download-note a{display:inline-flex;align-items:center;gap:3px;color:#267b66;font-weight:800;text-decoration:underline;text-underline-offset:2px}
 @media(max-width:1000px){.app-download-grid{grid-template-columns:repeat(2,minmax(0,1fr));max-width:760px}}
-@media(max-width:560px){.app-download-grid{grid-template-columns:1fr;gap:10px}.app-download-card{min-height:174px;padding:15px}.app-download-note{align-items:flex-start;text-align:left;font-size:8px}.app-download-section::before{opacity:.5}}
+@media(max-width:560px){.app-download-grid{grid-template-columns:1fr;gap:10px}.app-download-card{min-height:174px;padding:15px}.app-download-section::before{opacity:.5}}

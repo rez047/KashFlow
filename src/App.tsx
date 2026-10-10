@@ -372,7 +372,6 @@ function KraFiscalReceipt({ draft, businessName }: { draft: ComplianceDraft; bus
 const CONTACT_PHONE = '0746827220'
 const CONTACT_PHONE_INTL = '254746827220'
 const CONTACT_EMAIL = 'ezrasimiyu777@gmail.com'
-const APP_RELEASES_URL = 'https://github.com/rez047/KashFlow/releases'
 const APP_RELEASES_API = 'https://api.github.com/repos/rez047/KashFlow/releases?per_page=10'
 function publicDistributionUrl(value: string | undefined) {
   try {
@@ -594,7 +593,6 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
           )
         })}
       </div>
-      <p className="app-download-note"><ShieldCheck size={14} /> Only downloads from a published stable release appear here. <a href={APP_RELEASES_URL} target="_blank" rel="noreferrer">View KashFlow release notes <ArrowUpRight size={12} /></a></p>
     </section>
 
     <section className="landing-section" id="features">
