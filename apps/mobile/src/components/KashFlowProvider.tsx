@@ -34,9 +34,14 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
 
   const refresh = useCallback(async () => {
     if (!token) return
-    await refreshCatalog(token, snapshot?.userEmail ?? '')
-    setSnapshot(await getOfflineSnapshot())
-  }, [snapshot?.userEmail, token])
+    try {
+      const cached = await getOfflineSnapshot()
+      await refreshCatalog(token, cached?.userEmail ?? '')
+      setSnapshot(await getOfflineSnapshot())
+    } catch (error) {
+      Alert.alert('Refresh paused', error instanceof Error ? error.message : 'Your last saved inventory is still available offline. Try again when the connection is stable.')
+    }
+  }, [token])
 
   const reloadLocal = useCallback(async () => { setSnapshot(await getOfflineSnapshot()) }, [])
 

@@ -14,15 +14,25 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, token?: string, options: { method?: string; body?: unknown } = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: options.method ?? 'GET',
-    headers: { ...nativeHeaders, ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
-  })
-  if (response.status === 204) return undefined as T
-  const data = await response.json().catch(() => ({})) as Record<string, unknown>
-  if (!response.ok) throw new ApiError(response.status, data)
-  return data as T
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 20_000)
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      method: options.method ?? 'GET',
+      headers: { ...nativeHeaders, ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+      signal: controller.signal,
+    })
+    if (response.status === 204) return undefined as T
+    const data = await response.json().catch(() => ({})) as Record<string, unknown>
+    if (!response.ok) throw new ApiError(response.status, data)
+    return data as T
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('The connection timed out. Your saved counts are still on this device and can be retried later.')
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 export async function refreshCatalog(token: string, userEmail: string) {
