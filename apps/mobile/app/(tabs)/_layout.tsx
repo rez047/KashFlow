@@ -5,7 +5,7 @@ import { KashFlowProvider } from '../../src/components/KashFlowProvider'
 
 export default function TabLayout() {
   return <KashFlowProvider>
-    <Tabs screenOptions={{
+    <Tabs backBehavior="history" screenOptions={{
       headerShown: false,
       tabBarActiveTintColor: '#0c9a79',
       tabBarInactiveTintColor: '#829098',
