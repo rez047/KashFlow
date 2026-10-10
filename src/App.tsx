@@ -373,6 +373,16 @@ const CONTACT_PHONE = '0746827220'
 const CONTACT_PHONE_INTL = '254746827220'
 const CONTACT_EMAIL = 'ezrasimiyu777@gmail.com'
 const APP_RELEASES_URL = 'https://github.com/rez047/KashFlow/releases'
+const APP_RELEASES_API = 'https://api.github.com/repos/rez047/KashFlow/releases?per_page=10'
+function publicDistributionUrl(value: string | undefined) {
+  try {
+    const url = new URL((value || '').trim())
+    return url.protocol === 'https:' ? url.href : ''
+  } catch { return '' }
+}
+const IOS_DISTRIBUTION_URL = publicDistributionUrl(import.meta.env.VITE_IOS_DISTRIBUTION_URL)
+const ANDROID_DISTRIBUTION_URL = publicDistributionUrl(import.meta.env.VITE_ANDROID_DISTRIBUTION_URL)
+type LandingAppPlatform = 'windows' | 'macos' | 'android' | 'ios'
 const LANDING_YEAR = new Date().getFullYear()
 
 // Selecting a subscription package signs the visitor into this shared demo workspace.
@@ -453,6 +463,38 @@ const landingSegments: Array<{ name: string; icon: typeof Gauge; fit: string }> 
 
 function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onDemo: (packageName: string) => void; onForgot: () => void }) {
   const phoneDisplay = `+254 746 827 220`
+  const [appDownloads, setAppDownloads] = useState<Record<LandingAppPlatform, string | null>>({ windows: null, macos: null, android: ANDROID_DISTRIBUTION_URL || null, ios: IOS_DISTRIBUTION_URL || null })
+  const [releaseLookupComplete, setReleaseLookupComplete] = useState(false)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetch(APP_RELEASES_API, { headers: { Accept: 'application/vnd.github+json' }, signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Release lookup returned ${response.status}.`)
+        return await response.json() as Array<{ draft: boolean; prerelease: boolean; assets: Array<{ name: string; browser_download_url: string }> }>
+      })
+      .then((releases) => {
+        const current = releases.find((release) => !release.draft && !release.prerelease)
+        if (!current) return
+        const assetUrl = (pattern: RegExp) => current.assets.find((asset) => pattern.test(asset.name) && asset.browser_download_url.startsWith('https://github.com/rez047/KashFlow/releases/download/'))?.browser_download_url ?? null
+        setAppDownloads({
+          windows: assetUrl(/^KashFlow-Desktop-.*-Setup\.exe$/i),
+          macos: assetUrl(/^KashFlow-Desktop-.*\.dmg$/i),
+          android: ANDROID_DISTRIBUTION_URL || assetUrl(/^KashFlow-Field-Android-.*\.apk$/i),
+          ios: IOS_DISTRIBUTION_URL || null,
+        })
+      })
+      .catch(() => undefined)
+      .finally(() => { if (!controller.signal.aborted) setReleaseLookupComplete(true) })
+    return () => controller.abort()
+  }, [])
+
+  const appPlatforms: Array<{ platform: LandingAppPlatform; name: string; detail: string; label: string; icon: typeof MonitorDown; badge: string }> = [
+    { platform: 'windows', name: 'Windows', detail: 'Windows 10 and newer', label: 'Desktop installer', icon: MonitorDown, badge: 'DESKTOP' },
+    { platform: 'macos', name: 'macOS', detail: 'Universal Apple Silicon and Intel app', label: 'Mac installer', icon: Laptop, badge: 'DESKTOP' },
+    { platform: 'ios', name: 'iPhone & iPad', detail: 'TestFlight or App Store distribution', label: 'iOS app', icon: Smartphone, badge: 'MOBILE' },
+    { platform: 'android', name: 'Android', detail: 'Android phone and tablet', label: 'Android APK', icon: Smartphone, badge: 'MOBILE' },
+  ]
   return <div className="landing">
     <header className="landing-nav">
       <div className="landing-nav-inner">
@@ -529,21 +571,19 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
       <div className="section-head">
         <span className="section-eyebrow"><Download size={14} /> KASHFLOW FIELD APPS</span>
         <h2>Made for the way your team <em>works</em></h2>
-        <p>Purpose-built screens for counting and managing inventory, with encrypted offline work and clear sync status. Choose a platform to see its release and install options.</p>
+        <p>Purpose-built screens for counting and managing inventory, with encrypted offline work and clear sync status. Download links appear when a published release is available for your platform.</p>
       </div>
       <div className="app-download-grid">
-        {[
-          { name: 'Windows', detail: 'Windows 10 and newer', label: 'Desktop installer', icon: MonitorDown, badge: 'DESKTOP' },
-          { name: 'macOS', detail: 'Apple Silicon and Intel', label: 'Universal Mac app', icon: Laptop, badge: 'DESKTOP' },
-          { name: 'iPhone & iPad', detail: 'iOS · TestFlight / App Store', label: 'iOS release', icon: Smartphone, badge: 'MOBILE' },
-          { name: 'Android', detail: 'Android phone and tablet', label: 'Android release', icon: Smartphone, badge: 'MOBILE' },
-        ].map(({ name, detail, label, icon: Icon, badge }) => <article className="app-download-card" key={name}>
+        {appPlatforms.map(({ platform, name, detail, label, icon: Icon, badge }) => (
+          <article className="app-download-card" key={platform}>
           <div className="app-download-head"><span className="app-download-icon"><Icon size={21} /></span><span className="app-download-badge">{badge}</span></div>
           <h3>{name}</h3><p>{detail}</p>
-          <a className="app-download-link" href={APP_RELEASES_URL} target="_blank" rel="noreferrer" aria-label={`${label} for ${name} on KashFlow releases`}><Download size={14} /> View {label}<ArrowUpRight size={14} /></a>
-        </article>)}
+          {appDownloads[platform] ? <a className="app-download-link" href={appDownloads[platform]!} target={platform === 'ios' || (platform === 'android' && Boolean(ANDROID_DISTRIBUTION_URL)) ? '_blank' : undefined} rel={platform === 'ios' || (platform === 'android' && Boolean(ANDROID_DISTRIBUTION_URL)) ? 'noreferrer' : undefined} aria-label={`${platform === 'ios' || (platform === 'android' && Boolean(ANDROID_DISTRIBUTION_URL)) ? 'Open' : 'Download'} ${label} for ${name}`}><Download size={14} />{platform === 'ios' ? 'Open iOS app' : platform === 'android' && ANDROID_DISTRIBUTION_URL ? 'Open Android app' : `Download ${label}`}<ArrowUpRight size={14} /></a>
+            : <span className="app-download-link app-download-link-disabled" aria-live="polite">{platform === 'ios' ? 'App Store release pending' : releaseLookupComplete ? 'Release not available yet' : 'Checking releases…'}</span>}
+          </article>
+        ))}
       </div>
-      <p className="app-download-note"><ShieldCheck size={14} /> Signed release packages and iOS distribution details are published on the KashFlow release page as each platform build is ready.</p>
+      <p className="app-download-note"><ShieldCheck size={14} /> Only downloads from a published stable release appear here. <a href={APP_RELEASES_URL} target="_blank" rel="noreferrer">View KashFlow release notes <ArrowUpRight size={12} /></a></p>
     </section>
 
     <section className="landing-section" id="features">
