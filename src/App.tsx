@@ -426,7 +426,7 @@ function KraFiscalReceipt({ draft, businessName }: { draft: ComplianceDraft; bus
 const CONTACT_PHONE = '0746827220'
 const CONTACT_PHONE_INTL = '254746827220'
 const CONTACT_EMAIL = 'ezrasimiyu777@gmail.com'
-const APP_RELEASES_API = 'https://api.github.com/repos/rez047/KashFlow/releases?per_page=10'
+const LATEST_RELEASE_DOWNLOAD = 'https://github.com/rez047/KashFlow/releases/latest/download'
 function publicDistributionUrl(value: string | undefined) {
   try {
     const url = new URL((value || '').trim())
@@ -518,33 +518,12 @@ const landingSegments: Array<{ name: string; icon: typeof Gauge; fit: string }> 
 
 function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onDemo: (packageName: string) => void; onForgot: () => void }) {
   const phoneDisplay = `+254 746 827 220`
-  const [appDownloads, setAppDownloads] = useState<Record<LandingAppPlatform, string | null>>({ windows: null, macos: null, android: ANDROID_DISTRIBUTION_URL || null, ios: IOS_DISTRIBUTION_URL || null })
-  const [releaseLookupComplete, setReleaseLookupComplete] = useState(false)
-
-  useEffect(() => {
-    const controller = new AbortController()
-    void fetch(APP_RELEASES_API, { headers: { Accept: 'application/vnd.github+json' }, signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`Release lookup returned ${response.status}.`)
-        return await response.json() as Array<{ draft: boolean; prerelease: boolean; assets: Array<{ name: string; browser_download_url: string }> }>
-      })
-      .then((releases) => {
-        const current = releases.find((release) => !release.draft && !release.prerelease)
-        if (!current) return
-        const assetUrl = (pattern: RegExp) => current.assets.find((asset) => pattern.test(asset.name) && asset.browser_download_url.startsWith('https://github.com/rez047/KashFlow/releases/download/'))?.browser_download_url ?? null
-        setAppDownloads({
-          windows: assetUrl(/^KashFlow-Desktop-.*-Setup\.exe$/i),
-          macos: assetUrl(/^KashFlow-Desktop-.*\.dmg$/i),
-          android: assetUrl(/^KashFlow-Field-Android-.*\.apk$/i),
-          // An .ipa cannot be installed from a web page. iOS only shows a link when a real
-          // TestFlight/App Store URL is configured; otherwise it stays in the pending state.
-          ios: IOS_DISTRIBUTION_URL || null,
-        })
-      })
-      .catch(() => undefined)
-      .finally(() => { if (!controller.signal.aborted) setReleaseLookupComplete(true) })
-    return () => controller.abort()
-  }, [])
+  const appDownloads: Record<LandingAppPlatform, string | null> = {
+    windows: `${LATEST_RELEASE_DOWNLOAD}/KashFlow-Desktop-Windows-Setup.exe`,
+    macos: `${LATEST_RELEASE_DOWNLOAD}/KashFlow-Desktop-macOS.dmg`,
+    android: ANDROID_DISTRIBUTION_URL || `${LATEST_RELEASE_DOWNLOAD}/KashFlow-Field-Android.apk`,
+    ios: IOS_DISTRIBUTION_URL || null,
+  }
 
   const appPlatforms: Array<{ platform: LandingAppPlatform; name: string; detail: string; label: string; icon: typeof MonitorDown; badge: string }> = [
     { platform: 'windows', name: 'Windows', detail: 'Windows 10 and newer', label: 'Desktop installer', icon: MonitorDown, badge: 'DESKTOP' },
@@ -639,7 +618,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
           <div className="app-download-head"><span className="app-download-icon"><Icon size={21} /></span><span className="app-download-badge">{badge}</span></div>
           <h3>{name}</h3><p>{detail}</p>
           {target ? <a className="app-download-link" href={target} target={opensStore ? '_blank' : undefined} rel={opensStore ? 'noreferrer' : undefined} aria-label={`${opensStore ? 'Open' : 'Download'} ${label} for ${name}`}><Download size={14} />{platform === 'ios' ? (IOS_DISTRIBUTION_URL ? (IOS_DISTRIBUTION_URL.includes('testflight.apple.com') ? 'Open in TestFlight' : 'Get it on the App Store') : 'Get it on the App Store') : platform === 'android' && ANDROID_DISTRIBUTION_URL ? 'Open Android app' : `Download ${label}`}<ArrowUpRight size={14} /></a>
-            : <span className="app-download-link app-download-link-disabled" aria-live="polite">{platform === 'ios' ? 'App Store release pending' : releaseLookupComplete ? 'Release not available yet' : 'Checking releases…'}</span>}
+            : <span className="app-download-link app-download-link-disabled" aria-live="polite">App Store release pending</span>}
           {platform === 'android' && target && !ANDROID_DISTRIBUTION_URL && <span className="app-download-hint">Android may ask you to allow installing apps from this source.</span>}
           {platform === 'ios' && target && <span className="app-download-hint">iOS installs through Apple&apos;s App Store or TestFlight, not a direct file download.</span>}
           {platform === 'macos' && target && <span className="app-download-hint">Open the DMG, then drag KashFlow Field into Applications.</span>}

@@ -119,6 +119,15 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+      - name: Add stable download names
+        run: |
+          set -euo pipefail
+          windows_assets=(release-assets/KashFlow-Desktop-*-Setup.exe)
+          macos_assets=(release-assets/KashFlow-Desktop-*.dmg)
+          [[ ${#windows_assets[@]} -eq 1 ]] || { echo "Expected one Windows installer." >&2; exit 1; }
+          [[ ${#macos_assets[@]} -eq 1 ]] || { echo "Expected one macOS installer." >&2; exit 1; }
+          cp -- "${windows_assets[0]}" release-assets/KashFlow-Desktop-Windows-Setup.exe
+          cp -- "${macos_assets[0]}" release-assets/KashFlow-Desktop-macOS.dmg
       - name: Publish (or update) the GitHub release
         run: |
           set -euo pipefail

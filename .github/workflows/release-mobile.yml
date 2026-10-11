@@ -60,11 +60,13 @@ jobs:
       - name: Install mobile dependencies
         run: npm ci
 
-      # The `preview` profile produces an installable signed APK. The landing page
-      # matches the asset by the exact KashFlow-Field-Android-*.apk name below.
+      # The `preview` profile produces an installable signed APK. Attach a
+      # versioned artifact and a stable name used by the landing page.
       - name: Build and download Android APK
         id: build
         shell: bash
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           eas build --platform android --profile preview --non-interactive --wait --json > "$RUNNER_TEMP/eas-android-build.json"
@@ -79,14 +81,16 @@ jobs:
             echo "::error::The Android preview build did not produce an installable .apk package."
             exit 1
           fi
-          cp -- "$artifact_path" "$GITHUB_WORKSPACE/KashFlow-Field-Android-${{ github.ref_name }}.apk"
+          cp -- "$artifact_path" "$GITHUB_WORKSPACE/KashFlow-Field-Android-${TAG}.apk"
+          cp -- "$artifact_path" "$GITHUB_WORKSPACE/KashFlow-Field-Android.apk"
           echo "build_id=$build_id" >> "$GITHUB_OUTPUT"
 
       - name: Upload Android package artifact
         uses: actions/upload-artifact@v7
         with:
           name: kashflow-android-${{ github.ref_name }}-${{ github.run_id }}
-          path: KashFlow-Field-Android-${{ github.ref_name }}.apk
+          path: |
+            KashFlow-Field-Android-*.apk
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
@@ -98,6 +102,6 @@ jobs:
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" "$GITHUB_WORKSPACE/KashFlow-Field-Android-${{ github.ref_name }}.apk" --clobber
-          echo "Attached the Android APK to the $TAG release." >> "$GITHUB_STEP_SUMMARY"
+          gh release upload "$TAG" "$GITHUB_WORKSPACE/KashFlow-Field-Android-${TAG}.apk" "$GITHUB_WORKSPACE/KashFlow-Field-Android.apk" --clobber
+          echo "Attached the versioned Android APK and stable download alias to the $TAG release." >> "$GITHUB_STEP_SUMMARY"
           echo "Add the URL shown by Apple/Google to the VITE_IOS_DISTRIBUTION_URL / VITE_ANDROID_DISTRIBUTION_URL site settings when public store listings exist." >> "$GITHUB_STEP_SUMMARY"
