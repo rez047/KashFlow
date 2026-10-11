@@ -16,6 +16,10 @@
       "channel": "preview",
       "android": { "buildType": "apk" }
     },
+    "ios-simulator": {
+      "channel": "preview",
+      "ios": { "simulator": true }
+    },
     "production": {
       "channel": "production",
       "autoIncrement": true,
