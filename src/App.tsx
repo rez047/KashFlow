@@ -219,11 +219,54 @@ type DatabaseBackup = { key: string; lastModified: string | null; size: number }
 type ImportType = 'customers' | 'suppliers' | 'inventory' | 'projects'
 type RecordImportPreview = { type: ImportType; totalRows: number; wouldImport: number; duplicateRows: number[] }
 
+type NativeWorkspaceWindow = Window & {
+  __kashflowNativeToken?: string
+  ReactNativeWebView?: { postMessage(message: string): void }
+  kashflowWorkspace?: { getToken(): Promise<string>; setToken(token: string): Promise<void> }
+}
+let desktopWorkspaceToken: string | undefined
+let desktopWorkspaceTokenLoaded = false
+
+async function readNativeWorkspaceToken(host: NativeWorkspaceWindow) {
+  if (host.__kashflowNativeToken) return host.__kashflowNativeToken
+  if (!host.kashflowWorkspace) return undefined
+  if (!desktopWorkspaceTokenLoaded) {
+    desktopWorkspaceToken = await host.kashflowWorkspace.getToken().catch(() => '') || undefined
+    desktopWorkspaceTokenLoaded = true
+  }
+  return desktopWorkspaceToken
+}
+
+async function updateNativeWorkspaceToken(host: NativeWorkspaceWindow, token: string) {
+  if (host.ReactNativeWebView) {
+    host.__kashflowNativeToken = token
+    host.ReactNativeWebView.postMessage(JSON.stringify({ type: 'session-token', accessToken: token }))
+  }
+  if (host.kashflowWorkspace) {
+    desktopWorkspaceToken = token || undefined
+    desktopWorkspaceTokenLoaded = true
+    await host.kashflowWorkspace.setToken(token)
+  }
+}
+
+async function nativeRequestContext(host: NativeWorkspaceWindow) {
+  const nativeMode = Boolean(host.ReactNativeWebView || host.kashflowWorkspace)
+  const nativeToken = nativeMode ? await readNativeWorkspaceToken(host) : undefined
+  return {
+    nativeMode,
+    nativeToken,
+    credentials: nativeMode ? 'omit' as RequestCredentials : 'include' as RequestCredentials,
+    headers: { ...(nativeMode ? { 'X-Kashflow-Client': 'native' } : {}), ...(nativeToken ? { Authorization: `Bearer ${nativeToken}` } : {}) },
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const host = window as NativeWorkspaceWindow
+  const auth = await nativeRequestContext(host)
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
-    credentials: 'include',
-    headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...init?.headers },
+    credentials: auth.credentials,
+    headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...auth.headers, ...init?.headers },
   })
   if (!response.ok) {
     const payload = await response.json().catch(() => ({})) as { error?: string }
@@ -234,8 +277,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(payload.error || `Request failed (${response.status})`)
   }
-  if (response.status === 204) return undefined as T
-  return response.json() as Promise<T>
+  if (response.status === 204) {
+    if (path === '/v1/auth/logout' && auth.nativeMode) await updateNativeWorkspaceToken(host, '')
+    return undefined as T
+  }
+  const payload = await response.json() as Record<string, unknown>
+  if (auth.nativeMode && typeof payload.accessToken === 'string' && payload.accessToken !== auth.nativeToken) {
+    await updateNativeWorkspaceToken(host, payload.accessToken)
+  }
+  return payload as T
 }
 
 function requestInvoiceMpesaPayment(invoiceId: string, phone: string, amount?: number) {
@@ -3862,7 +3912,7 @@ async function createCameraReader(): Promise<CameraReader> {
   async function exportWorkspaceData(type: string) {
     setExportBusy(true); setError('')
     try {
-      const response = await fetch(`${API_BASE}/v1/exports/${encodeURIComponent(type)}`, { credentials: 'include' })
+      const response = await fetch(`${API_BASE}/v1/exports/${encodeURIComponent(type)}`, await nativeRequestContext(window as NativeWorkspaceWindow))
       if (!response.ok) {
         const payload = await response.json().catch(() => ({})) as { error?: string }
         throw new Error(payload.error || `Export failed (${response.status})`)
@@ -3876,6 +3926,8 @@ async function createCameraReader(): Promise<CameraReader> {
       anchor.click()
       anchor.remove()
       URL.revokeObjectURL(url)
+      const nativeBridge = (window as NativeWorkspaceWindow).ReactNativeWebView
+      nativeBridge?.postMessage(JSON.stringify({ type: 'workspace-export-finished', expected: 1 }))
       notify(`${type[0].toUpperCase()}${type.slice(1)} CSV downloaded.`)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not export workspace data.')
@@ -3891,7 +3943,7 @@ async function createCameraReader(): Promise<CameraReader> {
     try {
       for (const type of EXPORT_TYPES) {
         try {
-          const response = await fetch(`${API_BASE}/v1/exports/${encodeURIComponent(type)}`, { credentials: 'include' })
+          const response = await fetch(`${API_BASE}/v1/exports/${encodeURIComponent(type)}`, await nativeRequestContext(window as NativeWorkspaceWindow))
           if (!response.ok) {
             const payload = await response.json().catch(() => ({})) as { error?: string }
             throw new Error(payload.error || `Export failed (${response.status})`)
@@ -3910,6 +3962,8 @@ async function createCameraReader(): Promise<CameraReader> {
           failed.push(`${type}: ${reason instanceof Error ? reason.message : 'failed'}`)
         }
       }
+      const nativeBridge = (window as NativeWorkspaceWindow).ReactNativeWebView
+      nativeBridge?.postMessage(JSON.stringify({ type: 'workspace-export-finished', expected: EXPORT_TYPES.length - failed.length }))
       if (failed.length) setError(`Some exports could not be downloaded — ${failed.join('; ')}`)
       else notify(`All workspace exports downloaded as separate CSV files (${EXPORT_TYPES.length} files).`)
     } finally { setExportBusy(false) }

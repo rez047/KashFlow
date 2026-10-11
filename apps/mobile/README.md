@@ -1,6 +1,8 @@
-# KashFlow mobile field app
+# KashFlow mobile app
 
-This is a native iOS and Android app built with React Native and Expo Router. It has separate Today, Stock, Count, Sync & Review, and Settings screens; it does not display the KashFlow website in a WebView.
+This is a native iOS and Android app built with React Native and Expo Router. It includes Today, Stock, Count, Sync & Review, and Settings screens for offline field work, plus a **Workspace** tab with the complete KashFlow business suite.
+
+The Workspace tab loads the configured KashFlow frontend in a WebView and uses the app's short-lived bearer session. Session tokens stay in iOS Keychain or Android Keystore and pass through the web page in memory; business switches and sign-out update the native session. Set `EXPO_PUBLIC_WORKSPACE_URL` to use a different frontend deployment. The workspace requires an internet connection. CSV exports are shared as a single CSV or a ZIP of all selected exports, and printing uses the device print sheet.
 
 ## Offline inventory
 
@@ -15,7 +17,7 @@ The first catalog download needs a connection. If an item or branch was not cach
 
 ## Development and builds
 
-Set `EXPO_PUBLIC_API_BASE_URL` to the API origin, for example `http://localhost:3001` for local development or the production API URL. This is a public service URL, not a secret. The API accepts the app's native bearer session; no web view or cookie-sharing bridge is used.
+Set `EXPO_PUBLIC_API_BASE_URL` to the API origin, for example `http://localhost:3001` for local development or the production API URL. Set `EXPO_PUBLIC_WORKSPACE_URL` to the matching frontend origin when testing against a non-production deployment. Both are public service addresses, not secrets. The API accepts the app's native bearer session.
 
 Install dependencies with `npm ci`, then run `npm start`. Use a native development build or EAS build; Expo Go does not include the SQLCipher native configuration and the app deliberately refuses an unencrypted local database.
 

@@ -1,6 +1,6 @@
 {
   "name": "@kashflow/desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "main": "main.cjs",
@@ -34,7 +34,7 @@
     "productName": "KashFlow Field",
     "directories": { "output": "release" },
     "asar": true,
-    "files": ["dist/**/*", "main.cjs", "preload.cjs", "package.json"],
+    "files": ["dist/**/*", "main.cjs", "preload.cjs", "workspace-preload.cjs", "package.json"],
     "win": {
       "icon": "assets/icon.ico",
       "target": ["nsis"],

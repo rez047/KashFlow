@@ -205,8 +205,8 @@ Never commit `.env`, `.env.local`, database URLs, session secrets, passwords, pr
 - `api/src/server.ts` — Express API, authentication, database access, and current endpoints.
 - `api/migrations/` — SQL schema migrations, automatically applied on API startup.
 - `render.yaml` — Render Blueprint for the frontend, API, and PostgreSQL resources.
-- `apps/mobile/` — Native React Native iOS/Android field app with SQLCipher-backed offline inventory.
-- `apps/desktop/` — Electron field app with separate desktop pages and an OS-encrypted local vault; packages Windows, macOS, and Linux builds.
+- `apps/mobile/` — Native React Native iOS/Android app with a full-workspace WebView and SQLCipher-backed offline inventory.
+- `apps/desktop/` — Electron app with the full hosted workspace and an OS-encrypted offline Field workspace; packages Windows, macOS, and Linux builds.
 
 ## Native field apps
 
@@ -219,7 +219,7 @@ Push a stable `v*` tag to publish a release that the download hub can read:
 
 Signing is automatic when the relevant repository secrets are present and otherwise produces an unsigned build; see [`apps/desktop/README.md`](apps/desktop/README.md) for the Windows and macOS secret names. **iOS cannot be downloaded directly from a browser**: Apple permits distribution only through TestFlight or the App Store, so the hub shows an Apple button only when `VITE_IOS_DISTRIBUTION_URL` points at a real listing and otherwise shows a pending state. There are no published releases in this repository yet, so the download buttons stay unavailable until a release is published or a store listing is configured. Android APKs always show the on-device "install from this source" prompt; Windows unsigned installers trigger SmartScreen, and unsigned macOS DMGs trigger Gatekeeper unless the app is signed and notarized with a paid Apple Developer account.
 
-Desktop and mobile builds have their own page navigation and offline inventory workflow. Offline counts require an initial successful inventory refresh, are saved encrypted on device, and are posted with idempotency protection when the user syncs. A changed server balance pauses the count for review.
+All client builds use the same hosted web workspace, so the business suite and current features are available in the PWA, desktop, Android, and iOS versions. The native apps also retain their local inventory and count tools: offline counts require an initial successful inventory refresh, are saved encrypted on device, and are posted with idempotency protection when the user syncs. A changed server balance pauses the count for review. Native mobile CSV exports are shared as a ZIP when several exports are requested together; mobile print actions use the device print sheet.
 
 See [`apps/mobile/README.md`](apps/mobile/README.md) for native iOS/Android builds and [`apps/desktop/README.md`](apps/desktop/README.md) for Windows/macOS/Linux installers. iOS distribution needs an Apple Developer account and signing; Android and EAS builds need the release project's Expo credentials (`EXPO_TOKEN` secret and `EXPO_PROJECT_ID` variable, already wired into the release workflow).
 

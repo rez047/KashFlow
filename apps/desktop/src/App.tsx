@@ -1,6 +1,6 @@
 import {
   Activity, ArrowLeft, ArrowRight, ArrowUpRight, Check, CheckCircle2,
-  ChevronDown, ChevronRight, CircleAlert, Cloud, CloudOff, CloudUpload,
+  ChevronDown, ChevronRight, CircleAlert, Cloud, CloudOff, CloudUpload, Globe2,
   Home, Layers3, LockKeyhole, LogOut, Minus, Package, Plus, RefreshCw, Search, Settings2,
   ShieldCheck, Sparkles, Store, Wifi, WifiOff,
 } from 'lucide-react'
@@ -40,7 +40,7 @@ export default function App() {
   const [twoFactorChallenge, setTwoFactorChallenge] = useState('')
   const [twoFactorCode, setTwoFactorCode] = useState('')
   const [loginError, setLoginError] = useState('')
-  const [appVersion, setAppVersion] = useState('1.0.0')
+  const [appVersion, setAppVersion] = useState('1.1.0')
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
   const activeCounts = vault.counts.filter((count) => count.workspaceId === vault.workspaceId)
 
@@ -97,6 +97,15 @@ export default function App() {
     await persistVault(next)
     return next
   }, [persistVault, vault])
+
+  useEffect(() => window.kashflowDesktop.onWorkspaceTokenChanged((token) => {
+    if (!token) {
+      setVault((current) => ({ ...current, token: '' }))
+      setPage('home')
+      return
+    }
+    void refreshCatalog(token, vault.userEmail).catch(() => notify('The full workspace session changed. Reconnect to refresh this computer’s saved inventory.'))
+  }), [notify, refreshCatalog, vault.userEmail])
 
   const syncCounts = useCallback(async (showToast = true) => {
     if (!vault.token) { notify('Sign in again while connected to sync this device.'); return }
@@ -296,12 +305,13 @@ export default function App() {
         <NavButton page="inventory" active={page === 'inventory'} icon={<Package size={17} />} label="Inventory" onClick={navigate} />
         <NavButton page="count" active={page === 'count'} icon={<Layers3 size={17} />} label="Stock count" onClick={navigate} />
         <NavButton page="sync" active={page === 'sync'} icon={<RefreshCw size={17} />} label="Sync & review" onClick={navigate} badge={pendingCount + conflictCount || undefined} />
+        <button type="button" className="nav-button full-workspace-link" onClick={() => void window.kashflowDesktop.openWorkspace().catch((error: unknown) => notify(error instanceof Error ? error.message : 'The full workspace could not be opened.'))}><Globe2 size={17} /><span>Full workspace</span><ArrowUpRight size={14} /></button>
       </nav>
       <div className="sidebar-grow" />
       <div className="side-status"><span className={`side-status-dot ${online ? 'connected' : ''}`} /><span>{online ? 'Connected to KashFlow' : 'Working offline'}</span><Wifi size={14} /></div>
       <button type="button" className={`nav-button ${page === 'settings' ? 'active' : ''}`} onClick={() => navigate('settings')}><Settings2 size={17} /><span>Settings</span></button>
       <div className="profile-row"><div className="profile-avatar">{vault.userEmail.slice(0, 1).toUpperCase() || 'K'}</div><div className="profile-copy"><strong>{vault.userEmail || 'KashFlow user'}</strong><span>{vault.workspaceName || 'Business workspace'}</span></div><button type="button" title="Sign out and clear device" onClick={() => void clearLocalData()} className="logout-button"><LogOut size={15} /></button></div>
-      <div className="sidebar-version">SECURE OFFLINE WORKSPACE · 1.0</div>
+      <div className="sidebar-version">SECURE OFFLINE WORKSPACE · 1.1.0</div>
     </aside>
 
     <main className="main-area">

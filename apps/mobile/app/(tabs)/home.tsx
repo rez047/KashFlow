@@ -51,6 +51,12 @@ export default function HomeScreen() {
         <Pressable style={styles.actionCard} onPress={() => router.push('/(tabs)/stock')}><View style={styles.actionIcon}><Ionicons name="cube-outline" size={21} color="#0d9174" /></View><Text style={styles.actionTitle}>Browse stock</Text><Text style={styles.actionCaption}>Find an item, check a location.</Text><View style={styles.actionArrow}><Ionicons name="arrow-up-right-box" size={17} color="#60716f" /></View></Pressable>
       </View>
 
+      <Pressable accessibilityRole="button" style={styles.workspaceCard} onPress={() => router.push('/(tabs)/workspace')}>
+        <View style={styles.workspaceIcon}><Ionicons name="business-outline" size={20} color="#118c71" /></View>
+        <View style={styles.workspaceCopy}><Text style={styles.workspaceTitle}>Open your full workspace</Text><Text style={styles.workspaceCaption}>Sales, accounting, payroll, reports, settings, and more.</Text></View>
+        <Ionicons name="arrow-forward" size={17} color="#16866e" />
+      </Pressable>
+
       {(conflicts > 0 || recentCounts.length > 0) && <View style={styles.recentSection}>
         <View style={styles.sectionHead}><View><Text style={styles.sectionTitle}>{conflicts > 0 ? 'Needs a closer look' : 'Recent counts'}</Text><Text style={styles.sectionSub}>{conflicts > 0 ? `${conflicts} count${conflicts === 1 ? '' : 's'} changed elsewhere` : 'Your latest inventory activity.'}</Text></View><Pressable onPress={() => router.push('/(tabs)/sync')}><Text style={styles.viewAll}>View all</Text></Pressable></View>
         <View style={styles.activityCard}>{recentCounts.map((count, index) => <View key={count.idempotencyKey} style={[styles.activityRow, index > 0 && styles.activityBorder]}><View style={[styles.activitySymbol, count.state === 'conflict' ? styles.symbolWarning : count.state === 'synced' ? styles.symbolSynced : styles.symbolPending]}><Ionicons name={count.state === 'conflict' ? 'alert-outline' : count.state === 'synced' ? 'checkmark' : 'time-outline'} size={16} color={count.state === 'conflict' ? '#b27b34' : count.state === 'synced' ? '#14866b' : '#5d7883'} /></View><View style={styles.activityCopy}><Text style={styles.activityTitle}>{count.itemName}</Text><Text style={styles.activityCaption}>{count.locationName} · {new Date(count.createdAt).toLocaleDateString()}</Text></View><View style={styles.activityRight}><Text style={styles.activityQuantity}>{count.countedQuantity}</Text><Text style={[styles.activityState, count.state === 'conflict' && styles.stateConflict]}>{count.state === 'synced' ? 'SYNCED' : count.state === 'conflict' ? 'REVIEW' : 'PENDING'}</Text></View></View>)}</View>
@@ -100,6 +106,9 @@ const styles = StyleSheet.create({
   sectionTitle: { color: '#1b282d', fontSize: 16, fontWeight: '800', letterSpacing: -0.35 }, sectionSub: { color: '#85918b', fontSize: 13, marginTop: 4 },
   sectionKicker: { color: '#91a09b', fontSize: 10, fontWeight: '900', letterSpacing: 1.4, marginBottom: 2 },
   actionRow: { flexDirection: 'row', gap: 10 },
+  workspaceCard: { minHeight: 66, marginTop: 12, paddingHorizontal: 13, paddingVertical: 11, borderRadius: 15, borderWidth: 1, borderColor: '#d8e9df', backgroundColor: '#fff', flexDirection: 'row', alignItems: 'center', gap: 11 },
+  workspaceIcon: { width: 36, height: 36, borderRadius: 12, backgroundColor: '#e7f4ee', alignItems: 'center', justifyContent: 'center' },
+  workspaceCopy: { flex: 1 }, workspaceTitle: { color: '#1b2c30', fontSize: 13, fontWeight: '800' }, workspaceCaption: { color: '#788682', fontSize: 11, lineHeight: 14, marginTop: 3 },
   actionCard: { flex: 1, minHeight: 149, padding: 13, borderRadius: 17, borderWidth: 1, borderColor: '#e5e6e1', backgroundColor: '#fff' },
   primaryAction: { backgroundColor: '#dff3eb', borderColor: '#ceeadd' },
   actionIcon: { width: 34, height: 34, borderRadius: 12, backgroundColor: '#e7f4ee', alignItems: 'center', justifyContent: 'center' }, actionIconLight: { width: 34, height: 34, borderRadius: 12, backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },

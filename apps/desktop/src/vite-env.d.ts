@@ -7,6 +7,8 @@ interface Window {
     request(path: string, token?: string, options?: { method?: string; body?: unknown }): Promise<{ ok: boolean; status: number; data: Record<string, unknown> }>
     ping(): Promise<boolean>
     version(): Promise<string>
+    openWorkspace(): Promise<void>
+    onWorkspaceTokenChanged(callback: (token: string) => void): () => void
   }
 }
 

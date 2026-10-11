@@ -14,6 +14,7 @@ type AppState = {
   reloadLocal: () => Promise<void>
   refresh: () => Promise<void>
   syncNow: (showMessage?: boolean) => Promise<void>
+  updateSessionToken: (nextToken: string) => Promise<void>
   switchBusiness: (workspaceId: string) => Promise<void>
 }
 
@@ -45,6 +46,21 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
   }, [token])
 
   const reloadLocal = useCallback(async () => { setSnapshot(await getOfflineSnapshot()) }, [])
+
+  const updateSessionToken = useCallback(async (nextToken: string) => {
+    if (!nextToken) {
+      await SecureStore.deleteItemAsync('kashflow.access-token')
+      setToken(null)
+      return
+    }
+    await SecureStore.setItemAsync('kashflow.access-token', nextToken, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY })
+    setToken(nextToken)
+    try {
+      const cached = await getOfflineSnapshot()
+      await refreshCatalog(nextToken, cached?.userEmail ?? '')
+      setSnapshot(await getOfflineSnapshot())
+    } catch { /* Keep the last encrypted inventory snapshot until a refresh succeeds. */ }
+  }, [])
 
   const switchBusiness = useCallback(async (workspaceId: string) => {
     if (!token) throw new Error('Sign in while connected before switching businesses.')
@@ -161,6 +177,6 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
     return () => { active = false; subscription.remove() }
   }, [])
 
-  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow, switchBusiness }), [token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow, switchBusiness])
+  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness }), [token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness])
   return <AppContext.Provider value={context}>{children}</AppContext.Provider>
 }

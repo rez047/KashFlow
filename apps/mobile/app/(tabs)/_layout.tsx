@@ -13,6 +13,7 @@ export default function TabLayout() {
       tabBarLabelStyle: { fontSize: 13, fontWeight: '700', letterSpacing: 0.2 },
     }}>
       <Tabs.Screen name="home" options={{ title: 'Today', tabBarIcon: ({ color, size }) => <Ionicons name="grid-outline" size={size} color={color} /> }} />
+      <Tabs.Screen name="workspace" options={{ title: 'Workspace', tabBarIcon: ({ color, size }) => <Ionicons name="business-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="stock" options={{ title: 'Stock', tabBarIcon: ({ color, size }) => <Ionicons name="cube-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="count" options={{ title: 'Count', tabBarIcon: ({ color, size }) => <Ionicons name="scan-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="sync" options={{ title: 'Sync', tabBarIcon: ({ color, size }) => <Ionicons name="sync-outline" size={size} color={color} /> }} />

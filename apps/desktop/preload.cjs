@@ -6,4 +6,10 @@ contextBridge.exposeInMainWorld('kashflowDesktop', {
   request: (path, token, options) => ipcRenderer.invoke('kashflow:request', { path, token, options }),
   ping: () => ipcRenderer.invoke('kashflow:ping'),
   version: () => ipcRenderer.invoke('kashflow:version'),
+  openWorkspace: () => ipcRenderer.invoke('kashflow:open-workspace'),
+  onWorkspaceTokenChanged: (callback) => {
+    const listener = (_event, token) => callback(token)
+    ipcRenderer.on('kashflow:workspace-token-changed', listener)
+    return () => ipcRenderer.removeListener('kashflow:workspace-token-changed', listener)
+  },
 })

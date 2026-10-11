@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, safeStorage } = require('electron')
+const { app, BrowserWindow, ipcMain, safeStorage, shell } = require('electron')
 const fs = require('node:fs')
 const path = require('node:path')
 
@@ -51,6 +51,78 @@ ipcMain.handle('kashflow:ping', async () => {
   } catch { return false }
 })
 ipcMain.handle('kashflow:version', () => app.getVersion())
+let fullWorkspaceWindow = null
+
+function configuredWorkspaceUrl() {
+  const target = new URL(process.env.KASHFLOW_WORKSPACE_URL || 'https://kashflow-frontend.onrender.com')
+  if (target.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(target.hostname)) {
+    throw new Error('The full workspace address must use HTTPS.')
+  }
+  return target
+}
+
+function isFullWorkspaceRequest(event) {
+  if (!fullWorkspaceWindow || fullWorkspaceWindow.isDestroyed() || event.sender !== fullWorkspaceWindow.webContents || event.senderFrame !== event.sender.mainFrame) return false
+  try { return new URL(event.senderFrame.url).origin === configuredWorkspaceUrl().origin } catch { return false }
+}
+
+ipcMain.handle('kashflow:workspace-token', (event) => {
+  if (!isFullWorkspaceRequest(event)) throw new Error('This desktop session cannot be read from this page.')
+  return loadVault().token || ''
+})
+ipcMain.handle('kashflow:workspace-token-update', (event, token) => {
+  if (!isFullWorkspaceRequest(event)) throw new Error('This desktop session cannot be updated from this page.')
+  if (typeof token !== 'string' || token.length > 1000) throw new Error('The workspace session response is invalid.')
+  saveVault({ ...loadVault(), token })
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window !== fullWorkspaceWindow && !window.isDestroyed()) window.webContents.send('kashflow:workspace-token-changed', token)
+  }
+})
+
+ipcMain.handle('kashflow:open-workspace', async () => {
+  const workspaceUrl = configuredWorkspaceUrl()
+  if (fullWorkspaceWindow && !fullWorkspaceWindow.isDestroyed()) {
+    fullWorkspaceWindow.focus()
+    return
+  }
+
+  fullWorkspaceWindow = new BrowserWindow({
+    width: 1440,
+    height: 940,
+    minWidth: 960,
+    minHeight: 680,
+    backgroundColor: '#f5f5f1',
+    title: 'KashFlow · Full Workspace',
+    show: false,
+    autoHideMenuBar: true,
+    webPreferences: { preload: path.join(__dirname, 'workspace-preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  })
+  fullWorkspaceWindow.once('ready-to-show', () => fullWorkspaceWindow?.show())
+  fullWorkspaceWindow.on('closed', () => { fullWorkspaceWindow = null })
+  fullWorkspaceWindow.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const target = new URL(url)
+      if (target.protocol === 'https:' || target.protocol === 'mailto:') void shell.openExternal(url).catch(() => undefined)
+    } catch { /* Ignore malformed external links. */ }
+    return { action: 'deny' }
+  })
+  fullWorkspaceWindow.webContents.on('will-navigate', (event, url) => {
+    try {
+      const target = new URL(url)
+      if (target.origin !== workspaceUrl.origin) {
+        event.preventDefault()
+        if (target.protocol === 'https:' || target.protocol === 'mailto:') void shell.openExternal(url).catch(() => undefined)
+      }
+    } catch { event.preventDefault() }
+  })
+  try {
+    await fullWorkspaceWindow.loadURL(workspaceUrl.href)
+  } catch (error) {
+    if (fullWorkspaceWindow && !fullWorkspaceWindow.isDestroyed()) fullWorkspaceWindow.destroy()
+    fullWorkspaceWindow = null
+    throw error
+  }
+})
 
 function createWindow() {
   const window = new BrowserWindow({
