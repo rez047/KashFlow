@@ -5144,8 +5144,14 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
   if (!daraja) { response.status(503).json({ error: 'M-Pesa is not configured for this business. A business administrator must add this business’s Daraja consumer key, consumer secret, shortcode, passkey, and callback URL on the Kenya compliance page.' }); return }
   if (daraja.environment === 'production' && !daraja.callbackUrl.startsWith('https://')) { response.status(503).json({ error: 'Production Daraja requires a public HTTPS callback URL.' }); return }
 
-  const input = z.object({ phone: z.string().trim().min(7).max(24) }).safeParse(request.body)
+  // `amount` is optional and used for split payments, where only part of the invoice
+  // balance is collected by M-Pesa. It must be a whole KSh value within the outstanding
+  // balance; when omitted the full remaining balance is requested.
+  const input = z.object({ phone: z.string().trim().min(7).max(24), amount: z.number().optional() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter the customer’s Safaricom-compatible Kenyan phone number.' }); return }
+  if (input.data.amount !== undefined && (!Number.isSafeInteger(input.data.amount) || input.data.amount < 1)) {
+    response.status(400).json({ error: 'A split M-Pesa amount must be a whole number of KSh, at least 1.' }); return
+  }
   const phone = normalizeKenyanPhone(input.data.phone)
   if (!phone) { response.status(400).json({ error: 'Use a valid Kenyan mobile number, such as 0712345678 or 254712345678.' }); return }
 
@@ -5157,8 +5163,15 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
       await client.query('BEGIN')
       const invoiceResult = await client.query('SELECT id, amount, amount_paid, status FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.invoiceId, request.session!.workspaceId])
       if (!invoiceResult.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invoice not found in this business.' }); return }
-      invoiceAmount = Number(invoiceResult.rows[0].amount) - Number(invoiceResult.rows[0].amount_paid)
-      if (invoiceResult.rows[0].status !== 'unpaid') { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only unpaid invoices can be sent for M-Pesa payment.' }); return }
+      const outstanding = Number(invoiceResult.rows[0].amount) - Number(invoiceResult.rows[0].amount_paid)
+      // A paid invoice cannot be sent for M-Pesa. An outstanding balance of zero is also
+      // rejected because there is nothing left to collect, even for a split payment.
+      if (invoiceResult.rows[0].status !== 'unpaid' || outstanding < 1) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only invoices with an outstanding balance can be sent for M-Pesa payment.' }); return }
+      if (input.data.amount !== undefined && input.data.amount > outstanding) {
+        await client.query('ROLLBACK')
+        response.status(400).json({ error: `The M-Pesa split amount (KSh ${input.data.amount}) is more than the outstanding balance (KSh ${outstanding}).` }); return
+      }
+      invoiceAmount = input.data.amount ?? outstanding
       if (!Number.isSafeInteger(invoiceAmount) || invoiceAmount < 1) { await client.query('ROLLBACK'); response.status(400).json({ error: 'M-Pesa STK Push requires a whole-number KSh invoice amount.' }); return }
       const activeRequest = await client.query("SELECT 1 FROM mpesa_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 AND status IN ('initiating', 'pending', 'verification_required') LIMIT 1", [request.params.invoiceId, request.session!.workspaceId])
       if (activeRequest.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'A payment request is already in progress for this invoice. Check its status before trying again.' }); return }

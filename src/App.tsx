@@ -138,6 +138,8 @@ type Remittance = { id: string; remittance_type: string; amount: string; status:
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
 type InvoiceMpesaPayment = { id: string; status: string; amount: string; result_description?: string | null; mpesa_receipt_number?: string | null; created_at: string }
 type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number; kind: 'item' | 'service' }
+// Every workspace export the API supports, in the order the Settings buttons list them.
+const EXPORT_TYPES = ['customers', 'suppliers', 'inventory', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit'] as const
 type PosReceipt = { invoiceId: string; businessName?: string; customer: string; customerEmail?: string; customerPhone?: string; amount: number; amountPaid: number; balanceDue: number; paymentMethod: string; status: string; createdAt: string; lines: PosCartLine[] }
 type PosCustomerSale = { id: string; description: string; amount: string; amount_paid: string; due_date: string; status: string; created_at: string }
 type PosCustomerHistory = { sales: PosCustomerSale[]; summary: { sale_count: number; lifetime_sales: string } }
@@ -236,10 +238,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-function requestInvoiceMpesaPayment(invoiceId: string, phone: string) {
+function requestInvoiceMpesaPayment(invoiceId: string, phone: string, amount?: number) {
   return request<{ customerMessage: string }>(`/v1/invoices/${invoiceId}/payments/mpesa`, {
     method: 'POST',
-    body: JSON.stringify({ phone }),
+    // `amount` is sent only for a split payment so the STK Push collects the dedicated
+    // M-Pesa portion rather than the whole outstanding invoice balance.
+    body: JSON.stringify(amount === undefined ? { phone } : { phone, amount }),
   })
 }
 
@@ -2468,7 +2472,7 @@ async function createCameraReader(): Promise<CameraReader> {
       setError('Add available stock items to the cart before checkout.')
       return
     }
-    if (posPaymentMethod === 'mpesa' && !posPaymentPhone.trim()) {
+    if (posPaymentMethod === 'mpesa' && !posPaymentPhone.trim() && !(multiMethodEnabled && (paymentSplits.pos ?? []).some((split) => split.method === 'mpesa' && Number(split.amount) > 0))) {
       setError('Enter the customer’s M-Pesa phone number before requesting payment.')
       return
     }
@@ -2536,26 +2540,33 @@ async function createCameraReader(): Promise<CameraReader> {
       setPosCustomerHistoryForId('')
       setPosPaymentPhone('')
 
-      if (posPaymentMethod === 'cash' && splits.length) {
-        // Record each captured method against the same invoice, then report exactly
-        // which ones succeeded so the counter never assumes money was received.
+      if (splits.length) {
+        // Split payment takes priority over the single-method selector. Every captured
+        // method is recorded against the same invoice and each is reported separately.
         const failures: string[] = []
-        for (const split of splits) {
+        const cashSplits = splits.filter((split) => split.method === 'cash')
+        const mpesaSplits = splits.filter((split) => split.method === 'mpesa')
+        for (const split of cashSplits) {
           try {
-            if (split.method === 'cash') {
-              await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today }) })
-              receipt.amountPaid += Number(split.amount)
-            } else {
-              await request<{ customerMessage: string }>(`/v1/invoices/${created.invoice.id}/payments/mpesa`, { method: 'POST', body: JSON.stringify({ phone: split.phone.trim() }) })
-            }
+            await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today }) })
+            receipt.amountPaid += Number(split.amount)
           } catch (reason) {
-            failures.push(`${split.method === 'cash' ? 'Cash' : 'M-Pesa'} ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
+            failures.push(`Cash ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
+          }
+        }
+        // M-Pesa requests run after any cash is applied and carry the exact M-Pesa split
+        // amount, so a part-cash sale can still raise an STK Push for the M-Pesa portion.
+        for (const split of mpesaSplits) {
+          try {
+            await requestInvoiceMpesaPayment(created.invoice.id, split.phone.trim(), Number(split.amount))
+          } catch (reason) {
+            failures.push(`M-Pesa ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not requested'}`)
           }
         }
         receipt.balanceDue = Math.max(0, total - receipt.amountPaid)
         receipt.paymentMethod = [...new Set(splits.map((split) => split.method))].join(' + ')
         setPaymentSplits((current) => ({ ...current, pos: [] }))
-        receipt.status = failures.length ? `Partially recorded · ${failures.join(' · ')}` : splits.some((split) => split.method === 'mpesa') ? `M-Pesa request started · ${money(receipt.amountPaid)} collected in cash; confirm M-Pesa before releasing goods` : 'Paid · cash recorded'
+        receipt.status = failures.length ? `Partially recorded · ${failures.join(' · ')}` : mpesaSplits.length ? `M-Pesa request started · ${money(receipt.amountPaid)} collected in cash; confirm M-Pesa before releasing goods` : 'Paid · cash recorded'
         if (failures.length) setError(`Sale saved as invoice ${created.invoice.id.slice(0, 8)}, but some split payments were not recorded: ${failures.join('; ')}`)
         else notify('Sale completed. Stock and split payments recorded.')
       } else if (posPaymentMethod === 'cash') {
@@ -2802,15 +2813,20 @@ async function createCameraReader(): Promise<CameraReader> {
     setBusy(true); setError('')
     const failures: string[] = []
     try {
-      for (const split of splits) {
+      // Cash is recorded first, then each M-Pesa split is requested with its own amount so
+      // the STK Push collects only that portion and a part-paid invoice still works.
+      for (const split of splits.filter((item) => item.method === 'cash')) {
         try {
-          if (split.method === 'cash') {
-            await request(`/v1/invoices/${invoiceRow.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today }) })
-          } else {
-            await requestInvoiceMpesaPayment(invoiceRow.id, split.phone.trim())
-          }
+          await request(`/v1/invoices/${invoiceRow.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today }) })
         } catch (reason) {
-          failures.push(`${split.method === 'cash' ? 'Cash' : 'M-Pesa'} ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
+          failures.push(`Cash ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
+        }
+      }
+      for (const split of splits.filter((item) => item.method === 'mpesa')) {
+        try {
+          await requestInvoiceMpesaPayment(invoiceRow.id, split.phone.trim(), Number(split.amount))
+        } catch (reason) {
+          failures.push(`M-Pesa ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not requested'}`)
         }
       }
       const result = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
@@ -3863,6 +3879,39 @@ async function createCameraReader(): Promise<CameraReader> {
       notify(`${type[0].toUpperCase()}${type.slice(1)} CSV downloaded.`)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not export workspace data.')
+    } finally { setExportBusy(false) }
+  }
+
+  // Downloads every supported export in one action. Each file is fetched and saved with
+  // a short gap so the browser does not block the burst of downloads. Any type that
+  // fails is reported at the end instead of silently dropping data.
+  async function exportAllWorkspaceData() {
+    setExportBusy(true); setError('')
+    const failed: string[] = []
+    try {
+      for (const type of EXPORT_TYPES) {
+        try {
+          const response = await fetch(`${API_BASE}/v1/exports/${encodeURIComponent(type)}`, { credentials: 'include' })
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({})) as { error?: string }
+            throw new Error(payload.error || `Export failed (${response.status})`)
+          }
+          const blob = await response.blob()
+          const url = URL.createObjectURL(blob)
+          const anchor = document.createElement('a')
+          anchor.href = url
+          anchor.download = `kashflow-${type}-${today}.csv`
+          document.body.append(anchor)
+          anchor.click()
+          anchor.remove()
+          URL.revokeObjectURL(url)
+          await new Promise((resolve) => window.setTimeout(resolve, 350))
+        } catch (reason) {
+          failed.push(`${type}: ${reason instanceof Error ? reason.message : 'failed'}`)
+        }
+      }
+      if (failed.length) setError(`Some exports could not be downloaded — ${failed.join('; ')}`)
+      else notify(`All workspace exports downloaded as separate CSV files (${EXPORT_TYPES.length} files).`)
     } finally { setExportBusy(false) }
   }
 
@@ -5175,7 +5224,7 @@ async function createCameraReader(): Promise<CameraReader> {
                 <button type="button" className={posPaymentMethod === 'cash' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'cash'} onClick={() => setPosPaymentMethod('cash')}><Banknote size={17} />Cash / manual</button>
                 <button type="button" className={posPaymentMethod === 'mpesa' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'mpesa'} disabled={!mpesaConfigured} title={mpesaConfigured ? 'Request an M-Pesa STK push' : 'Configure Daraja before requesting M-Pesa'} onClick={() => setPosPaymentMethod('mpesa')}><Smartphone size={17} />M-Pesa{!mpesaConfigured && <small>Setup needed</small>}</button>
               </fieldset>
-              {posPaymentMethod === 'mpesa' && <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="07XX XXX XXX" value={posPaymentPhone} onChange={(event) => setPosPaymentPhone(event.target.value)} /></label>}
+              {posPaymentMethod === 'mpesa' && !((paymentSplits.pos ?? []).some((split) => split.method === 'mpesa' && Number(split.amount) > 0)) && <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="07XX XXX XXX" value={posPaymentPhone} onChange={(event) => setPosPaymentPhone(event.target.value)} /></label>}
               {multiMethodEnabled && <div className="payment-split-editor">
                 <div className="panel-header"><div><h3>Split payment (optional)</h3><p>Part cash, part M-Pesa, or any mix. Amounts must add up to the sale total of {money(posTotal)}.</p></div><button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, pos: [...(current.pos ?? []), { method: 'cash', amount: '', phone: '', reference: '' }] }))}><Plus size={14} /> Add method</button></div>
                 {(paymentSplits.pos ?? []).map((split, index) => <div className="field-row payment-split-row" key={index}>
@@ -5184,10 +5233,24 @@ async function createCameraReader(): Promise<CameraReader> {
                   {split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="07XX XXX XXX" value={split.phone} onChange={(event) => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).map((item, row) => row === index ? { ...item, phone: event.target.value } : item) }))} /></label>}
                   <button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).filter((_, row) => row !== index) }))}>Remove</button>
                 </div>)}
-                {Boolean((paymentSplits.pos ?? []).length) && <p className="dialog-note">Split total {money((paymentSplits.pos ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0))} of {money(posTotal)}. When splits are set, the button below records each method instead of one payment.</p>}
+                {Boolean((paymentSplits.pos ?? []).length) && (() => {
+                  const rows = (paymentSplits.pos ?? []).filter((split) => Number(split.amount) > 0)
+                  const cashTotal = rows.filter((split) => split.method === 'cash').reduce((sum, split) => sum + Number(split.amount || 0), 0)
+                  const mpesaTotal = rows.filter((split) => split.method === 'mpesa').reduce((sum, split) => sum + Number(split.amount || 0), 0)
+                  const splitTotal = cashTotal + mpesaTotal
+                  const remaining = posTotal - splitTotal
+                  const balanced = Math.abs(remaining) < 0.009
+                  return <div className={`split-summary${balanced ? ' is-balanced' : ' is-unbalanced'}`} role="status" aria-live="polite">
+                    <span><small>Cash</small><strong>{money(cashTotal)}</strong></span>
+                    <span><small>M-Pesa</small><strong>{money(mpesaTotal)}</strong></span>
+                    <span><small>Sale total</small><strong>{money(posTotal)}</strong></span>
+                    <span><small>{remaining > 0 ? 'Still to allocate' : remaining < 0 ? 'Over the total' : 'Balanced'}</small><strong>{money(Math.abs(remaining))}</strong></span>
+                  </div>
+                })()}
+                {Boolean((paymentSplits.pos ?? []).length) && Math.abs((paymentSplits.pos ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0) - posTotal) >= 0.009 && <p className="form-error" role="alert">The split amounts do not add up to {money(posTotal)}. Adjust them before completing the sale.</p>}
                 {Boolean((paymentSplits.pos ?? []).filter((split) => split.method === 'mpesa').length) && !mpesaConfigured && <p className="form-error" role="alert">Daraja M-Pesa is not configured for this business, so M-Pesa splits cannot be requested. Remove them or ask a business administrator to add this business’s credentials on the Kenya compliance page.</p>}
               </div>}
-              <button type="button" className="button button-primary pos-complete" disabled={busy || !posCart.length || posTotal <= 0} onClick={() => void checkoutPos()}>{busy ? 'Processing sale…' : posPaymentMethod === 'mpesa' ? 'Request M-Pesa payment' : 'Complete cash sale'}</button>
+              <button type="button" className="button button-primary pos-complete" disabled={busy || !posCart.length || posTotal <= 0 || (Boolean((paymentSplits.pos ?? []).length) && Math.abs((paymentSplits.pos ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0) - posTotal) >= 0.009)} onClick={() => void checkoutPos()}>{busy ? 'Processing sale…' : (paymentSplits.pos ?? []).length ? 'Complete sale with split payment' : posPaymentMethod === 'mpesa' ? 'Request M-Pesa payment' : 'Complete cash sale'}</button>
               <p className="pos-disclaimer"><ShieldCheck size={14} />Internal invoice only—not a KRA/eTIMS fiscal receipt. M-Pesa requests require configured Daraja; verify payment before releasing goods.</p>
             </aside>
           </div>
@@ -5440,7 +5503,8 @@ async function createCameraReader(): Promise<CameraReader> {
               <h2>Export workspace data</h2>
               <p>Download business-scoped CSV files for reporting, migration, or accountant review. Exports are limited to 50,000 rows and require administrator access.</p>
               {error && <p className="form-error" role="alert">{error}</p>}
-              <div className="button-row">{['customers', 'suppliers', 'inventory', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit'].map((type) => <button key={type} className="button button-secondary" disabled={exportBusy} onClick={() => void exportWorkspaceData(type)}>{exportBusy ? 'Preparing…' : `Export ${type}`}</button>)}</div>
+              <div className="button-row">{EXPORT_TYPES.map((type) => <button key={type} className="button button-secondary" disabled={exportBusy} onClick={() => void exportWorkspaceData(type)}>{exportBusy ? 'Preparing…' : `Export ${type}`}</button>)}<button className="button button-primary" disabled={exportBusy} onClick={() => void exportAllWorkspaceData()}>{exportBusy ? 'Preparing…' : 'Export all data'}</button></div>
+              <p className="dialog-note">“Export all data” downloads each of the {EXPORT_TYPES.length} CSV files above in one action. Your browser may ask to allow multiple downloads.</p>
             </section>
             <section className="module-card">
               <h2>Import records from CSV</h2>

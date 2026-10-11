@@ -638,6 +638,14 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .payment-split-editor h3{margin:0 0 4px;font-size:12px}
 .payment-split-row{align-items:end;gap:9px;margin-bottom:9px;flex-wrap:wrap}
 .payment-split-row .field-label{flex:1;min-width:130px;margin:0}
+.split-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:10px 0;padding:11px 12px;border-radius:10px;border:1px solid #e3e8f0;background:#f7faf9}
+.split-summary>span{display:flex;flex-direction:column;gap:2px}
+.split-summary small{color:#8b968f;font-size:8px;font-weight:700;letter-spacing:.4px;text-transform:uppercase}
+.split-summary strong{color:#243f37;font-size:13px;font-weight:800;letter-spacing:-.2px}
+.split-summary.is-unbalanced{border-color:#f0cfc9;background:#fdf6f4}
+.split-summary.is-unbalanced>span:last-child strong{color:#c2412f}
+.split-summary.is-balanced{border-color:#cfe6d7;background:#f4fbf6}
+.split-summary.is-balanced>span:last-child strong{color:#15805f}
 @media(max-width:680px){.payment-split-row{display:grid;grid-template-columns:1fr}.payment-split-row .field-label{min-width:0}}
 
 /* Services sit alongside inventory as sellable records. */
