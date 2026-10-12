@@ -132,6 +132,46 @@ test('KashFlow integration', { timeout: 120_000 }, async (t) => {
   })
 
 
+  // The native mobile and desktop apps embed the workspace page in a WebView, so their
+  // fetches carry both the trusted frontend Origin and the X-Kashflow-Client: native header.
+  // Activating a business from inside that WebView must return a fresh access token, otherwise
+  // the switcher appears to work while the embedded app keeps the old business session.
+  await t.test('a native WebView session receives a fresh token when switching businesses', async () => {
+    const native = { cookie: '', token: '' }
+    const api = async (pathName: string, init: RequestInit & { body?: string } = {}): Promise<ApiResult> => {
+      const headers: Record<string, string> = { Origin: ORIGIN, 'X-Kashflow-Client': 'native' }
+      if (native.cookie) headers.Cookie = native.cookie
+      if (native.token) headers.Authorization = `Bearer ${native.token}`
+      if (init.body !== undefined) headers['Content-Type'] = 'application/json'
+      const response = await fetch(`${BASE}${pathName}`, { ...init, headers })
+      for (const raw of response.headers.getSetCookie?.() ?? []) {
+        const [pair] = raw.split(';')
+        if (pair.slice(0, pair.indexOf('=')) === 'kashflow_session') native.cookie = pair
+      }
+      const text = await response.text()
+      let json: unknown
+      try { json = text ? JSON.parse(text) : null } catch { json = text }
+      return { status: response.status, json: json as Record<string, any> }
+    }
+
+    const bootstrap = await api('/v1/auth/bootstrap', { method: 'POST', body: JSON.stringify({ identifier: 'native@acme.test', password: 'NativePassword1!', businessName: 'Native First' }) })
+    assert.equal(bootstrap.status, 201)
+    assert.equal(typeof bootstrap.json.accessToken, 'string', 'native sign-in returns an access token')
+    native.token = bootstrap.json.accessToken as string
+    const first = bootstrap.json.workspace.id as string
+
+    const created = await api('/v1/workspaces', { method: 'POST', body: JSON.stringify({ name: 'Native Second' }) })
+    assert.equal(created.status, 201)
+
+    const activated = await api(`/v1/workspaces/${first}/activate`, { method: 'POST', body: JSON.stringify({}) })
+    assert.equal(activated.status, 200)
+    assert.equal(typeof activated.json.accessToken, 'string', 'switching returns a new access token for the native WebView')
+
+    const me = await api('/v1/auth/me')
+    assert.equal(me.json.workspace.id, first, 'the fresh token now points at the switched business')
+    assert.equal((me.json.workspaces as unknown[]).length, 2, 'both businesses remain listed')
+  })
+
   await t.test('a user can switch between businesses', async () => {
     const admin = client()
     const bootstrap = await admin.api('/v1/auth/bootstrap', { method: 'POST', body: JSON.stringify({ identifier: 'switcher@acme.test', password: 'SwitcherPassword1!', businessName: 'First Shop' }) })

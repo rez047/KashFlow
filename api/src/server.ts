@@ -238,8 +238,12 @@ function isAllowedOrigin(origin: string | undefined) {
   }
 }
 function isNativeClient(request: express.Request) {
+  if (request.get('x-kashflow-client') !== 'native') return false
   const origin = request.get('origin')
-  return request.get('x-kashflow-client') === 'native' && (!origin || origin === 'null')
+  // Desktop IPC requests arrive with no origin, while the native mobile and desktop
+  // WebViews embed the trusted workspace page, so their fetches carry that page's origin.
+  // Both are native clients and must receive a fresh access token when a business is switched.
+  return !origin || origin === 'null' || isAllowedOrigin(origin)
 }
 async function hashPassword(password: string) {
   const salt = randomBytes(16)
