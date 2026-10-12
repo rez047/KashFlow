@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
+import { Readable } from 'node:stream'
 import { promisify } from 'node:util'
 import cors from 'cors'
 import express from 'express'
@@ -737,6 +738,67 @@ app.use((request, response, next) => {
   if (env.BACKUP_RESTORE_MAINTENANCE_MODE !== 'true') { next(); return }
   if (request.path.startsWith('/v1/platform/backups') || request.path === '/health' || request.path === '/ready') { next(); return }
   response.status(503).json({ error: 'This API instance is in database restore maintenance mode.' })
+})
+
+const releaseDownloads = {
+  windows: {
+    asset: 'KashFlow-Desktop-Windows-Setup.exe',
+    contentType: 'application/vnd.microsoft.portable-executable',
+  },
+  macos: {
+    asset: 'KashFlow-Desktop-macOS.dmg',
+    contentType: 'application/x-apple-diskimage',
+  },
+  android: {
+    asset: 'KashFlow-Field-Android.apk',
+    contentType: 'application/vnd.android.package-archive',
+  },
+} as const
+
+// Stream public release assets through KashFlow so the visitor starts a download here
+// instead of navigating to GitHub. The fixed allowlist keeps this from becoming a proxy.
+app.get('/downloads/:platform', async (request, response) => {
+  const download = releaseDownloads[request.params.platform as keyof typeof releaseDownloads]
+  if (!download) { response.status(404).type('text/plain').send('Download not found.'); return }
+
+  try {
+    const range = request.get('range')
+    const upstream = await fetch(`https://github.com/rez047/KashFlow/releases/latest/download/${download.asset}`, {
+      headers: range ? { Range: range } : undefined,
+    })
+
+    if (![200, 206, 416].includes(upstream.status)) {
+      await upstream.body?.cancel()
+      response.status(upstream.status === 404 ? 404 : 502).type('text/plain').send(
+        upstream.status === 404 ? 'This app release is not available yet.' : 'The app download is temporarily unavailable.',
+      )
+      return
+    }
+
+    response.status(upstream.status)
+    response.set({
+      'Accept-Ranges': upstream.headers.get('accept-ranges') ?? 'bytes',
+      'Cache-Control': 'public, max-age=300',
+      'Content-Disposition': `attachment; filename="${download.asset}"`,
+      'Content-Type': download.contentType,
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+      'X-Content-Type-Options': 'nosniff',
+    })
+    for (const name of ['content-length', 'content-range', 'last-modified', 'etag']) {
+      const value = upstream.headers.get(name)
+      if (value) response.setHeader(name, value)
+    }
+
+    if (upstream.status === 416) { response.end(); return }
+    if (!upstream.body) { response.status(502).end('The app download is temporarily unavailable.'); return }
+
+    Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream)
+      .on('error', () => response.destroy())
+      .pipe(response)
+  } catch {
+    if (!response.headersSent) response.status(502).type('text/plain').send('The app download is temporarily unavailable.')
+    else response.destroy()
+  }
 })
 
 app.get('/healthz', async (_request, response) => {

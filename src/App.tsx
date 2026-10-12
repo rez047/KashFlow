@@ -426,7 +426,6 @@ function KraFiscalReceipt({ draft, businessName }: { draft: ComplianceDraft; bus
 const CONTACT_PHONE = '0746827220'
 const CONTACT_PHONE_INTL = '254746827220'
 const CONTACT_EMAIL = 'ezrasimiyu777@gmail.com'
-const LATEST_RELEASE_DOWNLOAD = 'https://github.com/rez047/KashFlow/releases/latest/download'
 function publicDistributionUrl(value: string | undefined) {
   try {
     const url = new URL((value || '').trim())
@@ -519,9 +518,9 @@ const landingSegments: Array<{ name: string; icon: typeof Gauge; fit: string }> 
 function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onDemo: (packageName: string) => void; onForgot: () => void }) {
   const phoneDisplay = `+254 746 827 220`
   const appDownloads: Record<LandingAppPlatform, string | null> = {
-    windows: `${LATEST_RELEASE_DOWNLOAD}/KashFlow-Desktop-Windows-Setup.exe`,
-    macos: `${LATEST_RELEASE_DOWNLOAD}/KashFlow-Desktop-macOS.dmg`,
-    android: ANDROID_DISTRIBUTION_URL || `${LATEST_RELEASE_DOWNLOAD}/KashFlow-Field-Android.apk`,
+    windows: `${API_BASE}/downloads/windows`,
+    macos: `${API_BASE}/downloads/macos`,
+    android: ANDROID_DISTRIBUTION_URL || `${API_BASE}/downloads/android`,
     ios: IOS_DISTRIBUTION_URL || null,
   }
 
@@ -607,7 +606,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
       <div className="section-head">
         <span className="section-eyebrow"><Download size={14} /> KASHFLOW BUSINESS APPS</span>
         <h2>Made for the way your team <em>works</em></h2>
-        <p>Get the complete KashFlow business suite in every app, including sales, accounting, payroll, reports, settings, and more. Encrypted offline inventory and stock-count tools stay ready on your device. Windows and macOS installers and the Android APK download straight to your device; iPhone and iPad install through Apple&apos;s own App Store or TestFlight.</p>
+        <p>Get the complete KashFlow business suite in every app, including sales, accounting, payroll, reports, settings, and more. Encrypted offline inventory and stock-count tools stay ready on your device. Windows and macOS installers and the Android APK download directly from KashFlow without opening GitHub; iPhone and iPad install through Apple&apos;s own App Store or TestFlight.</p>
       </div>
       <div className="app-download-grid">
         {appPlatforms.map(({ platform, name, detail, label, icon: Icon, badge }) => {
@@ -617,7 +616,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
           <article className="app-download-card" key={platform}>
           <div className="app-download-head"><span className="app-download-icon"><Icon size={21} /></span><span className="app-download-badge">{badge}</span></div>
           <h3>{name}</h3><p>{detail}</p>
-          {target ? <a className="app-download-link" href={target} target={opensStore ? '_blank' : undefined} rel={opensStore ? 'noreferrer' : undefined} aria-label={`${opensStore ? 'Open' : 'Download'} ${label} for ${name}`}><Download size={14} />{platform === 'ios' ? (IOS_DISTRIBUTION_URL ? (IOS_DISTRIBUTION_URL.includes('testflight.apple.com') ? 'Open in TestFlight' : 'Get it on the App Store') : 'Get it on the App Store') : platform === 'android' && ANDROID_DISTRIBUTION_URL ? 'Open Android app' : `Download ${label}`}<ArrowUpRight size={14} /></a>
+          {target ? <a className="app-download-link" href={target} target={opensStore ? '_blank' : undefined} rel={opensStore ? 'noreferrer' : undefined} aria-label={`${opensStore ? 'Open' : 'Download'} ${label} for ${name}`}><Download size={14} />{platform === 'ios' ? (IOS_DISTRIBUTION_URL ? (IOS_DISTRIBUTION_URL.includes('testflight.apple.com') ? 'Open in TestFlight' : 'Get it on the App Store') : 'Get it on the App Store') : platform === 'android' && ANDROID_DISTRIBUTION_URL ? 'Open Android app' : `Download ${label}`}{opensStore && <ArrowUpRight size={14} />}</a>
             : <span className="app-download-link app-download-link-disabled" aria-live="polite">App Store release pending</span>}
           {platform === 'android' && target && !ANDROID_DISTRIBUTION_URL && <span className="app-download-hint">Android may ask you to allow installing apps from this source.</span>}
           {platform === 'ios' && target && <span className="app-download-hint">iOS installs through Apple&apos;s App Store or TestFlight, not a direct file download.</span>}
