@@ -62,6 +62,24 @@ export function activateBusiness(token: string, workspaceId: string) {
   return api<{ workspace: BusinessWorkspace; accessToken?: string }>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/activate`, token, { method: 'POST', body: {} })
 }
 
+export type AccountDeletionPreview = {
+  workspaces: Array<{ id: string; name: string; role: string; archivedAt: string | null; soleAdmin: boolean; otherMemberCount: number }>
+}
+
+export function getAccountDeletionPreview(token: string) {
+  return api<AccountDeletionPreview>('/v1/auth/account-deletion/preview', token)
+}
+
+export function archiveWorkspaceForAccountDeletion(token: string, workspaceId: string, currentPassword: string, workspaceName: string) {
+  return api<{ archived: boolean; archivedAt: string }>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/archive`, token, {
+    method: 'POST', body: { currentPassword, workspaceName },
+  })
+}
+
+export function deleteAccount(token: string, currentPassword: string) {
+  return api<void>('/v1/auth/account', token, { method: 'DELETE', body: { currentPassword, confirmation: 'DELETE' } })
+}
+
 export async function syncQueuedCounts(token: string, workspaceId: string) {
   if (!workspaceId) throw new Error('Refresh a business inventory before syncing saved counts.')
   const session = await api<{ workspace: { id: string } }>('/v1/auth/me', token)

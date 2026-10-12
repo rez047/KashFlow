@@ -125,6 +125,7 @@ type ServiceSupplierPayment = { id: string; amount: string; payment_date: string
 // Optional system-wide split-payment capture for an invoice or a counter sale.
 type PaymentSplit = { method: 'cash' | 'mpesa'; amount: string; phone: string; reference: string }
 type Account = { user: { email: string }; workspace: { id: string; name: string; permissions?: MemberPermission[] }; workspaces?: Array<{ id: string; name: string; role: string }> }
+type AccountDeletionPreview = { workspaces: Array<{ id: string; name: string; role: string; archivedAt: string | null; soleAdmin: boolean; otherMemberCount: number }> }
 type IntegrationReadiness = { integrations: Array<{ id: string; status: string }> }
 type PayrollEstimate = {
   ruleSet: string; effectiveFrom: string; reviewRequired: true; grossMonthlyPay: number
@@ -905,6 +906,12 @@ function App() {
   const [passwordChange, setPasswordChange] = useState({ current: '', next: '', confirm: '' })
   const [passwordChangeStatus, setPasswordChangeStatus] = useState('')
   const [passwordChangeError, setPasswordChangeError] = useState('')
+  const [accountDeletionOpen, setAccountDeletionOpen] = useState(false)
+  const [accountDeletionPreview, setAccountDeletionPreview] = useState<AccountDeletionPreview | null>(null)
+  const [accountDeletionPassword, setAccountDeletionPassword] = useState('')
+  const [accountDeletionConfirmation, setAccountDeletionConfirmation] = useState('')
+  const [accountDeletionBusy, setAccountDeletionBusy] = useState(false)
+  const [accountDeletionError, setAccountDeletionError] = useState('')
   const [authChannel, setAuthChannel] = useState<'email' | 'sms'>('email')
   const [newPassword, setNewPassword] = useState('')
   const [resetToken, setResetToken] = useState('')
@@ -3855,6 +3862,45 @@ async function createCameraReader(): Promise<CameraReader> {
     } finally { setBusy(false) }
   }
 
+  async function loadAccountDeletionReview() {
+    setAccountDeletionBusy(true); setAccountDeletionError('')
+    try { setAccountDeletionPreview(await request<AccountDeletionPreview>('/v1/auth/account-deletion/preview')) }
+    catch (reason) { setAccountDeletionError(reason instanceof Error ? reason.message : 'Could not review account access.') }
+    finally { setAccountDeletionBusy(false) }
+  }
+
+  async function openAccountDeletion() {
+    if (accountDeletionOpen) { setAccountDeletionOpen(false); return }
+    setAccountDeletionOpen(true)
+    if (!accountDeletionPreview) await loadAccountDeletionReview()
+  }
+
+  async function archiveWorkspaceBeforeDeletion(workspace: AccountDeletionPreview['workspaces'][number]) {
+    if (!accountDeletionPassword || accountDeletionBusy) return
+    if (!window.confirm(`Archive “${workspace.name}”? It will become read-only, and shared records will remain stored with the business.`)) return
+    setAccountDeletionBusy(true); setAccountDeletionError('')
+    try {
+      await request(`/v1/workspaces/${encodeURIComponent(workspace.id)}/archive`, { method: 'POST', body: JSON.stringify({ currentPassword: accountDeletionPassword, workspaceName: workspace.name }) })
+      setAccountDeletionPreview(await request<AccountDeletionPreview>('/v1/auth/account-deletion/preview'))
+    } catch (reason) { setAccountDeletionError(reason instanceof Error ? reason.message : 'Could not archive the business.') }
+    finally { setAccountDeletionBusy(false) }
+  }
+
+  async function deleteCurrentAccount() {
+    if (!accountDeletionPassword || accountDeletionConfirmation !== 'DELETE' || accountDeletionBusy) return
+    if (!window.confirm('Delete your account and remove its access to every business? Shared business records will be retained. This cannot be undone.')) return
+    setAccountDeletionBusy(true); setAccountDeletionError('')
+    try {
+      await request('/v1/auth/account', { method: 'DELETE', body: JSON.stringify({ currentPassword: accountDeletionPassword, confirmation: 'DELETE' }) })
+      await logout()
+      setAccountDeletionOpen(false)
+      notify('Account deleted. Shared business records remain with their workspaces.')
+    } catch (reason) {
+      setAccountDeletionError(reason instanceof Error ? reason.message : 'Could not delete this account.')
+      try { setAccountDeletionPreview(await request<AccountDeletionPreview>('/v1/auth/account-deletion/preview')) } catch { /* Keep the server error visible if the session has expired. */ }
+    } finally { setAccountDeletionBusy(false) }
+  }
+
   async function saveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     try {
@@ -5451,6 +5497,28 @@ async function createCameraReader(): Promise<CameraReader> {
                 <div className="dialog-actions"><button type="submit" className="button button-primary" disabled={busy || !passwordChange.current || passwordChange.next.length < 12 || !passwordChange.confirm}>{busy ? 'Changing password…' : 'Change password'}</button></div>
               </form>
             </section>}
+            <section className="module-card security-card account-deletion-card">
+              <div className="panel-header"><div><h2>Delete account</h2><p>Remove your authentication and access to every business. Shared business and audit records remain with their workspaces under a separate retention review.</p></div><Trash2 size={20} /></div>
+              <button type="button" className="button button-secondary" disabled={accountDeletionBusy} onClick={() => void openAccountDeletion()}>{accountDeletionOpen ? 'Hide account deletion' : 'Review account deletion'}</button>
+              {accountDeletionOpen && <div className="account-deletion-review">
+                {accountDeletionBusy && !accountDeletionPreview && <p className="dialog-note">Reviewing your business memberships…</p>}
+                {accountDeletionError && <p className="form-error" role="alert">{accountDeletionError}</p>}
+                {!accountDeletionPreview && !accountDeletionBusy && <button type="button" className="button button-small" onClick={() => void loadAccountDeletionReview()}>Retry review</button>}
+                {accountDeletionPreview && <>
+                  <h3>Businesses and access</h3>
+                  {accountDeletionPreview.workspaces.map((workspace) => <div className="transaction-row" key={workspace.id}>
+                    <span><strong>{workspace.name}</strong><small>{workspace.role.replaceAll('_', ' ').toUpperCase()}{workspace.archivedAt ? ' · archived, read-only' : ''} · {workspace.otherMemberCount} other member{workspace.otherMemberCount === 1 ? '' : 's'}</small></span>
+                    {workspace.soleAdmin && !workspace.archivedAt && <button type="button" className="button button-small" disabled={accountDeletionBusy || !accountDeletionPassword} onClick={() => void archiveWorkspaceBeforeDeletion(workspace)}>Archive workspace</button>}
+                  </div>)}
+                  {accountDeletionPreview.workspaces.some((workspace) => workspace.soleAdmin && !workspace.archivedAt) && <p className="dialog-note">Archive each workspace where you are the sole administrator before deleting your account. Archived businesses remain read-only and have no administrator after deletion. Email ezrasimiyu777@gmail.com if a business must remain active.</p>}
+                  {accountDeletionPreview.workspaces.some((workspace) => workspace.soleAdmin && workspace.archivedAt) && <p className="dialog-note">These archived businesses will have no administrator after deletion. Other members may view retained records but cannot make changes. Email ezrasimiyu777@gmail.com if a business must remain active.</p>}
+                  {accountDeletionPreview.workspaces.some((workspace) => workspace.otherMemberCount === 0) && <p className="dialog-note">A business with no other members will stay stored but have no user access after deletion. Email ezrasimiyu777@gmail.com if you need help restoring access later.</p>}
+                  <label className="field-label">Current password<input type="password" autoComplete="current-password" value={accountDeletionPassword} onChange={(event) => setAccountDeletionPassword(event.target.value)} /></label>
+                  <label className="field-label">Type DELETE to confirm<input autoComplete="off" value={accountDeletionConfirmation} onChange={(event) => setAccountDeletionConfirmation(event.target.value.toUpperCase())} /></label>
+                  <div className="dialog-actions"><button type="button" className="button button-danger" disabled={accountDeletionBusy || !accountDeletionPassword || accountDeletionConfirmation !== 'DELETE' || accountDeletionPreview.workspaces.some((workspace) => workspace.soleAdmin && !workspace.archivedAt)} onClick={() => void deleteCurrentAccount()}>{accountDeletionBusy ? 'Processing…' : 'Delete account'}</button></div>
+                </>}
+              </div>}
+            </section>
             <section className="module-card security-card">
               <div className="panel-header"><div><h2>Account security · two-factor authentication</h2><p>Protect this account's access to your business with an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, or any TOTP app). No paid service is required.</p></div><span className={`status-pill ${twoFactorStatus?.enabled ? 'green' : 'amber'}`}>{twoFactorStatus?.enabled ? 'Enabled' : twoFactorSetup?.otpauthUri ? 'Setup in progress' : 'Not enabled'}</span></div>
               <label className="field-label checkbox-row"><input type="checkbox" checked={Boolean(twoFactorStatus?.enabled || twoFactorSetup?.otpauthUri)} disabled={!twoFactorStatus || twoFactorBusy || (!twoFactorStatus.available && !twoFactorStatus.enabled)} onChange={(event) => toggleTwoFactor(event.target.checked)} /> Enable two-factor authentication for this account</label>

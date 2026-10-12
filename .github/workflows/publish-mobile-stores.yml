@@ -1,0 +1,90 @@
+name: Build and upload mobile store test releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Build and upload this platform to its private store test service.
+        required: true
+        type: choice
+        options:
+          - all
+          - android
+          - ios
+        default: all
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-submit:
+    name: Build and upload ${{ inputs.platform }} test release
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: apps/mobile
+    env:
+      EXPO_PROJECT_ID: ${{ vars.EXPO_PROJECT_ID }}
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      IOS_ASC_APP_ID: ${{ vars.IOS_ASC_APP_ID }}
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      PLATFORM: ${{ inputs.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check release configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$EXPO_PROJECT_ID" || "$EXPO_PROJECT_ID" == "replace-with-your-eas-project-id" ]]; then
+            echo "::error::Set the EXPO_PROJECT_ID repository variable to the linked EAS project ID."
+            exit 1
+          fi
+          if [[ -z "$EXPO_TOKEN" ]]; then
+            echo "::error::Set the EXPO_TOKEN repository secret. Do not put the token in source control."
+            exit 1
+          fi
+          if [[ "$PLATFORM" == "ios" || "$PLATFORM" == "all" ]]; then
+            if [[ -z "$IOS_ASC_APP_ID" || -z "$APPLE_TEAM_ID" ]]; then
+              echo "::error::Set IOS_ASC_APP_ID and APPLE_TEAM_ID repository variables after creating the App Store Connect app record."
+              exit 1
+            fi
+          fi
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.13.0
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+
+      - uses: expo/expo-github-action@v9
+        with:
+          eas-version: latest
+          packager: npm
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Install mobile dependencies
+        run: npm ci
+
+      - name: Link EAS project and configure store submission identifiers
+        run: node scripts/configure-store-submit.mjs
+
+      - name: Build and upload signed store binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          platforms=("$PLATFORM")
+          if [[ "$PLATFORM" == "all" ]]; then
+            platforms=(android ios)
+          fi
+          for platform in "${platforms[@]}"; do
+            build_json="$RUNNER_TEMP/eas-${platform}-store-build.json"
+            eas build --platform "$platform" --profile production --non-interactive --wait --json > "$build_json"
+            build_id="$(jq -r --arg platform "$platform" 'if type == "array" then .[] else . end | select((.platform // "" | ascii_downcase) == $platform) | .id' "$build_json" | head -n 1)"
+            if [[ -z "$build_id" ]]; then
+              echo "::error::EAS finished without returning a $platform build ID."
+              exit 1
+            fi
+            eas submit --platform "$platform" --profile production --id "$build_id" --non-interactive --wait
+          done

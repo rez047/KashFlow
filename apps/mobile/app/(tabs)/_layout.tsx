@@ -18,6 +18,7 @@ export default function TabLayout() {
       <Tabs.Screen name="count" options={{ title: 'Count', tabBarIcon: ({ color, size }) => <Ionicons name="scan-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="sync" options={{ title: 'Sync', tabBarIcon: ({ color, size }) => <Ionicons name="sync-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="settings" options={{ href: null }} />
+      <Tabs.Screen name="account-deletion" options={{ href: null }} />
     </Tabs>
   </KashFlowProvider>
 }

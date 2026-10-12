@@ -11,6 +11,7 @@ The Business tab loads the configured KashFlow frontend in a WebView and uses th
 - Reconnect prompts let the user send saved counts. The API accepts idempotency keys so a retry after a dropped connection cannot post the same adjustment twice.
 - If the server balance changed after the saved baseline, the count stops for review. The user is asked to physically recount against the fresh balance before sending a replacement count.
 - Sign out clears the local encrypted database and the local database key.
+- Account deletion is available from Settings while online. It reauthenticates with the current password, requires sole administrators to archive their workspace first, removes server authentication and memberships, preserves shared workspace records, and clears the local vault after success.
 - Provider actions such as M-Pesa STK, KRA eTIMS submissions, and remote bank feeds need a live connection.
 
 The first catalog download needs a connection. If an item or branch was not cached before going offline, it cannot be counted on that device until the next refresh.
@@ -32,6 +33,21 @@ EAS builds require an Expo project linked to this app. Put its ID in `EXPO_PROJE
 Push a stable `v*` tag (for example `v1.2.0`) or run **Actions → Attach mobile apps to release** and supply an existing tag. The workflow waits for the EAS `preview` build, downloads the signed installable APK, and attaches it to that GitHub release as `KashFlow-Field-Android-<tag>.apk`. The landing page matches that asset by name and serves it as a direct download button.
 
 Android sideloading always triggers the "install from this source" / Play Protect prompt on the device. That prompt cannot be suppressed for an APK; it only disappears with a Google Play release.
+
+## Store testing releases
+
+The **Build and upload mobile store test releases** GitHub Actions workflow creates production-signed Android App Bundles and iOS App Store builds, then uploads Android to the Play internal testing track and iOS to App Store Connect/TestFlight. It does not promote a Play release to production or submit an iOS version for App Review.
+
+Before running the workflow:
+
+- Set the `EXPO_PROJECT_ID` repository variable and `EXPO_TOKEN` repository secret.
+- Configure Android production signing and a Google Play service account key in the linked EAS project. The Android application ID must already exist in Play Console.
+- Enroll in the Apple Developer Program, create the App Store Connect app record for `ke.kashflow.inventory`, set the `IOS_ASC_APP_ID` and `APPLE_TEAM_ID` repository variables, and configure the App Store Connect API key and iOS distribution credentials in EAS.
+- Complete each store's listing, privacy, data-safety, and account-deletion requirements before requesting public review.
+
+Public review is not ready yet: the account-deletion flow is implemented, but the repository has no published privacy-policy page or finalized retention schedule and backup-expiry policy. Store listing deletion disclosures still need a public destination that explains how to reach the in-app deletion flow. The Business tab also relies on a hosted WebView, so Apple may assess whether the native offline inventory tools provide enough functionality beyond the website.
+
+The workflow requires a new `workflow_dispatch` run for each upload. Select `all`, `android`, or `ios` in GitHub Actions. Store credentials belong in EAS or GitHub's encrypted secrets; never commit or send them in chat.
 
 ### iOS
 

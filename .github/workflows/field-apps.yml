@@ -30,6 +30,9 @@ jobs:
           - platform: macos
             runner: macos-latest
             script: build:mac
+          - platform: linux
+            runner: ubuntu-latest
+            script: build:linux
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -64,33 +67,147 @@ jobs:
         env:
           CERT: ${{ secrets.MACOS_CSC_LINK }}
           NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [[ -z "$CERT" || -z "$NOTARY_APPLE_ID" || -z "$NOTARY_TEAM_ID" ]]; then
+          if [[ -z "$CERT" || -z "$NOTARY_APPLE_ID" || -z "$NOTARY_PASSWORD" || -z "$NOTARY_TEAM_ID" ]]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::macOS signing/notarization secrets (MACOS_CSC_LINK, APPLE_ID, APPLE_TEAM_ID) are not all configured. The DMG will be unsigned or held as a draft."
+            echo "::warning::macOS signing/notarization secrets (MACOS_CSC_LINK, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID) are not all configured. The DMG will be unsigned or held as a draft."
           else
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build installer (signed)
-        if: steps.signing-windows.outputs.available == 'true' || steps.signing-macos.outputs.available == 'true'
-        run: npm run ${{ matrix.script }}
+      - name: Build Windows installer (signed)
+        if: matrix.platform == 'windows' && steps.signing-windows.outputs.available == 'true'
+        run: npm run build:win
         working-directory: apps/desktop
         env:
-          CSC_LINK: ${{ matrix.platform == 'windows' && secrets.WINDOWS_CSC_LINK || secrets.MACOS_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ matrix.platform == 'windows' && secrets.WINDOWS_CSC_KEY_PASSWORD || secrets.MACOS_CSC_KEY_PASSWORD }}
+          CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'true'
+
+      - name: Verify Windows installer signature
+        if: matrix.platform == 'windows' && steps.signing-windows.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem release/KashFlow-Desktop-*-Setup.exe | Select-Object -First 1
+          if (-not $installer) { throw 'The Windows installer was not produced.' }
+          $signature = Get-AuthenticodeSignature -FilePath $installer.FullName
+          if ($signature.Status -ne 'Valid') { throw "Windows installer signature is $($signature.Status), expected Valid." }
+
+      - name: Build macOS installer (signed and notarized)
+        if: matrix.platform == 'macos' && steps.signing-macos.outputs.available == 'true'
+        run: npm run build && npx electron-builder --mac dmg zip --universal -c.mac.notarize=true
+        working-directory: apps/desktop
+        env:
+          CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'true'
 
-      - name: Build installer (unsigned draft)
-        if: steps.signing-windows.outputs.available != 'true' && steps.signing-macos.outputs.available != 'true'
+      - name: Verify macOS signature and notarization
+        if: matrix.platform == 'macos' && steps.signing-macos.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find release -maxdepth 1 -name 'KashFlow-Desktop-*.zip' -print -quit)"
+          if [[ -z "$archive" ]]; then
+            echo "::error::The macOS ZIP containing the app bundle was not produced."
+            exit 1
+          fi
+          app_dir="$RUNNER_TEMP/kashflow-macos-verify"
+          mkdir -p "$app_dir"
+          ditto -x -k "$archive" "$app_dir"
+          app_path="$(find "$app_dir" -maxdepth 3 -name 'KashFlow.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo "::error::Could not find KashFlow.app in the macOS build archive."
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose "$app_path"
+          xcrun stapler validate "$app_path"
+
+      - name: Detect Mac App Store signing configuration
+        if: matrix.platform == 'macos'
+        id: signing-mas
+        shell: bash
+        env:
+          CERT: ${{ secrets.MAC_APP_STORE_CSC_LINK }}
+          PROFILE: ${{ secrets.MAC_APP_STORE_PROVISIONING_PROFILE }}
+          CERT_PASSWORD: ${{ secrets.MAC_APP_STORE_CSC_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$CERT" || -z "$PROFILE" || -z "$CERT_PASSWORD" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Mac App Store package skipped until its distribution certificate bundle, certificate password, and provisioning profile are configured."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build signed Mac App Store package
+        if: matrix.platform == 'macos' && steps.signing-mas.outputs.available == 'true'
+        shell: bash
+        working-directory: apps/desktop
+        env:
+          CSC_LINK: ${{ secrets.MAC_APP_STORE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_APP_STORE_CSC_KEY_PASSWORD }}
+          MAS_PROFILE: ${{ secrets.MAC_APP_STORE_PROVISIONING_PROFILE }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          printf '%s' "$MAS_PROFILE" | base64 -D > build/mas.provisionprofile
+          npm run build
+          npx electron-builder --mac mas --universal
+
+      - name: Verify Mac App Store package signatures
+        if: matrix.platform == 'macos' && steps.signing-mas.outputs.available == 'true'
+        shell: bash
+        working-directory: apps/desktop
+        run: |
+          set -euo pipefail
+          package="$(find release -maxdepth 1 -name 'KashFlow-Desktop-*.pkg' -print -quit)"
+          app_path="$(find release -type d -path '*/mas-*/KashFlow.app' -print -quit)"
+          if [[ -z "$package" || -z "$app_path" ]]; then
+            echo "::error::The Mac App Store package or app bundle was not produced."
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          pkgutil --check-signature "$package"
+
+      - name: Build unsigned installers or Linux packages
+        if: (matrix.platform == 'windows' && steps.signing-windows.outputs.available != 'true') || (matrix.platform == 'macos' && steps.signing-macos.outputs.available != 'true') || matrix.platform == 'linux'
         run: npm run ${{ matrix.script }}
         working-directory: apps/desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Sign Linux release packages
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          LINUX_RELEASE_GPG_PRIVATE_KEY: ${{ secrets.LINUX_RELEASE_GPG_PRIVATE_KEY }}
+          LINUX_RELEASE_GPG_PASSPHRASE: ${{ secrets.LINUX_RELEASE_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$LINUX_RELEASE_GPG_PRIVATE_KEY" || -z "$LINUX_RELEASE_GPG_PASSPHRASE" ]]; then
+            echo "::notice::Linux packages are unsigned in this build. Stable releases require the publisher GPG signing key and passphrase."
+            exit 0
+          fi
+          printf '%s' "$LINUX_RELEASE_GPG_PRIVATE_KEY" | gpg --batch --import
+          mkdir -p apps/desktop/release
+          gpg --batch --armor --export > apps/desktop/release/Ezz-Prime-Technologies-Linux-signing-key.asc
+          shopt -s nullglob
+          packages=(apps/desktop/release/KashFlow-Desktop-*.AppImage apps/desktop/release/KashFlow-Desktop-*.deb apps/desktop/release/KashFlow-Desktop-*.snap)
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "::error::No Linux packages were produced for signing."
+            exit 1
+          fi
+          for package in "${packages[@]}"; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 3<<<"$LINUX_RELEASE_GPG_PASSPHRASE" --armor --detach-sign --output "$package.asc" "$package"
+            gpg --batch --verify "$package.asc" "$package"
+          done
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v7
@@ -101,6 +218,12 @@ jobs:
             apps/desktop/release/KashFlow-Desktop-*-Setup.exe.blockmap
             apps/desktop/release/KashFlow-Desktop-*.dmg
             apps/desktop/release/KashFlow-Desktop-*.zip
+            apps/desktop/release/KashFlow-Desktop-*.pkg
+            apps/desktop/release/KashFlow-Desktop-*.AppImage
+            apps/desktop/release/KashFlow-Desktop-*.deb
+            apps/desktop/release/KashFlow-Desktop-*.snap
+            apps/desktop/release/KashFlow-Desktop-*.asc
+            apps/desktop/release/Ezz-Prime-Technologies-Linux-signing-key.asc
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
@@ -114,6 +237,42 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Require signed desktop releases
+        shell: bash
+        env:
+          WINDOWS_CERT: ${{ secrets.WINDOWS_CSC_LINK }}
+          MACOS_CERT: ${{ secrets.MACOS_CSC_LINK }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MAC_APP_STORE_CERT: ${{ secrets.MAC_APP_STORE_CSC_LINK }}
+          MAC_APP_STORE_CERT_PASSWORD: ${{ secrets.MAC_APP_STORE_CSC_KEY_PASSWORD }}
+          MAC_APP_STORE_PROFILE: ${{ secrets.MAC_APP_STORE_PROVISIONING_PROFILE }}
+          LINUX_GPG_KEY: ${{ secrets.LINUX_RELEASE_GPG_PRIVATE_KEY }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_RELEASE_GPG_PASSPHRASE }}
+          SNAP_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$WINDOWS_CERT" ]]; then
+            echo "::error::Stable releases require WINDOWS_CSC_LINK so the Windows installer can be signed."
+            exit 1
+          fi
+          if [[ -z "$MACOS_CERT" || -z "$APPLE_ID" || -z "$APPLE_PASSWORD" || -z "$APPLE_TEAM_ID" ]]; then
+            echo "::error::Stable releases require a Developer ID certificate and Apple notarization credentials for macOS."
+            exit 1
+          fi
+          if [[ -z "$MAC_APP_STORE_CERT" || -z "$MAC_APP_STORE_CERT_PASSWORD" || -z "$MAC_APP_STORE_PROFILE" ]]; then
+            echo "::error::Stable releases require the Mac App Store distribution certificate bundle and provisioning profile."
+            exit 1
+          fi
+          if [[ -z "$LINUX_GPG_KEY" || -z "$LINUX_GPG_PASSPHRASE" ]]; then
+            echo "::error::Stable releases require LINUX_RELEASE_GPG_PRIVATE_KEY and LINUX_RELEASE_GPG_PASSPHRASE for Linux package signatures."
+            exit 1
+          fi
+          if [[ -z "$SNAP_STORE_CREDENTIALS" ]]; then
+            echo "::error::Stable releases require SNAPCRAFT_STORE_CREDENTIALS to upload the Linux Snap to the Snap Store candidate channel."
+            exit 1
+          fi
       - name: Download desktop installers
         uses: actions/download-artifact@v8
         with:
@@ -128,6 +287,24 @@ jobs:
           [[ ${#macos_assets[@]} -eq 1 ]] || { echo "Expected one macOS installer." >&2; exit 1; }
           cp -- "${windows_assets[0]}" release-assets/KashFlow-Desktop-Windows-Setup.exe
           cp -- "${macos_assets[0]}" release-assets/KashFlow-Desktop-macOS.dmg
+      - name: Locate signed Snap package
+        id: snap
+        shell: bash
+        run: |
+          set -euo pipefail
+          snap_path="$(find release-assets -maxdepth 1 -type f -name 'KashFlow-Desktop-*.snap' -print -quit)"
+          if [[ -z "$snap_path" ]]; then
+            echo "::error::The signed Linux Snap package was not included in the desktop artifacts."
+            exit 1
+          fi
+          echo "path=$snap_path" >> "$GITHUB_OUTPUT"
+      - name: Publish signed Snap to the candidate channel
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.snap.outputs.path }}
+          release: candidate
       - name: Publish (or update) the GitHub release
         run: |
           set -euo pipefail

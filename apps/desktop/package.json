@@ -10,7 +10,8 @@
     "build": "tsc -b && vite build",
     "build:win": "npm run build && electron-builder --win nsis --x64",
     "build:mac": "npm run build && electron-builder --mac dmg zip --universal",
-    "build:linux": "npm run build && electron-builder --linux AppImage deb"
+    "build:mac:store": "npm run build && electron-builder --mac mas --universal",
+    "build:linux": "npm run build && electron-builder --linux AppImage deb snap"
   },
   "dependencies": {
     "lucide-react": "^1.50.0",
@@ -52,7 +53,28 @@
         "NSCameraUsageDescription": "KashFlow uses the camera to scan product barcodes when you choose camera scanning in Point of Sale."
       }
     },
-    "linux": { "icon": "assets/icon.png", "target": ["AppImage", "deb"], "artifactName": "KashFlow-Desktop-${version}-${arch}.${ext}" },
+    "mas": {
+      "entitlements": "build/entitlements.mas.plist",
+      "entitlementsInherit": "build/entitlements.mas.inherit.plist",
+      "provisioningProfile": "build/mas.provisionprofile",
+      "category": "public.app-category.business"
+    },
+    "linux": {
+      "icon": "assets/icon.png",
+      "target": ["AppImage", "deb", "snap"],
+      "artifactName": "KashFlow-Desktop-${version}-${arch}.${ext}",
+      "category": "Office",
+      "synopsis": "Business workspace and offline inventory tools",
+      "description": "KashFlow business workspace with offline inventory and stock counting tools."
+    },
+    "snapcraft": {
+      "base": "core22",
+      "core22": {
+        "confinement": "strict",
+        "summary": "Business workspace and offline inventory tools",
+        "plugs": ["default", "camera", "password-manager-service"]
+      }
+    },
     "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true, "createStartMenuShortcut": true, "perMachine": false }
   }
 }

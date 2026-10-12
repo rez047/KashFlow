@@ -557,8 +557,9 @@ async function requireSession(request: AuthedRequest, response: express.Response
   request.session = readSession(cookies(request.headers.cookie)[cookieName] ?? bearer) ?? undefined
   if (!request.session) { response.status(401).json({ error: 'Authentication is required to access this workspace.' }); return }
   try {
-    const membership = await pool!.query(`SELECT wm.role, wm.permissions, u.session_version
+    const membership = await pool!.query(`SELECT wm.role, wm.permissions, u.session_version, w.archived_at
       FROM workspace_members wm JOIN users u ON u.id = wm.user_id
+      JOIN workspaces w ON w.id = wm.workspace_id
       WHERE wm.user_id = $1 AND wm.workspace_id = $2`, [request.session.userId, request.session.workspaceId])
     if (!membership.rowCount) { response.status(401).json({ error: 'Workspace membership has been revoked or is no longer valid.' }); return }
     if (Number(membership.rows[0].session_version ?? 0) !== (request.session.sessionVersion ?? 0)) {
@@ -566,6 +567,12 @@ async function requireSession(request: AuthedRequest, response: express.Response
       response.status(401).json({ error: 'Your password changed, so this session has expired. Sign in again.' }); return
     }
     request.workspaceRole = String(membership.rows[0].role)
+    const routePath = String(request.route?.path ?? '')
+    const archivedWorkspaceException = routePath === '/v1/workspaces/:workspaceId/activate' || routePath === '/v1/workspaces/:workspaceId/archive' || routePath === '/v1/auth/account'
+    if (membership.rows[0].archived_at && !['GET', 'HEAD', 'OPTIONS'].includes(request.method) && !archivedWorkspaceException) {
+      response.status(423).json({ error: 'This workspace is archived and read-only.' })
+      return
+    }
     const overrides = membership.rows[0].permissions
     request.workspacePermissions = request.workspaceRole === 'admin'
       ? rolePermissionDefaults.admin
@@ -574,7 +581,7 @@ async function requireSession(request: AuthedRequest, response: express.Response
         : rolePermissionDefaults[request.workspaceRole] ?? (await pool!.query('SELECT permissions FROM custom_workspace_roles WHERE workspace_id = $1 AND role_key = $2', [request.session!.workspaceId, request.workspaceRole])).rows[0]?.permissions ?? []
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
       const routePath = String(request.route?.path ?? '')
-      const selfServiceRoute = routePath === '/v1/workspaces/:workspaceId/activate' || routePath === '/v1/auth/change-password' || routePath.startsWith('/v1/auth/two-factor/')
+      const selfServiceRoute = routePath === '/v1/workspaces/:workspaceId/activate' || routePath === '/v1/workspaces/:workspaceId/archive' || routePath === '/v1/auth/account' || routePath === '/v1/auth/change-password' || routePath.startsWith('/v1/auth/two-factor/')
       const permission = selfServiceRoute
         ? null
         : permissionForRequest(request) ?? 'operations.write'
@@ -589,6 +596,7 @@ async function requireSession(request: AuthedRequest, response: express.Response
 function permissionForRequest(request: AuthedRequest): WorkspacePermission | null {
   const routePath = String(request.route?.path ?? '')
   if (routePath === '/v1/workspaces/:workspaceId/activate') return null
+  if (routePath === '/v1/workspaces/:workspaceId/archive' || routePath === '/v1/auth/account') return null
   if (routePath === '/v1/auth/change-password') return null
   if (routePath.startsWith('/v1/auth/two-factor/')) return null
   if (routePath.includes('/invitations') || routePath.includes('/members') || routePath.includes('/roles')) return 'team.manage'
@@ -1432,6 +1440,76 @@ app.post('/v1/auth/change-password', requirePool, verifyOrigin, rateLimit({ wind
   finally { client.release() }
 })
 
+app.get('/v1/auth/account-deletion/preview', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT wm.workspace_id AS id, w.name, wm.role, w.archived_at,
+        (SELECT count(*)::int FROM workspace_members admins WHERE admins.workspace_id = w.id AND admins.role = 'admin') AS admin_count,
+        (SELECT count(*)::int FROM workspace_members other_members WHERE other_members.workspace_id = w.id AND other_members.user_id <> $1) AS other_member_count
+      FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id
+      WHERE wm.user_id = $1 ORDER BY w.name, w.id`, [request.session!.userId])
+    response.json({ workspaces: result.rows.map((workspace: Record<string, unknown>) => ({
+      id: String(workspace.id),
+      name: String(workspace.name),
+      role: String(workspace.role),
+      archivedAt: workspace.archived_at ?? null,
+      soleAdmin: String(workspace.role) === 'admin' && Number(workspace.admin_count) <= 1,
+      otherMemberCount: Number(workspace.other_member_count),
+    })) })
+  } catch (error) { next(error) }
+})
+
+app.delete('/v1/auth/account', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 5, standardHeaders: 'draft-8', legacyHeaders: false }), requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ currentPassword: z.string().min(1).max(200), confirmation: z.literal('DELETE') }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter your current password and type DELETE to confirm account deletion.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    // Lock every workspace and membership before checking ownership so an archive operation
+    // cannot race this deletion and leave an unarchived workspace without its sole admin.
+    const memberships = await client.query(`SELECT w.id AS workspace_id, w.name, w.archived_at, wm.role
+      FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id
+      WHERE wm.user_id = $1 ORDER BY w.id FOR NO KEY UPDATE OF w, wm`, [request.session!.userId])
+    const user = await client.query('SELECT email, phone, password_hash FROM users WHERE id = $1 FOR UPDATE', [request.session!.userId])
+    if (!user.rowCount || !(await verifyPassword(input.data.currentPassword, String(user.rows[0].password_hash)))) {
+      await client.query('ROLLBACK')
+      response.status(401).json({ error: 'The current password is incorrect.' }); return
+    }
+    const workspaceIds = memberships.rows.map((membership: Record<string, unknown>) => String(membership.workspace_id))
+    const adminCounts = workspaceIds.length
+      ? await client.query(`SELECT workspace_id, count(*)::int AS count FROM workspace_members
+          WHERE workspace_id = ANY($1::uuid[]) AND role = 'admin' GROUP BY workspace_id`, [workspaceIds])
+      : { rows: [] as Array<Record<string, unknown>> }
+    const adminsByWorkspace = new Map(adminCounts.rows.map((row: Record<string, unknown>) => [String(row.workspace_id), Number(row.count)]))
+    const blockedWorkspaces = memberships.rows
+      .filter((membership: Record<string, unknown>) => String(membership.role) === 'admin'
+        && !membership.archived_at && (adminsByWorkspace.get(String(membership.workspace_id)) ?? 0) <= 1)
+      .map((membership: Record<string, unknown>) => ({ id: String(membership.workspace_id), name: String(membership.name) }))
+    if (blockedWorkspaces.length) {
+      await client.query('ROLLBACK')
+      response.status(409).json({ error: 'Archive each workspace where you are the sole administrator before deleting this account. Email ezrasimiyu777@gmail.com if a business must remain active.', soleAdminWorkspaces: blockedWorkspaces })
+      return
+    }
+
+    // These entries intentionally contain no email, phone, or user ID. Business records and
+    // existing audit history remain attached to their workspace; user FKs are nulled/cascaded.
+    for (const membership of memberships.rows) {
+      await recordAudit(client, { workspaceId: String(membership.workspace_id), actorUserId: null, eventType: 'account.deleted', entityType: 'account', eventData: {} })
+    }
+    await client.query(`UPDATE workspace_invitations SET
+        email = CASE WHEN $1::text IS NOT NULL AND lower(email) = lower($1) THEN NULL ELSE email END,
+        phone = CASE WHEN $2::text IS NOT NULL AND phone = $2 THEN NULL ELSE phone END,
+        status = CASE WHEN status = 'pending' AND (($1::text IS NOT NULL AND lower(email) = lower($1)) OR ($2::text IS NOT NULL AND phone = $2)) THEN 'declined' ELSE status END
+      WHERE ($1::text IS NOT NULL AND lower(email) = lower($1)) OR ($2::text IS NOT NULL AND phone = $2)`,
+    [user.rows[0].email ?? null, user.rows[0].phone ?? null])
+    await client.query('DELETE FROM workspace_members WHERE user_id = $1', [request.session!.userId])
+    await client.query('DELETE FROM users WHERE id = $1', [request.session!.userId])
+    await client.query('COMMIT')
+    response.clearCookie(cookieName, { httpOnly: true, secure: env.NODE_ENV === 'production', sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax', path: '/' })
+    response.status(204).end()
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
 // Search all business records through the active workspace session. The term is treated as a
 // literal substring, so SQL wildcard characters in a customer's query have no special meaning.
 app.get('/v1/search', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
@@ -1872,7 +1950,7 @@ app.get('/v1/public/stores/:slug', requirePool, rateLimit({ windowMs: 60_000, li
   try {
     const result = await pool!.query(`SELECT s.workspace_id, s.slug, s.title, s.description, w.name AS business_name
       FROM online_stores s JOIN workspaces w ON w.id = s.workspace_id
-      WHERE s.slug = $1 AND s.enabled = true`, [request.params.slug])
+      WHERE s.slug = $1 AND s.enabled = true AND w.archived_at IS NULL`, [request.params.slug])
     const store = result.rows[0]
     if (!store) { response.status(404).json({ error: 'This online store is not available.' }); return }
     const records = await pool!.query("SELECT id, data FROM workspace_records WHERE workspace_id = $1 AND record_type = 'inventory'", [store.workspace_id])
@@ -1899,7 +1977,8 @@ app.post('/v1/public/stores/:slug/orders', requirePool, verifyOrigin, rateLimit(
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
-    const storeResult = await client.query('SELECT workspace_id, slug FROM online_stores WHERE slug = $1 AND enabled = true FOR SHARE', [request.params.slug])
+    const storeResult = await client.query(`SELECT s.workspace_id, s.slug FROM online_stores s JOIN workspaces w ON w.id = s.workspace_id
+      WHERE s.slug = $1 AND s.enabled = true AND w.archived_at IS NULL FOR SHARE OF s, w`, [request.params.slug])
     const store = storeResult.rows[0]
     if (!store) { await client.query('ROLLBACK'); response.status(404).json({ error: 'This online store is not available.' }); return }
     const lines: Array<{ itemId: string; name: string; sku: string; quantity: number; priceCents: number; totalCents: number }> = []
@@ -3094,6 +3173,40 @@ app.post('/v1/workspaces', requirePool, verifyOrigin, requireSession, async (req
   finally { client.release() }
 })
 
+app.post('/v1/workspaces/:workspaceId/archive', requirePool, verifyOrigin, rateLimit({ windowMs: 15 * 60_000, limit: 5, standardHeaders: 'draft-8', legacyHeaders: false }), requireSession, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ currentPassword: z.string().min(1).max(200), workspaceName: z.string().trim().min(1).max(120) }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter your current password and the exact business name to archive it.' }); return }
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const workspace = await client.query(`SELECT w.id, w.name, w.archived_at, wm.role
+      FROM workspaces w JOIN workspace_members wm ON wm.workspace_id = w.id
+      WHERE w.id = $1 AND wm.user_id = $2 FOR NO KEY UPDATE OF w, wm`, [request.params.workspaceId, request.session!.userId])
+    if (!workspace.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Business not found in your account.' }); return }
+    if (String(workspace.rows[0].role) !== 'admin') { await client.query('ROLLBACK'); response.status(403).json({ error: 'Only a workspace administrator can archive this business.' }); return }
+    if (String(workspace.rows[0].name) !== input.data.workspaceName) { await client.query('ROLLBACK'); response.status(400).json({ error: 'The business name does not match. Check the name and try again.' }); return }
+    const user = await client.query('SELECT password_hash FROM users WHERE id = $1 FOR UPDATE', [request.session!.userId])
+    if (!user.rowCount || !(await verifyPassword(input.data.currentPassword, String(user.rows[0].password_hash)))) {
+      await client.query('ROLLBACK'); response.status(401).json({ error: 'The current password is incorrect.' }); return
+    }
+    if (workspace.rows[0].archived_at) {
+      await client.query('COMMIT')
+      response.json({ archived: true, archivedAt: workspace.rows[0].archived_at })
+      return
+    }
+    const admins = await client.query("SELECT count(*)::int AS count FROM workspace_members WHERE workspace_id = $1 AND role = 'admin'", [request.params.workspaceId])
+    if (Number(admins.rows[0].count) > 1) {
+      await client.query('ROLLBACK')
+      response.status(409).json({ error: 'This business has another administrator, so it does not need to be archived before you delete your account.' }); return
+    }
+    const archived = await client.query('UPDATE workspaces SET archived_at = now() WHERE id = $1 RETURNING archived_at', [request.params.workspaceId])
+    await recordAudit(client, { workspaceId: String(workspace.rows[0].id), actorUserId: request.session!.userId, eventType: 'workspace.archived', entityType: 'workspace', entityId: String(workspace.rows[0].id), eventData: {} })
+    await client.query('COMMIT')
+    response.json({ archived: true, archivedAt: archived.rows[0].archived_at })
+  } catch (error) { await client.query('ROLLBACK'); next(error) }
+  finally { client.release() }
+})
+
 app.post('/v1/workspaces/:workspaceId/invitations', requirePool, verifyOrigin, requireSession, async (request: AuthedRequest, response, next) => {
   const input = z.object({
     email: z.string().trim().email().max(254).transform((value) => value.toLowerCase()).optional(),
@@ -3343,8 +3456,10 @@ app.post('/v1/invitations/accept', requirePool, verifyOrigin, rateLimit({ window
       WHERE i.token_hash = $1 AND i.status = 'pending' AND i.expires_at > now() FOR UPDATE`, [tokenHash])
     const invite = inviteResult.rows[0]
     if (!invite) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invitation is invalid, expired, or already used.' }); return }
-    const targets = await client.query('SELECT workspace_id FROM invitation_workspaces WHERE invitation_id = $1 ORDER BY workspace_id', [invite.id])
+    const targets = await client.query(`SELECT iw.workspace_id, w.archived_at FROM invitation_workspaces iw
+      JOIN workspaces w ON w.id = iw.workspace_id WHERE iw.invitation_id = $1 ORDER BY iw.workspace_id`, [invite.id])
     if (!targets.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Invitation has no associated businesses.' }); return }
+    if (targets.rows.some((target: Record<string, unknown>) => target.archived_at)) { await client.query('ROLLBACK'); response.status(410).json({ error: 'This invitation includes an archived business and can no longer be accepted.' }); return }
     const session = readSession(cookies(request.headers.cookie)[cookieName])
     let userId = session?.userId
     if (session) {

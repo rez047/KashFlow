@@ -927,3 +927,4 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .app-download-hint{width:100%;margin:7px 0 0;color:#93a09a;font-size:7.5px;line-height:1.45}
 @media(max-width:1000px){.app-download-grid{grid-template-columns:repeat(2,minmax(0,1fr));max-width:760px}}
 @media(max-width:560px){.app-download-grid{grid-template-columns:1fr;gap:10px}.app-download-card{min-height:174px;padding:15px}.app-download-section::before{opacity:.5}}
+.account-deletion-review{margin-top:15px}.account-deletion-review h3{margin:18px 0 8px}.account-deletion-review .transaction-row{align-items:center}.account-deletion-review .field-label{margin-top:12px}.account-deletion-review input{margin-top:5px}.button-danger{background:#a6443d;border:1px solid #a6443d;color:#fff}.button-danger:hover:not(:disabled){background:#8e3732;border-color:#8e3732}.button-danger:disabled{opacity:.5;cursor:not-allowed}
