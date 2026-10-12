@@ -1001,6 +1001,10 @@ function App() {
   // old fixed "cash received" / "M-Pesa received" pair; the next-due-date and payment-due logic
   // stay unchanged and still drive the bill through the same billing endpoint.
   const [subscriptionBillingSplits, setSubscriptionBillingSplits] = useState<PaymentSplit[]>([])
+  // A subscriber bill whose M-Pesa portion was prompted but is not yet confirmed. Nothing is added
+  // to income for the M-Pesa part until Daraja confirms it, exactly like the point of sale.
+  const [subscriptionMpesaPending, setSubscriptionMpesaPending] = useState<{ subscriptionId: string; invoiceId: string; amount: number; phone: string } | null>(null)
+  const [subscriptionMpesaChecking, setSubscriptionMpesaChecking] = useState(false)
   const [supplierPaymentInput, setSupplierPaymentInput] = useState({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' as 'none' | 'monthly' | 'quarterly' | 'annually' })
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
@@ -3084,19 +3088,19 @@ async function createCameraReader(): Promise<CameraReader> {
     const cashAmount = splits.filter((split) => split.method === 'cash').reduce((sum, split) => sum + Number(split.amount), 0)
     const mpesaSplits = splits.filter((split) => split.method === 'mpesa')
     const mpesaAmount = mpesaSplits.reduce((sum, split) => sum + Number(split.amount), 0)
-    const mpesaReference = mpesaSplits.map((split) => split.reference.trim()).filter(Boolean).join(', ')
     if (mpesaSplits.some((split) => !split.phone.trim())) {
       setError('Enter the M-Pesa phone number for each M-Pesa split.')
       return
     }
     setBusy(true); setError('')
     try {
+      // Only the cash portion is booked with the bill, so nothing is added to income for the
+      // M-Pesa part until Daraja confirms it. This mirrors the point-of-sale and invoice prompts.
       const result = await request<{ invoice: InvoiceRecord & { amount_paid?: string; status: string }; payment: { received: string; applied: string; overpayment: string }; nextInvoiceDate: string | null }>(`/v1/service-subscriptions/${subscription.id}/billing`, { method: 'POST', body: JSON.stringify({
         ...(subscription.open_invoice_id ? { invoiceId: subscription.open_invoice_id } : { dueDate: subscriptionBillingInput.dueDate }),
         paymentDate: subscriptionBillingInput.paymentDate,
         cashAmount,
-        mpesaAmount,
-        mpesaReference,
+        mpesaAmount: 0,
       }) })
       let emailed = false
       if (isNewBill && result.invoice.customer_email) {
@@ -3115,12 +3119,60 @@ async function createCameraReader(): Promise<CameraReader> {
       setSubscriptionBillingId('')
       setSubscriptionBillingInput({ dueDate: result.nextInvoiceDate ?? today, paymentDate: today })
       setSubscriptionBillingSplits([])
-      await refresh()
-      const due = Math.max(0, Number(result.invoice.amount) - Number(result.invoice.amount_paid ?? 0))
-      notify(`${isNewBill ? 'Bill created' : 'Payment recorded'} for ${subscription.customer_name}. Received ${money(result.payment.received)}${due ? `; ${money(due)} remains due` : ''}${Number(result.payment.overpayment) > 0 ? `; ${money(result.payment.overpayment)} held as customer credit` : ''}${emailed ? '; invoice emailed' : ''}.`)
+      const cashDue = Math.max(0, Number(result.invoice.amount) - Number(result.invoice.amount_paid ?? 0))
+      if (mpesaAmount > 0) {
+        // Start the M-Pesa prompt. The invoice stays unpaid for this portion until it is confirmed;
+        // the same prompt route is used as the point of sale and the invoice prompt.
+        const phone = mpesaSplits[0]?.phone.trim() ?? ''
+        try {
+          const prompt = await requestInvoiceMpesaPayment(result.invoice.id, phone, mpesaAmount)
+          setSubscriptionMpesaPending({ subscriptionId: subscription.id, invoiceId: result.invoice.id, amount: mpesaAmount, phone })
+          await refresh()
+          notify(`${isNewBill ? 'Bill created' : 'Cash payment recorded'} for ${subscription.customer_name}. An M-Pesa prompt for ${money(mpesaAmount)} was sent; confirm it before releasing the service. ${prompt.customerMessage}`)
+        } catch (reason) {
+          await refresh()
+          setError(`Bill saved${cashAmount > 0 ? ` with ${money(cashAmount)} cash recorded` : ''} for ${subscription.customer_name}, but the M-Pesa prompt did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try again.'} Nothing was added to income for the M-Pesa part.`)
+        }
+      } else {
+        await refresh()
+        notify(`${isNewBill ? 'Bill created' : 'Payment recorded'} for ${subscription.customer_name}. Received ${money(result.payment.received)}${cashDue ? `; ${money(cashDue)} remains due` : ''}${Number(result.payment.overpayment) > 0 ? `; ${money(result.payment.overpayment)} held as customer credit` : ''}${emailed ? '; invoice emailed' : ''}.`)
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not bill or record payment for this subscriber.')
     } finally { setBusy(false) }
+  }
+
+  // Ask Daraja whether the prompted M-Pesa portion was actually paid. Nothing is added to income
+  // for that portion unless this returns a confirmed 'paid' status, exactly like the POS prompt.
+  async function confirmSubscriptionMpesa() {
+    const pending = subscriptionMpesaPending
+    if (!pending) return
+    setSubscriptionMpesaChecking(true); setError('')
+    try {
+      const status = await request<{ payments: InvoiceMpesaPayment[] }>(`/v1/invoices/${pending.invoiceId}/payments/mpesa`)
+      const confirmed = status.payments.find((payment) => payment.status === 'paid')
+      if (confirmed) {
+        setSubscriptionMpesaPending(null)
+        const [subscribers, invoices] = await Promise.all([
+          request<{ subscriptions: ServiceSubscription[]; supplierPayments: ServiceSupplierPayment[] }>(`/v1/services/${serviceDetailId}/subscriptions`),
+          request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
+        ])
+        setServiceSubscriptions((current) => ({ ...current, [serviceDetailId]: subscribers.subscriptions }))
+        setServiceSupplierPayments((current) => ({ ...current, [serviceDetailId]: subscribers.supplierPayments }))
+        setInvoicesList(invoices.invoices)
+        await refresh()
+        notify(`M-Pesa payment of ${money(pending.amount)} confirmed${confirmed.mpesa_receipt_number ? ` · receipt ${confirmed.mpesa_receipt_number}` : ''}. It has been added to income.`)
+        return
+      }
+      // Not confirmed yet: never add it to income. Warn and let the user keep it on the invoice unpaid.
+      const keepUnpaid = window.confirm(`No confirmed M-Pesa payment was found for this subscriber bill.\n\nThe M-Pesa ${money(pending.amount)} has NOT been added to income.\n\nChoose OK to keep the invoice marked as not paid (no income added) and close this prompt. Choose Cancel to keep waiting and check again.`)
+      if (keepUnpaid) {
+        setSubscriptionMpesaPending(null)
+        setError(`M-Pesa ${money(pending.amount)} was not confirmed. The subscriber bill stays marked as not paid and no income was added for it.`)
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not check the M-Pesa payment status. The bill stays not paid for the M-Pesa part.')
+    } finally { setSubscriptionMpesaChecking(false) }
   }
 
   async function saveInventoryPrice(event: FormEvent<HTMLFormElement>, item: WorkspaceRecord) {
@@ -5014,7 +5066,6 @@ async function createCameraReader(): Promise<CameraReader> {
                               <label className="field-label">Method<select value={split.method} onChange={(event) => setSubscriptionBillingSplits((current) => current.map((item, row) => row === index ? { ...item, method: event.target.value as 'cash' | 'mpesa' } : item))}><option value="cash">Cash / manual</option><option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option></select></label>
                               <label className="field-label">Amount (KSh)<input type="number" min="0" step="0.01" value={split.amount} onChange={(event) => setSubscriptionBillingSplits((current) => current.map((item, row) => row === index ? { ...item, amount: event.target.value } : item))} /></label>
                               {split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="07XX XXX XXX" value={split.phone} onChange={(event) => setSubscriptionBillingSplits((current) => current.map((item, row) => row === index ? { ...item, phone: event.target.value } : item))} /></label>}
-                              {split.method === 'mpesa' && <label className="field-label">M-Pesa reference<input maxLength={100} value={split.reference} onChange={(event) => setSubscriptionBillingSplits((current) => current.map((item, row) => row === index ? { ...item, reference: event.target.value } : item))} /></label>}
                               <button type="button" className="button button-small" onClick={() => setSubscriptionBillingSplits((current) => current.filter((_, row) => row !== index))}>Remove</button>
                             </div>)}
                             {Boolean(subscriptionBillingSplits.length) && <div className={`split-summary${balanced ? ' is-balanced' : ' is-unbalanced'}`} role="status" aria-live="polite">
@@ -5027,9 +5078,14 @@ async function createCameraReader(): Promise<CameraReader> {
                             {Boolean(subscriptionBillingSplits.filter((split) => split.method === 'mpesa').length) && !mpesaConfigured && <p className="form-error" role="alert">Daraja M-Pesa is not configured for this business, so M-Pesa splits cannot be requested. Remove them or ask a business administrator to add this business’s credentials on the Kenya compliance page.</p>}
                           </div>
                         })()}
-                        <p className="dialog-note">You can collect part or all of the charge using cash, M-Pesa, or both. Any extra is saved as customer credit. The next due date and payment due stay unchanged.</p>
-                        <div className="button-row"><button className="button button-primary" disabled={busy || (Boolean(subscriptionBillingSplits.length) && Math.abs(subscriptionBillingSplits.reduce((sum, split) => sum + Number(split.amount || 0), 0) - (subscription.open_invoice_id ? Number(subscription.amount_due) : subscriberCharge)) >= 0.009)}>{busy ? 'Saving…' : subscription.open_invoice_id ? 'Record payment' : 'Create bill and record payment'}</button><button type="button" className="button button-small" onClick={() => setSubscriptionBillingId('')}>Cancel</button></div>
+                        <p className="dialog-note">You can collect part or all of the charge using cash, M-Pesa, or both. Cash is recorded to income immediately; M-Pesa is prompted and is only added to income once the customer confirms the payment. Any extra is saved as customer credit. The next due date and payment due stay unchanged.</p>
+                        <div className="button-row"><button className="button button-primary" disabled={busy || (Boolean(subscriptionBillingSplits.length) && Math.abs(subscriptionBillingSplits.reduce((sum, split) => sum + Number(split.amount || 0), 0) - (subscription.open_invoice_id ? Number(subscription.amount_due) : subscriberCharge)) >= 0.009)}>{busy ? 'Saving…' : subscriptionBillingSplits.some((split) => split.method === 'mpesa' && Number(split.amount) > 0) ? (subscription.open_invoice_id ? 'Record cash and prompt M-Pesa' : 'Create bill and prompt M-Pesa') : subscription.open_invoice_id ? 'Record payment' : 'Create bill and record payment'}</button><button type="button" className="button button-small" onClick={() => setSubscriptionBillingId('')}>Cancel</button></div>
                       </form>}
+                      {subscriptionMpesaPending?.subscriptionId === subscription.id && <div className="invoice-mpesa-prompt">
+                        <p className="dialog-note"><strong>M-Pesa prompt sent for {money(subscriptionMpesaPending.amount)}.</strong> The M-Pesa amount has not been added to income yet. Ask the customer to enter their M-Pesa PIN, then confirm below once they have paid.</p>
+                        <div className="button-row"><button type="button" className="button button-primary button-small" disabled={subscriptionMpesaChecking} onClick={() => void confirmSubscriptionMpesa()}>{subscriptionMpesaChecking ? 'Checking…' : 'Confirm M-Pesa payment'}</button></div>
+                        <p className="dialog-note">If the customer has not paid, keep this bill marked as not paid. It will not be added to income unless Daraja confirms the payment.</p>
+                      </div>}
                     </div>}) : <div className="empty-state">No customers subscribed to this service yet.</div>}
                   </div>}
                 </div>
