@@ -16,15 +16,21 @@ export default function AccountDeletionScreen() {
   const [error, setError] = useState('')
 
   const loadPreview = useCallback(async () => {
-    if (!token) { setError('Sign in while connected to review or delete your account.'); setLoading(false); return }
-    setLoading(true)
-    setError('')
+    if (!token) return
     try { setPreview(await getAccountDeletionPreview(token)) }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not load your businesses.') }
     finally { setLoading(false) }
   }, [token])
 
-  useEffect(() => { void loadPreview() }, [loadPreview])
+  useEffect(() => {
+    if (!token) return
+    let cancelled = false
+    getAccountDeletionPreview(token)
+      .then((value) => { if (!cancelled) setPreview(value) })
+      .catch((reason) => { if (!cancelled) setError(reason instanceof Error ? reason.message : 'Could not load your businesses.') })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [token])
 
   const needsArchive = preview?.workspaces.filter((workspace) => workspace.soleAdmin && !workspace.archivedAt) ?? []
   const pendingCounts = snapshot?.counts.filter((count) => count.state === 'pending' || count.state === 'conflict').length ?? 0
@@ -48,6 +54,7 @@ export default function AccountDeletionScreen() {
     setError('')
     try {
       await archiveWorkspaceForAccountDeletion(token, workspace.id, currentPassword, workspace.name)
+      setLoading(true)
       await loadPreview()
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'The business could not be archived.') }
     finally { setBusy(false) }
@@ -78,7 +85,6 @@ export default function AccountDeletionScreen() {
       if (localClearFailed) Alert.alert('Account deleted', 'Your account is deleted. Clear this app’s storage from device settings before sharing the device.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'The account could not be deleted.')
-      await loadPreview()
     } finally { setBusy(false) }
   }
 
@@ -94,7 +100,7 @@ export default function AccountDeletionScreen() {
     <View style={styles.notice}><Ionicons name="information-circle-outline" size={19} color="#99743c" /><Text style={styles.noticeText}>Sync pending counts and export anything you need first. Deleting your account clears saved inventory and unsynced counts from this device.</Text></View>
 
     <Text style={styles.section}>BUSINESSES YOU ADMINISTER</Text>
-    {loading ? <View style={styles.loading}><ActivityIndicator color="#11876e" /><Text style={styles.loadingText}>Reviewing your businesses…</Text></View> : preview?.workspaces.length ? preview.workspaces.map((workspace) => <View key={workspace.id} style={styles.workspace}>
+    {loading && token ? <View style={styles.loading}><ActivityIndicator color="#11876e" /><Text style={styles.loadingText}>Reviewing your businesses…</Text></View> : preview?.workspaces.length ? preview.workspaces.map((workspace) => <View key={workspace.id} style={styles.workspace}>
       <View style={styles.workspaceCopy}><Text style={styles.workspaceName}>{workspace.name}</Text><Text style={styles.workspaceRole}>{workspace.role.replaceAll('_', ' ').toUpperCase()}{workspace.archivedAt ? ' · ARCHIVED, READ ONLY' : ''} · {workspace.otherMemberCount} other member{workspace.otherMemberCount === 1 ? '' : 's'}</Text></View>
       {workspace.soleAdmin && !workspace.archivedAt ? <Pressable disabled={!online || busy || !currentPassword} onPress={() => confirmArchive(workspace)} style={[styles.archiveButton, (!online || busy || !currentPassword) && styles.disabled]}><Text style={styles.archiveText}>{busy ? 'Working…' : 'Archive'}</Text></Pressable> : null}
     </View>) : <Text style={styles.helper}>{preview ? 'No business memberships were found for this account.' : 'Business review is unavailable until you reconnect and sign in.'}</Text>}

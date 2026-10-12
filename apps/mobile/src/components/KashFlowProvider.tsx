@@ -14,7 +14,7 @@ type AppState = {
   reloadLocal: () => Promise<void>
   refresh: () => Promise<void>
   syncNow: (showMessage?: boolean) => Promise<void>
-  updateSessionToken: (nextToken: string) => Promise<void>
+  updateSessionToken: (nextToken: string | null) => Promise<void>
   switchBusiness: (workspaceId: string) => Promise<void>
 }
 
@@ -47,7 +47,7 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
 
   const reloadLocal = useCallback(async () => { setSnapshot(await getOfflineSnapshot()) }, [])
 
-  const updateSessionToken = useCallback(async (nextToken: string) => {
+  const updateSessionToken = useCallback(async (nextToken: string | null) => {
     if (!nextToken) {
       await SecureStore.deleteItemAsync('kashflow.access-token')
       setToken(null)

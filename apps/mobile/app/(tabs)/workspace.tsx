@@ -2,7 +2,7 @@ import { Ionicons } from '@expo/vector-icons'
 import * as FileSystem from 'expo-file-system/legacy'
 import * as Print from 'expo-print'
 import * as Sharing from 'expo-sharing'
-import { strToU8, zipSync } from 'fflate'
+import { zipSync } from 'fflate'
 import { Alert, Linking, Pressable, StyleSheet, Text, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { WebView, type WebViewNavigation } from 'react-native-webview'
@@ -215,7 +215,7 @@ const styles = StyleSheet.create({
   controls: { flexDirection: 'row', gap: 7 }, control: { width: 36, height: 36, borderRadius: 11, backgroundColor: '#f2f5f1', borderWidth: 1, borderColor: '#e5e9e2', alignItems: 'center', justifyContent: 'center' }, controlDisabled: { backgroundColor: '#f8f9f7' },
   webArea: { flex: 1, backgroundColor: '#fff' }, webView: { flex: 1, backgroundColor: '#fff' },
   footnote: { color: '#7f8c86', backgroundColor: '#fff', fontSize: 10, lineHeight: 13, textAlign: 'center', paddingHorizontal: 12, paddingTop: 7, paddingBottom: 8 },
-  loadingOverlay: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center', gap: 9, backgroundColor: '#f8faf7' }, loadingMark: { width: 41, height: 41, borderRadius: 14, backgroundColor: '#128d71', alignItems: 'center', justifyContent: 'center' }, loadingText: { color: '#74827a', fontSize: 12, fontWeight: '700' },
-  errorOverlay: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 30, backgroundColor: '#f8faf7' }, errorIcon: { width: 45, height: 45, borderRadius: 15, backgroundColor: '#fff0ec', alignItems: 'center', justifyContent: 'center' }, errorTitle: { color: '#283b3d', fontSize: 16, fontWeight: '800', marginTop: 13 }, errorBody: { color: '#7f8c86', fontSize: 12, lineHeight: 17, textAlign: 'center', marginTop: 6, maxWidth: 290 }, retryButton: { height: 39, paddingHorizontal: 15, borderRadius: 11, backgroundColor: '#128d71', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, marginTop: 14 }, retryText: { color: '#fff', fontSize: 12, fontWeight: '800' },
+  loadingOverlay: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, alignItems: 'center', justifyContent: 'center', gap: 9, backgroundColor: '#f8faf7' }, loadingMark: { width: 41, height: 41, borderRadius: 14, backgroundColor: '#128d71', alignItems: 'center', justifyContent: 'center' }, loadingText: { color: '#74827a', fontSize: 12, fontWeight: '700' },
+  errorOverlay: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 30, backgroundColor: '#f8faf7' }, errorIcon: { width: 45, height: 45, borderRadius: 15, backgroundColor: '#fff0ec', alignItems: 'center', justifyContent: 'center' }, errorTitle: { color: '#283b3d', fontSize: 16, fontWeight: '800', marginTop: 13 }, errorBody: { color: '#7f8c86', fontSize: 12, lineHeight: 17, textAlign: 'center', marginTop: 6, maxWidth: 290 }, retryButton: { height: 39, paddingHorizontal: 15, borderRadius: 11, backgroundColor: '#128d71', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, marginTop: 14 }, retryText: { color: '#fff', fontSize: 12, fontWeight: '800' },
   offlineCard: { margin: 18, padding: 19, backgroundColor: '#fff', borderWidth: 1, borderColor: '#e5e8e0', borderRadius: 17, alignItems: 'center' }, offlineIcon: { width: 45, height: 45, borderRadius: 15, backgroundColor: '#fff4e2', alignItems: 'center', justifyContent: 'center' }, offlineTitle: { color: '#27373b', fontSize: 15, fontWeight: '800', marginTop: 12, textAlign: 'center' }, offlineBody: { color: '#7c8983', fontSize: 12, lineHeight: 17, marginTop: 6, textAlign: 'center' },
 })

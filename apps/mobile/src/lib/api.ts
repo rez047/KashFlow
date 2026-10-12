@@ -63,7 +63,7 @@ export function activateBusiness(token: string, workspaceId: string) {
 }
 
 export type AccountDeletionPreview = {
-  workspaces: Array<{ id: string; name: string; role: string; archivedAt: string | null; soleAdmin: boolean; otherMemberCount: number }>
+  workspaces: { id: string; name: string; role: string; archivedAt: string | null; soleAdmin: boolean; otherMemberCount: number }[]
 }
 
 export function getAccountDeletionPreview(token: string) {

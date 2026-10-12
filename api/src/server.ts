@@ -1479,7 +1479,7 @@ app.delete('/v1/auth/account', requirePool, verifyOrigin, rateLimit({ windowMs: 
       ? await client.query(`SELECT workspace_id, count(*)::int AS count FROM workspace_members
           WHERE workspace_id = ANY($1::uuid[]) AND role = 'admin' GROUP BY workspace_id`, [workspaceIds])
       : { rows: [] as Array<Record<string, unknown>> }
-    const adminsByWorkspace = new Map(adminCounts.rows.map((row: Record<string, unknown>) => [String(row.workspace_id), Number(row.count)]))
+    const adminsByWorkspace = new Map<string, number>(adminCounts.rows.map((row: Record<string, unknown>) => [String(row.workspace_id), Number(row.count)]))
     const blockedWorkspaces = memberships.rows
       .filter((membership: Record<string, unknown>) => String(membership.role) === 'admin'
         && !membership.archived_at && (adminsByWorkspace.get(String(membership.workspace_id)) ?? 0) <= 1)
