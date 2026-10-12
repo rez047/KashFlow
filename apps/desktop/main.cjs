@@ -189,7 +189,7 @@ function installWorkspaceMenu() {
 app.whenReady().then(() => {
   app.setAppUserModelId('ke.kashflow.desktop')
   installWorkspaceMenu()
-  void openWorkspaceWindow().catch(() => createFieldWindow())
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void openWorkspaceWindow().catch(() => createFieldWindow()) })
+  createFieldWindow()
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createFieldWindow() })
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })

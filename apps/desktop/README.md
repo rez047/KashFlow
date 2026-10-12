@@ -1,6 +1,6 @@
 # KashFlow desktop app
 
-The desktop app opens directly into the complete KashFlow business suite. Use the **Workspace** menu to switch to the encrypted offline Field tools for inventory, stock counts, sync review, and settings (or use `Ctrl/Cmd+2`). `Ctrl/Cmd+1` returns to the business suite.
+The desktop app opens to the encrypted offline Field Edition with **Today**, **Stock**, **Count**, and **Sync** navigation always visible. Select **Full business suite** in the sidebar or use `Ctrl/Cmd+1` to open the complete online KashFlow suite in its own window. Use the **Workspace → Offline field tools** menu item or `Ctrl/Cmd+2` to return to the field screens.
 
 The inventory snapshot and pending count queue are encrypted through the operating system's secure storage: Windows DPAPI, macOS Keychain, or a Linux desktop keyring. The app refuses to save business data on Linux if Electron falls back to its weak `basic_text` backend. Offline counts are replayed with idempotency keys; changed stock baselines stop for a physical recount.
 
@@ -27,7 +27,7 @@ The **Build KashFlow Field installers** GitHub Actions workflow packages Windows
 
 The landing page reads the newest published (non-draft, non-prerelease) GitHub release and links any asset whose name matches `KashFlow-Desktop-*-Setup.exe` (Windows) or `KashFlow-Desktop-*.dmg` (macOS). Do not rename those artifacts.
 
-- **Stable release:** push a `v*` tag (for example `v1.2.0`). The workflow publishes a public GitHub release with the installers attached, so the landing page download buttons work immediately.
+- **Stable release:** push a `v*` tag (for example `v1.2.1`). The workflow publishes a public GitHub release with the installers attached, so the landing page download buttons work immediately.
 - **Draft for manual signing:** push a `field-v*` tag to create a draft release instead, for review before publishing.
 
 ### Code signing
