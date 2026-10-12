@@ -996,7 +996,11 @@ function App() {
   const [serviceDetailId, setServiceDetailId] = useState('')
   const [subscriptionInput, setSubscriptionInput] = useState({ customerMode: 'saved' as 'saved' | 'new', customerId: '', newCustomerName: '', newCustomerEmail: '', newCustomerPhone: '', rateSource: 'consumer' as 'consumer' | 'renewal' | 'custom', customRate: '', billingCycle: 'monthly' as 'none' | 'monthly' | 'quarterly' | 'annually', paymentPreference: 'either' as 'cash' | 'mpesa' | 'either', startDate: today, notes: '', createRecurringSchedule: false })
   const [subscriptionBillingId, setSubscriptionBillingId] = useState('')
-  const [subscriptionBillingInput, setSubscriptionBillingInput] = useState({ dueDate: today, paymentDate: today, cashAmount: '', mpesaAmount: '', mpesaReference: '' })
+  const [subscriptionBillingInput, setSubscriptionBillingInput] = useState({ dueDate: today, paymentDate: today })
+  // POS-style optional split payment for a subscriber bill. The methods captured here replace the
+  // old fixed "cash received" / "M-Pesa received" pair; the next-due-date and payment-due logic
+  // stay unchanged and still drive the bill through the same billing endpoint.
+  const [subscriptionBillingSplits, setSubscriptionBillingSplits] = useState<PaymentSplit[]>([])
   const [supplierPaymentInput, setSupplierPaymentInput] = useState({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' as 'none' | 'monthly' | 'quarterly' | 'annually' })
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
@@ -3074,14 +3078,25 @@ async function createCameraReader(): Promise<CameraReader> {
   async function billSubscription(subscription: ServiceSubscription) {
     const serviceId = serviceDetailId
     const isNewBill = !subscription.open_invoice_id
+    // POS-style split capture: sum the cash and M-Pesa methods the user entered. The bill's
+    // due-date and payment-due logic is untouched; only how the received amount is captured changes.
+    const splits = multiMethodEnabled ? subscriptionBillingSplits.filter((split) => Number(split.amount) > 0) : []
+    const cashAmount = splits.filter((split) => split.method === 'cash').reduce((sum, split) => sum + Number(split.amount), 0)
+    const mpesaSplits = splits.filter((split) => split.method === 'mpesa')
+    const mpesaAmount = mpesaSplits.reduce((sum, split) => sum + Number(split.amount), 0)
+    const mpesaReference = mpesaSplits.map((split) => split.reference.trim()).filter(Boolean).join(', ')
+    if (mpesaSplits.some((split) => !split.phone.trim())) {
+      setError('Enter the M-Pesa phone number for each M-Pesa split.')
+      return
+    }
     setBusy(true); setError('')
     try {
       const result = await request<{ invoice: InvoiceRecord & { amount_paid?: string; status: string }; payment: { received: string; applied: string; overpayment: string }; nextInvoiceDate: string | null }>(`/v1/service-subscriptions/${subscription.id}/billing`, { method: 'POST', body: JSON.stringify({
         ...(subscription.open_invoice_id ? { invoiceId: subscription.open_invoice_id } : { dueDate: subscriptionBillingInput.dueDate }),
         paymentDate: subscriptionBillingInput.paymentDate,
-        cashAmount: Number(subscriptionBillingInput.cashAmount || 0),
-        mpesaAmount: Number(subscriptionBillingInput.mpesaAmount || 0),
-        mpesaReference: subscriptionBillingInput.mpesaReference,
+        cashAmount,
+        mpesaAmount,
+        mpesaReference,
       }) })
       let emailed = false
       if (isNewBill && result.invoice.customer_email) {
@@ -3098,7 +3113,8 @@ async function createCameraReader(): Promise<CameraReader> {
       setServiceSupplierPayments((current) => ({ ...current, [serviceId]: subscribers.supplierPayments }))
       setInvoicesList(invoices.invoices)
       setSubscriptionBillingId('')
-      setSubscriptionBillingInput({ dueDate: result.nextInvoiceDate ?? today, paymentDate: today, cashAmount: '', mpesaAmount: '', mpesaReference: '' })
+      setSubscriptionBillingInput({ dueDate: result.nextInvoiceDate ?? today, paymentDate: today })
+      setSubscriptionBillingSplits([])
       await refresh()
       const due = Math.max(0, Number(result.invoice.amount) - Number(result.invoice.amount_paid ?? 0))
       notify(`${isNewBill ? 'Bill created' : 'Payment recorded'} for ${subscription.customer_name}. Received ${money(result.payment.received)}${due ? `; ${money(due)} remains due` : ''}${Number(result.payment.overpayment) > 0 ? `; ${money(result.payment.overpayment)} held as customer credit` : ''}${emailed ? '; invoice emailed' : ''}.`)
@@ -4972,7 +4988,8 @@ async function createCameraReader(): Promise<CameraReader> {
                       <div className="service-subscriber-actions">
                         <button type="button" className="button button-primary button-small" disabled={busy || subscription.status === 'cancelled' || (subscription.status !== 'active' && !subscription.open_invoice_id) || !canUse('sales.write')} onClick={() => {
                           setSubscriptionBillingId(billingOpen ? '' : subscription.id)
-                          setSubscriptionBillingInput({ dueDate: subscription.next_invoice_date ?? today, paymentDate: today, cashAmount: '', mpesaAmount: '', mpesaReference: '' })
+                          setSubscriptionBillingInput({ dueDate: subscription.next_invoice_date ?? today, paymentDate: today })
+                          setSubscriptionBillingSplits([])
                         }}><FileText size={14} /> {subscription.open_invoice_id ? 'Record payment' : 'Bill subscriber'}</button>
                         {subscription.status === 'active'
                           ? <button type="button" className="button button-small" disabled={busy} onClick={() => void updateSubscription(subscription, { status: 'paused' })}>Pause</button>
@@ -4983,11 +5000,35 @@ async function createCameraReader(): Promise<CameraReader> {
                         <h4>{subscription.open_invoice_id ? `Collect payment · ${money(subscription.amount_due)} due` : `Bill subscriber · ${money(subscriberCharge)}`}</h4>
                         {!subscription.open_invoice_id && <label className="field-label">Next due date<input required type="date" value={subscriptionBillingInput.dueDate} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, dueDate: event.target.value })} /></label>}
                         <label className="field-label">Payment date<input required type="date" value={subscriptionBillingInput.paymentDate} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, paymentDate: event.target.value })} /></label>
-                        <label className="field-label">Cash received (KSh)<input type="number" min="0" step="0.01" value={subscriptionBillingInput.cashAmount} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, cashAmount: event.target.value })} /></label>
-                        <label className="field-label">M-Pesa received (KSh)<input type="number" min="0" step="0.01" value={subscriptionBillingInput.mpesaAmount} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, mpesaAmount: event.target.value })} /></label>
-                        {Number(subscriptionBillingInput.mpesaAmount) > 0 && <label className="field-label">M-Pesa reference<input maxLength={100} value={subscriptionBillingInput.mpesaReference} onChange={(event) => setSubscriptionBillingInput({ ...subscriptionBillingInput, mpesaReference: event.target.value })} /></label>}
-                        <p className="dialog-note">You can collect part or all of the charge using cash, M-Pesa, or both. Any extra is saved as customer credit.</p>
-                        <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : subscription.open_invoice_id ? 'Record payment' : 'Create bill and record payment'}</button><button type="button" className="button button-small" onClick={() => setSubscriptionBillingId('')}>Cancel</button></div>
+                        {(() => {
+                          const billTotal = subscription.open_invoice_id ? Number(subscription.amount_due) : subscriberCharge
+                          const splitRows = subscriptionBillingSplits.filter((split) => Number(split.amount) > 0)
+                          const cashTotal = splitRows.filter((split) => split.method === 'cash').reduce((sum, split) => sum + Number(split.amount || 0), 0)
+                          const mpesaTotal = splitRows.filter((split) => split.method === 'mpesa').reduce((sum, split) => sum + Number(split.amount || 0), 0)
+                          const splitTotal = cashTotal + mpesaTotal
+                          const remaining = billTotal - splitTotal
+                          const balanced = Math.abs(remaining) < 0.009
+                          return <div className="payment-split-editor">
+                            <div className="panel-header"><div><h3>Payment (optional split)</h3><p>Part cash, part M-Pesa, or any mix. Amounts must add up to the {subscription.open_invoice_id ? 'amount due' : 'charge'} of {money(billTotal)}. Leave empty to bill without collecting now.</p></div><button type="button" className="button button-small" onClick={() => setSubscriptionBillingSplits((current) => [...current, { method: 'cash', amount: '', phone: '', reference: '' }])}><Plus size={14} /> Add method</button></div>
+                            {subscriptionBillingSplits.map((split, index) => <div className="field-row payment-split-row" key={index}>
+                              <label className="field-label">Method<select value={split.method} onChange={(event) => setSubscriptionBillingSplits((current) => current.map((item, row) => row === index ? { ...item, method: event.target.value as 'cash' | 'mpesa' } : item))}><option value="cash">Cash / manual</option><option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option></select></label>
+                              <label className="field-label">Amount (KSh)<input type="number" min="0" step="0.01" value={split.amount} onChange={(event) => setSubscriptionBillingSplits((current) => current.map((item, row) => row === index ? { ...item, amount: event.target.value } : item))} /></label>
+                              {split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="07XX XXX XXX" value={split.phone} onChange={(event) => setSubscriptionBillingSplits((current) => current.map((item, row) => row === index ? { ...item, phone: event.target.value } : item))} /></label>}
+                              {split.method === 'mpesa' && <label className="field-label">M-Pesa reference<input maxLength={100} value={split.reference} onChange={(event) => setSubscriptionBillingSplits((current) => current.map((item, row) => row === index ? { ...item, reference: event.target.value } : item))} /></label>}
+                              <button type="button" className="button button-small" onClick={() => setSubscriptionBillingSplits((current) => current.filter((_, row) => row !== index))}>Remove</button>
+                            </div>)}
+                            {Boolean(subscriptionBillingSplits.length) && <div className={`split-summary${balanced ? ' is-balanced' : ' is-unbalanced'}`} role="status" aria-live="polite">
+                              <span><small>Cash</small><strong>{money(cashTotal)}</strong></span>
+                              <span><small>M-Pesa</small><strong>{money(mpesaTotal)}</strong></span>
+                              <span><small>{subscription.open_invoice_id ? 'Amount due' : 'Charge'}</small><strong>{money(billTotal)}</strong></span>
+                              <span><small>{remaining > 0 ? 'Still to allocate' : remaining < 0 ? 'Over the total' : 'Balanced'}</small><strong>{money(Math.abs(remaining))}</strong></span>
+                            </div>}
+                            {Boolean(subscriptionBillingSplits.length) && !balanced && <p className="form-error" role="alert">The split amounts do not add up to {money(billTotal)}. Adjust them before recording the payment.</p>}
+                            {Boolean(subscriptionBillingSplits.filter((split) => split.method === 'mpesa').length) && !mpesaConfigured && <p className="form-error" role="alert">Daraja M-Pesa is not configured for this business, so M-Pesa splits cannot be requested. Remove them or ask a business administrator to add this business’s credentials on the Kenya compliance page.</p>}
+                          </div>
+                        })()}
+                        <p className="dialog-note">You can collect part or all of the charge using cash, M-Pesa, or both. Any extra is saved as customer credit. The next due date and payment due stay unchanged.</p>
+                        <div className="button-row"><button className="button button-primary" disabled={busy || (Boolean(subscriptionBillingSplits.length) && Math.abs(subscriptionBillingSplits.reduce((sum, split) => sum + Number(split.amount || 0), 0) - (subscription.open_invoice_id ? Number(subscription.amount_due) : subscriberCharge)) >= 0.009)}>{busy ? 'Saving…' : subscription.open_invoice_id ? 'Record payment' : 'Create bill and record payment'}</button><button type="button" className="button button-small" onClick={() => setSubscriptionBillingId('')}>Cancel</button></div>
                       </form>}
                     </div>}) : <div className="empty-state">No customers subscribed to this service yet.</div>}
                   </div>}
