@@ -1382,6 +1382,7 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
         SELECT e.id, e.description, COALESCE(SUM(l.credit - l.debit), 0)::text AS amount, 'income' AS direction, 'Sales invoice' AS account, e.entry_date AS transaction_date, e.created_at AS created_at
         FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
         JOIN workspace_accounts a ON a.id = l.account_id AND a.code = '4000'
+        JOIN invoices i ON i.id = e.source_id AND i.workspace_id = e.workspace_id AND i.amount_paid > 0
         WHERE e.workspace_id = $1 AND e.source_type IN ('invoice', 'online_store_invoice', 'recurring_invoice')
         GROUP BY e.id, e.description, e.entry_date, e.created_at
         ORDER BY transaction_date DESC, created_at DESC LIMIT 20`, [workspaceId]),
@@ -1395,6 +1396,7 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
         SELECT e.entry_date AS date, SUM(l.credit - l.debit) AS income, 0::numeric AS expense
         FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
         JOIN workspace_accounts a ON a.id = l.account_id AND a.code = '4000'
+        JOIN invoices i ON i.id = e.source_id AND i.workspace_id = e.workspace_id AND i.amount_paid > 0
         WHERE e.workspace_id = $1 AND e.entry_date >= $2 AND e.entry_date <= $3
           AND e.source_type IN ('invoice', 'online_store_invoice', 'recurring_invoice')
         GROUP BY e.id, e.entry_date
@@ -1405,6 +1407,7 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
         COALESCE(SUM(l.credit - l.debit) FILTER (WHERE e.entry_date >= $4 AND e.entry_date <= $5), 0)::text AS month_income
         FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
         JOIN workspace_accounts a ON a.id = l.account_id AND a.code = '4000'
+        JOIN invoices i ON i.id = e.source_id AND i.workspace_id = e.workspace_id AND i.amount_paid > 0
         WHERE e.workspace_id = $1 AND e.source_type IN ('invoice', 'online_store_invoice', 'recurring_invoice')`,
       [workspaceId, query.data.from, query.data.to, monthStart, today]),
     ])

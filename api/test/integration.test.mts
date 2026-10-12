@@ -172,6 +172,27 @@ test('KashFlow integration', { timeout: 120_000 }, async (t) => {
     assert.equal((me.json.workspaces as unknown[]).length, 2, 'both businesses remain listed')
   })
 
+  // An invoice whose payment has not been confirmed must not be recognised as income. The dashboard
+  // used to count the whole invoice journal (account 4000) the moment the invoice was created.
+  await t.test('an unpaid invoice is not counted as income until it is paid', async () => {
+    const admin = client()
+    await admin.api('/v1/auth/bootstrap', { method: 'POST', body: JSON.stringify({ identifier: 'income@acme.test', password: 'IncomePassword1!', businessName: 'Income Shop' }) })
+
+    const created = await admin.api('/v1/invoices', { method: 'POST', body: JSON.stringify({ customer: 'Income Customer', description: 'Security · monthly subscription', amount: 2499, dueDate: '2026-10-12' }) })
+    assert.equal(created.status, 201)
+    const invoiceId = created.json.invoice.id as string
+
+    const before = await admin.api('/v1/dashboard?from=2026-10-01&to=2026-10-12')
+    assert.equal(before.json.totals.income, '0.00', 'an unpaid invoice adds nothing to income')
+    assert.equal((before.json.transactions as Array<{ description: string }>).some((row) => row.description.includes('Security')), false, 'an unpaid invoice is not listed as income')
+
+    const paid = await admin.api(`/v1/invoices/${invoiceId}/payments`, { method: 'POST', body: JSON.stringify({ amount: 2499, paymentDate: '2026-10-12' }) })
+    assert.equal(paid.status, 201)
+
+    const after = await admin.api('/v1/dashboard?from=2026-10-01&to=2026-10-12')
+    assert.equal(after.json.totals.income, '2499.00', 'the paid invoice is counted as income')
+  })
+
   await t.test('a user can switch between businesses', async () => {
     const admin = client()
     const bootstrap = await admin.api('/v1/auth/bootstrap', { method: 'POST', body: JSON.stringify({ identifier: 'switcher@acme.test', password: 'SwitcherPassword1!', businessName: 'First Shop' }) })
