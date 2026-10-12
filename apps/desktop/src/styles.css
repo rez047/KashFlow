@@ -84,6 +84,9 @@ button:disabled { cursor: not-allowed; }
 .offline-ribbon-copy { color: #a48c64; font-weight: 500; flex: 1; }
 .offline-ribbon button { border: 0; background: transparent; display: flex; align-items: center; gap: 4px; color: #90692e; font-weight: 800; font-size: 12px; }
 .page-content { flex: 1; padding: 29px 38px 24px; width: 100%; max-width: 1480px; margin: 0 auto; }
+.page-content.business-page-content { position: relative; padding: 0; max-width: none; margin: 0; overflow: hidden; }
+.business-viewport { position: absolute; inset: 0; }
+.business-viewport[hidden], .field-page-content[hidden] { display: none !important; }
 .main-footer { min-height: 38px; border-top: 1px solid #e8eae5; padding: 0 38px; display: flex; justify-content: space-between; align-items: center; color: #a0aaa3; font-size: 11px; letter-spacing: .25px; }
 .main-footer span:first-child { display: flex; align-items: center; gap: 6px; }
 .main-footer svg { color: #799387; }

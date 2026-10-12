@@ -7,7 +7,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 
-type Page = 'home' | 'inventory' | 'count' | 'sync' | 'settings'
+type Page = 'home' | 'inventory' | 'count' | 'sync' | 'settings' | 'business'
 type Item = DesktopVault['items'][number]
 type Count = DesktopVault['counts'][number]
 const emptyVault: DesktopVault = { token: '', userEmail: '', workspaceId: '', workspaceName: '', workspaces: [], refreshedAt: '', items: [], locations: [], stock: [], counts: [] }
@@ -40,8 +40,10 @@ export default function App() {
   const [twoFactorChallenge, setTwoFactorChallenge] = useState('')
   const [twoFactorCode, setTwoFactorCode] = useState('')
   const [loginError, setLoginError] = useState('')
-  const [appVersion, setAppVersion] = useState('1.2.1')
+  const [appVersion, setAppVersion] = useState('1.2.2')
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
+  const [workspaceOpened, setWorkspaceOpened] = useState(false)
+  const workspaceViewport = useRef<HTMLDivElement>(null)
   const activeCounts = vault.counts.filter((count) => count.workspaceId === vault.workspaceId)
 
   const currentItem = vault.items.find((item) => item.id === itemId)
@@ -173,7 +175,7 @@ export default function App() {
   useEffect(() => {
     const handlePop = () => {
       const requested = location.hash.replace('#', '') as Page
-      setPage(['home', 'inventory', 'count', 'sync', 'settings'].includes(requested) ? requested : 'home')
+      setPage(['home', 'inventory', 'count', 'sync', 'settings', 'business'].includes(requested) ? requested : 'home')
     }
     window.addEventListener('popstate', handlePop)
     return () => window.removeEventListener('popstate', handlePop)
@@ -187,10 +189,50 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKey)
   }, [loaded, page, vault.token])
 
+  useEffect(() => window.kashflowDesktop.onWorkspaceNavigation((destination) => {
+    if (destination === 'business') void enterBusiness()
+    else navigate('home')
+  }), [page, notify])
+
+  useEffect(() => window.kashflowDesktop.onWorkspaceLoadError((message) => {
+    notify(message || 'The business suite could not be loaded.')
+  }), [notify])
+
+  useEffect(() => {
+    const updateWorkspaceBounds = () => {
+      const viewport = workspaceViewport.current
+      if (page !== 'business' || !workspaceOpened || !vault.token || !viewport) {
+        void window.kashflowDesktop.setWorkspaceView(false).catch(() => undefined)
+        return
+      }
+      const bounds = viewport.getBoundingClientRect()
+      void window.kashflowDesktop.setWorkspaceView(true, { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }).catch(() => undefined)
+    }
+    updateWorkspaceBounds()
+    const viewport = workspaceViewport.current
+    const observer = page === 'business' && workspaceOpened && viewport ? new ResizeObserver(updateWorkspaceBounds) : null
+    if (observer && viewport) observer.observe(viewport)
+    window.addEventListener('resize', updateWorkspaceBounds)
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', updateWorkspaceBounds)
+    }
+  }, [page, workspaceOpened, vault.token])
+
   function navigate(next: Page) {
     if (next === page) return
     window.history.pushState({ page: next }, '', `#${next}`)
     setPage(next)
+  }
+
+  async function enterBusiness() {
+    try {
+      await window.kashflowDesktop.openWorkspace()
+      setWorkspaceOpened(true)
+      navigate('business')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'The business suite could not be opened.')
+    }
   }
 
   async function signIn(event: FormEvent) {
@@ -293,7 +335,7 @@ export default function App() {
   if (vaultError) return <div className="error-screen"><div className="error-mark"><LockKeyhole size={23} /></div><h1>Secure storage unavailable</h1><p>{vaultError}</p><small>KashFlow won’t fall back to saving business data in plain text.</small></div>
   if (!vault.token) return <LoginPage identifier={loginIdentifier} setIdentifier={setLoginIdentifier} password={loginPassword} setPassword={setLoginPassword} challenge={twoFactorChallenge} code={twoFactorCode} setCode={setTwoFactorCode} error={loginError} busy={busy} onSubmit={signIn} onCancelChallenge={() => { setTwoFactorChallenge(''); setTwoFactorCode(''); setLoginError('') }} online={online} />
 
-  const title = page === 'home' ? 'Today' : page === 'inventory' ? 'Stock' : page === 'count' ? 'Count' : page === 'sync' ? 'Sync' : 'Settings'
+  const title = page === 'home' ? 'Today' : page === 'inventory' ? 'Stock' : page === 'count' ? 'Count' : page === 'sync' ? 'Sync' : page === 'business' ? 'Business' : 'Settings'
 
   return <div className="app-shell">
     <aside className="sidebar">
@@ -305,7 +347,7 @@ export default function App() {
         <NavButton page="inventory" active={page === 'inventory'} icon={<Package size={17} />} label="Stock" onClick={navigate} />
         <NavButton page="count" active={page === 'count'} icon={<Layers3 size={17} />} label="Count" onClick={navigate} />
         <NavButton page="sync" active={page === 'sync'} icon={<RefreshCw size={17} />} label="Sync" onClick={navigate} badge={pendingCount + conflictCount || undefined} />
-        <button type="button" className="nav-button full-workspace-link" onClick={() => void window.kashflowDesktop.openWorkspace().catch((error: unknown) => notify(error instanceof Error ? error.message : 'The business suite could not be opened.'))}><Globe2 size={17} /><span>Full business suite</span><ArrowUpRight size={14} /></button>
+        <button type="button" className={`nav-button full-workspace-link ${page === 'business' ? 'active' : ''}`} onClick={() => void enterBusiness()}><Globe2 size={17} /><span>Business</span></button>
       </nav>
       <div className="sidebar-grow" />
       <div className="side-status"><span className={`side-status-dot ${online ? 'connected' : ''}`} /><span>{online ? 'Connected to KashFlow' : 'Working offline'}</span><Wifi size={14} /></div>
@@ -318,12 +360,15 @@ export default function App() {
       <header className="topbar"><div className="crumb">{page !== 'home' && <button type="button" className="back-button" aria-label="Go to previous screen" title="Go back (Alt + ←)" onClick={() => window.history.back()}><ArrowLeft size={16} /></button>}<span>Workspace</span><ChevronRight size={13} /><strong>{title}</strong></div><div className="topbar-actions"><span className={`connection-chip ${online ? 'is-online' : 'is-offline'}`}>{online ? <Wifi size={13} /> : <WifiOff size={13} />}{online ? 'Online' : 'Offline'}</span><button type="button" className="toolbar-button" title="Refresh business data" onClick={() => void refreshAndNotify()} disabled={busy}>{busy ? <span className="mini-spinner" /> : <RefreshCw size={15} />}</button><button type="button" className="toolbar-profile" onClick={() => navigate('settings')} title="Account settings">{vault.userEmail.slice(0, 1).toUpperCase() || 'K'}</button></div></header>
       {!online && <div className="offline-ribbon"><CloudOff size={15} /><span>Offline mode</span><span className="offline-ribbon-copy">Counts are encrypted and saved on this computer. Live stock may have changed.</span><button type="button" onClick={() => void refreshAndNotify()}>Try again <ArrowRight size={13} /></button></div>}
 
-      <div className="page-content">
+      <div className={`page-content ${page === 'business' ? 'business-page-content' : ''}`}>
+      <div className="field-page-content" hidden={page === 'business'}>
         {page === 'home' && <Dashboard vault={{ ...vault, counts: activeCounts }} online={online} pending={pendingCount} conflicts={conflictCount} onNavigate={navigate} onSync={() => void syncCounts()} onRefresh={() => void refreshAndNotify()} busy={busy} />}
         {page === 'inventory' && <InventoryPage items={visibleItems} total={vault.items.length} locations={activeLocations} locationFilter={locationFilter} onLocation={setLocationFilter} query={query} onQuery={setQuery} getQty={(item) => itemTotal(item, locationFilter)} onCount={(item) => { setItemId(item.id); setCountedQuantity(''); setLocationId(''); navigate('count') }} />}
         {page === 'count' && <CountPage items={vault.items} locations={activeLocations} itemId={itemId} setItemId={setItemId} locationId={currentLocationId} setLocationId={setLocationId} quantity={countedQuantity} setQuantity={setCountedQuantity} reference={countReference} setReference={setCountReference} currentBalance={currentBalance} query={query} setQuery={setQuery} selectedItem={currentItem} online={online} busy={busy} onSave={savePhysicalCount} />}
         {page === 'sync' && <SyncPage counts={activeCounts} online={online} busy={busy} onSync={() => void syncCounts()} onRecount={startRecount} />}
         {page === 'settings' && <SettingsPage vault={vault} online={online} onClear={() => void clearLocalData()} version={appVersion} />}
+      </div>
+      <div ref={workspaceViewport} className="business-viewport" hidden={page !== 'business'} aria-label="Business workspace" />
       </div>
       <footer className="main-footer"><span><LockKeyhole size={12} /> Local inventory vault encrypted by this computer</span><span>KashFlow Field</span></footer>
     </main>

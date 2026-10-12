@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Menu, safeStorage, shell } = require('electron')
+const { app, BrowserWindow, WebContentsView, ipcMain, Menu, safeStorage, session, shell } = require('electron')
 const fs = require('node:fs')
 const path = require('node:path')
 
@@ -51,8 +51,9 @@ ipcMain.handle('kashflow:ping', async () => {
   } catch { return false }
 })
 ipcMain.handle('kashflow:version', () => app.getVersion())
-let fullWorkspaceWindow = null
+let businessView = null
 let fieldWindow = null
+const workspacePartition = 'persist:kashflow-workspace'
 
 function configuredWorkspaceUrl() {
   const target = new URL(process.env.KASHFLOW_WORKSPACE_URL || 'https://kashflow-frontend.onrender.com')
@@ -63,8 +64,12 @@ function configuredWorkspaceUrl() {
 }
 
 function isFullWorkspaceRequest(event) {
-  if (!fullWorkspaceWindow || fullWorkspaceWindow.isDestroyed() || event.sender !== fullWorkspaceWindow.webContents || event.senderFrame !== event.sender.mainFrame) return false
+  if (!businessView || businessView.webContents.isDestroyed() || event.sender !== businessView.webContents || event.senderFrame !== event.sender.mainFrame) return false
   try { return new URL(event.senderFrame.url).origin === configuredWorkspaceUrl().origin } catch { return false }
+}
+
+function isFieldWindowRequest(event) {
+  return !!fieldWindow && !fieldWindow.isDestroyed() && event.sender === fieldWindow.webContents && event.senderFrame === event.sender.mainFrame
 }
 
 ipcMain.handle('kashflow:workspace-token', (event) => {
@@ -75,51 +80,52 @@ ipcMain.handle('kashflow:workspace-token-update', (event, token) => {
   if (!isFullWorkspaceRequest(event)) throw new Error('This desktop session cannot be updated from this page.')
   if (typeof token !== 'string' || token.length > 1000) throw new Error('The workspace session response is invalid.')
   saveVault({ ...loadVault(), token })
-  for (const window of BrowserWindow.getAllWindows()) {
-    if (window !== fullWorkspaceWindow && !window.isDestroyed()) window.webContents.send('kashflow:workspace-token-changed', token)
-  }
+  if (fieldWindow && !fieldWindow.isDestroyed()) fieldWindow.webContents.send('kashflow:workspace-token-changed', token)
 })
 
-async function openWorkspaceWindow() {
-  const workspaceUrl = configuredWorkspaceUrl()
-  if (fullWorkspaceWindow && !fullWorkspaceWindow.isDestroyed()) {
-    fullWorkspaceWindow.focus()
-    return
-  }
-
-  fullWorkspaceWindow = new BrowserWindow({
-    width: 1440,
-    height: 940,
-    minWidth: 960,
-    minHeight: 680,
-    backgroundColor: '#f5f5f1',
-    title: 'KashFlow · Business Suite',
-    show: false,
-    webPreferences: { preload: path.join(__dirname, 'workspace-preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
-  })
-  const workspaceSession = fullWorkspaceWindow.webContents.session
+function configureWorkspaceSession() {
+  const workspaceSession = session.fromPartition(workspacePartition)
   workspaceSession.setPermissionCheckHandler((contents, permission, origin, details) =>
-    contents === fullWorkspaceWindow?.webContents &&
+    contents === businessView?.webContents &&
     permission === 'media' &&
-    origin === workspaceUrl.origin &&
+    origin === configuredWorkspaceUrl().origin &&
     details.mediaType === 'video'
   )
   workspaceSession.setPermissionRequestHandler((contents, permission, callback, details) => {
     let requesterOrigin = ''
     try { requesterOrigin = new URL(details.requestingUrl).origin } catch { /* Reject malformed origins. */ }
     const videoOnly = permission === 'media' && 'mediaTypes' in details && details.mediaTypes?.includes('video') && !details.mediaTypes.includes('audio')
-    callback(contents === fullWorkspaceWindow?.webContents && details.isMainFrame && requesterOrigin === workspaceUrl.origin && videoOnly)
+    callback(contents === businessView?.webContents && details.isMainFrame && requesterOrigin === configuredWorkspaceUrl().origin && videoOnly)
   })
-  fullWorkspaceWindow.once('ready-to-show', () => fullWorkspaceWindow?.show())
-  fullWorkspaceWindow.on('closed', () => { fullWorkspaceWindow = null })
-  fullWorkspaceWindow.webContents.setWindowOpenHandler(({ url }) => {
+}
+
+function openWorkspaceView() {
+  const workspaceUrl = configuredWorkspaceUrl()
+  if (!fieldWindow || fieldWindow.isDestroyed()) throw new Error('The KashFlow app window is not available.')
+  if (businessView && !businessView.webContents.isDestroyed()) return businessView
+
+  businessView = new WebContentsView({
+    webPreferences: {
+      partition: workspacePartition,
+      preload: path.join(__dirname, 'workspace-preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  businessView.setBounds({ x: 0, y: 0, width: 1, height: 1 })
+  businessView.setVisible(false)
+  fieldWindow.contentView.addChildView(businessView)
+
+  const workspaceContents = businessView.webContents
+  workspaceContents.setWindowOpenHandler(({ url }) => {
     try {
       const target = new URL(url)
       if (target.protocol === 'https:' || target.protocol === 'mailto:') void shell.openExternal(url).catch(() => undefined)
     } catch { /* Ignore malformed external links. */ }
     return { action: 'deny' }
   })
-  fullWorkspaceWindow.webContents.on('will-navigate', (event, url) => {
+  workspaceContents.on('will-navigate', (event, url) => {
     try {
       const target = new URL(url)
       if (target.origin !== workspaceUrl.origin) {
@@ -128,17 +134,61 @@ async function openWorkspaceWindow() {
       }
     } catch { event.preventDefault() }
   })
-  try {
-    await fullWorkspaceWindow.loadURL(workspaceUrl.href)
-  } catch (error) {
-    if (fullWorkspaceWindow && !fullWorkspaceWindow.isDestroyed()) fullWorkspaceWindow.destroy()
-    fullWorkspaceWindow = null
-    throw error
-  }
+  workspaceContents.on('destroyed', () => { if (businessView?.webContents === workspaceContents) businessView = null })
+  void workspaceContents.loadURL(workspaceUrl.href).catch((error) => {
+    if (businessView?.webContents !== workspaceContents) return
+    businessView.setVisible(false)
+    if (fieldWindow && !fieldWindow.isDestroyed()) {
+      fieldWindow.contentView.removeChildView(businessView)
+      fieldWindow.webContents.send('kashflow:workspace-load-error', error instanceof Error ? error.message : 'The business suite could not be loaded.')
+    }
+    workspaceContents.close()
+    businessView = null
+  })
+  return businessView
 }
 
-ipcMain.handle('kashflow:open-workspace', () => openWorkspaceWindow())
+ipcMain.handle('kashflow:open-workspace', (event) => {
+  if (!isFieldWindowRequest(event)) throw new Error('This desktop session cannot open the business suite from this page.')
+  openWorkspaceView()
+})
+ipcMain.handle('kashflow:set-workspace-view', (event, input) => {
+  if (!isFieldWindowRequest(event)) throw new Error('This desktop session cannot move the business suite view from this page.')
+  if (!businessView || businessView.webContents.isDestroyed()) {
+    if (input?.visible) throw new Error('The business suite view has not been opened yet.')
+    return false
+  }
+  if (!input?.visible) {
+    businessView.setVisible(false)
+    return true
+  }
+  const bounds = input.bounds
+  if (!bounds || !['x', 'y', 'width', 'height'].every((key) => Number.isFinite(bounds[key]))) throw new Error('The business suite view bounds are invalid.')
+  const [contentWidth, contentHeight] = fieldWindow.getContentSize()
+  const x = Math.max(0, Math.min(Math.floor(bounds.x), contentWidth))
+  const y = Math.max(0, Math.min(Math.floor(bounds.y), contentHeight))
+  const width = Math.min(Math.floor(bounds.width), contentWidth - x)
+  const height = Math.min(Math.floor(bounds.height), contentHeight - y)
+  if (width < 1 || height < 1) {
+    businessView.setVisible(false)
+    return false
+  }
+  businessView.setBounds({ x, y, width, height })
+  businessView.setVisible(true)
+  return true
+})
 
+function navigateWorkspace(destination) {
+  const window = createFieldWindow()
+  const send = () => {
+    if (window.isDestroyed()) return
+    window.show()
+    window.focus()
+    window.webContents.send('kashflow:workspace-navigation', destination)
+  }
+  if (window.webContents.isLoadingMainFrame()) window.webContents.once('did-finish-load', send)
+  else send()
+}
 function createFieldWindow() {
   if (fieldWindow && !fieldWindow.isDestroyed()) {
     fieldWindow.focus()
@@ -160,7 +210,11 @@ function createFieldWindow() {
     },
   })
   fieldWindow.once('ready-to-show', () => fieldWindow?.show())
-  fieldWindow.on('closed', () => { fieldWindow = null })
+  fieldWindow.on('closed', () => {
+    fieldWindow = null
+    if (businessView && !businessView.webContents.isDestroyed()) businessView.webContents.close()
+    businessView = null
+  })
   fieldWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   fieldWindow.webContents.on('will-navigate', (event, url) => {
     if (url.startsWith('http://') || url.startsWith('https://')) event.preventDefault()
@@ -176,8 +230,8 @@ function installWorkspaceMenu() {
     {
       label: 'Workspace',
       submenu: [
-        { label: 'Full business suite', accelerator: 'CmdOrCtrl+1', click: () => { void openWorkspaceWindow().catch(() => createFieldWindow()) } },
-        { label: 'Offline field tools', accelerator: 'CmdOrCtrl+2', click: () => createFieldWindow() },
+        { label: 'Full business suite', accelerator: 'CmdOrCtrl+1', click: () => navigateWorkspace('business') },
+        { label: 'Offline field tools', accelerator: 'CmdOrCtrl+2', click: () => navigateWorkspace('field') },
         { type: 'separator' },
         { role: 'quit' },
       ],
@@ -188,6 +242,7 @@ function installWorkspaceMenu() {
 
 app.whenReady().then(() => {
   app.setAppUserModelId('ke.kashflow.desktop')
+  configureWorkspaceSession()
   installWorkspaceMenu()
   createFieldWindow()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createFieldWindow() })

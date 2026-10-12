@@ -8,6 +8,9 @@ interface Window {
     ping(): Promise<boolean>
     version(): Promise<string>
     openWorkspace(): Promise<void>
+    setWorkspaceView(visible: boolean, bounds?: { x: number; y: number; width: number; height: number }): Promise<boolean>
+    onWorkspaceNavigation(callback: (destination: 'business' | 'field') => void): () => void
+    onWorkspaceLoadError(callback: (message: string) => void): () => void
     onWorkspaceTokenChanged(callback: (token: string) => void): () => void
   }
 }

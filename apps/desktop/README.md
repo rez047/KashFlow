@@ -1,6 +1,6 @@
 # KashFlow desktop app
 
-The desktop app opens to the encrypted offline Field Edition with **Today**, **Stock**, **Count**, and **Sync** navigation always visible. Select **Full business suite** in the sidebar or use `Ctrl/Cmd+1` to open the complete online KashFlow suite in its own window. Use the **Workspace → Offline field tools** menu item or `Ctrl/Cmd+2` to return to the field screens.
+The desktop app opens to the encrypted offline Field Edition with **Today**, **Stock**, **Count**, and **Sync** navigation always visible. Select **Business** in the sidebar or use `Ctrl/Cmd+1` to open the complete online KashFlow suite inside the same app window. Use the **Workspace → Offline field tools** menu item or `Ctrl/Cmd+2` to return to the field screens.
 
 The inventory snapshot and pending count queue are encrypted through the operating system's secure storage: Windows DPAPI, macOS Keychain, or a Linux desktop keyring. The app refuses to save business data on Linux if Electron falls back to its weak `basic_text` backend. Offline counts are replayed with idempotency keys; changed stock baselines stop for a physical recount.
 
