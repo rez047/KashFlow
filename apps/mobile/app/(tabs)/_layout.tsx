@@ -17,7 +17,7 @@ export default function TabLayout() {
       <Tabs.Screen name="stock" options={{ title: 'Stock', tabBarIcon: ({ color, size }) => <Ionicons name="cube-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="count" options={{ title: 'Count', tabBarIcon: ({ color, size }) => <Ionicons name="scan-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="sync" options={{ title: 'Sync', tabBarIcon: ({ color, size }) => <Ionicons name="sync-outline" size={size} color={color} /> }} />
-      <Tabs.Screen name="settings" options={{ href: null, tabBarButton: () => null }} />
+      <Tabs.Screen name="settings" options={{ href: null }} />
     </Tabs>
   </KashFlowProvider>
 }
