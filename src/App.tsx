@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { languages, useTranslation, type LanguageCode } from './i18n'
 import {
-  Activity, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
+  Activity, AlertCircle, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
   BriefcaseBusiness, CalendarDays, Camera, Check, ChevronRight, CircleHelp,
   FileText, Filter, Gauge, Landmark, LayoutDashboard,
   LifeBuoy, LogOut, Mail, Menu, MessageCircle, Minus, Package, Phone, Plus, Printer, QrCode,
@@ -939,6 +939,10 @@ function App() {
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null)
   const cameraRafRef = useRef<number | null>(null)
   const scanFlashTimer = useRef<number | null>(null)
+  // Shared M-Pesa confirmation watcher used by every prompt site.
+  const mpesaPoll = useRef<ReturnType<typeof setInterval> | null>(null)
+  const mpesaPollStarted = useRef(0)
+  const mpesaWatchRef = useRef<{ invoiceId: string; amount: number; label: string; phase: 'waiting' | 'paid' | 'unpaid' | 'failed'; receipt: string; message: string; onPaid?: () => void; onUnpaid?: () => void } | null>(null)
   const [posCart, setPosCart] = useState<PosCartLine[]>([])
   const [posCustomer, setPosCustomer] = useState('')
   const [posCustomerType, setPosCustomerType] = useState<'walk_in' | 'remote'>('walk_in')
@@ -1005,6 +1009,10 @@ function App() {
   // to income for the M-Pesa part until Daraja confirms it, exactly like the point of sale.
   const [subscriptionMpesaPending, setSubscriptionMpesaPending] = useState<{ subscriptionId: string; invoiceId: string; amount: number; phone: string } | null>(null)
   const [subscriptionMpesaChecking, setSubscriptionMpesaChecking] = useState(false)
+  // A shared M-Pesa confirmation watcher used by every prompt site (POS, invoices, services and
+  // recurring). While it is open it polls Daraja for the receipt, confirms the payment when it
+  // arrives, and warns the user when no payment is received in time.
+  const [mpesaWatch, setMpesaWatch] = useState<{ invoiceId: string; amount: number; label: string; phase: 'waiting' | 'paid' | 'unpaid' | 'failed'; receipt: string; message: string; onPaid?: () => void; onUnpaid?: () => void } | null>(null)
   const [supplierPaymentInput, setSupplierPaymentInput] = useState({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' as 'none' | 'monthly' | 'quarterly' | 'annually' })
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
@@ -2184,6 +2192,10 @@ function App() {
 
   useEffect(() => { resolveScanCodeRef.current = resolveScanCode })
 
+  // Keep the M-Pesa watcher ref in sync and stop polling when the overlay closes or the app unmounts.
+  useEffect(() => { mpesaWatchRef.current = mpesaWatch }, [mpesaWatch])
+  useEffect(() => () => { if (mpesaPoll.current) clearInterval(mpesaPoll.current) }, [])
+
   // Manual Enter submit from the search / scan box.
   function scanPosBarcode(event: KeyboardEvent<HTMLInputElement>) {
     if (event.key !== 'Enter') return
@@ -2599,9 +2611,11 @@ async function createCameraReader(): Promise<CameraReader> {
         }
         // M-Pesa requests run after any cash is applied and carry the exact M-Pesa split
         // amount, so a part-cash sale can still raise an STK Push for the M-Pesa portion.
+        let mpesaPrompted = 0
         for (const split of mpesaSplits) {
           try {
             await requestInvoiceMpesaPayment(created.invoice.id, split.phone.trim(), Number(split.amount))
+            mpesaPrompted += Number(split.amount)
           } catch (reason) {
             failures.push(`M-Pesa ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not requested'}`)
           }
@@ -2612,6 +2626,8 @@ async function createCameraReader(): Promise<CameraReader> {
         receipt.status = failures.length ? `Partially recorded · ${failures.join(' · ')}` : mpesaSplits.length ? `M-Pesa request started · ${money(receipt.amountPaid)} collected in cash; confirm M-Pesa before releasing goods` : 'Paid · cash recorded'
         if (failures.length) setError(`Sale saved as invoice ${created.invoice.id.slice(0, 8)}, but some split payments were not recorded: ${failures.join('; ')}`)
         else notify('Sale completed. Stock and split payments recorded.')
+        // Wait for Daraja to confirm the M-Pesa portion so the user can see the sale is paid.
+        if (mpesaPrompted > 0) watchMpesaPayment(created.invoice.id, mpesaPrompted, `Point of sale · ${customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid for the M-Pesa ${money(mpesaPrompted)}`; setPosReceipt({ ...receipt }) })
       } else if (posPaymentMethod === 'cash') {
         try {
           await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: total, paymentDate: today }) })
@@ -2628,6 +2644,7 @@ async function createCameraReader(): Promise<CameraReader> {
           const result = await requestInvoiceMpesaPayment(created.invoice.id, posPaymentPhone.trim())
           receipt.status = 'M-Pesa request started · confirm payment status before releasing goods'
           notify(result.customerMessage)
+          watchMpesaPayment(created.invoice.id, total, `Point of sale · ${customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid for the M-Pesa ${money(total)}`; setPosReceipt({ ...receipt }) })
         } catch (reason) {
           receipt.status = 'Unpaid · M-Pesa request did not start'
           setError(`Sale and stock were saved as invoice ${created.invoice.id.slice(0, 8)}, but the M-Pesa request did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try from Sales.'}`)
@@ -2725,6 +2742,7 @@ async function createCameraReader(): Promise<CameraReader> {
         try {
           const result = await requestInvoiceMpesaPayment(created.invoice.id, mobileNumber)
           notify(`Invoice saved. ${result.customerMessage}`)
+          watchMpesaPayment(created.invoice.id, Number(invoiceLines.reduce((sum, line) => sum + Number(line.quantity) * Number(line.unitPrice), 0).toFixed(2)) || Number(invoice.amount || 0), `Invoice · ${customerName}`, () => { void refreshAfterMpesaPaid(created.invoice.id) })
         } catch (reason) {
           notify(`Invoice saved; M-Pesa request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
         }
@@ -2876,6 +2894,8 @@ async function createCameraReader(): Promise<CameraReader> {
       setInvoicesList(result.invoices)
       setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: [] }))
       await refresh()
+      const mpesaTotal = splits.filter((item) => item.method === 'mpesa').reduce((sum, item) => sum + Number(item.amount), 0)
+      if (mpesaTotal > 0) watchMpesaPayment(invoiceRow.id, mpesaTotal, `Invoice · ${invoiceRow.customer}`, () => { void refreshAfterMpesaPaid(invoiceRow.id) })
       if (failures.length) setError(`Some split payments were not recorded: ${failures.join('; ')}`)
       else notify(splits.some((split) => split.method === 'mpesa') ? 'Split payments started. The invoice stays unpaid until Daraja confirms the M-Pesa amount.' : 'Split cash payments recorded in the ledger.')
     } catch (reason) {
@@ -2902,6 +2922,8 @@ async function createCameraReader(): Promise<CameraReader> {
       const result = await requestInvoiceMpesaPayment(invoiceRow.id, phone)
       await loadInvoiceMpesaPayments(invoiceRow.id)
       notify(result.customerMessage)
+      const due = Number(invoiceRow.amount_due ?? invoiceRow.amount)
+      watchMpesaPayment(invoiceRow.id, due, `Invoice · ${invoiceRow.customer}`, () => { void refreshAfterMpesaPaid(invoiceRow.id) })
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not start the M-Pesa prompt. The invoice remains unpaid.')
       await loadInvoiceMpesaPayments(invoiceRow.id)
@@ -3129,6 +3151,7 @@ async function createCameraReader(): Promise<CameraReader> {
           setSubscriptionMpesaPending({ subscriptionId: subscription.id, invoiceId: result.invoice.id, amount: mpesaAmount, phone })
           await refresh()
           notify(`${isNewBill ? 'Bill created' : 'Cash payment recorded'} for ${subscription.customer_name}. An M-Pesa prompt for ${money(mpesaAmount)} was sent; confirm it before releasing the service. ${prompt.customerMessage}`)
+          watchMpesaPayment(result.invoice.id, mpesaAmount, `Service · ${subscription.customer_name}`, () => { setSubscriptionMpesaPending(null); void refreshAfterMpesaPaid(result.invoice.id) })
         } catch (reason) {
           await refresh()
           setError(`Bill saved${cashAmount > 0 ? ` with ${money(cashAmount)} cash recorded` : ''} for ${subscription.customer_name}, but the M-Pesa prompt did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try again.'} Nothing was added to income for the M-Pesa part.`)
@@ -3173,6 +3196,82 @@ async function createCameraReader(): Promise<CameraReader> {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not check the M-Pesa payment status. The bill stays not paid for the M-Pesa part.')
     } finally { setSubscriptionMpesaChecking(false) }
+  }
+
+  // Watch a prompted M-Pesa payment across every prompt site. This polls Daraja through the
+  // invoice M-Pesa status endpoint, shows a waiting screen, confirms the payment when Daraja
+  // returns the receipt, and warns the user when no payment arrives in time.
+  function watchMpesaPayment(invoiceId: string, amount: number, label: string, onPaid?: () => void, onUnpaid?: () => void) {
+    if (mpesaPoll.current) { clearInterval(mpesaPoll.current); mpesaPoll.current = null }
+    mpesaPollStarted.current = Date.now()
+    const next = { invoiceId, amount, label, phase: 'waiting' as const, receipt: '', message: '', onPaid, onUnpaid }
+    // Update the ref before starting the poll so the first status check sees the new watch.
+    mpesaWatchRef.current = next
+    setMpesaWatch(next)
+    mpesaPoll.current = setInterval(() => { void checkMpesaWatch() }, 4000)
+    void checkMpesaWatch()
+  }
+
+  async function checkMpesaWatch() {
+    const watch = mpesaWatchRef.current
+    if (!watch || watch.phase !== 'waiting') return
+    try {
+      const result = await request<{ payments: InvoiceMpesaPayment[] }>(`/v1/invoices/${watch.invoiceId}/payments/mpesa`)
+      const paid = result.payments.find((payment) => payment.status === 'paid')
+      if (paid) {
+        stopMpesaWatch()
+        setMpesaWatch((current) => current ? { ...current, phase: 'paid', receipt: paid.mpesa_receipt_number ?? '', message: '' } : current)
+        watch.onPaid?.()
+        return
+      }
+      const failed = result.payments.find((payment) => payment.status === 'failed')
+      if (failed) {
+        stopMpesaWatch()
+        setMpesaWatch((current) => current ? { ...current, phase: 'failed', message: failed.result_description ?? 'Daraja reported the request was not completed.' } : current)
+        return
+      }
+      // Give the customer time to enter their PIN before warning that nothing has arrived.
+      if (Date.now() - mpesaPollStarted.current > 90000) {
+        stopMpesaWatch()
+        setMpesaWatch((current) => current ? { ...current, phase: 'unpaid', message: '' } : current)
+      }
+    } catch (reason) {
+      if (Date.now() - mpesaPollStarted.current > 90000) {
+        stopMpesaWatch()
+        setMpesaWatch((current) => current ? { ...current, phase: 'unpaid', message: reason instanceof Error ? reason.message : '' } : current)
+      }
+    }
+  }
+
+  function stopMpesaWatch() {
+    if (mpesaPoll.current) { clearInterval(mpesaPoll.current); mpesaPoll.current = null }
+  }
+
+  function closeMpesaWatch() {
+    stopMpesaWatch()
+    const watch = mpesaWatchRef.current
+    if (watch?.phase !== 'paid') watch?.onUnpaid?.()
+    mpesaWatchRef.current = null
+    setMpesaWatch(null)
+  }
+
+  async function refreshAfterMpesaPaid(invoiceId: string) {
+    try {
+      const [invoices, payments] = await Promise.all([
+        request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
+        request<{ payments: InvoiceMpesaPayment[] }>(`/v1/invoices/${invoiceId}/payments/mpesa`).catch(() => ({ payments: [] as InvoiceMpesaPayment[] })),
+      ])
+      setInvoicesList(invoices.invoices)
+      setInvoiceMpesaPayments((current) => ({ ...current, [invoiceId]: payments.payments }))
+    } catch { /* the confirmation still stands; the lists refresh on the next load */ }
+    if (serviceDetailId) {
+      try {
+        const subscribers = await request<{ subscriptions: ServiceSubscription[]; supplierPayments: ServiceSupplierPayment[] }>(`/v1/services/${serviceDetailId}/subscriptions`)
+        setServiceSubscriptions((current) => ({ ...current, [serviceDetailId]: subscribers.subscriptions }))
+        setServiceSupplierPayments((current) => ({ ...current, [serviceDetailId]: subscribers.supplierPayments }))
+      } catch { /* ignore; the invoice list above already reflects the payment */ }
+    }
+    await refresh()
   }
 
   async function saveInventoryPrice(event: FormEvent<HTMLFormElement>, item: WorkspaceRecord) {
@@ -3366,6 +3465,7 @@ async function createCameraReader(): Promise<CameraReader> {
         try {
           const payment = await requestInvoiceMpesaPayment(run.generatedId, template.customer_phone)
           notify(`Recurring invoice created. ${payment.customerMessage}`)
+          watchMpesaPayment(run.generatedId, Number(template.amount ?? 0), `Recurring invoice · ${template.counterparty}`, () => { void refreshAfterMpesaPaid(run.generatedId!) })
         } catch (reason) {
           notify(`Recurring invoice created; Daraja request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
         }
@@ -4544,6 +4644,38 @@ async function createCameraReader(): Promise<CameraReader> {
     </aside>
     {sidebarOpen && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={() => setSidebarOpen(false)} />}
     {switchingBusiness && <div className="workspace-switching-overlay" role="status" aria-live="polite"><span>Switching business…</span></div>}
+    {mpesaWatch && <div className="mpesa-confirm-overlay" role="dialog" aria-modal="true" aria-live="assertive">
+      <div className={`mpesa-confirm-card is-${mpesaWatch.phase}`}>
+        {mpesaWatch.phase === 'waiting' ? <>
+          <div className="mpesa-spinner" aria-hidden="true" />
+          <h2>Waiting for M-Pesa payment</h2>
+          <p className="mpesa-confirm-amount">{money(mpesaWatch.amount)}</p>
+          <p className="mpesa-confirm-subject">{mpesaWatch.label}</p>
+          <p className="mpesa-confirm-body">We are holding this open until Daraja returns the M-Pesa reference. Ask the customer to enter their M-Pesa PIN now. Do not release the goods or service until this confirms.</p>
+          <p className="dialog-note">Checking payment status automatically…</p>
+          <div className="button-row"><button type="button" className="button button-small" onClick={closeMpesaWatch}>Stop waiting</button></div>
+        </> : mpesaWatch.phase === 'paid' ? <>
+          <div className="mpesa-confirm-icon paid"><Check size={26} /></div>
+          <h2>Payment received</h2>
+          <p className="mpesa-confirm-amount">{money(mpesaWatch.amount)}</p>
+          <p className="mpesa-confirm-subject">{mpesaWatch.label}</p>
+          {mpesaWatch.receipt && <p className="mpesa-confirm-receipt">M-Pesa reference <strong>{mpesaWatch.receipt}</strong></p>}
+          <p className="mpesa-confirm-body">Daraja confirmed this payment and it has been added to income.</p>
+          <div className="button-row"><button type="button" className="button button-primary" onClick={() => setMpesaWatch(null)}>Done</button></div>
+        </> : <>
+          <div className="mpesa-confirm-icon unpaid"><AlertCircle size={26} /></div>
+          <h2>{mpesaWatch.phase === 'failed' ? 'Payment failed' : 'Payment not received'}</h2>
+          <p className="mpesa-confirm-amount">{money(mpesaWatch.amount)}</p>
+          <p className="mpesa-confirm-subject">{mpesaWatch.label}</p>
+          <p className="mpesa-confirm-body">{mpesaWatch.phase === 'failed' ? mpesaWatch.message || 'Daraja reported this M-Pesa request was not completed.' : 'No confirmed M-Pesa payment has arrived yet and nothing was added to income.'} Do you want to send it to the invoice and mark it as not paid?</p>
+          <p className="dialog-note">If the customer has already paid, wait and check again. Amounts are only recognised once Daraja confirms the receipt.</p>
+          <div className="button-row">
+            <button type="button" className="button button-primary" onClick={() => { closeMpesaWatch() }}>Keep marked as not paid</button>
+            <button type="button" className="button button-small" onClick={() => { const watch = mpesaWatchRef.current; if (watch) watchMpesaPayment(watch.invoiceId, watch.amount, watch.label, watch.onPaid, watch.onUnpaid) }}>Check again</button>
+          </div>
+        </>}
+      </div>
+    </div>}
 
     <main className="main-area">
       <header className="topbar">
