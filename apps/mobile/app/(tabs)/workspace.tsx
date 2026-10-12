@@ -156,7 +156,7 @@ export default function WorkspaceScreen() {
       <View style={styles.toolbar}>
         <View style={styles.heading}>
           <Text style={styles.kicker}>KASHFLOW</Text>
-          <Text style={styles.title}>Full workspace</Text>
+          <Text style={styles.title}>Full business suite</Text>
         </View>
         <View style={styles.controls}>
           <Pressable accessibilityRole="button" accessibilityLabel="Go back in workspace" disabled={!canGoBack} onPress={() => webView.current?.goBack()} style={[styles.control, !canGoBack && styles.controlDisabled]}><Ionicons name="arrow-back" size={17} color={canGoBack ? '#32413e' : '#a7b0aa'} /></Pressable>
@@ -167,8 +167,8 @@ export default function WorkspaceScreen() {
 
       {!online ? <View style={styles.offlineCard}>
         <View style={styles.offlineIcon}><Ionicons name="cloud-offline-outline" size={23} color="#a87532" /></View>
-        <Text style={styles.offlineTitle}>The full workspace needs a connection</Text>
-        <Text style={styles.offlineBody}>Your saved inventory, counts, and sync review remain available in the other tabs while you’re offline.</Text>
+        <Text style={styles.offlineTitle}>The business suite needs a connection</Text>
+        <Text style={styles.offlineBody}>Connect to use sales, accounting, payroll, reports, settings, and the rest of your online workspace. Your saved inventory, counts, and sync review remain available in the other tabs.</Text>
       </View> : <View style={styles.webArea}>
         <WebView
           key={token ?? 'guest'}
@@ -181,6 +181,7 @@ export default function WorkspaceScreen() {
           domStorageEnabled
           sharedCookiesEnabled
           thirdPartyCookiesEnabled
+          mediaCapturePermissionGrantType="grantIfSameHostElsePrompt"
           setSupportMultipleWindows={false}
           mixedContentMode="never"
           onNavigationStateChange={handleNavigation}
@@ -201,7 +202,7 @@ export default function WorkspaceScreen() {
         </View>}
         {loading && !loadError && <View pointerEvents="none" style={styles.loadingOverlay}><View style={styles.loadingMark}><Ionicons name="layers" size={20} color="#fff" /></View><Text style={styles.loadingText}>Opening your business workspace…</Text></View>}
       </View>}
-      <Text style={styles.footnote}>{sharingExport ? 'Preparing your workspace export…' : 'Sign in once to use the full workspace here. Printing and exports use the device share sheets.'}</Text>
+      <Text style={styles.footnote}>{sharingExport ? 'Preparing your workspace export…' : 'Complete KashFlow business suite · printing and exports use the device share sheets.'}</Text>
     </View>
   </SafeAreaView>
 }

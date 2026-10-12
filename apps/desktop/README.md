@@ -1,10 +1,10 @@
 # KashFlow desktop app
 
-The desktop app includes an encrypted offline Field workspace for Overview, Inventory, Stock Count, Sync & Review, and Settings. Choose **Full workspace** in the side navigation to open the complete KashFlow business suite in a separate secure Electron window.
+The desktop app opens directly into the complete KashFlow business suite. Use the **Workspace** menu to switch to the encrypted offline Field tools for inventory, stock counts, sync review, and settings (or use `Ctrl/Cmd+2`). `Ctrl/Cmd+1` returns to the business suite.
 
 The inventory snapshot and pending count queue are encrypted through the operating system's secure storage: Windows DPAPI, macOS Keychain, or a Linux desktop keyring. The app refuses to save business data on Linux if Electron falls back to its weak `basic_text` backend. Offline counts are replayed with idempotency keys; changed stock baselines stop for a physical recount.
 
-The full suite is served from `https://kashflow-frontend.onrender.com` by default and needs an internet connection. Its requests use the encrypted desktop session; business switches and sign-out update the local session. Set `KASHFLOW_WORKSPACE_URL` before launch to use a different HTTPS frontend deployment. CSV exports and printing use Electron's normal save and print dialogs.
+The full suite is served from `https://kashflow-frontend.onrender.com` by default and needs an internet connection. Its requests use the encrypted desktop session; business switches and sign-out update the local session. Set `KASHFLOW_WORKSPACE_URL` before launch to use a different HTTPS frontend deployment. CSV exports and printing use Electron's normal save and print dialogs. POS camera scanning is limited to video requests from the configured KashFlow frontend.
 
 ## Development
 

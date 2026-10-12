@@ -53,7 +53,7 @@ export default function HomeScreen() {
 
       <Pressable accessibilityRole="button" style={styles.workspaceCard} onPress={() => router.push('/(tabs)/workspace')}>
         <View style={styles.workspaceIcon}><Ionicons name="business-outline" size={20} color="#118c71" /></View>
-        <View style={styles.workspaceCopy}><Text style={styles.workspaceTitle}>Open your full workspace</Text><Text style={styles.workspaceCaption}>Sales, accounting, payroll, reports, settings, and more.</Text></View>
+        <View style={styles.workspaceCopy}><Text style={styles.workspaceTitle}>Open the full business suite</Text><Text style={styles.workspaceCaption}>Sales, accounting, payroll, reports, settings, and every online workspace feature.</Text></View>
         <Ionicons name="arrow-forward" size={17} color="#16866e" />
       </Pressable>
 

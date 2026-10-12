@@ -1,6 +1,6 @@
 {
   "name": "@kashflow/desktop",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "main": "main.cjs",
@@ -31,7 +31,7 @@
   },
   "build": {
     "appId": "ke.kashflow.desktop",
-    "productName": "KashFlow Field",
+    "productName": "KashFlow",
     "directories": { "output": "release" },
     "asar": true,
     "files": ["dist/**/*", "main.cjs", "preload.cjs", "workspace-preload.cjs", "package.json"],
@@ -47,7 +47,10 @@
       "artifactName": "KashFlow-Desktop-${version}-${arch}.${ext}",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
-      "notarize": false
+      "notarize": false,
+      "extendInfo": {
+        "NSCameraUsageDescription": "KashFlow uses the camera to scan product barcodes when you choose camera scanning in Point of Sale."
+      }
     },
     "linux": { "icon": "assets/icon.png", "target": ["AppImage", "deb"], "artifactName": "KashFlow-Desktop-${version}-${arch}.${ext}" },
     "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true, "createStartMenuShortcut": true, "perMachine": false }

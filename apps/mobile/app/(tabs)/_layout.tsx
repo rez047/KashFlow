@@ -5,15 +5,15 @@ import { KashFlowProvider } from '../../src/components/KashFlowProvider'
 
 export default function TabLayout() {
   return <KashFlowProvider>
-    <Tabs backBehavior="history" screenOptions={{
+    <Tabs initialRouteName="workspace" backBehavior="history" screenOptions={{
       headerShown: false,
       tabBarActiveTintColor: '#0c9a79',
       tabBarInactiveTintColor: '#829098',
       tabBarStyle: { height: 69, paddingTop: 8, paddingBottom: 8, backgroundColor: '#fff', borderTopColor: '#e7e8e3', elevation: 0 },
       tabBarLabelStyle: { fontSize: 13, fontWeight: '700', letterSpacing: 0.2 },
     }}>
+      <Tabs.Screen name="workspace" options={{ title: 'Business', tabBarIcon: ({ color, size }) => <Ionicons name="business-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="home" options={{ title: 'Today', tabBarIcon: ({ color, size }) => <Ionicons name="grid-outline" size={size} color={color} /> }} />
-      <Tabs.Screen name="workspace" options={{ title: 'Workspace', tabBarIcon: ({ color, size }) => <Ionicons name="business-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="stock" options={{ title: 'Stock', tabBarIcon: ({ color, size }) => <Ionicons name="cube-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="count" options={{ title: 'Count', tabBarIcon: ({ color, size }) => <Ionicons name="scan-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="sync" options={{ title: 'Sync', tabBarIcon: ({ color, size }) => <Ionicons name="sync-outline" size={size} color={color} /> }} />

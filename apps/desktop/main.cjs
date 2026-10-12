@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, safeStorage, shell } = require('electron')
+const { app, BrowserWindow, ipcMain, Menu, safeStorage, shell } = require('electron')
 const fs = require('node:fs')
 const path = require('node:path')
 
@@ -52,6 +52,7 @@ ipcMain.handle('kashflow:ping', async () => {
 })
 ipcMain.handle('kashflow:version', () => app.getVersion())
 let fullWorkspaceWindow = null
+let fieldWindow = null
 
 function configuredWorkspaceUrl() {
   const target = new URL(process.env.KASHFLOW_WORKSPACE_URL || 'https://kashflow-frontend.onrender.com')
@@ -79,7 +80,7 @@ ipcMain.handle('kashflow:workspace-token-update', (event, token) => {
   }
 })
 
-ipcMain.handle('kashflow:open-workspace', async () => {
+async function openWorkspaceWindow() {
   const workspaceUrl = configuredWorkspaceUrl()
   if (fullWorkspaceWindow && !fullWorkspaceWindow.isDestroyed()) {
     fullWorkspaceWindow.focus()
@@ -92,10 +93,22 @@ ipcMain.handle('kashflow:open-workspace', async () => {
     minWidth: 960,
     minHeight: 680,
     backgroundColor: '#f5f5f1',
-    title: 'KashFlow · Full Workspace',
+    title: 'KashFlow · Business Suite',
     show: false,
-    autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'workspace-preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  })
+  const workspaceSession = fullWorkspaceWindow.webContents.session
+  workspaceSession.setPermissionCheckHandler((contents, permission, origin, details) =>
+    contents === fullWorkspaceWindow?.webContents &&
+    permission === 'media' &&
+    origin === workspaceUrl.origin &&
+    details.mediaType === 'video'
+  )
+  workspaceSession.setPermissionRequestHandler((contents, permission, callback, details) => {
+    let requesterOrigin = ''
+    try { requesterOrigin = new URL(details.requestingUrl).origin } catch { /* Reject malformed origins. */ }
+    const videoOnly = permission === 'media' && 'mediaTypes' in details && details.mediaTypes?.includes('video') && !details.mediaTypes.includes('audio')
+    callback(contents === fullWorkspaceWindow?.webContents && details.isMainFrame && requesterOrigin === workspaceUrl.origin && videoOnly)
   })
   fullWorkspaceWindow.once('ready-to-show', () => fullWorkspaceWindow?.show())
   fullWorkspaceWindow.on('closed', () => { fullWorkspaceWindow = null })
@@ -122,18 +135,23 @@ ipcMain.handle('kashflow:open-workspace', async () => {
     fullWorkspaceWindow = null
     throw error
   }
-})
+}
 
-function createWindow() {
-  const window = new BrowserWindow({
+ipcMain.handle('kashflow:open-workspace', () => openWorkspaceWindow())
+
+function createFieldWindow() {
+  if (fieldWindow && !fieldWindow.isDestroyed()) {
+    fieldWindow.focus()
+    return fieldWindow
+  }
+  fieldWindow = new BrowserWindow({
     width: 1440,
     height: 940,
     minWidth: 1040,
     minHeight: 690,
     backgroundColor: '#f5f5f1',
-    title: 'KashFlow Field',
+    title: 'KashFlow · Offline Field Tools',
     show: false,
-    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -141,18 +159,37 @@ function createWindow() {
       sandbox: true,
     },
   })
-  window.once('ready-to-show', () => window.show())
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
-  window.webContents.on('will-navigate', (event, url) => {
+  fieldWindow.once('ready-to-show', () => fieldWindow?.show())
+  fieldWindow.on('closed', () => { fieldWindow = null })
+  fieldWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  fieldWindow.webContents.on('will-navigate', (event, url) => {
     if (url.startsWith('http://') || url.startsWith('https://')) event.preventDefault()
   })
-  if (!app.isPackaged) void window.loadURL(devServer)
-  else void window.loadFile(path.join(__dirname, 'dist', 'index.html'))
+  if (!app.isPackaged) void fieldWindow.loadURL(devServer)
+  else void fieldWindow.loadFile(path.join(__dirname, 'dist', 'index.html'))
+  return fieldWindow
+}
+
+function installWorkspaceMenu() {
+  const template = [
+    ...(process.platform === 'darwin' ? [{ label: app.name, submenu: [{ role: 'about' }, { type: 'separator' }, { role: 'quit' }] }] : []),
+    {
+      label: 'Workspace',
+      submenu: [
+        { label: 'Full business suite', accelerator: 'CmdOrCtrl+1', click: () => { void openWorkspaceWindow().catch(() => createFieldWindow()) } },
+        { label: 'Offline field tools', accelerator: 'CmdOrCtrl+2', click: () => createFieldWindow() },
+        { type: 'separator' },
+        { role: 'quit' },
+      ],
+    },
+  ]
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
 app.whenReady().then(() => {
   app.setAppUserModelId('ke.kashflow.desktop')
-  createWindow()
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
+  installWorkspaceMenu()
+  void openWorkspaceWindow().catch(() => createFieldWindow())
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void openWorkspaceWindow().catch(() => createFieldWindow()) })
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })

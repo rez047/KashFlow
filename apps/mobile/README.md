@@ -1,8 +1,8 @@
 # KashFlow mobile app
 
-This is a native iOS and Android app built with React Native and Expo Router. It includes Today, Stock, Count, Sync & Review, and Settings screens for offline field work, plus a **Workspace** tab with the complete KashFlow business suite.
+This is a native iOS and Android app built with React Native and Expo Router. It opens on the **Business** tab with the complete KashFlow business suite. Today, Stock, Count, Sync & Review, and Settings provide native tools for offline field work.
 
-The Workspace tab loads the configured KashFlow frontend in a WebView and uses the app's short-lived bearer session. Session tokens stay in iOS Keychain or Android Keystore and pass through the web page in memory; business switches and sign-out update the native session. Set `EXPO_PUBLIC_WORKSPACE_URL` to use a different frontend deployment. The workspace requires an internet connection. CSV exports are shared as a single CSV or a ZIP of all selected exports, and printing uses the device print sheet.
+The Business tab loads the configured KashFlow frontend in a WebView and uses the app's short-lived bearer session. Session tokens stay in iOS Keychain or Android Keystore and pass through the web page in memory; business switches and sign-out update the native session. Set `EXPO_PUBLIC_WORKSPACE_URL` to use a different frontend deployment. The suite requires an internet connection. POS camera scanning uses the device camera only after a barcode scan is requested. CSV exports are shared as a single CSV or a ZIP of all selected exports, and printing uses the device print sheet.
 
 ## Offline inventory
 

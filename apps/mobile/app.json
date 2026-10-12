@@ -3,16 +3,20 @@
     "name": "KashFlow",
     "slug": "kashflow",
     "scheme": "kashflow",
-    "version": "1.1.1",
+    "version": "1.2.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
       "bundleIdentifier": "ke.kashflow.inventory",
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "KashFlow uses the camera to scan product barcodes when you choose camera scanning in Point of Sale."
+      }
     },
     "android": {
       "package": "ke.kashflow.inventory",
+      "permissions": ["android.permission.CAMERA"],
       "adaptiveIcon": {
       "backgroundColor": "#123139",
         "foregroundImage": "./assets/android-icon-foreground.png",

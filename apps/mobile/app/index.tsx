@@ -17,7 +17,7 @@ export default function SignInScreen() {
 
   useEffect(() => {
     void Promise.all([SecureStore.getItemAsync('kashflow.access-token'), getOfflineSnapshot()]).then(([token]) => {
-      if (token) router.replace('/(tabs)/home')
+      if (token) router.replace('/(tabs)/workspace')
     }).catch(() => undefined)
   }, [])
 
@@ -29,7 +29,7 @@ export default function SignInScreen() {
         const verified = await api<{ accessToken: string }>('/v1/auth/two-factor/verify-login', undefined, { method: 'POST', body: { challengeToken, code } })
         if (!verified.accessToken) throw new Error('The secure sign-in response was incomplete. Try again.')
         await SecureStore.setItemAsync('kashflow.access-token', verified.accessToken, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY })
-        router.replace('/(tabs)/home')
+        router.replace('/(tabs)/workspace')
         return
       }
       const result = await api<{ accessToken?: string; twoFactorRequired?: boolean; challengeToken?: string }>('/v1/auth/login', undefined, { method: 'POST', body: { identifier: identifier.trim(), password } })
@@ -40,7 +40,7 @@ export default function SignInScreen() {
       }
       if (!result.accessToken) throw new Error('The secure sign-in response was incomplete. Try again.')
       await SecureStore.setItemAsync('kashflow.access-token', result.accessToken, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY })
-      router.replace('/(tabs)/home')
+      router.replace('/(tabs)/workspace')
     } catch (reason) {
       setError(reason instanceof ApiError || reason instanceof Error ? reason.message : 'Could not sign in. Check your connection and try again.')
     } finally { setBusy(false) }
@@ -51,18 +51,18 @@ export default function SignInScreen() {
       <View style={styles.topline}><View style={styles.brand}>
         <LinearGradient colors={['#2ec7a0', '#0c9879']} style={styles.logo}><Ionicons name="layers" size={21} color="#fff" /></LinearGradient>
         <Text style={styles.brandName}>KashFlow<Text style={styles.brandDot}>.</Text></Text>
-      </View><Text style={styles.topTag}>FIELD EDITION</Text></View>
+      </View><Text style={styles.topTag}>BUSINESS SUITE</Text></View>
 
       <LinearGradient colors={['#122a35', '#0f202b']} style={styles.hero}>
         <View style={styles.heroGlow} />
-        <View style={styles.heroBadge}><View style={styles.greenDot} /><Text style={styles.heroBadgeText}>BUILT FOR THE SHOP FLOOR</Text></View>
-        <Text style={styles.heroTitle}>Count with{ '\n' }<Text style={styles.heroAccent}>confidence.</Text></Text>
-        <Text style={styles.heroBody}>Your business, one tap away. Keep stock moving even when the network doesn&apos;t.</Text>
-        <View style={styles.heroFoot}><View style={styles.heroLine} /><Text style={styles.heroFootText}>OFFLINE READY · KENYA FIRST</Text></View>
+        <View style={styles.heroBadge}><View style={styles.greenDot} /><Text style={styles.heroBadgeText}>BUILT FOR YOUR WHOLE BUSINESS</Text></View>
+        <Text style={styles.heroTitle}>Your business,{ '\n' }<Text style={styles.heroAccent}>one workspace.</Text></Text>
+        <Text style={styles.heroBody}>Sales, accounting, payroll, and reports in the full KashFlow suite. Your stock and counts stay ready offline.</Text>
+        <View style={styles.heroFoot}><View style={styles.heroLine} /><Text style={styles.heroFootText}>ONLINE BUSINESS SUITE · OFFLINE STOCK TOOLS</Text></View>
       </LinearGradient>
 
       <View style={styles.formHeader}><View><Text style={styles.eyebrow}>WELCOME BACK</Text><Text style={styles.formTitle}>{challengeToken ? 'Verify it’s you' : 'Sign in to KashFlow'}</Text></View><View style={styles.lockIcon}><Ionicons name="lock-closed-outline" size={17} color="#14866e" /></View></View>
-      <Text style={styles.formSub}>{challengeToken ? 'Use your authenticator app or a one-time recovery code.' : 'Your saved stock and counts stay on this device when you’re offline.'}</Text>
+      <Text style={styles.formSub}>{challengeToken ? 'Use your authenticator app or a one-time recovery code.' : 'Sign in for the complete business suite. Your saved stock and counts also stay on this device when you’re offline.'}</Text>
       {!challengeToken && <>
         <Text style={styles.label}>EMAIL OR PHONE</Text>
         <TextInput autoCapitalize="none" autoComplete="username" keyboardType="email-address" placeholder="you@business.co.ke" placeholderTextColor="#9aa4a7" style={styles.input} value={identifier} onChangeText={setIdentifier} returnKeyType="next" />
