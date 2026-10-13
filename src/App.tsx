@@ -3114,16 +3114,22 @@ async function createCameraReader(): Promise<CameraReader> {
       setError('Enter the M-Pesa phone number for each M-Pesa split.')
       return
     }
+    // An all-M-Pesa split against an already-open bill has nothing to book up front, so the
+    // billing endpoint is skipped (it rejects a zero received amount) and the STK Push is raised
+    // straight away against the open invoice. This is what made the prompt appear to do nothing.
+    const promptOnlyExistingBill = Boolean(subscription.open_invoice_id) && cashAmount <= 0 && mpesaAmount > 0
     setBusy(true); setError('')
     try {
       // Only the cash portion is booked with the bill, so nothing is added to income for the
       // M-Pesa part until Daraja confirms it. This mirrors the point-of-sale and invoice prompts.
-      const result = await request<{ invoice: InvoiceRecord & { amount_paid?: string; status: string }; payment: { received: string; applied: string; overpayment: string }; nextInvoiceDate: string | null }>(`/v1/service-subscriptions/${subscription.id}/billing`, { method: 'POST', body: JSON.stringify({
-        ...(subscription.open_invoice_id ? { invoiceId: subscription.open_invoice_id } : { dueDate: subscriptionBillingInput.dueDate }),
-        paymentDate: subscriptionBillingInput.paymentDate,
-        cashAmount,
-        mpesaAmount: 0,
-      }) })
+      const result = promptOnlyExistingBill
+        ? { invoice: { ...subscription, id: subscription.open_invoice_id as string, amount: String(subscription.amount_due), amount_paid: '0' } as InvoiceRecord & { amount_paid?: string; status: string }, payment: { received: '0', applied: '0', overpayment: '0' }, nextInvoiceDate: subscription.next_invoice_date ?? null }
+        : await request<{ invoice: InvoiceRecord & { amount_paid?: string; status: string }; payment: { received: string; applied: string; overpayment: string }; nextInvoiceDate: string | null }>(`/v1/service-subscriptions/${subscription.id}/billing`, { method: 'POST', body: JSON.stringify({
+          ...(subscription.open_invoice_id ? { invoiceId: subscription.open_invoice_id } : { dueDate: subscriptionBillingInput.dueDate }),
+          paymentDate: subscriptionBillingInput.paymentDate,
+          cashAmount,
+          mpesaAmount: 0,
+        }) })
       let emailed = false
       if (isNewBill && result.invoice.customer_email) {
         try {
@@ -3131,13 +3137,15 @@ async function createCameraReader(): Promise<CameraReader> {
           emailed = true
         } catch { /* the bill exists; sending can be retried from Networking */ }
       }
-      const [subscribers, invoices] = await Promise.all([
-        request<{ subscriptions: ServiceSubscription[]; supplierPayments: ServiceSupplierPayment[] }>(`/v1/services/${serviceId}/subscriptions`),
-        request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
-      ])
-      setServiceSubscriptions((current) => ({ ...current, [serviceId]: subscribers.subscriptions }))
-      setServiceSupplierPayments((current) => ({ ...current, [serviceId]: subscribers.supplierPayments }))
-      setInvoicesList(invoices.invoices)
+      if (!promptOnlyExistingBill) {
+        const [subscribers, invoices] = await Promise.all([
+          request<{ subscriptions: ServiceSubscription[]; supplierPayments: ServiceSupplierPayment[] }>(`/v1/services/${serviceId}/subscriptions`),
+          request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
+        ])
+        setServiceSubscriptions((current) => ({ ...current, [serviceId]: subscribers.subscriptions }))
+        setServiceSupplierPayments((current) => ({ ...current, [serviceId]: subscribers.supplierPayments }))
+        setInvoicesList(invoices.invoices)
+      }
       setSubscriptionBillingId('')
       setSubscriptionBillingInput({ dueDate: result.nextInvoiceDate ?? today, paymentDate: today })
       setSubscriptionBillingSplits([])
@@ -3164,7 +3172,6 @@ async function createCameraReader(): Promise<CameraReader> {
     } finally { setBusy(false) }
   }
 
-  // Ask Daraja whether the prompted M-Pesa portion was actually paid. Nothing is added to income
   // Ask Daraja whether the prompted M-Pesa portion was actually paid. Nothing is added to income
   // for that portion unless this returns a confirmed 'paid' status, exactly like the POS prompt.
   async function confirmSubscriptionMpesa() {
