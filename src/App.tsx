@@ -3123,7 +3123,7 @@ async function createCameraReader(): Promise<CameraReader> {
       // Only the cash portion is booked with the bill, so nothing is added to income for the
       // M-Pesa part until Daraja confirms it. This mirrors the point-of-sale and invoice prompts.
       const result = promptOnlyExistingBill
-        ? { invoice: { ...subscription, id: subscription.open_invoice_id as string, amount: String(subscription.amount_due), amount_paid: '0' } as InvoiceRecord & { amount_paid?: string; status: string }, payment: { received: '0', applied: '0', overpayment: '0' }, nextInvoiceDate: subscription.next_invoice_date ?? null }
+        ? { invoice: { id: subscription.open_invoice_id as string, customer: subscription.customer_name, customer_email: subscription.customer_email, description: `Service payment · ${subscription.customer_name}`, amount: String(subscription.amount_due), amount_paid: '0', due_date: subscription.next_invoice_date ?? today, status: 'unpaid' } as InvoiceRecord, payment: { received: '0', applied: '0', overpayment: '0' }, nextInvoiceDate: subscription.next_invoice_date ?? null }
         : await request<{ invoice: InvoiceRecord & { amount_paid?: string; status: string }; payment: { received: string; applied: string; overpayment: string }; nextInvoiceDate: string | null }>(`/v1/service-subscriptions/${subscription.id}/billing`, { method: 'POST', body: JSON.stringify({
           ...(subscription.open_invoice_id ? { invoiceId: subscription.open_invoice_id } : { dueDate: subscriptionBillingInput.dueDate }),
           paymentDate: subscriptionBillingInput.paymentDate,
