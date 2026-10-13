@@ -35,27 +35,30 @@ export function OverviewCashflowChart({ data, money }: { data: CashflowPoint[]; 
 
 export function ReportCharts({
   data,
-  monthlyIncome,
-  monthlyExpenses,
   rangeLabel,
   money,
 }: {
   data: CashflowPoint[]
-  monthlyIncome: number
-  monthlyExpenses: number
   rangeLabel: string
   money: MoneyFormatter
 }) {
+  const chartData = data.map((point) => ({
+    ...point,
+    income: Number.isFinite(point.income) ? point.income : 0,
+    expense: Number.isFinite(point.expense) ? point.expense : 0,
+  }))
+  const incomeTotal = chartData.reduce((total, point) => total + point.income, 0)
+  const expensesTotal = chartData.reduce((total, point) => total + point.expense, 0)
   const mix = [
-    { name: 'Income', value: monthlyIncome, color: '#7256df' },
-    { name: 'Expenses', value: monthlyExpenses, color: '#48b99e' },
+    { name: 'Income', value: incomeTotal, color: '#7256df' },
+    { name: 'Expenses', value: expensesTotal, color: '#48b99e' },
   ].filter((item) => item.value > 0)
 
   return <div className="dashboard-grid">
     <article className="module-card report-chart">
       <h2>Income vs expenses · {rangeLabel}</h2>
       <ResponsiveContainer width="100%" height={260}>
-        <BarChart data={data}>
+        <BarChart data={chartData}>
           <CartesianGrid vertical={false} stroke="#eff0f4" />
           <XAxis dataKey="date" />
           <YAxis />
@@ -77,7 +80,7 @@ export function ReportCharts({
           <Legend />
         </PieChart>
       </ResponsiveContainer>
-      {monthlyIncome + monthlyExpenses === 0 && <div className="empty-state">Add transactions to populate this chart.</div>}
+      {mix.length === 0 && <div className="empty-state">Add transactions to populate this chart.</div>}
     </article>
   </div>
 }

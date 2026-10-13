@@ -3148,10 +3148,9 @@ async function createCameraReader(): Promise<CameraReader> {
         const phone = mpesaSplits[0]?.phone.trim() ?? ''
         try {
           const prompt = await requestInvoiceMpesaPayment(result.invoice.id, phone, mpesaAmount)
-          setSubscriptionMpesaPending({ subscriptionId: subscription.id, invoiceId: result.invoice.id, amount: mpesaAmount, phone })
           await refresh()
           notify(`${isNewBill ? 'Bill created' : 'Cash payment recorded'} for ${subscription.customer_name}. An M-Pesa prompt for ${money(mpesaAmount)} was sent; confirm it before releasing the service. ${prompt.customerMessage}`)
-          watchMpesaPayment(result.invoice.id, mpesaAmount, `Service · ${subscription.customer_name}`, () => { setSubscriptionMpesaPending(null); void refreshAfterMpesaPaid(result.invoice.id) })
+          watchMpesaPayment(result.invoice.id, mpesaAmount, `Service · ${subscription.customer_name}`, () => { void refreshAfterMpesaPaid(result.invoice.id) })
         } catch (reason) {
           await refresh()
           setError(`Bill saved${cashAmount > 0 ? ` with ${money(cashAmount)} cash recorded` : ''} for ${subscription.customer_name}, but the M-Pesa prompt did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try again.'} Nothing was added to income for the M-Pesa part.`)
@@ -3165,6 +3164,7 @@ async function createCameraReader(): Promise<CameraReader> {
     } finally { setBusy(false) }
   }
 
+  // Ask Daraja whether the prompted M-Pesa portion was actually paid. Nothing is added to income
   // Ask Daraja whether the prompted M-Pesa portion was actually paid. Nothing is added to income
   // for that portion unless this returns a confirmed 'paid' status, exactly like the POS prompt.
   async function confirmSubscriptionMpesa() {
@@ -5441,7 +5441,7 @@ async function createCameraReader(): Promise<CameraReader> {
         </section> : page === 'Reports' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> REPORTS · WORKSPACE RECORDS</div><h1>Business reports</h1><p className="welcome-subtitle">Visual summaries from saved transactions and invoices. These are management views, not audited financial statements.</p>
           <Suspense fallback={<div className="dashboard-grid"><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-label="Loading reports charts" /><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-hidden="true" /></div>}>
-            <ReportCharts data={chart} monthlyIncome={Number(dashboard?.totals.monthIncome ?? 0)} monthlyExpenses={Number(dashboard?.totals.monthExpenses ?? 0)} rangeLabel={overviewRangeNames[overviewRange]} money={money} />
+            <ReportCharts data={chart} rangeLabel={overviewRangeNames[overviewRange]} money={money} />
           </Suspense>
           <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.income ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.expenses ?? 0)}</strong></div><div className="transaction-row"><span>Net movement · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.net ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices, for the period chosen in the Overview toolbar. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
           {retailReport && <article className="module-card"><h2>Retail and inventory insights</h2><div className="transaction-row"><span>Inventory valuation at recorded unit cost</span><strong>{money(retailReport.totalValuation)}</strong></div><h3>Reorder alerts</h3>{retailReport.reorderAlerts.map((item) => <div className="transaction-row" key={`${item.itemId}-${item.locationId}`}><span><strong>{item.name} · {item.location}</strong><small>{item.quantity} {item.unit} on hand · alert at {item.reorderPoint}</small></span><span className="status-pill amber">Reorder</span></div>)}{!retailReport.reorderAlerts.length && <p>No items are at or below their configured reorder points.</p>}<h3>Best sellers</h3>{retailReport.bestSellers.map((item) => <div className="transaction-row" key={item.itemId}><span><strong>{item.name}</strong><small>{item.quantitySold.toLocaleString('en-KE')} sold · revenue {money(item.revenue)} · cost estimate {money(item.cost)}</small></span><strong>Gross profit est. {money(item.grossProfit)}</strong></div>)}{!retailReport.bestSellers.length && <div className="empty-state">Post product sales to see best sellers and gross profit estimates.</div>}<p className="dialog-note">Inventory value uses current average item cost; product margins are management estimates and do not replace reviewed accounting valuation.</p></article>}

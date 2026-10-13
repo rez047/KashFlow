@@ -6,7 +6,7 @@ import { zipSync } from 'fflate'
 import { Alert, Linking, Pressable, StyleSheet, Text, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { WebView, type WebViewNavigation } from 'react-native-webview'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useKashFlow } from '../../src/components/KashFlowProvider'
 
 const WORKSPACE_URL = (process.env.EXPO_PUBLIC_WORKSPACE_URL || 'https://kashflow-frontend.onrender.com').replace(/\/$/, '')
@@ -60,6 +60,12 @@ export default function WorkspaceScreen() {
   const pendingExportChunks = useRef(new Map<string, { chunks: string[]; received: number }>())
   const expectedExports = useRef<number | null>(null)
   const exportTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    const nextToken = token ?? ''
+    const script = `(function(){var nextToken=${JSON.stringify(nextToken)};if(window.__kashflowNativeToken!==nextToken){window.__kashflowNativeToken=nextToken;window.location.reload();}})();true;`
+    webView.current?.injectJavaScript(script)
+  }, [token])
 
   function handleNavigation(state: WebViewNavigation) {
     setCanGoBack(state.canGoBack)
@@ -171,7 +177,6 @@ export default function WorkspaceScreen() {
         <Text style={styles.offlineBody}>Connect to use sales, accounting, payroll, reports, settings, and the rest of your online workspace. Your saved inventory, counts, and sync review remain available in the other tabs.</Text>
       </View> : <View style={styles.webArea}>
         <WebView
-          key={token ?? 'guest'}
           ref={webView}
           source={{ uri: WORKSPACE_URL }}
           injectedJavaScriptBeforeContentLoaded={`window.__kashflowNativeToken = ${JSON.stringify(token ?? '')}; true;`}
