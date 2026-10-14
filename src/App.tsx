@@ -544,7 +544,6 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
           <a href="#who-we-serve">Who we serve</a>
           <a href="#whats-included">What&apos;s included</a>
           <a href="#compliance">Kenya compliance</a>
-          <a href="#pricing">Pricing</a>
           <a href="#contact">Contact</a>
         </nav>
         <div className="landing-nav-actions">
@@ -2560,7 +2559,7 @@ async function createCameraReader(): Promise<CameraReader> {
         const mpesaSplits = splits.filter((split) => split.method === 'mpesa')
         for (const split of cashSplits) {
           try {
-            await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today }) })
+            await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today, paymentMethod: 'cash' }) })
             receipt.amountPaid += Number(split.amount)
           } catch (reason) {
             failures.push(`Cash ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
@@ -2587,7 +2586,7 @@ async function createCameraReader(): Promise<CameraReader> {
         if (mpesaPrompted > 0) watchMpesaPayment(created.invoice.id, mpesaPrompted, `Point of sale · ${customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid for the M-Pesa ${money(mpesaPrompted)}`; setPosReceipt({ ...receipt }) })
       } else if (posPaymentMethod === 'cash') {
         try {
-          await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: total, paymentDate: today }) })
+          await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: total, paymentDate: today, paymentMethod: 'cash' }) })
           receipt.amountPaid = total
           receipt.balanceDue = 0
           receipt.status = 'Paid · cash recorded'
@@ -2636,7 +2635,7 @@ async function createCameraReader(): Promise<CameraReader> {
     setBusy(true)
     setError('')
     try {
-      await request(`/v1/invoices/${posReceipt.invoiceId}/payments`, { method: 'POST', body: JSON.stringify({ amount: posReceipt.amount, paymentDate: today }) })
+      await request(`/v1/invoices/${posReceipt.invoiceId}/payments`, { method: 'POST', body: JSON.stringify({ amount: posReceipt.amount, paymentDate: today, paymentMethod: 'cash' }) })
       setPosReceipt({ ...posReceipt, amountPaid: posReceipt.amount, balanceDue: 0, status: 'Paid · cash recorded' })
       notify('Cash payment recorded against the saved POS invoice.')
       const listedInvoices = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
@@ -2812,7 +2811,7 @@ async function createCameraReader(): Promise<CameraReader> {
   async function payInvoice(invoiceRow: InvoiceRecord) {
     setBusy(true); setError('')
     try {
-      await request(`/v1/invoices/${invoiceRow.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(paymentAmounts[invoiceRow.id]), paymentDate: today }) })
+      await request(`/v1/invoices/${invoiceRow.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(paymentAmounts[invoiceRow.id]), paymentDate: today, paymentMethod: 'cash' }) })
       const result = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
       setInvoicesList(result.invoices); setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: '' })); await refresh(); notify('Invoice payment recorded in the ledger.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not record invoice payment.') }
@@ -2835,7 +2834,7 @@ async function createCameraReader(): Promise<CameraReader> {
       // the STK Push collects only that portion and a part-paid invoice still works.
       for (const split of splits.filter((item) => item.method === 'cash')) {
         try {
-          await request(`/v1/invoices/${invoiceRow.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today }) })
+          await request(`/v1/invoices/${invoiceRow.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(split.amount), paymentDate: today, paymentMethod: 'cash' }) })
         } catch (reason) {
           failures.push(`Cash ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
         }

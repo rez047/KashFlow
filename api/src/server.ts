@@ -3724,8 +3724,11 @@ app.patch('/v1/invoices/:invoiceId/status', requirePool, verifyOrigin, requireSe
 })
 
 app.post('/v1/invoices/:invoiceId/payments', requirePool, verifyOrigin, requireSession, requireAccountingRole, async (request: AuthedRequest, response, next) => {
-  const input = z.object({ amount: z.coerce.number().finite().positive().max(999999999999), paymentDate: z.string().date() }).safeParse(request.body)
+  const input = z.object({ amount: z.coerce.number().finite().positive().max(999999999999), paymentDate: z.string().date(), paymentMethod: z.enum(['cash', 'mpesa', 'manual']).default('manual') }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a positive payment amount and valid payment date.' }); return }
+  // M-Pesa money is only ever booked by the signed Daraja callback. Reject any attempt to record
+  // an M-Pesa amount manually here so income is never credited before Daraja confirms receipt.
+  if (input.data.paymentMethod === 'mpesa') { response.status(400).json({ error: 'M-Pesa payments cannot be recorded manually. Start the M-Pesa prompt from the invoice or point of sale; income is posted only after Daraja confirms the payment.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
@@ -3737,7 +3740,7 @@ app.post('/v1/invoices/:invoiceId/payments', requirePool, verifyOrigin, requireS
     const due = Number(invoice.amount) - Number(invoice.amount_paid) - Number(returns.rows[0].returned) + Number(returns.rows[0].refunded)
     if (Math.round(input.data.amount * 100) > Math.round(due * 100)) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Payment cannot exceed the outstanding invoice balance.' }); return }
     const paymentId = randomUUID()
-    await client.query('INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, created_by) VALUES ($1, $2, $3, $4, $5, $6)', [paymentId, request.session!.workspaceId, invoice.id, input.data.amount.toFixed(2), input.data.paymentDate, request.session!.userId])
+    await client.query('INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, created_by, payment_method) VALUES ($1, $2, $3, $4, $5, $6, $7)', [paymentId, request.session!.workspaceId, invoice.id, input.data.amount.toFixed(2), input.data.paymentDate, request.session!.userId, input.data.paymentMethod === 'cash' ? 'cash' : 'manual'])
     const updated = await client.query(`UPDATE invoices SET amount_paid = amount_paid + $1,
       status = CASE WHEN amount_paid + $1 >= amount
         - COALESCE((SELECT SUM(amount) FROM sales_returns WHERE invoice_id = $2), 0)
@@ -5985,6 +5988,10 @@ app.post('/v1/service-subscriptions/:subscriptionId/billing', requirePool, verif
   if (!input.success) { response.status(400).json({ error: 'Enter a valid due date and non-negative cash or M-Pesa payment amounts.' }); return }
   const cashAmount = Number(input.data.cashAmount.toFixed(2))
   const mpesaAmount = Number(input.data.mpesaAmount.toFixed(2))
+  // An M-Pesa portion must never be booked here. Daraja confirms a payment only through its
+  // signed STK callback, which is the single place that posts M-Pesa income. If a split sends
+  // mpesaAmount > 0, we reject it so a client cannot credit income before Daraja confirms receipt.
+  if (mpesaAmount > 0) { response.status(400).json({ error: 'The M-Pesa part of a split cannot be recorded here. Start the M-Pesa prompt with POST /v1/invoices/:invoiceId/payments/mpesa; income is posted only after Daraja confirms the payment.' }); return }
   const paymentTotal = Number((cashAmount + mpesaAmount).toFixed(2))
   if (input.data.invoiceId && paymentTotal <= 0) { response.status(400).json({ error: 'Enter an amount received before recording an additional payment.' }); return }
 
@@ -6039,19 +6046,14 @@ app.post('/v1/service-subscriptions/:subscriptionId/billing', requirePool, verif
     const applied = Math.min(paymentTotal, outstanding)
     const overpayment = Number((paymentTotal - applied).toFixed(2))
     if (paymentTotal > 0) {
-      if (cashAmount > 0) await client.query(`INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, created_by, payment_method)
+      await client.query(`INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, created_by, payment_method)
         VALUES ($1, $2, $3, $4, $5, $6, 'cash')`,
       [randomUUID(), request.session!.workspaceId, invoice.id, cashAmount.toFixed(2), input.data.paymentDate, request.session!.userId])
-      if (mpesaAmount > 0) await client.query(`INSERT INTO invoice_payments
-        (id, workspace_id, invoice_id, amount, payment_date, created_by, payment_method, payment_reference)
-        VALUES ($1, $2, $3, $4, $5, $6, 'mpesa', $7)`,
-      [randomUUID(), request.session!.workspaceId, invoice.id, mpesaAmount.toFixed(2), input.data.paymentDate, request.session!.userId, input.data.mpesaReference])
       const paidAmount = Math.min(Number(invoice.amount), Number(invoice.amount_paid ?? 0) + applied)
       await client.query(`UPDATE invoices SET amount_paid = $1, status = CASE WHEN $1 >= amount THEN 'paid' ELSE 'unpaid' END
         WHERE id = $2 AND workspace_id = $3`, [paidAmount.toFixed(2), invoice.id, request.session!.workspaceId])
       const lines: JournalLineInput[] = []
       if (cashAmount > 0) lines.push({ accountCode: '1000', debit: cashAmount, credit: 0, description: 'Cash received' })
-      if (mpesaAmount > 0) lines.push({ accountCode: '1000', debit: mpesaAmount, credit: 0, description: 'M-Pesa received' })
       if (applied > 0) lines.push({ accountCode: '1100', debit: 0, credit: applied, description: 'Applied to subscriber bill' })
       if (overpayment > 0) lines.push({ accountCode: '2300', debit: 0, credit: overpayment, description: 'Customer advance' })
       await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId,
@@ -6059,7 +6061,7 @@ app.post('/v1/service-subscriptions/:subscriptionId/billing', requirePool, verif
         sourceType: 'service_subscription_payment', sourceId: String(invoice.id), lines })
       await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId,
         eventType: 'service_subscription.payment_recorded', entityType: 'service_subscription', entityId: String(subscription.id),
-        eventData: { invoiceId: invoice.id, paymentDate: input.data.paymentDate, cashAmount, mpesaAmount, applied: applied.toFixed(2), overpayment: overpayment.toFixed(2) } })
+        eventData: { invoiceId: invoice.id, paymentDate: input.data.paymentDate, cashAmount, applied: applied.toFixed(2), overpayment: overpayment.toFixed(2) } })
     }
     const refreshed = await client.query('SELECT id, customer, customer_email, description, amount::text, amount_paid::text, due_date, status FROM invoices WHERE id = $1', [invoice.id])
     await client.query('COMMIT')
