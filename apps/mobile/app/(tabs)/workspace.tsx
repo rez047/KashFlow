@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons'
 import * as FileSystem from 'expo-file-system/legacy'
 import * as Print from 'expo-print'
+import * as SecureStore from 'expo-secure-store'
 import * as Sharing from 'expo-sharing'
 import { zipSync } from 'fflate'
 import { Alert, Linking, Pressable, StyleSheet, Text, View } from 'react-native'
@@ -13,6 +14,7 @@ const WORKSPACE_URL = (process.env.EXPO_PUBLIC_WORKSPACE_URL || 'https://kashflo
 const WORKSPACE_ORIGIN = new URL(WORKSPACE_URL).origin
 const WORKSPACE_PROTOCOL = new URL(WORKSPACE_URL).protocol
 const WEBVIEW_BRIDGE = `(function(){if(window.__kashflowMobileBridgeInstalled)return true;window.__kashflowMobileExports=new Map();const create=URL.createObjectURL.bind(URL);URL.createObjectURL=function(blob){const url=create(blob);window.__kashflowMobileExports.set(url,blob);return url};document.addEventListener('click',function(event){const link=event.target instanceof Element?event.target.closest('a[download]'):null;if(!link||!link.href.startsWith('blob:'))return;const blob=window.__kashflowMobileExports.get(link.href);if(!blob)return;event.preventDefault();const reader=new FileReader();reader.onloadend=function(){const data=String(reader.result||'');const base64=data.slice(data.indexOf(',')+1);const size=32768;const total=Math.max(1,Math.ceil(base64.length/size));for(let index=0;index<total;index++){window.ReactNativeWebView.postMessage(JSON.stringify({type:'workspace-export-chunk',name:link.download||'kashflow-export.csv',index,total,chunk:base64.slice(index*size,(index+1)*size)}))}};reader.readAsDataURL(blob)},true);window.print=function(){window.ReactNativeWebView.postMessage(JSON.stringify({type:'workspace-print',html:document.documentElement.outerHTML,title:document.title}))};window.__kashflowMobileBridgeInstalled=true})();true;`
+const OFFLINE_SHELL_CHECK = `(async function(){const finish=function(ready){try{window.ReactNativeWebView.postMessage(JSON.stringify({type:'workspace-offline-shell-status',ready:Boolean(ready)}))}catch(_){}};const timeout=function(){return new Promise(function(_,reject){setTimeout(function(){reject(new Error('offline-shell-timeout'))},45000)})};try{if(!('serviceWorker'in navigator)||!('caches'in window)){finish(false);return}await Promise.race([navigator.serviceWorker.ready,timeout()]);if(!navigator.serviceWorker.controller){await Promise.race([new Promise(function(resolve){navigator.serviceWorker.addEventListener('controllerchange',resolve,{once:true})}),timeout()])}const appShell=await caches.match(new URL('/index.html',location.origin).href);const assets=Array.from(document.querySelectorAll('script[src],link[rel~="stylesheet"],link[rel~="modulepreload"]')).map(function(node){return node.src||node.href}).filter(function(url){return url&&new URL(url).origin===location.origin});const cachedAssets=await Promise.all(assets.map(function(url){return caches.match(url)}));finish(Boolean(appShell&&navigator.serviceWorker.controller&&cachedAssets.every(Boolean)))}catch(_){finish(false)}})();true;`
 
 function bytesToBase64(bytes: Uint8Array) {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -53,6 +55,8 @@ export default function WorkspaceScreen() {
   const webView = useRef<WebView>(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
+  const [offlineShellReady, setOfflineShellReady] = useState(false)
+  const [offlineShellChecked, setOfflineShellChecked] = useState(false)
   const [canGoBack, setCanGoBack] = useState(false)
   const [currentUrl, setCurrentUrl] = useState(WORKSPACE_URL)
   const [sharingExport, setSharingExport] = useState(false)
@@ -60,6 +64,14 @@ export default function WorkspaceScreen() {
   const pendingExportChunks = useRef(new Map<string, { chunks: string[]; received: number }>())
   const expectedExports = useRef<number | null>(null)
   const exportTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    let active = true
+    void SecureStore.getItemAsync('kashflow.workspace.offline-shell-ready').then((value) => {
+      if (active && value === 'true') setOfflineShellReady(true)
+    }).catch(() => undefined)
+    return () => { active = false }
+  }, [])
 
   useEffect(() => {
     const nextToken = token ?? ''
@@ -99,9 +111,13 @@ export default function WorkspaceScreen() {
 
   function handleWebMessage(message: string) {
     try {
-      const payload = JSON.parse(message) as { type?: string; accessToken?: string; name?: string; index?: number; total?: number; chunk?: string; expected?: number; html?: string }
+      const payload = JSON.parse(message) as { type?: string; accessToken?: string; name?: string; index?: number; total?: number; chunk?: string; expected?: number; html?: string; ready?: boolean }
       if (payload.type === 'session-token' && typeof payload.accessToken === 'string') {
         void updateSessionToken(payload.accessToken).catch(() => Alert.alert('Session update failed', 'The device could not save the workspace session securely. Sign in again or check device storage.'))
+      } else if (payload.type === 'workspace-offline-shell-status' && typeof payload.ready === 'boolean') {
+        setOfflineShellChecked(true)
+        setOfflineShellReady(payload.ready)
+        void SecureStore.setItemAsync('kashflow.workspace.offline-shell-ready', String(payload.ready)).catch(() => undefined)
       } else if (payload.type === 'workspace-export-chunk' && typeof payload.name === 'string' && typeof payload.index === 'number' && typeof payload.total === 'number' && typeof payload.chunk === 'string') {
         const name = payload.name.replace(/[^a-zA-Z0-9._-]/g, '-')
         const part = pendingExportChunks.current.get(name) ?? { chunks: Array.from({ length: payload.total }, () => ''), received: 0 }
@@ -171,10 +187,12 @@ export default function WorkspaceScreen() {
         </View>
       </View>
 
+      {online && <View style={styles.shellStatus}><Ionicons name={offlineShellReady ? 'checkmark-circle' : offlineShellChecked ? 'cloud-download-outline' : 'time-outline'} size={14} color={offlineShellReady ? '#14866b' : '#a87532'} /><Text style={styles.shellStatusText}>{offlineShellReady ? 'Offline workspace saved on this phone' : offlineShellChecked ? 'Offline cache not ready. Reconnect and reload this tab.' : 'Saving the mobile workspace for offline use…'}</Text></View>}
+
       {!online && <View style={styles.offlineCard}>
         <View style={styles.offlineIcon}><Ionicons name="cloud-offline-outline" size={19} color="#a87532" /></View>
-        <View style={styles.offlineCopy}><Text style={styles.offlineTitle}>Offline workspace</Text>
-          <Text style={styles.offlineBody}>Opening this device’s saved workspace. Changes will sync when you reconnect.</Text></View>
+        <View style={styles.offlineCopy}><Text style={styles.offlineTitle}>{offlineShellReady ? 'Saved full workspace ready' : 'Offline field tools available'}</Text>
+          <Text style={styles.offlineBody}>{offlineShellReady ? 'Opening this phone’s saved workspace. Changes will sync when you reconnect.' : offlineShellChecked ? 'This phone has no confirmed saved suite yet. Reconnect and open this tab once to cache it.' : 'Checking this phone’s saved suite. Inventory and count tools remain available.'}</Text></View>
       </View>}
       <View style={styles.webArea}>
         <WebView
@@ -194,16 +212,16 @@ export default function WorkspaceScreen() {
           onMessage={(event) => handleWebMessage(event.nativeEvent.data)}
           onShouldStartLoadWithRequest={(request) => allowNavigation(request.url)}
           onLoadStart={() => { setLoading(true); setLoadError(false) }}
-          onLoadEnd={() => setLoading(false)}
-          onError={() => { setLoading(false); setLoadError(true) }}
-          onHttpError={(event) => { if (event.nativeEvent.statusCode >= 500) setLoadError(true) }}
+          onLoadEnd={() => { setLoading(false); webView.current?.injectJavaScript(OFFLINE_SHELL_CHECK) }}
+          onError={() => { setLoading(false); setLoadError(true); setOfflineShellChecked(true); setOfflineShellReady(false); void SecureStore.setItemAsync('kashflow.workspace.offline-shell-ready', 'false').catch(() => undefined) }}
+          onHttpError={(event) => { if (event.nativeEvent.statusCode >= 500) { setLoadError(true); setOfflineShellChecked(true); setOfflineShellReady(false); void SecureStore.setItemAsync('kashflow.workspace.offline-shell-ready', 'false').catch(() => undefined) } }}
           onFileDownload={({ nativeEvent }) => { void Linking.openURL(nativeEvent.downloadUrl).catch(() => setLoadError(true)) }}
           style={styles.webView}
         />
         {loadError && <View style={styles.errorOverlay}>
           <View style={styles.errorIcon}><Ionicons name="cloud-offline-outline" size={22} color="#b04c40" /></View>
           <Text style={styles.errorTitle}>Workspace could not load</Text>
-          <Text style={styles.errorBody}>Check your connection and try again. Your offline stock tools are still available in the other tabs.</Text>
+          <Text style={styles.errorBody}>{offlineShellReady ? 'This phone has cached the suite, but the last load failed. Retry it; your offline inventory and counts remain available in the other tabs.' : 'The full suite has not been confirmed in this phone’s offline cache. Reconnect and open it once; your offline inventory and counts remain available in the other tabs.'}</Text>
           <Pressable accessibilityRole="button" onPress={() => { setLoadError(false); webView.current?.reload() }} style={styles.retryButton}><Ionicons name="refresh" size={15} color="#fff" /><Text style={styles.retryText}>Try again</Text></Pressable>
         </View>}
         {loading && !loadError && <View pointerEvents="none" style={styles.loadingOverlay}><View style={styles.loadingMark}><Ionicons name="layers" size={20} color="#fff" /></View><Text style={styles.loadingText}>Opening your business workspace…</Text></View>}
@@ -217,6 +235,7 @@ const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: '#f6f5f1' },
   screen: { flex: 1, backgroundColor: '#f6f5f1' },
   toolbar: { minHeight: 58, paddingHorizontal: 16, paddingVertical: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 1, borderBottomColor: '#e6e8e2', backgroundColor: '#fff' },
+  shellStatus: { minHeight: 29, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#f0f7f2' }, shellStatusText: { color: '#71827a', fontSize: 10, fontWeight: '700' },
   heading: { flex: 1 }, kicker: { color: '#14876d', fontSize: 9, fontWeight: '900', letterSpacing: 1.5 }, title: { color: '#1d2b30', fontSize: 17, fontWeight: '800', marginTop: 2 },
   controls: { flexDirection: 'row', gap: 7 }, control: { width: 36, height: 36, borderRadius: 11, backgroundColor: '#f2f5f1', borderWidth: 1, borderColor: '#e5e9e2', alignItems: 'center', justifyContent: 'center' }, controlDisabled: { backgroundColor: '#f8f9f7' },
   webArea: { flex: 1, backgroundColor: '#fff' }, webView: { flex: 1, backgroundColor: '#fff' },

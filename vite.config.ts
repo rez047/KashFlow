@@ -5,6 +5,7 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [react()],
   build: {
+    manifest: 'kashflow-assets-manifest.json',
     rolldownOptions: {
       output: {
         codeSplitting: {
