@@ -1387,6 +1387,18 @@ app.get('/v1/auth/me', requirePool, requireSession, async (request: AuthedReques
   } catch (error) { next(error) }
 })
 
+app.get('/v1/expenses', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
+  try {
+    const expenses = await pool!.query(`SELECT id, description, amount::text, direction, account, transaction_date
+      FROM ledger_transactions WHERE workspace_id = $1 AND direction = 'expense'
+      ORDER BY transaction_date DESC, created_at DESC`, [request.session!.workspaceId])
+    response.json({ expenses: expenses.rows.map((row: Record<string, unknown>) => ({
+      ...row,
+      transaction_date: row.transaction_date instanceof Date ? row.transaction_date.toISOString().slice(0, 10) : String(row.transaction_date).slice(0, 10),
+    })) })
+  } catch (error) { next(error) }
+})
+
 app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   const today = nairobiToday()
   const defaultFrom = `${today.slice(0, 7)}-01`

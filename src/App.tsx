@@ -838,6 +838,7 @@ function App() {
   const [statusOpen, setStatusOpen] = useState(false)
   const [account, setAccount] = useState<Account | null>(null)
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
+  const [expenses, setExpenses] = useState<Transaction[] | null>(null)
   const [integrationReadiness, setIntegrationReadiness] = useState<IntegrationReadiness | null>(null)
   const [showSetupFlow, setShowSetupFlow] = useState(false)
   const [authPanelOpen, setAuthPanelOpen] = useState(false)
@@ -1404,6 +1405,12 @@ function App() {
   useEffect(() => {
     if (!account) return
     void request<IntegrationReadiness>('/v1/integrations/readiness').then(setIntegrationReadiness).catch(() => undefined)
+    if (page === 'Expenses') {
+      setExpenses(null)
+      void request<{ expenses: Transaction[] }>('/v1/expenses')
+        .then((result) => setExpenses(result.expenses))
+        .catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load expenses.'))
+    }
     if (page === 'Payroll') {
       void Promise.all([
         request<{ employees: Employee[] }>('/v1/payroll/employees').then((result) => {
@@ -2030,7 +2037,16 @@ function App() {
     try {
       await request('/v1/transactions', { method: 'POST', body: JSON.stringify({ ...transaction, amount: Number(transaction.amount) }) })
       setModal(null); setTransaction({ description: '', amount: '', direction: 'expense', account: '', date: today })
-      await refresh(); notify('Transaction saved to this workspace')
+      await refresh()
+      if (page === 'Expenses') {
+        try {
+          const result = await request<{ expenses: Transaction[] }>('/v1/expenses')
+          setExpenses(result.expenses)
+        } catch (reason) {
+          setError(reason instanceof Error ? reason.message : 'Transaction saved, but could not refresh expenses.')
+        }
+      }
+      notify('Transaction saved to this workspace')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not save transaction.')
     } finally { setBusy(false) }
@@ -4938,7 +4954,7 @@ async function createCameraReader(): Promise<CameraReader> {
           <div className="eyebrow"><span className="live-dot" /> EXPENSES · SAVED TRANSACTIONS</div><h1>Expenses</h1><p className="welcome-subtitle">Create and review expenses. Saving a record posts its balanced ledger entry.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <button className="button button-primary" onClick={() => { setTransaction({ description: '', amount: '', direction: 'expense', account: 'Operating expenses', date: today }); setModal('transaction') }}><Plus size={16} /> Add expense</button>
-          <article className="module-card">{(dashboard?.transactions ?? []).filter((row) => row.direction === 'expense').map((row) => <div className="transaction-row" key={row.id}><span><strong>{row.description}</strong><small>{row.transaction_date} · {row.account}</small></span><strong>{money(row.amount)}</strong></div>)}{!(dashboard?.transactions ?? []).some((row) => row.direction === 'expense') && <div className="empty-state">No expenses saved yet.</div>}</article>
+          <article className="module-card"><h2>All saved expenses{expenses ? ` · ${expenses.length}` : ''}</h2>{expenses === null ? <div className="empty-state">Loading expenses…</div> : expenses.map((row) => <div className="transaction-row" key={row.id}><span><strong>{row.description}</strong><small>{row.transaction_date} · {row.account}</small></span><strong>{money(row.amount)}</strong></div>)}{expenses?.length === 0 && <div className="empty-state">No expenses saved yet.</div>}</article>
         </section> : ['Customers', 'Suppliers', 'Inventory', 'Services', 'Projects'].includes(page) ? (() => {
           const type = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Services: 'services', Projects: 'projects' } as Record<string, 'customers' | 'suppliers' | 'inventory' | 'services' | 'projects'>)[page]
           const recordLabel = type === 'inventory' ? 'inventory item' : type === 'services' ? 'service' : page.slice(0, -1).toLowerCase()
