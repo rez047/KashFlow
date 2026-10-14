@@ -624,6 +624,89 @@ function permissionForRequest(request: AuthedRequest): WorkspacePermission | nul
   if (routePath.startsWith('/v1/workspaces')) return 'workspace.manage'
   return null
 }
+function idempotentMutationHandler(handler: express.RequestHandler): express.RequestHandler {
+  return async (request, response, next) => {
+    const key = request.get('Idempotency-Key')
+    const sessionRequest = request as AuthedRequest
+    if (!key || !sessionRequest.session || !pool) return handler(request, response, next)
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(key)) {
+      response.status(400).json({ error: 'Idempotency-Key must be a UUID.' })
+      return
+    }
+    const requestHash = createHash('sha256').update(JSON.stringify({ method: request.method, path: request.originalUrl, body: request.body ?? null })).digest('hex')
+    try {
+      const inserted = await pool.query(`INSERT INTO api_idempotency_keys (workspace_id, user_id, idempotency_key, request_hash, status)
+        VALUES ($1, $2, $3, $4, 'processing') ON CONFLICT (workspace_id, user_id, idempotency_key) DO NOTHING RETURNING idempotency_key`,
+      [sessionRequest.session.workspaceId, sessionRequest.session.userId, key, requestHash])
+      if (!inserted.rowCount) {
+        const prior = await pool.query(`SELECT request_hash, status, response_status, response_body
+          FROM api_idempotency_keys WHERE workspace_id = $1 AND user_id = $2 AND idempotency_key = $3`,
+        [sessionRequest.session.workspaceId, sessionRequest.session.userId, key])
+        const row = prior.rows[0]
+        if (!row || row.request_hash !== requestHash) {
+          response.status(409).json({ error: 'This idempotency key was already used for a different change.' })
+          return
+        }
+        if (row.status === 'complete') {
+          response.setHeader('Idempotency-Replayed', 'true')
+          response.status(Number(row.response_status) || 200).json(row.response_body ?? {})
+          return
+        }
+        response.status(409).json({ error: 'A previous attempt has an unknown or in-progress result. Review the record before retrying this change.' })
+        return
+      }
+
+      const send = response.send.bind(response)
+      const end = response.end.bind(response)
+      let responseCaptured = false
+      function persistResult(status: number, body: unknown, finish: () => void) {
+        if (responseCaptured) { finish(); return }
+        responseCaptured = true
+        let responseBody: unknown = {}
+        if (Buffer.isBuffer(body)) {
+          try { responseBody = JSON.parse(body.toString('utf8')) } catch { responseBody = { message: body.toString('utf8').slice(0, 500) } }
+        } else if (typeof body === 'string') {
+          try { responseBody = JSON.parse(body) } catch { responseBody = { message: body.slice(0, 500) } }
+        } else if (body !== undefined && body !== null && typeof body !== 'function') responseBody = body
+        void pool!.query(`UPDATE api_idempotency_keys SET status = $1, response_status = $2, response_body = $3::jsonb, updated_at = now()
+          WHERE workspace_id = $4 AND user_id = $5 AND idempotency_key = $6`,
+        [status >= 500 ? 'unknown' : 'complete', status, JSON.stringify(responseBody), sessionRequest.session!.workspaceId, sessionRequest.session!.userId, key])
+          .then(finish)
+          .catch((error: unknown) => {
+            console.error('Could not persist an API idempotency result:', error)
+            response.statusCode = 503
+            response.setHeader('Content-Type', 'application/json; charset=utf-8')
+            end(JSON.stringify({ error: 'The change may have reached the business system, but its sync receipt could not be saved. Reconcile it before retrying.' }))
+          })
+      }
+      response.send = ((body?: unknown) => {
+        persistResult(response.statusCode, body, () => { send(body as never) })
+        return response
+      }) as typeof response.send
+      response.end = ((...args: any[]) => {
+        if (responseCaptured) return end(...args)
+        const body = typeof args[0] === 'function' ? undefined : args[0]
+        persistResult(response.statusCode, body, () => { end(...args) })
+        return response
+      }) as typeof response.end
+      return handler(request, response, next)
+    } catch (error) { next(error) }
+  }
+}
+
+function installIdempotencyOnMutationRoutes() {
+  const register = app as unknown as Record<string, (path: string, ...handlers: express.RequestHandler[]) => express.Application>
+  for (const method of ['post', 'put', 'patch', 'delete'] as const) {
+    const original = register[method]?.bind(app)
+    if (!original) continue
+    register[method] = (path, ...handlers) => {
+      const last = handlers.length - 1
+      const callback = handlers[last]
+      if (typeof callback === 'function') handlers[last] = idempotentMutationHandler(callback)
+      return original(path, ...handlers)
+    }
+  }
+}
 async function requireWorkspaceAdmin(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
   const permission = permissionForRequest(request)
   if (request.workspaceRole !== 'admin' && (!permission || !(request.workspacePermissions ?? []).includes(permission))) {
@@ -763,7 +846,7 @@ async function resolveWorkspaceDarajaConfig(workspaceId: string): Promise<Daraja
 }
 app.disable('x-powered-by')
 app.use(helmet())
-app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Kashflow-Client'] }))
+app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Kashflow-Client', 'Idempotency-Key'] }))
 app.use(express.json({ limit: '8mb', type: 'application/json' }))
 app.use(rateLimit({
   windowMs: 60_000,
@@ -778,6 +861,8 @@ app.use((request, response, next) => {
   if (request.path.startsWith('/v1/platform/backups') || request.path === '/health' || request.path === '/ready') { next(); return }
   response.status(503).json({ error: 'This API instance is in database restore maintenance mode.' })
 })
+
+installIdempotencyOnMutationRoutes()
 
 const releaseDownloads = {
   windows: {
@@ -997,7 +1082,7 @@ app.post('/v1/auth/bootstrap', requirePool, verifyOrigin, rateLimit({ windowMs: 
     const session = { userId: row.id, workspaceId: row.workspace_id, sessionVersion: Number(row.session_version), expiresAt: Date.now() + sessionTtlSeconds * 1000 }
     setSessionCookie(response, session)
     const accessToken = isNativeClient(request) ? nativeSessionToken(session) : null
-    response.status(201).json({ user: { email: row.email ?? row.phone }, workspace: { id: row.workspace_id, name: input.data.businessName }, workspaces: [{ id: row.workspace_id, name: input.data.businessName, role: 'admin' }], ...(accessToken ? { accessToken } : {}) })
+    response.status(201).json({ user: { id: row.id, email: row.email ?? row.phone }, workspace: { id: row.workspace_id, name: input.data.businessName }, workspaces: [{ id: row.workspace_id, name: input.data.businessName, role: 'admin' }], ...(accessToken ? { accessToken } : {}) })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
@@ -1041,7 +1126,7 @@ app.post('/v1/auth/login', requirePool, verifyOrigin, rateLimit({ windowMs: 15 *
     const session = { userId: user.id, workspaceId: user.workspace_id, sessionVersion: Number(user.session_version ?? 0), expiresAt: Date.now() + sessionTtlSeconds * 1000 }
     setSessionCookie(response, session)
     const accessToken = isNativeClient(request) ? nativeSessionToken(session) : null
-    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces, ...(accessToken ? { accessToken } : {}) })
+    response.json({ user: { id: user.id, email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces, ...(accessToken ? { accessToken } : {}) })
   } catch (error) { next(error) }
 })
 
@@ -1098,7 +1183,7 @@ app.post('/v1/auth/two-factor/verify-login', requirePool, verifyOrigin, rateLimi
     const session = { userId: user.id, workspaceId: user.workspace_id, sessionVersion: Number(user.session_version ?? 0), expiresAt: Date.now() + sessionTtlSeconds * 1000 }
     setSessionCookie(response, session)
     const accessToken = isNativeClient(request) ? nativeSessionToken(session) : null
-    response.json({ user: { email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces, verifiedWith: method, ...(accessToken ? { accessToken } : {}) })
+    response.json({ user: { id: user.id, email: user.email ?? user.phone }, workspace: { id: user.workspace_id, name: user.workspace_name }, workspaces, verifiedWith: method, ...(accessToken ? { accessToken } : {}) })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
@@ -1383,7 +1468,7 @@ app.get('/v1/auth/me', requirePool, requireSession, async (request: AuthedReques
     const membershipsResult = await pool!.query('SELECT wm.workspace_id, wm.role, w.name FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id WHERE wm.user_id = $1 ORDER BY w.name ASC', [request.session!.userId])
     const memberships: Array<{ workspace_id: string; role: string; name: string }> = membershipsResult.rows as Array<{ workspace_id: string; role: string; name: string }>
     const workspaces = memberships.length ? memberships.map((row) => ({ id: row.workspace_id, name: row.name, role: row.role })) : [{ id: result.rows[0].workspace_id, name: result.rows[0].workspace_name, role: 'admin' }]
-    response.json({ user: { email: result.rows[0].email ?? result.rows[0].phone }, workspace: { id: result.rows[0].workspace_id, name: result.rows[0].workspace_name, permissions: request.workspacePermissions ?? [] }, workspaces })
+    response.json({ user: { id: request.session!.userId, email: result.rows[0].email ?? result.rows[0].phone }, workspace: { id: result.rows[0].workspace_id, name: result.rows[0].workspace_name, permissions: request.workspacePermissions ?? [] }, workspaces })
   } catch (error) { next(error) }
 })
 

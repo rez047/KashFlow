@@ -41,7 +41,7 @@ export default function HomeScreen() {
 
       <Pressable style={[styles.connectCard, online ? styles.connectOnline : styles.connectOffline]} onPress={() => online ? void refresh() : void syncNow()}>
         <View style={[styles.connectIcon, online ? styles.connectIconOnline : styles.connectIconOffline]}><Ionicons name={online ? 'cloud-done-outline' : 'cloud-offline-outline'} size={19} color={online ? '#14866b' : '#bc7b28'} /></View>
-        <View style={styles.connectCopy}><Text style={styles.connectTitle}>{online ? 'Your workspace is connected' : 'You’re ready to keep counting'}</Text><Text style={styles.connectSub}>{online ? `Last refresh ${snapshot?.refreshedAt ? new Date(snapshot.refreshedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'not yet'}` : 'Counts save on this device until you reconnect.'}</Text></View>
+        <View style={styles.connectCopy}><Text style={styles.connectTitle}>{online ? 'Your workspace is connected' : 'Working from this device’s saved data'}</Text><Text style={styles.connectSub}>{online ? `Last refresh ${snapshot?.refreshedAt ? new Date(snapshot.refreshedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'not yet'}` : 'Workspace edits and counts sync when you reconnect.'}</Text></View>
         {loading || syncing ? <ActivityIndicator size="small" color={online ? '#14866b' : '#bc7b28'} /> : <Ionicons name="chevron-forward" size={17} color="#8c9891" />}
       </Pressable>
 
@@ -53,7 +53,7 @@ export default function HomeScreen() {
 
       <Pressable accessibilityRole="button" style={styles.workspaceCard} onPress={() => router.push('/(tabs)/workspace')}>
         <View style={styles.workspaceIcon}><Ionicons name="business-outline" size={20} color="#118c71" /></View>
-        <View style={styles.workspaceCopy}><Text style={styles.workspaceTitle}>Open the full business suite</Text><Text style={styles.workspaceCaption}>Sales, accounting, payroll, reports, settings, and every online workspace feature.</Text></View>
+        <View style={styles.workspaceCopy}><Text style={styles.workspaceTitle}>Open the full business suite</Text><Text style={styles.workspaceCaption}>Sales, accounting, payroll, reports, and saved workspace data are available offline after the first connected visit.</Text></View>
         <Ionicons name="arrow-forward" size={17} color="#16866e" />
       </Pressable>
 

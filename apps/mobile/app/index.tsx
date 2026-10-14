@@ -57,12 +57,12 @@ export default function SignInScreen() {
         <View style={styles.heroGlow} />
         <View style={styles.heroBadge}><View style={styles.greenDot} /><Text style={styles.heroBadgeText}>BUILT FOR YOUR WHOLE BUSINESS</Text></View>
         <Text style={styles.heroTitle}>Your business,{ '\n' }<Text style={styles.heroAccent}>one workspace.</Text></Text>
-        <Text style={styles.heroBody}>Sales, accounting, payroll, and reports in the full KashFlow suite. Your stock and counts stay ready offline.</Text>
-        <View style={styles.heroFoot}><View style={styles.heroLine} /><Text style={styles.heroFootText}>ONLINE BUSINESS SUITE · OFFLINE STOCK TOOLS</Text></View>
+        <Text style={styles.heroBody}>Sales, accounting, payroll, and reports in the full KashFlow suite. Open it online once on this device to save its offline workspace.</Text>
+        <View style={styles.heroFoot}><View style={styles.heroLine} /><Text style={styles.heroFootText}>WORKSPACE SYNC · OFFLINE READY</Text></View>
       </LinearGradient>
 
       <View style={styles.formHeader}><View><Text style={styles.eyebrow}>WELCOME BACK</Text><Text style={styles.formTitle}>{challengeToken ? 'Verify it’s you' : 'Sign in to KashFlow'}</Text></View><View style={styles.lockIcon}><Ionicons name="lock-closed-outline" size={17} color="#14866e" /></View></View>
-      <Text style={styles.formSub}>{challengeToken ? 'Use your authenticator app or a one-time recovery code.' : 'Sign in for the complete business suite. Your saved stock and counts also stay on this device when you’re offline.'}</Text>
+      <Text style={styles.formSub}>{challengeToken ? 'Use your authenticator app or a one-time recovery code.' : 'Sign in while connected to save this device’s workspace. Supported changes sync when you reconnect.'}</Text>
       {!challengeToken && <>
         <Text style={styles.label}>EMAIL OR PHONE</Text>
         <TextInput autoCapitalize="none" autoComplete="username" keyboardType="email-address" placeholder="you@business.co.ke" placeholderTextColor="#9aa4a7" style={styles.input} value={identifier} onChangeText={setIdentifier} returnKeyType="next" />

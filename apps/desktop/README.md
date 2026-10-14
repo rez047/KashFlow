@@ -1,10 +1,10 @@
 # KashFlow desktop app
 
-The desktop app opens to the encrypted offline Field Edition with **Today**, **Stock**, **Count**, and **Sync** navigation always visible. Select **Business** in the sidebar or use `Ctrl/Cmd+1` to open the complete online KashFlow suite inside the same app window. Use the **Workspace → Offline field tools** menu item or `Ctrl/Cmd+2` to return to the field screens.
+The desktop app opens to the encrypted offline Field Edition with **Today**, **Stock**, **Count**, and **Sync** navigation always visible. Select **Business** in the sidebar or use `Ctrl/Cmd+1` to open the KashFlow suite inside the same app window. After the suite has loaded once while connected, its cached app shell and downloaded workspace data remain available offline; supported edits queue on this computer for sync when connectivity returns. Use the **Workspace → Offline field tools** menu item or `Ctrl/Cmd+2` to return to the native field screens.
 
 The inventory snapshot and pending count queue are encrypted through the operating system's secure storage: Windows DPAPI, macOS Keychain, or a Linux desktop keyring. The app refuses to save business data on Linux if Electron falls back to its weak `basic_text` backend. Offline counts are replayed with idempotency keys; changed stock baselines stop for a physical recount.
 
-The full suite is served from `https://kashflow-frontend.onrender.com` by default and needs an internet connection. Its requests use the encrypted desktop session; business switches and sign-out update the local session. Set `KASHFLOW_WORKSPACE_URL` before launch to use a different HTTPS frontend deployment. CSV exports and printing use Electron's normal save and print dialogs. POS camera scanning is limited to video requests from the configured KashFlow frontend.
+The suite is served from `https://kashflow-frontend.onrender.com` by default. Its requests use the desktop session; business switches and sign-out update the local session. Each desktop and workspace stores its own offline queue; reconnect before expecting its changes on another device. Safaricom STK prompts and KRA submissions wait for connectivity, and provider confirmation is still required. Set `KASHFLOW_WORKSPACE_URL` before launch to use a different HTTPS frontend deployment. CSV exports and printing use Electron's normal save and print dialogs. POS camera scanning is limited to video requests from the configured KashFlow frontend.
 
 ## Development
 

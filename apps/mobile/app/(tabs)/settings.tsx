@@ -39,7 +39,7 @@ export default function SettingsScreen() {
   }
   return <View style={styles.screen}><ScrollView contentContainerStyle={styles.page}>
     <View style={styles.nav}><Pressable accessibilityLabel="Back" onPress={() => router.back()} style={styles.back}><Ionicons name="arrow-back" size={19} color="#283a3c" /></Pressable><Text style={styles.navTitle}>Settings</Text><View style={{ width: 38 }} /></View>
-    <Text style={styles.eyebrow}>YOUR DEVICE</Text><Text style={styles.title}>A calmer way to work.</Text><Text style={styles.intro}>This app keeps inventory close at hand and tells you clearly when a connection is needed.</Text>
+    <Text style={styles.eyebrow}>YOUR DEVICE</Text><Text style={styles.title}>A calmer way to work.</Text><Text style={styles.intro}>Your saved workspace stays available here. Changes reach your other devices after this phone reconnects and syncs.</Text>
 
     <View style={styles.card}>
       <View style={styles.businessIcon}><Ionicons name="business-outline" size={19} color="#11876e" /></View><View style={styles.businessBody}><Text style={styles.cardEyebrow}>ACTIVE BUSINESS</Text><Text style={styles.businessName}>{snapshot?.workspaceName ?? 'No saved business'}</Text><Text style={styles.email}>{snapshot?.userEmail ?? 'Sign in while online to sync this device.'}</Text></View><View style={[styles.connection, online ? styles.connectionOnline : styles.connectionOffline]} />
@@ -49,6 +49,8 @@ export default function SettingsScreen() {
 
     <Text style={styles.section}>WORKS OFFLINE</Text>
     <View style={styles.capabilities}>
+      <Capability icon="checkmark-circle" title="Saved business workspace" detail="Open the suite with its most recently downloaded business data." />
+      <Capability icon="checkmark-circle" title="Queued workspace changes" detail="Supported edits stay on this phone and sync after reconnect." />
       <Capability icon="checkmark-circle" title="Inventory count sessions" detail="Save physical counts to encrypted device storage." />
       <Capability icon="checkmark-circle" title="Last saved product and branch list" detail="Search and count against your most recent snapshot." />
       <Capability icon="checkmark-circle" title="Pending sync and conflict review" detail="Each saved count is checked before stock is adjusted." />
@@ -56,17 +58,17 @@ export default function SettingsScreen() {
 
     <Text style={styles.section}>NEEDS AN INTERNET CONNECTION</Text>
     <View style={styles.capabilities}>
-      <Capability icon="cloud-outline" title="Sign in and business access" detail="An active session is required to send changes to KashFlow." />
-      <Capability icon="cloud-outline" title="Live refresh and stock reconciliation" detail="The app checks for new sales and stock movements when connected." />
-      <Capability icon="cloud-outline" title="M-Pesa, eTIMS and bank feeds" detail="Provider services are paused offline and resume online." />
+      <Capability icon="cloud-outline" title="First sign-in and session renewal" detail="Keep an active session on this device before going offline." />
+      <Capability icon="cloud-outline" title="Safaricom and KRA confirmation" detail="Queued M-Pesa prompts and eTIMS submissions are sent after reconnect; provider acceptance is still required." />
+      <Capability icon="cloud-outline" title="Live bank feeds" detail="A bank refresh needs a live connection." />
     </View>
 
-    <View style={styles.deviceCard}><Ionicons name="shield-checkmark-outline" size={17} color="#14876d" /><View style={styles.deviceCopy}><Text style={styles.deviceTitle}>Encrypted on this device</Text><Text style={styles.deviceDetail}>Inventory snapshots and unsynced counts use SQLCipher. Your sign-in is kept in the device keychain.</Text></View></View>
+    <View style={styles.deviceCard}><Ionicons name="shield-checkmark-outline" size={17} color="#14876d" /><View style={styles.deviceCopy}><Text style={styles.deviceTitle}>Device storage</Text><Text style={styles.deviceDetail}>Native inventory snapshots and counts use SQLCipher. Full-suite cache and queued changes are encrypted and tied to your account. Your sign-in is kept in the device keychain.</Text></View></View>
     {snapshot?.refreshedAt && <Text style={styles.refreshed}>Last inventory snapshot · {new Date(snapshot.refreshedAt).toLocaleString()}</Text>}
     <Text style={styles.section}>ACCOUNT AND DATA</Text>
     <Pressable accessibilityRole="button" onPress={() => router.push('/(tabs)/account-deletion')} style={styles.deleteAccount}><Ionicons name="person-remove-outline" size={16} color="#9c5048" /><Text style={styles.signoutText}>Delete account</Text><Ionicons name="chevron-forward" size={16} color="#a47770" /></Pressable>
     <Text style={styles.businessHint}>Account deletion removes your sign-in and business access. Shared business records are retained.</Text>
-    <Pressable disabled={busy} onPress={() => Alert.alert('Sign out and clear this device?', 'The local inventory, saved counts, and sign-in key will be deleted from this device.', [{ text: 'Keep working', style: 'cancel' }, { text: 'Clear & sign out', style: 'destructive', onPress: () => { void signOut() } }])} style={styles.signout}><Ionicons name="log-out-outline" size={16} color="#9c5048" /><Text style={styles.signoutText}>{busy ? 'Clearing device…' : 'Sign out & clear local data'}</Text></Pressable>
+    <Pressable disabled={busy} onPress={() => Alert.alert('Sign out and clear field data?', 'The native inventory, saved counts, and sign-in key will be deleted. The full-suite encrypted cache and queued changes stay on this device for this account so they can sync after you sign back in.', [{ text: 'Keep working', style: 'cancel' }, { text: 'Clear field data & sign out', style: 'destructive', onPress: () => { void signOut() } }])} style={styles.signout}><Ionicons name="log-out-outline" size={16} color="#9c5048" /><Text style={styles.signoutText}>{busy ? 'Clearing device…' : 'Sign out & clear field data'}</Text></Pressable>
     <Text style={styles.version}>KASHFLOW FIELD EDITION · 1.0.0</Text>
   </ScrollView></View>
 }

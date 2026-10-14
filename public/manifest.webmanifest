@@ -1,0 +1,9 @@
+{
+  "name": "KashFlow Business Suite",
+  "short_name": "KashFlow",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f8fb",
+  "theme_color": "#f7f8fb",
+  "icons": [{ "src": "/kashflow.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

@@ -8,6 +8,7 @@ import {
   ScanBarcode, Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Sparkles, Star, Trash2, Users, Volume2, Wallet, X, Laptop, MonitorDown, Download,
 } from 'lucide-react'
 import { SupplierBillEmailSection } from './SupplierBillEmailSection'
+import { cacheApiResponse, canQueueOfflinePath, clearOfflineResponseCache, getActiveOfflineUser, getActiveOfflineWorkspace, listOfflineMutations, OfflineQueuedError, queueOfflineMutation, readCachedApiResponse, readOfflineLocalData, setActiveOfflineWorkspace, syncOfflineMutations, writeOfflineLocalData, type OfflineMutation } from './offlineSync'
 import './App.css'
 import './Sidebar.css'
 
@@ -124,7 +125,7 @@ type ServiceSubscription = {
 type ServiceSupplierPayment = { id: string; amount: string; payment_date: string; billing_cycle: 'none' | 'monthly' | 'quarterly' | 'annually'; covered_until: string | null; expense_recorded: boolean }
 // Optional system-wide split-payment capture for an invoice or a counter sale.
 type PaymentSplit = { method: 'cash' | 'mpesa'; amount: string; phone: string; reference: string }
-type Account = { user: { email: string }; workspace: { id: string; name: string; permissions?: MemberPermission[] }; workspaces?: Array<{ id: string; name: string; role: string }> }
+type Account = { user: { id: string; email: string }; workspace: { id: string; name: string; permissions?: MemberPermission[] }; workspaces?: Array<{ id: string; name: string; role: string }> }
 type AccountDeletionPreview = { workspaces: Array<{ id: string; name: string; role: string; archivedAt: string | null; soleAdmin: boolean; otherMemberCount: number }> }
 type IntegrationReadiness = { integrations: Array<{ id: string; status: string }> }
 type PayrollEstimate = {
@@ -144,7 +145,7 @@ const EXPORT_TYPES = ['customers', 'suppliers', 'inventory', 'projects', 'invoic
 type PosReceipt = { invoiceId: string; businessName?: string; customer: string; customerEmail?: string; customerPhone?: string; amount: number; amountPaid: number; balanceDue: number; paymentMethod: string; status: string; createdAt: string; lines: PosCartLine[] }
 type PosCustomerSale = { id: string; description: string; amount: string; amount_paid: string; due_date: string; status: string; created_at: string }
 type PosCustomerHistory = { sales: PosCustomerSale[]; summary: { sale_count: number; lifetime_sales: string } }
-type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[] }
+type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; paymentIdempotencyKey?: string; cashPaymentIdempotencyKey?: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[]; paymentMethod?: 'cash' | 'mpesa'; paymentPhone?: string; paymentSplits?: Array<PaymentSplit & { idempotencyKey: string }> }
 type EstimateRecord = { id: string; customer: string; customer_email: string; description: string; amount: string; valid_until: string; status: string; invoice_id?: string | null }
 type VendorBill = { id: string; supplier: string; description: string; amount: string; amount_paid?: string; amount_due?: string; bill_date: string; due_date: string; status: string; approval_status?: string; inventory_expense_requested?: boolean }
 type DraftLine = { itemId?: string; description: string; quantity: string; unitPrice: string; discountAmount: string; taxAmount: string; recoverableTaxAmount?: string; vatTreatment?: string }
@@ -261,14 +262,59 @@ async function nativeRequestContext(host: NativeWorkspaceWindow) {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit & { queueOffline?: boolean }): Promise<T> {
+  const { queueOffline = true, ...fetchInit } = init ?? {}
   const host = window as NativeWorkspaceWindow
   const auth = await nativeRequestContext(host)
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    credentials: auth.credentials,
-    headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...auth.headers, ...init?.headers },
-  })
+  const method = (fetchInit.method ?? 'GET').toUpperCase()
+  const mutation = !['GET', 'HEAD', 'OPTIONS'].includes(method)
+  const headers = new Headers(fetchInit.headers)
+  if (fetchInit.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+  for (const [name, value] of Object.entries(auth.headers)) if (!headers.has(name)) headers.set(name, value)
+  const idempotencyKey = headers.get('Idempotency-Key') ?? (mutation && canQueueOfflinePath(path) ? crypto.randomUUID() : '')
+  if (idempotencyKey) headers.set('Idempotency-Key', idempotencyKey)
+
+  async function cachedRead(): Promise<T> {
+    const cached = await readCachedApiResponse(path)
+    if (cached === undefined) throw new Error(`No offline copy is available for ${path}. Open this section while connected once to save it on this device.`)
+    const data = cached as Record<string, unknown>
+    if (path === '/v1/auth/me' && data.workspace && typeof data.workspace === 'object' && typeof (data.workspace as { id?: unknown }).id === 'string') {
+      const userId = data.user && typeof data.user === 'object' ? (data.user as { id?: unknown }).id : undefined
+      await setActiveOfflineWorkspace(String((data.workspace as { id: string }).id), typeof userId === 'string' ? userId : undefined)
+    }
+    return cached as T
+  }
+
+  async function saveOfflineWrite() {
+    if (!mutation || !queueOffline || !canQueueOfflinePath(path)) return false
+    await queueOfflineMutation({
+      path,
+      method,
+      body: typeof init?.body === 'string' ? init.body : null,
+      idempotencyKey: idempotencyKey || crypto.randomUUID(),
+    })
+    throw new OfflineQueuedError(path)
+  }
+
+  if (!navigator.onLine) {
+    if (!mutation) return cachedRead()
+    if (await saveOfflineWrite()) throw new Error('This change could not be saved offline.')
+    throw new Error('This action needs a connection and cannot be saved offline.')
+  }
+
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...fetchInit,
+      method,
+      credentials: auth.credentials,
+      headers,
+    })
+  } catch (reason) {
+    if (!mutation) return cachedRead()
+    if (await saveOfflineWrite()) throw new Error('This change could not be saved offline.')
+    throw reason
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({})) as { error?: string }
     if (response.status === 401 && !path.startsWith('/v1/auth/')) {
@@ -286,15 +332,58 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (auth.nativeMode && typeof payload.accessToken === 'string' && payload.accessToken !== auth.nativeToken) {
     await updateNativeWorkspaceToken(host, payload.accessToken)
   }
+  if (payload.workspace && typeof payload.workspace === 'object' && typeof (payload.workspace as { id?: unknown }).id === 'string') {
+    const userId = payload.user && typeof payload.user === 'object' ? (payload.user as { id?: unknown }).id : undefined
+    await setActiveOfflineWorkspace(String((payload.workspace as { id: string }).id), typeof userId === 'string' ? userId : undefined)
+  }
+  if (!mutation) await cacheApiResponse(await getActiveOfflineWorkspace(), await getActiveOfflineUser(), path, payload).catch(() => undefined)
   return payload as T
 }
 
-function requestInvoiceMpesaPayment(invoiceId: string, phone: string, amount?: number) {
+async function replayOfflineMutation(mutation: OfflineMutation) {
+  const auth = await nativeRequestContext(window as NativeWorkspaceWindow)
+  const headers = new Headers(auth.headers)
+  headers.set('Idempotency-Key', mutation.idempotencyKey)
+  if (mutation.body) headers.set('Content-Type', 'application/json')
+  return fetch(`${API_BASE}${mutation.path}`, {
+    method: mutation.method,
+    credentials: auth.credentials,
+    headers,
+    body: mutation.body ?? undefined,
+    signal: AbortSignal.timeout(30_000),
+  })
+}
+
+async function warmOfflineWorkspace() {
+  const period = new URLSearchParams(overviewPeriod('ytd', yearStart, today))
+  const month = today.slice(0, 7)
+  const paths = [
+    '/v1/auth/me', '/v1/auth/two-factor/status', '/v1/dashboard', `/v1/dashboard?${period}`,
+    '/v1/settings', '/v1/transactions', '/v1/expenses', '/v1/invoices', '/v1/estimates', '/v1/sales-orders', '/v1/recurring',
+    '/v1/records/customers', '/v1/records/suppliers', '/v1/records/inventory', '/v1/records/services', '/v1/records/projects',
+    '/v1/inventory/locations', '/v1/inventory/location-stock', '/v1/purchase-orders', '/v1/bills', '/v1/documents',
+    '/v1/accounting/chart', '/v1/accounting/trial-balance', '/v1/accounting/journals', '/v1/accounting/periods', '/v1/accounting/reconciliations', '/v1/accounting/audit-events',
+    `/v1/accounting/reports/financial-statements?from=${yearStart}&to=${today}`,
+    '/v1/payroll/employees', '/v1/payroll/runs', '/v1/payroll/remittances',
+    '/v1/integrations/readiness', '/v1/integrations/onboarding', '/v1/integrations/drafts', '/v1/integrations/etims/config', '/v1/integrations/daraja',
+    '/v1/banking/mono/config', '/v1/banking/accounts', '/v1/banking/transactions?status=needs_review',
+    `/v1/reports/budgets?from=${month}-01&to=${today}`, '/v1/reports/cash-flow-forecast', `/v1/reports/aging?asOf=${today}`, '/v1/reports/retail',
+    '/v1/store/settings', '/v1/store/orders', '/v1/integrations/woocommerce',
+  ]
+  const workspaceId = await getActiveOfflineWorkspace()
+  if (workspaceId) paths.push(`/v1/workspaces/${workspaceId}/members`, `/v1/workspaces/${workspaceId}/roles`)
+  for (let index = 0; index < paths.length; index += 4) {
+    await Promise.all(paths.slice(index, index + 4).map((path) => request(path).catch(() => undefined)))
+  }
+}
+
+function requestInvoiceMpesaPayment(invoiceId: string, phone: string, amount?: number, idempotencyKey?: string) {
   return request<{ payment: { id: string; status: string }; customerMessage: string }>(`/v1/invoices/${invoiceId}/payments/mpesa`, {
     method: 'POST',
     // `amount` is sent only for a split payment so the STK Push collects the dedicated
     // M-Pesa portion rather than the whole outstanding invoice balance.
     body: JSON.stringify(amount === undefined ? { phone } : { phone, amount }),
+    ...(idempotencyKey ? { headers: { 'Idempotency-Key': idempotencyKey } } : {}),
   })
 }
 
@@ -919,8 +1008,14 @@ function App() {
   const [posIdempotencyKey, setPosIdempotencyKey] = useState(() => crypto.randomUUID())
   const [offlinePosDrafts, setOfflinePosDrafts] = useState<OfflinePosDraft[]>([])
   const [isOnline, setIsOnline] = useState(() => navigator.onLine)
+  const [offlineMutations, setOfflineMutations] = useState<OfflineMutation[]>([])
+  const [offlineSyncing, setOfflineSyncing] = useState(false)
+  const [offlineSyncRevision, setOfflineSyncRevision] = useState(0)
   const offlinePosWorkspaceLoaded = useRef<string | null>(null)
   const posCatalogWorkspaceLoaded = useRef<string | null>(null)
+  const offlineSyncRunning = useRef(false)
+  const offlineWarmWorkspace = useRef('')
+  const attemptedOfflinePosSyncs = useRef(new Set<string>())
   const [estimateInput, setEstimateInput] = useState({ customer: '', customerEmail: '', description: '', amount: '', validUntil: today })
   const [estimateEmailPromptId, setEstimateEmailPromptId] = useState('')
   const [estimateEmailDraft, setEstimateEmailDraft] = useState('')
@@ -1203,6 +1298,46 @@ function App() {
     setDashboard(await request<Dashboard>(`/v1/dashboard?${query}`))
   }, [overviewFrom, overviewRange, overviewTo])
 
+  async function reloadOfflineMutationQueue() {
+    const workspaceId = account?.workspace.id
+    if (!workspaceId) { setOfflineMutations([]); return }
+    try { setOfflineMutations(await listOfflineMutations(workspaceId, account?.user.id)) }
+    catch { setOfflineMutations([]) }
+  }
+
+  async function syncOfflineQueue() {
+    const workspaceId = account?.workspace.id
+    const userId = account?.user.id
+    if (!workspaceId || !userId || !navigator.onLine || offlineSyncRunning.current) return
+    offlineSyncRunning.current = true
+    setOfflineSyncing(true)
+    try {
+      const result = await syncOfflineMutations(workspaceId, userId, replayOfflineMutation)
+      await reloadOfflineMutationQueue()
+      if (result.synced > 0) {
+        attemptedOfflinePosSyncs.current.clear()
+        setOfflineSyncRevision((revision) => revision + 1)
+        void refresh().catch(() => undefined)
+        notify(`${result.synced} offline change${result.synced === 1 ? '' : 's'} synced${result.needsAttention ? ` · ${result.needsAttention} need review` : ''}.`)
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The offline queue could not be opened. Your saved changes remain on this device.')
+    } finally {
+      offlineSyncRunning.current = false
+      setOfflineSyncing(false)
+    }
+  }
+
+  async function syncAllOfflineWork() {
+    if (!account || !navigator.onLine) return
+    attemptedOfflinePosSyncs.current.clear()
+    await syncOfflineQueue()
+    for (const draft of offlinePosDrafts.filter((item) => item.workspaceId === account.workspace.id)) {
+      if (!navigator.onLine) break
+      await syncOfflinePosDraft(draft)
+    }
+  }
+
   const loadGlobalSearch = useCallback(async (term: string, sequence?: number) => {
     const query = term.trim()
     const requestSequence = sequence ?? ++searchSequenceRef.current
@@ -1347,7 +1482,10 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const setOnline = () => setIsOnline(navigator.onLine)
+    const setOnline = () => {
+      if (!navigator.onLine) attemptedOfflinePosSyncs.current.clear()
+      setIsOnline(navigator.onLine)
+    }
     window.addEventListener('online', setOnline)
     window.addEventListener('offline', setOnline)
     return () => {
@@ -1357,50 +1495,109 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const workspaceId = account?.workspace.id
-    if (!workspaceId) return
-    const storageKey = `kashflow-pos-offline-${workspaceId}`
-    try {
-      const saved = localStorage.getItem(storageKey)
-      const drafts: unknown = saved ? JSON.parse(saved) : []
-      if (!Array.isArray(drafts) || drafts.some((item) => !item || typeof item !== 'object' || (item as OfflinePosDraft).workspaceId !== workspaceId || typeof (item as OfflinePosDraft).idempotencyKey !== 'string' || !Array.isArray((item as OfflinePosDraft).lines))) {
-        throw new Error('Saved offline POS drafts are invalid; do not discard them until they have been reviewed.')
-      }
-      setOfflinePosDrafts(drafts as OfflinePosDraft[])
-      offlinePosWorkspaceLoaded.current = workspaceId
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not load offline POS drafts from this browser.')
-    }
-    try {
-      const catalog = localStorage.getItem(`kashflow-pos-catalog-${workspaceId}`)
-      if (catalog) {
-        const parsedCatalog: unknown = JSON.parse(catalog)
-        if (!parsedCatalog || typeof parsedCatalog !== 'object' || !Array.isArray((parsedCatalog as { inventory?: unknown }).inventory)) throw new Error('Cached POS inventory is invalid.')
-        const values = parsedCatalog as { inventory: WorkspaceRecord[]; locations?: InventoryLocation[]; stock?: InventoryLocationStock[] }
-        setRecords((current) => ({ ...current, inventory: values.inventory }))
-        setInventoryLocations(values.locations ?? [])
-        setInventoryLocationStock(values.stock ?? [])
-      }
-      posCatalogWorkspaceLoaded.current = workspaceId
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not load cached POS inventory.')
-    }
+    if (!account) { setOfflineMutations([]); return }
+    let active = true
+    const updateQueue = () => { if (active) void reloadOfflineMutationQueue() }
+    window.addEventListener('kashflow:offline-queue-changed', updateQueue)
+    void reloadOfflineMutationQueue()
+    return () => { active = false; window.removeEventListener('kashflow:offline-queue-changed', updateQueue) }
   }, [account?.workspace.id])
 
   useEffect(() => {
-    const workspaceId = account?.workspace.id
-    if (!workspaceId || offlinePosWorkspaceLoaded.current !== workspaceId) return
-    try { localStorage.setItem(`kashflow-pos-offline-${workspaceId}`, JSON.stringify(offlinePosDrafts)) }
-    catch (reason) { setError(reason instanceof Error ? `Offline POS drafts could not be saved on this device: ${reason.message}` : 'Offline POS drafts could not be saved on this device.') }
-  }, [offlinePosDrafts, account?.workspace.id])
+    if (!account || !isOnline) return
+    if (offlineWarmWorkspace.current !== account.workspace.id) {
+      offlineWarmWorkspace.current = account.workspace.id
+      void warmOfflineWorkspace().catch(() => undefined)
+    }
+    void syncOfflineQueue()
+  }, [account?.workspace.id, isOnline])
+
+  useEffect(() => {
+    if (!account || !isOnline || !navigator.onLine || busy) return
+    const pending = offlinePosDrafts.find((draft) => draft.workspaceId === account.workspace.id && !attemptedOfflinePosSyncs.current.has(draft.id))
+    if (!pending) return
+    attemptedOfflinePosSyncs.current.add(pending.id)
+    void syncOfflinePosDraft(pending)
+  }, [account?.workspace.id, isOnline, offlinePosDrafts, busy, offlineSyncRevision])
 
   useEffect(() => {
     const workspaceId = account?.workspace.id
-    if (!workspaceId || posCatalogWorkspaceLoaded.current !== workspaceId) return
-    try {
-      localStorage.setItem(`kashflow-pos-catalog-${workspaceId}`, JSON.stringify({ inventory: records.inventory, locations: inventoryLocations, stock: inventoryLocationStock }))
-    } catch (reason) { setError(reason instanceof Error ? `POS catalog could not be cached on this device: ${reason.message}` : 'POS catalog could not be cached on this device.') }
-  }, [records.inventory, inventoryLocations, inventoryLocationStock, account?.workspace.id])
+    const userId = account?.user.id
+    if (!workspaceId || !userId) return
+    const identityKey = `${userId}:${workspaceId}`
+    let active = true
+    const loadEncryptedPosData = async () => {
+      try {
+        let drafts = await readOfflineLocalData<OfflinePosDraft[]>(workspaceId, userId, 'pos-drafts')
+        let migrateLegacyDrafts = false
+        if (drafts === undefined) {
+          // Migrate the previous unencrypted localStorage format once, then remove it.
+          const legacy = localStorage.getItem(`kashflow-pos-offline-${workspaceId}`)
+          drafts = legacy ? JSON.parse(legacy) as OfflinePosDraft[] : []
+          migrateLegacyDrafts = Boolean(legacy)
+        }
+        if (!Array.isArray(drafts) || drafts.some((item) => !item || typeof item !== 'object' || item.workspaceId !== workspaceId || typeof item.idempotencyKey !== 'string' || !Array.isArray(item.lines))) {
+          throw new Error('Saved offline POS drafts are invalid; do not discard them until they have been reviewed.')
+        }
+        const normalizedDrafts = drafts.map((draft) => ({
+          ...draft,
+          cashPaymentIdempotencyKey: draft.cashPaymentIdempotencyKey ?? crypto.randomUUID(),
+          paymentIdempotencyKey: draft.paymentIdempotencyKey ?? crypto.randomUUID(),
+          paymentSplits: draft.paymentSplits?.map((split) => ({ ...split, idempotencyKey: split.idempotencyKey || crypto.randomUUID() })),
+        }))
+        const shouldPersistNormalizedDrafts = migrateLegacyDrafts || drafts.some((draft) => !draft.cashPaymentIdempotencyKey || !draft.paymentIdempotencyKey || draft.paymentSplits?.some((split) => !split.idempotencyKey))
+        if (shouldPersistNormalizedDrafts) {
+          await writeOfflineLocalData(workspaceId, userId, 'pos-drafts', normalizedDrafts)
+          if (migrateLegacyDrafts) localStorage.removeItem(`kashflow-pos-offline-${workspaceId}`)
+        }
+        drafts = normalizedDrafts
+        if (active) {
+          setOfflinePosDrafts(drafts)
+          offlinePosWorkspaceLoaded.current = identityKey
+        }
+      } catch (reason) {
+        if (active) setError(reason instanceof Error ? reason.message : 'Could not load encrypted offline POS drafts from this device.')
+      }
+      try {
+        let catalog = await readOfflineLocalData<{ inventory: WorkspaceRecord[]; locations?: InventoryLocation[]; stock?: InventoryLocationStock[] }>(workspaceId, userId, 'pos-catalog')
+        if (catalog === undefined) {
+          const legacy = localStorage.getItem(`kashflow-pos-catalog-${workspaceId}`)
+          catalog = legacy ? JSON.parse(legacy) as { inventory: WorkspaceRecord[]; locations?: InventoryLocation[]; stock?: InventoryLocationStock[] } : undefined
+          if (catalog) {
+            await writeOfflineLocalData(workspaceId, userId, 'pos-catalog', catalog)
+            localStorage.removeItem(`kashflow-pos-catalog-${workspaceId}`)
+          }
+        }
+        if (catalog && !Array.isArray(catalog.inventory)) throw new Error('Cached POS inventory is invalid.')
+        if (active && catalog) {
+          setRecords((current) => ({ ...current, inventory: catalog!.inventory }))
+          setInventoryLocations(catalog.locations ?? [])
+          setInventoryLocationStock(catalog.stock ?? [])
+        }
+        if (active) posCatalogWorkspaceLoaded.current = identityKey
+      } catch (reason) {
+        if (active) setError(reason instanceof Error ? reason.message : 'Could not load encrypted cached POS inventory.')
+      }
+    }
+    void loadEncryptedPosData()
+    return () => { active = false }
+  }, [account?.workspace.id, account?.user.id])
+
+  useEffect(() => {
+    const workspaceId = account?.workspace.id
+    const userId = account?.user.id
+    const identityKey = workspaceId && userId ? `${userId}:${workspaceId}` : ''
+    if (!workspaceId || !userId || offlinePosWorkspaceLoaded.current !== identityKey) return
+    void writeOfflineLocalData(workspaceId, userId, 'pos-drafts', offlinePosDrafts).catch((reason) => setError(reason instanceof Error ? `Encrypted offline POS drafts could not be saved on this device: ${reason.message}` : 'Encrypted offline POS drafts could not be saved on this device.'))
+  }, [offlinePosDrafts, account?.workspace.id, account?.user.id])
+
+  useEffect(() => {
+    const workspaceId = account?.workspace.id
+    const userId = account?.user.id
+    const identityKey = workspaceId && userId ? `${userId}:${workspaceId}` : ''
+    if (!workspaceId || !userId || posCatalogWorkspaceLoaded.current !== identityKey) return
+    void writeOfflineLocalData(workspaceId, userId, 'pos-catalog', { inventory: records.inventory, locations: inventoryLocations, stock: inventoryLocationStock }).catch((reason) => setError(reason instanceof Error ? `Encrypted POS catalog could not be cached on this device: ${reason.message}` : 'Encrypted POS catalog could not be cached on this device.'))
+  }, [records.inventory, inventoryLocations, inventoryLocationStock, account?.workspace.id, account?.user.id])
 
   useEffect(() => {
     if (!account) return
@@ -1522,7 +1719,7 @@ function App() {
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load store, WooCommerce, or team settings.'))
     }
     else if (account) void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
-  }, [account, dashboard?.workspaceName, page])
+  }, [account, dashboard?.workspaceName, page, offlineSyncRevision])
 
   async function saveStoreSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
@@ -1968,6 +2165,7 @@ function App() {
 
   async function logout() {
     try { await request('/v1/auth/logout', { method: 'POST' }) } catch { /* Discard an expired local session. */ }
+    await clearOfflineResponseCache().catch(() => undefined)
     setAccount(null); setDashboard(null); setPageHistory([]); setPage('Overview')
   }
 
@@ -2422,11 +2620,8 @@ async function createCameraReader(): Promise<CameraReader> {
       : cart.map((line) => line.itemId === itemId ? { ...line, quantity: Math.max(1, Math.min(quantity, line.onHand)) } : line))
   }
 
-  function queueOfflinePosSale() {
-    if (!account || !posCart.length) return
-    // Offline drafts are only ever saved for cash sales: no payment provider can be
-    // reached offline, so an M-Pesa request must wait until the device is back online.
-    if (posPaymentMethod !== 'cash') return
+  async function queueOfflinePosSale() {
+    if (!account || !posCart.length) return false
     const savedCustomer = records.customers.find((record) => record.id === posSavedCustomerId)
     const customer = savedCustomer
       ? String(savedCustomer.data.name ?? 'Saved customer')
@@ -2437,27 +2632,44 @@ async function createCameraReader(): Promise<CameraReader> {
       workspaceId: account.workspace.id,
       createdAt: new Date().toISOString(),
       idempotencyKey: posIdempotencyKey,
+      paymentIdempotencyKey: crypto.randomUUID(),
+      cashPaymentIdempotencyKey: crypto.randomUUID(),
       customer,
       customerEmail: savedCustomer ? String(savedCustomer.data.email ?? '') : posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
       locationId: posLocationId,
       amount: lines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0),
       lines,
+      paymentMethod: posPaymentMethod,
+      paymentPhone: posPaymentPhone.trim(),
+      paymentSplits: multiMethodEnabled ? (paymentSplits.pos ?? []).filter((split) => Number(split.amount) > 0).map((split) => ({ ...split, idempotencyKey: crypto.randomUUID() })) : undefined,
     }
-    setOfflinePosDrafts((current) => [...current, draft])
+    const nextDrafts = [...offlinePosDrafts, draft]
+    try {
+      await writeOfflineLocalData(account.workspace.id, account.user.id, 'pos-drafts', nextDrafts)
+    } catch (reason) {
+      setError(reason instanceof Error ? `Could not safely save this offline sale: ${reason.message}` : 'Could not safely save this offline sale. Keep the checkout open and reconnect.')
+      return false
+    }
+    setOfflinePosDrafts(nextDrafts)
     setPosIdempotencyKey(crypto.randomUUID())
     setPosCart([])
     setPosCustomer('')
     setPosCustomerType('walk_in')
     setPosCustomerEmail('')
     setPosPaymentPhone('')
+    setPaymentSplits((current) => ({ ...current, pos: [] }))
     posSavedCustomerIdRef.current = ''
     setPosSavedCustomerId('')
     setPosCustomerHistory(null)
     setPosCustomerHistoryForId('')
-    notify('Offline sale draft saved on this device only. It is not yet an invoice, payment, or stock deduction.')
+    notify(posPaymentMethod === 'mpesa' || (draft.paymentSplits ?? []).some((split) => split.method === 'mpesa')
+      ? 'Offline sale saved here. Its M-Pesa prompt will be sent after reconnect; no payment is confirmed yet.'
+      : 'Offline sale saved here. It is not yet an invoice, payment, or stock deduction.')
+    return true
   }
 
   async function syncOfflinePosDraft(draft: OfflinePosDraft) {
+    if (!navigator.onLine) return
     if (!account || draft.workspaceId !== account.workspace.id) {
       setError('This offline sale belongs to a different business workspace and cannot be synced here.')
       return
@@ -2475,9 +2687,39 @@ async function createCameraReader(): Promise<CameraReader> {
           lines: draft.lines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: 0 })),
         }),
       })
+      const mpesaSplits = draft.paymentSplits?.filter((split) => split.method === 'mpesa') ?? []
+      const cashSplits = draft.paymentSplits?.filter((split) => split.method === 'cash') ?? []
+      const cashAmount = cashSplits.length ? cashSplits.reduce((sum, split) => sum + Number(split.amount), 0) : draft.paymentMethod === 'cash' ? draft.amount : 0
+      const cashPaymentKey = cashSplits[0]?.idempotencyKey ?? draft.cashPaymentIdempotencyKey ?? draft.paymentIdempotencyKey
+      if (cashAmount > 0) {
+        await request(`/v1/invoices/${created.invoice.id}/payments`, {
+          method: 'POST',
+          body: JSON.stringify({ amount: cashAmount, paymentDate: today, paymentMethod: 'cash' }),
+          ...(cashPaymentKey ? { headers: { 'Idempotency-Key': cashPaymentKey } } : {}),
+        })
+      }
+      const mpesaRequests: string[] = []
+      let mpesaTotal = 0
+      if (mpesaSplits.length) {
+        for (const split of mpesaSplits) {
+          const result = await requestInvoiceMpesaPayment(created.invoice.id, split.phone.trim(), Number(split.amount), split.idempotencyKey)
+          mpesaRequests.push(result.payment.id)
+          mpesaTotal += Number(split.amount)
+        }
+      } else if (draft.paymentMethod === 'mpesa') {
+        const result = await requestInvoiceMpesaPayment(created.invoice.id, draft.paymentPhone ?? '', undefined, draft.paymentIdempotencyKey)
+        mpesaRequests.push(result.payment.id)
+        mpesaTotal = draft.amount
+      }
       setOfflinePosDrafts((current) => current.filter((item) => item.id !== draft.id))
-      setPosReceipt({ invoiceId: created.invoice.id, businessName: dashboard?.workspaceName, customer: draft.customer, amount: draft.amount, amountPaid: 0, balanceDue: draft.amount, paymentMethod: 'cash', status: 'Created after reconnect · payment not recorded', createdAt: new Date().toISOString(), lines: draft.lines })
-      notify(`Offline draft synced as invoice ${created.invoice.id.slice(0, 8)}. Review payment and stock before releasing goods.`)
+      const mpesaPending = mpesaTotal > 0
+      const paymentMethod = draft.paymentSplits?.length ? [...new Set(draft.paymentSplits.map((split) => split.method))].join(' + ') : draft.paymentMethod ?? 'cash'
+      const receipt: PosReceipt = { invoiceId: created.invoice.id, businessName: dashboard?.workspaceName, customer: draft.customer, amount: draft.amount, amountPaid: cashAmount, balanceDue: Math.max(0, draft.amount - cashAmount), paymentMethod, status: mpesaPending ? `${cashAmount ? `Cash ${money(cashAmount)} recorded · ` : ''}M-Pesa prompt sent after reconnect · awaiting confirmation for ${money(mpesaTotal)}` : cashAmount >= draft.amount ? 'Paid · cash recorded after reconnect' : cashAmount > 0 ? `Cash ${money(cashAmount)} recorded after reconnect · remaining balance unpaid` : 'Created after reconnect · payment not recorded', createdAt: new Date().toISOString(), lines: draft.lines }
+      setPosReceipt(receipt)
+      notify(mpesaPending
+        ? `Offline sale synced. Safaricom was asked to send a prompt for ${money(mpesaTotal)}; confirm payment before releasing goods.`
+        : cashAmount > 0 ? `Offline draft synced as invoice ${created.invoice.id.slice(0, 8)}; ${money(cashAmount)} cash recorded. Review stock before releasing goods.` : `Offline draft synced as invoice ${created.invoice.id.slice(0, 8)}. Review payment and stock before releasing goods.`)
+      if (mpesaPending) watchMpesaPayment(created.invoice.id, mpesaTotal, `Point of sale · ${draft.customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid`; setPosReceipt({ ...receipt }) }, mpesaRequests)
       const [inventory, listedInvoices, locationStock] = await Promise.all([
         request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
         request<{ invoices: InvoiceRecord[] }>('/v1/invoices'),
@@ -2526,6 +2768,10 @@ async function createCameraReader(): Promise<CameraReader> {
       setError('Enter the M-Pesa phone number for each M-Pesa split.')
       return
     }
+    if (splits.some((split) => split.method === 'mpesa' && (!Number.isSafeInteger(Number(split.amount)) || Number(split.amount) < 1))) {
+      setError('Each M-Pesa split must be a whole-KSh amount. Adjust the split before checkout.')
+      return
+    }
     if (total <= 0) {
       setError('The sale total must be greater than zero. Check the item selling prices in Inventory.')
       return
@@ -2534,10 +2780,8 @@ async function createCameraReader(): Promise<CameraReader> {
       setError('M-Pesa STK Push requires a whole-KSh total. Adjust item prices or quantities before checkout.')
       return
     }
-    const pendingSplits = multiMethodEnabled ? (paymentSplits.pos ?? []).filter((split) => Number(split.amount) > 0) : []
     if (!navigator.onLine) {
-      if (posPaymentMethod !== 'cash' || pendingSplits.some((split) => split.method === 'mpesa')) { setError('M-Pesa requests require an active connection. No offline M-Pesa payment can be requested.'); return }
-      queueOfflinePosSale()
+      await queueOfflinePosSale()
       return
     }
     setBusy(true)
@@ -2553,6 +2797,7 @@ async function createCameraReader(): Promise<CameraReader> {
           dueDate: today,
           lines: saleLines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: 0 })),
         }),
+        queueOffline: false,
       })
       setPosIdempotencyKey(crypto.randomUUID())
       const customerEmail = savedCustomer ? String(savedCustomer.data.email ?? '') : posCustomerType === 'remote' ? posCustomerEmail.trim() : ''
@@ -2622,8 +2867,9 @@ async function createCameraReader(): Promise<CameraReader> {
           notify(result.customerMessage)
           watchMpesaPayment(created.invoice.id, total, `Point of sale · ${customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid for the M-Pesa ${money(total)}`; setPosReceipt({ ...receipt }) }, [result.payment.id])
         } catch (reason) {
-          receipt.status = 'Unpaid · M-Pesa request did not start'
-          setError(`Sale and stock were saved as invoice ${created.invoice.id.slice(0, 8)}, but the M-Pesa request did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try from Sales.'}`)
+          const queued = reason instanceof OfflineQueuedError
+          receipt.status = queued ? 'M-Pesa request queued · waiting for connection' : 'Unpaid · M-Pesa request did not start'
+          setError(queued ? reason.message : `Sale and stock were saved as invoice ${created.invoice.id.slice(0, 8)}, but the M-Pesa request did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try from Sales.'}`)
         }
       }
       setPosReceipt({ ...receipt })
@@ -2641,9 +2887,9 @@ async function createCameraReader(): Promise<CameraReader> {
         setError((message) => [message, `Sale was saved, but the workspace view could not refresh: ${reason instanceof Error ? reason.message : 'reload the page.'}`].filter(Boolean).join(' '))
       }
     } catch (reason) {
-      if (reason instanceof TypeError && posPaymentMethod === 'cash') {
-        queueOfflinePosSale()
-        setError('The API could not be reached. The sale was saved as a local-only draft; it is not posted, paid, or deducted from stock.')
+      if (reason instanceof TypeError) {
+        const saved = await queueOfflinePosSale()
+        if (saved) setError('The API could not be reached. The sale was saved as a local-only draft; its M-Pesa prompt, if selected, will be sent after reconnect. No payment or stock change is confirmed yet.')
       } else setError(reason instanceof Error ? reason.message : 'Could not save the sale.')
     } finally {
       setBusy(false)
@@ -2720,7 +2966,7 @@ async function createCameraReader(): Promise<CameraReader> {
           notify(`Invoice saved. ${result.customerMessage}`)
           watchMpesaPayment(created.invoice.id, Number(invoiceLines.reduce((sum, line) => sum + Number(line.quantity) * Number(line.unitPrice), 0).toFixed(2)) || Number(invoice.amount || 0), `Invoice · ${customerName}`, () => { void refreshAfterMpesaPaid(created.invoice.id) }, undefined, [result.payment.id])
         } catch (reason) {
-          notify(`Invoice saved; M-Pesa request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
+          notify(reason instanceof OfflineQueuedError ? reason.message : `Invoice saved; M-Pesa request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
         }
       } else notify('Invoice saved to this workspace')
     } catch (reason) {
@@ -2936,7 +3182,7 @@ async function createCameraReader(): Promise<CameraReader> {
       const due = Number(invoiceRow.amount_due ?? invoiceRow.amount)
       watchMpesaPayment(invoiceRow.id, due, `Invoice · ${invoiceRow.customer}`, () => { void refreshAfterMpesaPaid(invoiceRow.id) }, undefined, [result.payment.id])
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not start the M-Pesa prompt. The invoice remains unpaid.')
+      setError(reason instanceof OfflineQueuedError ? reason.message : reason instanceof Error ? reason.message : 'Could not start the M-Pesa prompt. The invoice remains unpaid.')
       await loadInvoiceMpesaPayments(invoiceRow.id)
     } finally { setMpesaPromptSubmitting(false) }
   }
@@ -3172,7 +3418,7 @@ async function createCameraReader(): Promise<CameraReader> {
           watchMpesaPayment(result.invoice.id, mpesaAmount, `Service · ${subscription.customer_name}`, () => { void refreshAfterMpesaPaid(result.invoice.id) }, undefined, [prompt.payment.id])
         } catch (reason) {
           await refresh()
-          setError(`Bill saved${cashAmount > 0 ? ` with ${money(cashAmount)} cash recorded` : ''} for ${subscription.customer_name}, but the M-Pesa prompt did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try again.'} Nothing was added to income for the M-Pesa part.`)
+          setError(reason instanceof OfflineQueuedError ? reason.message : `Bill saved${cashAmount > 0 ? ` with ${money(cashAmount)} cash recorded` : ''} for ${subscription.customer_name}, but the M-Pesa prompt did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try again.'} Nothing was added to income for the M-Pesa part.`)
         }
       } else {
         await refresh()
@@ -3492,7 +3738,7 @@ async function createCameraReader(): Promise<CameraReader> {
           notify(`Recurring invoice created. ${payment.customerMessage}`)
           watchMpesaPayment(run.generatedId, Number(template.amount ?? 0), `Recurring invoice · ${template.counterparty}`, () => { void refreshAfterMpesaPaid(run.generatedId!) }, undefined, [payment.payment.id])
         } catch (reason) {
-          notify(`Recurring invoice created; Daraja request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
+          notify(reason instanceof OfflineQueuedError ? reason.message : `Recurring invoice created; Daraja request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
         }
       } else notify(template.template_type === 'invoice' ? 'Recurring invoice created. No customer M-Pesa number is saved; open the invoice to request payment.' : 'Recurring expense added to expenses and posted.')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not run recurring schedule.') }
@@ -4604,6 +4850,8 @@ async function createCameraReader(): Promise<CameraReader> {
   </>
 
   const periodLabel = overviewRangeNames[overviewRange]
+  const workspaceOfflinePosDrafts = offlinePosDrafts.filter((draft) => draft.workspaceId === account?.workspace.id)
+  const offlineWorkCount = offlineMutations.length + workspaceOfflinePosDrafts.length
   const activePayrollEmployees = employees.filter((employee) => employee.active)
   const selectedPayrollEmployees = activePayrollEmployees.filter((employee) => payrollIncludedEmployeeIds.includes(employee.id))
   const selectedPayrollSalaryTotal = selectedPayrollEmployees.reduce((sum, employee) => sum + Number(employee.grossMonthlyPay), 0)
@@ -4726,11 +4974,18 @@ async function createCameraReader(): Promise<CameraReader> {
               </> : <p className="search-result-message">No saved records match “{search.trim()}”.</p>}
             </div>}
           </div>
-          <button className="icon-button notification-button" aria-label="Workspace status" onClick={() => setStatusOpen((open) => !open)}><Bell size={18} /></button>
+          <button className="icon-button notification-button" aria-label={offlineWorkCount ? `Workspace status, ${offlineWorkCount} offline changes` : 'Workspace status'} onClick={() => setStatusOpen((open) => !open)}><Bell size={18} />{offlineWorkCount > 0 && <span className="offline-queue-count">{offlineWorkCount}</span>}</button>
           <button className="top-help" onClick={() => navigateTo('Help')}><CircleHelp size={17} /><span>Help</span></button>
         </div>
-        {statusOpen && <div className="notification-popover"><strong>{mpesaConfigured ? 'Daraja STK Push configured' : 'Connect your payment providers'}</strong><p>Your records are always available in this workspace. Open Kenya compliance to manage this business’s Daraja account, KRA eTIMS, bank feeds, and payroll tax preparation.</p><button onClick={() => setStatusOpen(false)}>Close</button></div>}
+        {statusOpen && <div className="notification-popover"><strong>{offlineWorkCount ? `${offlineWorkCount} offline change${offlineWorkCount === 1 ? '' : 's'}` : mpesaConfigured ? 'Daraja STK Push configured' : 'Connect your payment providers'}</strong>
+          {offlineWorkCount ? <><p>Changes are stored on this device. They become available to your other devices after sync.</p><div className="offline-queue-list">{offlineMutations.slice(0, 5).map((item) => <div key={item.id} className={item.state === 'attention' ? 'needs-review' : ''}><strong>{item.method} {item.path}</strong><small>{item.state === 'attention' ? item.message : new Date(item.createdAt).toLocaleString('en-KE')}</small></div>)}{workspaceOfflinePosDrafts.slice(0, Math.max(0, 5 - offlineMutations.length)).map((draft) => <div key={draft.id}><strong>POS sale · {money(draft.amount)}</strong><small>{draft.paymentMethod === 'mpesa' || draft.paymentSplits?.some((split) => split.method === 'mpesa') ? 'Invoice and M-Pesa prompt queued' : 'Invoice queued'} · {new Date(draft.createdAt).toLocaleString('en-KE')}</small></div>)}</div>{offlineWorkCount > 5 && <small>{offlineWorkCount - 5} more saved changes</small>}<button className="button button-primary button-small" disabled={!isOnline || offlineSyncing || offlineWorkCount === offlineMutations.filter((item) => item.state === 'attention').length} onClick={() => void syncAllOfflineWork()}>{offlineSyncing ? 'Syncing…' : isOnline ? 'Sync pending changes' : 'Reconnect to sync'}</button></> : <p>Your records are always available in this workspace. Open Kenya compliance to manage this business’s Daraja account, KRA eTIMS, bank feeds, and payroll tax preparation.</p>}
+          <button onClick={() => setStatusOpen(false)}>Close</button></div>}
       </header>
+
+      {(!isOnline || offlineWorkCount > 0) && <div className={`offline-workspace-banner ${isOnline ? 'is-connected' : ''}`} role="status">
+        <span><strong>{isOnline ? `${offlineWorkCount} offline change${offlineWorkCount === 1 ? '' : 's'} saved on this device` : 'Offline mode'}</strong><small>{isOnline ? 'Sync to make queued changes available to the rest of your devices.' : 'Using the last saved workspace data. New changes stay on this device until it reconnects.'}</small></span>
+        {isOnline && offlineWorkCount > offlineMutations.filter((item) => item.state === 'attention').length && <button type="button" disabled={offlineSyncing} onClick={() => void syncAllOfflineWork()}>{offlineSyncing ? 'Syncing…' : 'Sync now'}</button>}
+      </div>}
 
       <div className="content-wrap">
         {page !== 'Overview' && <div className="page-navigation"><button className="button button-secondary" onClick={navigateBack}><ArrowLeft size={15} /> Back</button></div>}
@@ -5482,7 +5737,7 @@ async function createCameraReader(): Promise<CameraReader> {
           <h1>{t('Counter checkout')}</h1>
           <p className="welcome-subtitle">Sell from saved inventory. Checkout creates an internal invoice, deducts stock, and records cash payments in your workspace.</p>
           <p className={`pos-connectivity ${isOnline ? 'online' : 'offline'}`} role="status">{isOnline ? 'Online · inventory and prices are current when refreshed.' : 'Offline · using this business’s last cached catalog; stock may have changed. Sales save locally and are not posted until synced.'}</p>
-          <p className="dialog-note">Offline drafts and the cached catalog are stored in this browser and are not encrypted by KashFlow. Use offline checkout only on a device protected by your organization.</p>
+          <p className="dialog-note">Offline drafts and the cached catalog are encrypted on this device and tied to your signed-in business account. They are not posted, paid, or deducted from stock until sync succeeds.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           {offlinePosDrafts.filter((draft) => draft.workspaceId === account?.workspace.id).length > 0 && <article className="module-card offline-pos-queue">
             <div className="panel-header"><div><h2>Offline sale drafts ({offlinePosDrafts.filter((draft) => draft.workspaceId === account?.workspace.id).length})</h2><p>Stored only in this browser for {dashboard?.workspaceName}; not posted, paid, or deducted from stock.</p></div></div>

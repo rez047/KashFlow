@@ -2,7 +2,7 @@
 
 This is a native iOS and Android app built with React Native and Expo Router. It opens on the **Business** tab with the complete KashFlow business suite. Today, Stock, Count, Sync & Review, and Settings provide native tools for offline field work.
 
-The Business tab loads the configured KashFlow frontend in a WebView and uses the app's short-lived bearer session. Session tokens stay in iOS Keychain or Android Keystore and pass through the web page in memory; business switches and sign-out update the native session. Set `EXPO_PUBLIC_WORKSPACE_URL` to use a different frontend deployment. The suite requires an internet connection. POS camera scanning uses the device camera only after a barcode scan is requested. CSV exports are shared as a single CSV or a ZIP of all selected exports, and printing uses the device print sheet.
+The Business tab loads the configured KashFlow frontend in a WebView and uses the app's bearer session. Session tokens stay in iOS Keychain or Android Keystore and pass through the web page in memory; business switches and sign-out update the native session. Set `EXPO_PUBLIC_WORKSPACE_URL` to use a different frontend deployment. Open the suite while connected once to cache its app shell and workspace data; supported edits then queue locally and sync when online. Each phone has its own queue, so another device sees those changes after they reach the API. POS camera scanning uses the device camera only after a barcode scan is requested. CSV exports are shared as a single CSV or a ZIP of all selected exports, and printing uses the device print sheet.
 
 ## Offline inventory
 
@@ -12,7 +12,7 @@ The Business tab loads the configured KashFlow frontend in a WebView and uses th
 - If the server balance changed after the saved baseline, the count stops for review. The user is asked to physically recount against the fresh balance before sending a replacement count.
 - Sign out clears the local encrypted database and the local database key.
 - Account deletion is available from Settings while online. It reauthenticates with the current password, requires sole administrators to archive their workspace first, removes server authentication and memberships, preserves shared workspace records, and clears the local vault after success.
-- Provider actions such as M-Pesa STK, KRA eTIMS submissions, and remote bank feeds need a live connection.
+- Daraja STK prompts and KRA eTIMS submissions can wait in the workspace sync queue, but are sent only after reconnect. Payment or fiscal acceptance still comes from Safaricom or KRA; it is never assumed offline. Remote bank refreshes need a live connection.
 
 The first catalog download needs a connection. If an item or branch was not cached before going offline, it cannot be counted on that device until the next refresh.
 
