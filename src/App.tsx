@@ -708,49 +708,6 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
       </div>
     </section>
 
-    <section className="landing-section landing-band" id="pricing">
-      <div className="section-head">
-        <span className="section-eyebrow">PRICING</span>
-        <h2>Simple monthly packages in Kenyan Shillings</h2>
-        <p>Both packages include the full suite — the difference is the premium payment, online shopping and bank-feed connections.</p>
-      </div>
-      <div className="pricing-grid">
-        <article className="price-card">
-          <span className="price-name">Comfort package</span>
-          <div className="price-amount"><strong>KSh 4,050</strong><span>/ month</span></div>
-          <p className="price-blurb">Everything a growing Kenyan business needs to run sales, stock, books and staff in one place.</p>
-          <ul className="price-list">
-            <li><Check size={15} /> Invoicing, estimates &amp; recurring schedules</li>
-            <li><Check size={15} /> Full point of sale with cash receipts</li>
-            <li><Check size={15} /> Inventory, multi-branch stock &amp; transfers</li>
-            <li><Check size={15} /> Accounting, reports &amp; documents</li>
-            <li><Check size={15} /> Payroll drafts &amp; payslips</li>
-            <li><Check size={15} /> Safaricom Daraja M-Pesa STK Push checkout</li>
-            <li><Check size={15} /> KRA eTIMS preparation &amp; compliance tracking</li>
-            <li><Check size={15} /> Team roles &amp; permissions</li>
-            <li><Check size={15} /> Invoice email delivery to customers &amp; suppliers</li>
-          </ul>
-          <button type="button" className="button button-secondary button-xl" onClick={() => onDemo('Comfort')}>Start with Comfort</button>
-        </article>
-        <article className="price-card price-card-premium">
-          <span className="price-ribbon">Most popular</span>
-          <span className="price-name">Premium package</span>
-          <div className="price-amount"><strong>KSh 7,499</strong><span>/ month</span></div>
-          <p className="price-blurb">Everything in Comfort, plus the live payment and bank connections that move money for you.</p>
-          <ul className="price-list">
-            <li><Check size={15} /> <strong>Everything in Comfort</strong></li>
-            <li><Check size={15} /> Mono bank feeds &amp; statement review</li>
-            <li><Check size={15} /> Priority onboarding for provider connections</li>
-            <li><Check size={15} /> M-Pesa receipt handling on the counter</li>
-            <li><Check size={15} /> Online store &amp; orders</li>
-            <li><Check size={15} /> Premium support for your team</li>
-          </ul>
-          <p className="price-note">Premium connections (M-Pesa, WooCommerce &amp; Mono) incur an extra charge and are billed within this package.</p>
-          <button type="button" className="button button-primary button-xl" onClick={() => onDemo('Premium')}>Go Premium</button>
-        </article>
-      </div>
-    </section>
-
     <section className="landing-section" id="stories">
       <div className="section-head">
         <span className="section-eyebrow">LOVED BY KENYAN BUSINESSES</span>
