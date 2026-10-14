@@ -717,6 +717,25 @@ async function queryDarajaPayment(config: DarajaConfig, checkoutRequestId: strin
     CheckoutRequestID: checkoutRequestId,
   })
 }
+// Verify a receipt number the user typed against Daraja's Transaction Status API. This is how a
+// manually recorded M-Pesa payment is checked before it can mark an invoice paid: the API returns
+// the original amount and the receipt for that transaction, or an error when it does not exist.
+// A receipt only counts when ResultCode is 0, the returned receipt matches, and the amount matches.
+async function queryDarajaTransactionStatus(config: DarajaConfig, transactionId: string) {
+  const timestamp = darajaTimestamp()
+  return darajaPost(config, '/mpesa/transactionstatus/v1/query', {
+    Initiator: config.shortcode,
+    SecurityCredential: mpesaPassword(config, timestamp),
+    CommandID: 'TransactionStatusQuery',
+    TransactionID: transactionId,
+    PartyA: config.shortcode,
+    IdentifierType: '4',
+    ResultURL: config.callbackUrl,
+    QueueTimeOutURL: config.callbackUrl,
+    Remarks: 'Manual receipt verification',
+    Occasion: 'Invoice payment verification',
+  })
+}
 // Resolve only the active workspace's encrypted Daraja credentials. Each business must connect
 // its own merchant account; platform-wide payment credentials are never used as a fallback.
 async function resolveWorkspaceDarajaConfig(workspaceId: string): Promise<DarajaConfig | null> {
@@ -1565,7 +1584,9 @@ app.get('/v1/search', requirePool, requireSession, async (request: AuthedRequest
         UNION ALL
         SELECT mr.id::text, 'M-Pesa payment', i.customer, concat_ws(' ', 'receipt', mr.mpesa_receipt_number, mr.result_description), mr.amount::text, mr.created_at::date::text, mr.status, 'Networking', mr.created_at
         FROM mpesa_payment_requests mr JOIN invoices i ON i.id = mr.invoice_id AND i.workspace_id = mr.workspace_id
-        WHERE mr.workspace_id = $1 AND position($2 in lower(concat_ws(' ', mr.id::text, mr.mpesa_receipt_number, mr.result_description, mr.status, i.customer, i.description, mr.amount::text))) > 0
+        -- Only a Daraja-confirmed payment is a real transaction. Pending, failed or verification-
+        -- required requests stay out of the feed so an unconfirmed split never shows as income.
+        WHERE mr.workspace_id = $1 AND mr.status = 'paid' AND position($2 in lower(concat_ws(' ', mr.id::text, mr.mpesa_receipt_number, mr.result_description, mr.status, i.customer, i.description, mr.amount::text))) > 0
         UNION ALL
         SELECT ssp.id::text, 'supplier service payment', service.data->>'name', concat_ws(' ', 'supplier payment', ssp.billing_cycle, ssp.expense_recorded::text), ssp.amount::text, ssp.payment_date::text, CASE WHEN ssp.expense_recorded THEN 'expense recorded' ELSE 'not in ledger' END, 'Expenses', ssp.created_at
         FROM service_supplier_payments ssp JOIN workspace_records service ON service.id = ssp.service_id AND service.workspace_id = ssp.workspace_id
