@@ -61,6 +61,8 @@ type DarajaConfig = {
   shortcode: string
   passkey: string
   callbackUrl: string
+  initiatorName: string | null
+  transactionStatusSecurityCredential: string | null
   transactionType: 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline'
 }
 const emailConfigured = Boolean(env.BREVO_API_KEY && (env.BREVO_SENDER_EMAIL || env.EMAIL_FROM))
@@ -717,21 +719,23 @@ async function queryDarajaPayment(config: DarajaConfig, checkoutRequestId: strin
     CheckoutRequestID: checkoutRequestId,
   })
 }
-// Verify a receipt number the user typed against Daraja's Transaction Status API. This is how a
-// manually recorded M-Pesa payment is checked before it can mark an invoice paid: the API returns
-// the original amount and the receipt for that transaction, or an error when it does not exist.
-// A receipt only counts when ResultCode is 0, the returned receipt matches, and the amount matches.
+// Submit a typed receipt to Daraja's asynchronous Transaction Status API. The acknowledgement
+// only queues the lookup; the ResultURL callback supplies the actual status, receipt and amount.
+// The callback posts the payment only when Daraja reports Completed and both receipt and amount match.
 async function queryDarajaTransactionStatus(config: DarajaConfig, transactionId: string) {
-  const timestamp = darajaTimestamp()
+  const callbackUrl = new URL(config.callbackUrl)
+  callbackUrl.pathname = '/v1/integrations/mpesa/transaction-status-callback'
+  callbackUrl.search = ''
+  callbackUrl.hash = ''
   return darajaPost(config, '/mpesa/transactionstatus/v1/query', {
-    Initiator: config.shortcode,
-    SecurityCredential: mpesaPassword(config, timestamp),
+    Initiator: config.initiatorName,
+    SecurityCredential: config.transactionStatusSecurityCredential,
     CommandID: 'TransactionStatusQuery',
     TransactionID: transactionId,
     PartyA: config.shortcode,
     IdentifierType: '4',
-    ResultURL: config.callbackUrl,
-    QueueTimeOutURL: config.callbackUrl,
+    ResultURL: callbackUrl.toString(),
+    QueueTimeOutURL: callbackUrl.toString(),
     Remarks: 'Manual receipt verification',
     Occasion: 'Invoice payment verification',
   })
@@ -739,7 +743,7 @@ async function queryDarajaTransactionStatus(config: DarajaConfig, transactionId:
 // Resolve only the active workspace's encrypted Daraja credentials. Each business must connect
 // its own merchant account; platform-wide payment credentials are never used as a fallback.
 async function resolveWorkspaceDarajaConfig(workspaceId: string): Promise<DarajaConfig | null> {
-  const row = (await pool!.query('SELECT consumer_key_ciphertext, consumer_secret_ciphertext, shortcode, passkey_ciphertext, callback_url, environment, transaction_type FROM daraja_connections WHERE workspace_id = $1 AND enabled = true', [workspaceId])).rows[0]
+  const row = (await pool!.query('SELECT consumer_key_ciphertext, consumer_secret_ciphertext, shortcode, passkey_ciphertext, callback_url, environment, transaction_type, initiator_name, initiator_security_credential_ciphertext FROM daraja_connections WHERE workspace_id = $1 AND enabled = true', [workspaceId])).rows[0]
   if (row) {
     return {
       environment: String(row.environment) === 'production' ? 'production' : 'sandbox',
@@ -748,6 +752,10 @@ async function resolveWorkspaceDarajaConfig(workspaceId: string): Promise<Daraja
       shortcode: String(row.shortcode),
       passkey: decryptCommerceSecret(String(row.passkey_ciphertext)),
       callbackUrl: String(row.callback_url),
+      initiatorName: row.initiator_name ? String(row.initiator_name) : null,
+      transactionStatusSecurityCredential: row.initiator_security_credential_ciphertext
+        ? decryptCommerceSecret(String(row.initiator_security_credential_ciphertext))
+        : null,
       transactionType: String(row.transaction_type) === 'CustomerBuyGoodsOnline' ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline',
     }
   }
@@ -1398,12 +1406,12 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
       pool!.query(`SELECT id, description, amount::text, direction, account, transaction_date, created_at
         FROM ledger_transactions WHERE workspace_id = $1
         UNION ALL
-        SELECT e.id, e.description, COALESCE(SUM(l.credit - l.debit), 0)::text AS amount, 'income' AS direction, 'Sales invoice' AS account, e.entry_date AS transaction_date, e.created_at AS created_at
-        FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
-        JOIN workspace_accounts a ON a.id = l.account_id AND a.code = '4000'
-        JOIN invoices i ON i.id = e.source_id AND i.workspace_id = e.workspace_id AND i.amount_paid > 0
-        WHERE e.workspace_id = $1 AND e.source_type IN ('invoice', 'online_store_invoice', 'recurring_invoice')
-        GROUP BY e.id, e.description, e.entry_date, e.created_at
+        SELECT ip.id, concat_ws(' ', 'Invoice payment', i.customer, i.description, ip.payment_method, ip.payment_reference) AS description,
+          ip.amount::text AS amount, 'income' AS direction, 'Invoice payment' AS account, ip.payment_date AS transaction_date, ip.created_at
+        FROM invoice_payments ip JOIN invoices i ON i.id = ip.invoice_id AND i.workspace_id = ip.workspace_id
+        WHERE ip.workspace_id = $1 AND (ip.payment_method <> 'mpesa' OR EXISTS (
+          SELECT 1 FROM mpesa_payment_requests mr WHERE mr.workspace_id = ip.workspace_id AND mr.invoice_id = ip.invoice_id
+            AND mr.status = 'paid' AND mr.amount = ip.amount AND (ip.payment_reference = '' OR ip.payment_reference = mr.mpesa_receipt_number)))
         ORDER BY transaction_date DESC, created_at DESC LIMIT 20`, [workspaceId]),
       pool!.query(`SELECT daily.date, SUM(daily.income)::text AS income, SUM(daily.expense)::text AS expense FROM (
         SELECT transaction_date AS date, amount AS income, 0::numeric AS expense
@@ -1412,22 +1420,20 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
         SELECT transaction_date AS date, 0::numeric AS income, amount AS expense
         FROM ledger_transactions WHERE workspace_id = $1 AND direction = 'expense' AND transaction_date >= $2 AND transaction_date <= $3
         UNION ALL
-        SELECT e.entry_date AS date, SUM(l.credit - l.debit) AS income, 0::numeric AS expense
-        FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
-        JOIN workspace_accounts a ON a.id = l.account_id AND a.code = '4000'
-        JOIN invoices i ON i.id = e.source_id AND i.workspace_id = e.workspace_id AND i.amount_paid > 0
-        WHERE e.workspace_id = $1 AND e.entry_date >= $2 AND e.entry_date <= $3
-          AND e.source_type IN ('invoice', 'online_store_invoice', 'recurring_invoice')
-        GROUP BY e.id, e.entry_date
+        SELECT ip.payment_date AS date, SUM(ip.amount) AS income, 0::numeric AS expense
+        FROM invoice_payments ip
+        WHERE ip.workspace_id = $1 AND ip.payment_date >= $2 AND ip.payment_date <= $3 AND (ip.payment_method <> 'mpesa' OR EXISTS (
+          SELECT 1 FROM mpesa_payment_requests mr WHERE mr.workspace_id = ip.workspace_id AND mr.invoice_id = ip.invoice_id
+            AND mr.status = 'paid' AND mr.amount = ip.amount AND (ip.payment_reference = '' OR ip.payment_reference = mr.mpesa_receipt_number)))
+        GROUP BY ip.payment_date
       ) daily GROUP BY daily.date ORDER BY daily.date`,
       [workspaceId, query.data.from, query.data.to]),
-      pool!.query("SELECT count(*)::int AS count, COALESCE(SUM(amount) FILTER (WHERE status = 'unpaid'), 0)::text AS unpaid_amount FROM invoices WHERE workspace_id = $1", [workspaceId]),
-      pool!.query(`SELECT COALESCE(SUM(l.credit - l.debit) FILTER (WHERE e.entry_date >= $2 AND e.entry_date <= $3), 0)::text AS income,
-        COALESCE(SUM(l.credit - l.debit) FILTER (WHERE e.entry_date >= $4 AND e.entry_date <= $5), 0)::text AS month_income
-        FROM journal_entries e JOIN journal_lines l ON l.journal_entry_id = e.id
-        JOIN workspace_accounts a ON a.id = l.account_id AND a.code = '4000'
-        JOIN invoices i ON i.id = e.source_id AND i.workspace_id = e.workspace_id AND i.amount_paid > 0
-        WHERE e.workspace_id = $1 AND e.source_type IN ('invoice', 'online_store_invoice', 'recurring_invoice')`,
+      pool!.query("SELECT count(*)::int AS count, COALESCE(SUM(amount - amount_paid) FILTER (WHERE status = 'unpaid'), 0)::text AS unpaid_amount FROM invoices WHERE workspace_id = $1", [workspaceId]),
+      pool!.query(`SELECT COALESCE(SUM(amount) FILTER (WHERE payment_date >= $2 AND payment_date <= $3), 0)::text AS income,
+        COALESCE(SUM(amount) FILTER (WHERE payment_date >= $4 AND payment_date <= $5), 0)::text AS month_income
+        FROM invoice_payments ip WHERE workspace_id = $1 AND (ip.payment_method <> 'mpesa' OR EXISTS (
+          SELECT 1 FROM mpesa_payment_requests mr WHERE mr.workspace_id = ip.workspace_id AND mr.invoice_id = ip.invoice_id
+            AND mr.status = 'paid' AND mr.amount = ip.amount AND (ip.payment_reference = '' OR ip.payment_reference = mr.mpesa_receipt_number)))`,
       [workspaceId, query.data.from, query.data.to, monthStart, today]),
     ])
     const asDateString = (value: unknown) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
@@ -1582,12 +1588,6 @@ app.get('/v1/search', requirePool, requireSession, async (request: AuthedRequest
         SELECT oo.id::text, 'online order', oo.customer_name, concat_ws(' ', oo.source, oo.status), oo.total::text, oo.created_at::date::text, oo.status, 'Networking', oo.created_at
         FROM online_store_orders oo WHERE oo.workspace_id = $1 AND position($2 in lower(concat_ws(' ', oo.id::text, oo.external_order_id, oo.customer_name, oo.customer_email, oo.customer_phone, oo.source, oo.status, oo.total::text))) > 0
         UNION ALL
-        SELECT mr.id::text, 'M-Pesa payment', i.customer, concat_ws(' ', 'receipt', mr.mpesa_receipt_number, mr.result_description), mr.amount::text, mr.created_at::date::text, mr.status, 'Networking', mr.created_at
-        FROM mpesa_payment_requests mr JOIN invoices i ON i.id = mr.invoice_id AND i.workspace_id = mr.workspace_id
-        -- Only a Daraja-confirmed payment is a real transaction. Pending, failed or verification-
-        -- required requests stay out of the feed so an unconfirmed split never shows as income.
-        WHERE mr.workspace_id = $1 AND mr.status = 'paid' AND position($2 in lower(concat_ws(' ', mr.id::text, mr.mpesa_receipt_number, mr.result_description, mr.status, i.customer, i.description, mr.amount::text))) > 0
-        UNION ALL
         SELECT ssp.id::text, 'supplier service payment', service.data->>'name', concat_ws(' ', 'supplier payment', ssp.billing_cycle, ssp.expense_recorded::text), ssp.amount::text, ssp.payment_date::text, CASE WHEN ssp.expense_recorded THEN 'expense recorded' ELSE 'not in ledger' END, 'Expenses', ssp.created_at
         FROM service_supplier_payments ssp JOIN workspace_records service ON service.id = ssp.service_id AND service.workspace_id = ssp.workspace_id
         WHERE ssp.workspace_id = $1 AND position($2 in lower(concat_ws(' ', ssp.id::text, service.data::text, ssp.amount::text, ssp.payment_date::text, ssp.billing_cycle, ssp.expense_recorded::text))) > 0
@@ -1598,7 +1598,10 @@ app.get('/v1/search', requirePool, requireSession, async (request: AuthedRequest
         UNION ALL
         SELECT ip.id::text, 'invoice payment', i.customer, concat_ws(' ', i.description, 'payment', ip.payment_method, ip.payment_reference), ip.amount::text, ip.payment_date::text, 'recorded', 'Networking', ip.created_at
         FROM invoice_payments ip JOIN invoices i ON i.id = ip.invoice_id AND i.workspace_id = ip.workspace_id
-        WHERE ip.workspace_id = $1 AND position($2 in lower(concat_ws(' ', ip.id::text, i.customer, i.description, ip.amount::text, ip.payment_date::text, ip.payment_method, ip.payment_reference))) > 0
+        WHERE ip.workspace_id = $1 AND (ip.payment_method <> 'mpesa' OR EXISTS (
+          SELECT 1 FROM mpesa_payment_requests mr WHERE mr.workspace_id = ip.workspace_id AND mr.invoice_id = ip.invoice_id
+            AND mr.status = 'paid' AND mr.amount = ip.amount AND (ip.payment_reference = '' OR ip.payment_reference = mr.mpesa_receipt_number)))
+          AND position($2 in lower(concat_ws(' ', ip.id::text, i.customer, i.description, ip.amount::text, ip.payment_date::text, ip.payment_method, ip.payment_reference))) > 0
         UNION ALL
         SELECT bp.id::text, 'bill payment', vb.supplier, concat_ws(' ', vb.description, 'payment'), bp.amount::text, bp.payment_date::text, 'recorded', 'Expenses', bp.created_at
         FROM bill_payments bp JOIN vendor_bills vb ON vb.id = bp.bill_id AND vb.workspace_id = bp.workspace_id
@@ -2211,9 +2214,13 @@ app.put('/v1/integrations/woocommerce', requirePool, verifyOrigin, requireSessio
 // credentials, encrypted with ONLINE_COMMERCE_ENCRYPTION_KEY. Secrets are never returned.
 app.get('/v1/integrations/daraja', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT shortcode, callback_url, environment, transaction_type, enabled, updated_at FROM daraja_connections WHERE workspace_id = $1', [request.session!.workspaceId])
+    const result = await pool!.query('SELECT shortcode, callback_url, environment, transaction_type, initiator_name, (initiator_security_credential_ciphertext IS NOT NULL) AS transaction_status_configured, enabled, updated_at FROM daraja_connections WHERE workspace_id = $1', [request.session!.workspaceId])
     response.json({
-      connection: result.rows[0] ? { ...result.rows[0], credentialsConfigured: true } : null,
+      connection: result.rows[0] ? {
+        ...result.rows[0],
+        transactionStatusConfigured: Boolean(result.rows[0].initiator_name && result.rows[0].transaction_status_configured),
+        credentialsConfigured: true,
+      } : null,
       encryptionReady: Boolean(env.ONLINE_COMMERCE_ENCRYPTION_KEY),
     })
   } catch (error) { next(error) }
@@ -2224,29 +2231,44 @@ app.put('/v1/integrations/daraja', requirePool, verifyOrigin, requireSession, re
     consumerSecret: z.string().trim().min(1).max(300),
     shortcode: z.string().trim().regex(/^[A-Za-z0-9]{1,20}$/, 'Enter the PayBill/Till shortcode (letters and numbers only).'),
     passkey: z.string().trim().min(1).max(300),
+    initiatorName: z.string().trim().max(100).optional().default(''),
+    transactionStatusSecurityCredential: z.string().trim().max(4096).optional().default(''),
     callbackUrl: z.string().trim().url().max(500),
     environment: z.enum(['sandbox', 'production']).default('sandbox'),
     transactionType: z.enum(['CustomerPayBillOnline', 'CustomerBuyGoodsOnline']).default('CustomerPayBillOnline'),
   }).safeParse(request.body)
-  if (!input.success) { response.status(400).json({ error: 'Enter the Daraja consumer key, consumer secret, shortcode, passkey, and a public callback URL for this business.' }); return }
+  if (!input.success) { response.status(400).json({ error: input.error.issues[0]?.message ?? 'Enter valid Daraja credentials and a public callback URL for this business.' }); return }
   if (input.data.environment === 'production' && !input.data.callbackUrl.startsWith('https://')) { response.status(400).json({ error: 'Production Daraja requires a public HTTPS callback URL.' }); return }
   if (!env.ONLINE_COMMERCE_ENCRYPTION_KEY) { response.status(503).json({ error: 'Daraja credential storage is disabled. Configure ONLINE_COMMERCE_ENCRYPTION_KEY on the API service.' }); return }
   try {
+    const priorStatusCredential = await pool!.query('SELECT environment, initiator_name, initiator_security_credential_ciphertext FROM daraja_connections WHERE workspace_id = $1', [request.session!.workspaceId])
+    const prior = priorStatusCredential.rows[0]
+    const statusCredentialChanged = prior?.initiator_security_credential_ciphertext
+      && (String(prior.environment) !== input.data.environment || String(prior.initiator_name ?? '') !== input.data.initiatorName)
+    if (statusCredentialChanged && !input.data.transactionStatusSecurityCredential) {
+      response.status(400).json({ error: 'Changing the Daraja environment or Transaction Status initiator requires a new encrypted security credential for that environment and initiator.' }); return
+    }
     const encrypted = {
       key: encryptCommerceSecret(input.data.consumerKey),
       secret: encryptCommerceSecret(input.data.consumerSecret),
       passkey: encryptCommerceSecret(input.data.passkey),
+      initiatorSecurityCredential: input.data.transactionStatusSecurityCredential
+        ? encryptCommerceSecret(input.data.transactionStatusSecurityCredential)
+        : null,
     }
-    const saved = await pool!.query(`INSERT INTO daraja_connections (workspace_id, consumer_key_ciphertext, consumer_secret_ciphertext, shortcode, passkey_ciphertext, callback_url, environment, transaction_type)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    const saved = await pool!.query(`INSERT INTO daraja_connections (workspace_id, consumer_key_ciphertext, consumer_secret_ciphertext, shortcode, passkey_ciphertext, callback_url, environment, transaction_type, initiator_name, initiator_security_credential_ciphertext)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       ON CONFLICT (workspace_id) DO UPDATE SET consumer_key_ciphertext = EXCLUDED.consumer_key_ciphertext,
         consumer_secret_ciphertext = EXCLUDED.consumer_secret_ciphertext, shortcode = EXCLUDED.shortcode,
         passkey_ciphertext = EXCLUDED.passkey_ciphertext, callback_url = EXCLUDED.callback_url,
-        environment = EXCLUDED.environment, transaction_type = EXCLUDED.transaction_type, enabled = true, updated_at = now()
-      RETURNING shortcode, callback_url, environment, transaction_type, enabled, updated_at`,
-    [request.session!.workspaceId, encrypted.key, encrypted.secret, input.data.shortcode, encrypted.passkey, input.data.callbackUrl, input.data.environment, input.data.transactionType])
+        environment = EXCLUDED.environment, transaction_type = EXCLUDED.transaction_type,
+        initiator_name = COALESCE(EXCLUDED.initiator_name, daraja_connections.initiator_name),
+        initiator_security_credential_ciphertext = COALESCE(EXCLUDED.initiator_security_credential_ciphertext, daraja_connections.initiator_security_credential_ciphertext),
+        enabled = true, updated_at = now()
+      RETURNING shortcode, callback_url, environment, transaction_type, initiator_name, (initiator_security_credential_ciphertext IS NOT NULL) AS transaction_status_configured, enabled, updated_at`,
+    [request.session!.workspaceId, encrypted.key, encrypted.secret, input.data.shortcode, encrypted.passkey, input.data.callbackUrl, input.data.environment, input.data.transactionType, input.data.initiatorName || null, encrypted.initiatorSecurityCredential])
     await recordAudit(pool!, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'integrations.daraja_credentials_saved', entityType: 'workspace', entityId: request.session!.workspaceId, eventData: { environment: input.data.environment, shortcode: input.data.shortcode } })
-    response.json({ connection: { ...saved.rows[0], credentialsConfigured: true } })
+    response.json({ connection: { ...saved.rows[0], transactionStatusConfigured: Boolean(saved.rows[0].initiator_name && saved.rows[0].transaction_status_configured), credentialsConfigured: true } })
   } catch (error) { next(error) }
 })
 app.post('/v1/integrations/woocommerce/products/sync', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
@@ -3747,9 +3769,9 @@ app.patch('/v1/invoices/:invoiceId/status', requirePool, verifyOrigin, requireSe
 app.post('/v1/invoices/:invoiceId/payments', requirePool, verifyOrigin, requireSession, requireAccountingRole, async (request: AuthedRequest, response, next) => {
   const input = z.object({ amount: z.coerce.number().finite().positive().max(999999999999), paymentDate: z.string().date(), paymentMethod: z.enum(['cash', 'mpesa', 'manual']).default('manual') }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a positive payment amount and valid payment date.' }); return }
-  // M-Pesa money is only ever booked by the signed Daraja callback. Reject any attempt to record
-  // an M-Pesa amount manually here so income is never credited before Daraja confirms receipt.
-  if (input.data.paymentMethod === 'mpesa') { response.status(400).json({ error: 'M-Pesa payments cannot be recorded manually. Start the M-Pesa prompt from the invoice or point of sale; income is posted only after Daraja confirms the payment.' }); return }
+  // M-Pesa money is only booked after Daraja confirms it through the STK or Transaction Status
+  // callback. Reject direct posting here so receipt references cannot bypass that verification.
+  if (input.data.paymentMethod === 'mpesa') { response.status(400).json({ error: 'Unverified M-Pesa cannot be recorded as cash. Use an M-Pesa prompt or submit its receipt reference for Daraja verification; income is posted only after confirmation.' }); return }
   const client = await pool!.connect()
   try {
     await client.query('BEGIN')
@@ -5422,8 +5444,159 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
 
 app.get('/v1/invoices/:invoiceId/payments/mpesa', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT id, status, amount::text, result_description, mpesa_receipt_number, created_at FROM mpesa_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 ORDER BY created_at DESC LIMIT 10', [request.params.invoiceId, request.session!.workspaceId])
+    const result = await pool!.query('SELECT id, origin, mpesa_reference, status, amount::text, result_description, mpesa_receipt_number, created_at FROM mpesa_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 ORDER BY created_at DESC LIMIT 10', [request.params.invoiceId, request.session!.workspaceId])
     response.json({ payments: result.rows })
+  } catch (error) { next(error) }
+})
+
+// Verify a customer-supplied receipt asynchronously through Daraja. Cash is recorded
+// immediately, but the M-Pesa portion is posted only from the status-result callback.
+app.post('/v1/invoices/:invoiceId/payments/mpesa/manual', requirePool, verifyOrigin, requireSession, requireAccountingRole, requireWorkspaceProviderPreference('darajaEnabled'), rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    mpesaReference: z.string().trim().min(3).max(100),
+    mpesaAmount: z.coerce.number().finite().positive().max(999999999999).optional(),
+    cashAmount: z.coerce.number().finite().min(0).max(999999999999).default(0),
+    paymentDate: z.string().date(),
+  }).safeParse(request.body ?? {})
+  if (!input.success) { response.status(400).json({ error: 'Enter a valid M-Pesa receipt, optional M-Pesa amount, cash amount, and payment date.' }); return }
+  const daraja = await resolveWorkspaceDarajaConfig(request.session!.workspaceId)
+  if (!daraja) { response.status(503).json({ error: 'M-Pesa is not configured for this business.' }); return }
+  if (!daraja.initiatorName || !daraja.transactionStatusSecurityCredential) {
+    response.status(503).json({ error: 'Add this business’s M-Pesa API initiator name and encrypted Transaction Status security credential on the Kenya compliance page before verifying receipt references.' }); return
+  }
+  if (daraja.environment === 'production' && !daraja.callbackUrl.startsWith('https://')) { response.status(503).json({ error: 'Production Daraja requires a public HTTPS callback URL.' }); return }
+
+  const reference = input.data.mpesaReference.toUpperCase()
+  const cashAmount = Number(input.data.cashAmount.toFixed(2))
+  const paymentId = randomUUID()
+  const client = await pool!.connect()
+  let mpesaAmount = 0
+  try {
+    await client.query('BEGIN')
+    const found = await client.query(`SELECT id, customer, description, amount::text, amount_paid::text
+      FROM invoices WHERE id = $1 AND workspace_id = $2 AND status = 'unpaid' FOR UPDATE`, [request.params.invoiceId, request.session!.workspaceId])
+    const invoice = found.rows[0]
+    if (!invoice) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Open invoice not found.' }); return }
+    const returns = await client.query('SELECT COALESCE(SUM(amount), 0)::text AS returned, COALESCE(SUM(refund_amount), 0)::text AS refunded FROM sales_returns WHERE invoice_id = $1', [invoice.id])
+    const outstanding = Number(invoice.amount) - Number(invoice.amount_paid) - Number(returns.rows[0].returned) + Number(returns.rows[0].refunded)
+    if (cashAmount > outstanding) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Cash payment cannot exceed the outstanding invoice balance.' }); return }
+    mpesaAmount = Number((input.data.mpesaAmount ?? (outstanding - cashAmount)).toFixed(2))
+    if (mpesaAmount <= 0 || cashAmount + mpesaAmount - outstanding > 0.009) {
+      await client.query('ROLLBACK'); response.status(409).json({ error: 'The cash and M-Pesa amounts must be positive and cannot exceed the outstanding invoice balance.' }); return
+    }
+    const duplicate = await client.query('SELECT id FROM mpesa_payment_requests WHERE workspace_id = $1 AND mpesa_reference = $2 LIMIT 1', [request.session!.workspaceId, reference])
+    if (duplicate.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This M-Pesa receipt has already been entered for this business.' }); return }
+    const active = await client.query("SELECT id FROM mpesa_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 AND status IN ('initiating', 'pending', 'verification_required') LIMIT 1", [invoice.id, request.session!.workspaceId])
+    if (active.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'An M-Pesa payment is already awaiting confirmation for this invoice. Refresh its status before adding another.' }); return }
+
+    await client.query(`INSERT INTO mpesa_payment_requests
+      (id, workspace_id, invoice_id, customer_phone, amount, status, origin, mpesa_reference, result_description)
+      VALUES ($1, $2, $3, 'manual receipt', $4, 'verification_required', 'manual', $5, 'Submitting receipt for Daraja verification.')`,
+    [paymentId, request.session!.workspaceId, invoice.id, mpesaAmount.toFixed(2), reference])
+    if (cashAmount > 0) {
+      const cashPaymentId = randomUUID()
+      await client.query('INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, created_by, payment_method) VALUES ($1, $2, $3, $4, $5, $6, \'cash\')', [cashPaymentId, request.session!.workspaceId, invoice.id, cashAmount.toFixed(2), input.data.paymentDate, request.session!.userId])
+      const updated = await client.query(`UPDATE invoices SET amount_paid = amount_paid + $1,
+        status = CASE WHEN amount_paid + $1 >= amount
+          - COALESCE((SELECT SUM(amount) FROM sales_returns WHERE invoice_id = $2), 0)
+          + COALESCE((SELECT SUM(refund_amount) FROM sales_returns WHERE invoice_id = $2), 0)
+          THEN 'paid' ELSE 'unpaid' END
+        WHERE id = $2 AND workspace_id = $3 RETURNING amount::text, amount_paid::text, status`, [cashAmount.toFixed(2), invoice.id, request.session!.workspaceId])
+      await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: input.data.paymentDate, description: `Invoice cash payment: ${invoice.customer} — ${invoice.description}`, sourceType: 'invoice_payment', sourceId: cashPaymentId, lines: [{ accountCode: '1000', debit: cashAmount, credit: 0 }, { accountCode: '1100', debit: 0, credit: cashAmount }] })
+      await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'invoice.payment_recorded', entityType: 'invoice', entityId: String(invoice.id), eventData: { paymentId: cashPaymentId, amount: cashAmount, paymentDate: input.data.paymentDate, paymentMethod: 'cash' } })
+      if (!updated.rowCount) throw new Error('Invoice changed while recording the cash payment.')
+    }
+    await recordAudit(client, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'mpesa.manual_verification_requested', entityType: 'mpesa_payment', entityId: paymentId, eventData: { invoiceId: invoice.id, receiptReference: reference, expectedAmount: mpesaAmount.toFixed(2), cashAmount: cashAmount.toFixed(2) } })
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof Error && error.message.startsWith('Accounting period ')) { response.status(409).json({ error: error.message }); return }
+    next(error)
+    return
+  } finally { client.release() }
+
+  try {
+    const result = await queryDarajaTransactionStatus(daraja, reference)
+    const conversationId = String(result.ConversationID ?? '')
+    if (String(result.ResponseCode ?? '') !== '0' || !conversationId) {
+      const message = String(result.ResponseDescription ?? 'Daraja did not accept the receipt verification request.').slice(0, 500)
+      await pool!.query("UPDATE mpesa_payment_requests SET status = 'failed', result_code = $1, result_description = $2 WHERE id = $3", [String(result.ResponseCode ?? 'request_failed'), message, paymentId])
+      response.status(502).json({ error: `${cashAmount > 0 ? 'Cash was recorded, but ' : ''}Daraja did not accept the M-Pesa receipt check: ${message}` }); return
+    }
+    await pool!.query(`UPDATE mpesa_payment_requests SET transaction_status_conversation_id = $1,
+      transaction_status_originator_id = $2, result_code = $3, result_description = $4 WHERE id = $5`,
+    [conversationId, String(result.OriginatorConversationID ?? '') || null, String(result.ResponseCode), String(result.ResponseDescription ?? 'Daraja accepted the receipt check; waiting for its result callback.').slice(0, 500), paymentId])
+    response.status(202).json({ payment: { id: paymentId, status: 'verification_required', amount: mpesaAmount.toFixed(2), mpesa_reference: reference }, message: 'Receipt sent to Daraja. The M-Pesa amount will be posted only after Daraja confirms the receipt and amount.' })
+  } catch (error) {
+    const message = error instanceof Error ? error.message.slice(0, 500) : 'Daraja receipt verification failed.'
+    await pool!.query("UPDATE mpesa_payment_requests SET status = 'failed', result_description = $1 WHERE id = $2", [message, paymentId])
+    response.status(502).json({ error: `${cashAmount > 0 ? 'Cash was recorded, but ' : ''}Daraja receipt verification could not start: ${message}` })
+  }
+})
+
+app.post('/v1/integrations/mpesa/transaction-status-callback', requirePool, rateLimit({ windowMs: 60_000, limit: 60 }), async (request: express.Request, response, next) => {
+  const input = z.object({ Result: z.object({
+    ConversationID: z.string().min(1),
+    OriginatorConversationID: z.string().optional(),
+    ResultCode: z.union([z.number(), z.string()]),
+    ResultDesc: z.string().optional(),
+    TransactionID: z.string().optional(),
+    ResultParameters: z.object({ ResultParameter: z.array(z.object({ Key: z.string(), Value: z.union([z.string(), z.number()]).optional() })).optional() }).optional(),
+  }).passthrough() }).passthrough().safeParse(request.body)
+  if (!input.success) { response.status(400).json({ ResultCode: 1, ResultDesc: 'Invalid Transaction Status callback payload.' }); return }
+  const result = input.data.Result
+  const parameters = Object.fromEntries((result.ResultParameters?.ResultParameter ?? []).map(({ Key, Value }) => [Key, Value]))
+  const resultCode = String(result.ResultCode)
+  const receipt = String(parameters.ReceiptNo ?? parameters.MpesaReceiptNumber ?? '')
+  const transactionAmount = Number(parameters.Amount ?? parameters.TransactionAmount)
+  const transactionStatus = String(parameters.TransactionStatus ?? '')
+  try {
+    const client = await pool!.connect()
+    try {
+      await client.query('BEGIN')
+      const requestResult = await client.query(`SELECT id, invoice_id, workspace_id, amount::text, status, mpesa_reference
+        FROM mpesa_payment_requests WHERE transaction_status_conversation_id = $1 OR transaction_status_originator_id = $2 FOR UPDATE`, [result.ConversationID, result.OriginatorConversationID ?? null])
+      const payment = requestResult.rows[0]
+      if (!payment) { await client.query('ROLLBACK'); response.status(503).json({ ResultCode: 1, ResultDesc: 'Receipt verification request is not available yet.' }); return }
+      if (payment.status === 'paid' || payment.status === 'failed') { await client.query('COMMIT'); response.status(200).json({ ResultCode: 0, ResultDesc: 'Transaction Status callback already processed.' }); return }
+      const resultDescription = String(result.ResultDesc ?? 'Daraja returned a receipt status.').slice(0, 500)
+      if (resultCode !== '0') {
+        await client.query("UPDATE mpesa_payment_requests SET status = 'failed', result_code = $1, result_description = $2, callback_received_at = now() WHERE id = $3", [resultCode, resultDescription, payment.id])
+        await client.query('COMMIT')
+        response.status(200).json({ ResultCode: 0, ResultDesc: 'Transaction Status callback received.' }); return
+      }
+      const receiptMismatch = Boolean(receipt) && receipt.toUpperCase() !== String(payment.mpesa_reference).toUpperCase()
+      const amountMismatch = Number.isFinite(transactionAmount) && Math.round(transactionAmount * 100) !== Math.round(Number(payment.amount) * 100)
+      if (transactionStatus !== 'Completed' || receiptMismatch || amountMismatch || !receipt || !Number.isFinite(transactionAmount)) {
+        const finalFailure = ['cancelled', 'declined', 'expired', 'failed'].includes(transactionStatus.toLowerCase())
+        const confirmedMismatch = transactionStatus === 'Completed' && (receiptMismatch || amountMismatch)
+        const nextStatus = finalFailure || confirmedMismatch ? 'failed' : 'verification_required'
+        const message = transactionStatus !== 'Completed'
+          ? `Daraja reports this receipt as ${transactionStatus || 'unconfirmed'}; no M-Pesa income was recorded.`
+          : confirmedMismatch
+            ? 'Daraja confirmed a different receipt or amount than entered; no M-Pesa income was recorded.'
+            : 'Daraja has not returned enough receipt details to verify this payment; no M-Pesa income was recorded.'
+        await client.query('UPDATE mpesa_payment_requests SET status = $1, result_code = $2, result_description = $3, callback_received_at = now() WHERE id = $4', [nextStatus, resultCode, message, payment.id])
+        await client.query('COMMIT')
+        response.status(200).json({ ResultCode: 0, ResultDesc: 'Transaction Status callback received; receipt remains unverified.' }); return
+      }
+      const invoice = await client.query(`UPDATE invoices SET amount_paid = amount_paid + $1,
+        status = CASE WHEN amount_paid + $1 >= amount THEN 'paid' ELSE 'unpaid' END
+        WHERE id = $2 AND workspace_id = $3 AND status = 'unpaid' AND amount_paid + $1 <= amount
+        RETURNING customer, description`, [payment.amount, payment.invoice_id, payment.workspace_id])
+      if (!invoice.rowCount) {
+        await client.query("UPDATE mpesa_payment_requests SET status = 'verification_required', result_code = $1, result_description = $2, callback_received_at = now() WHERE id = $3", [resultCode, 'Daraja confirmed this receipt, but the invoice balance changed and needs manual review.', payment.id])
+        await client.query('COMMIT')
+        response.status(200).json({ ResultCode: 0, ResultDesc: 'Receipt verified; invoice balance needs review.' }); return
+      }
+      await client.query("UPDATE mpesa_payment_requests SET status = 'paid', result_code = '0', result_description = $1, mpesa_receipt_number = $2, callback_received_at = now() WHERE id = $3", [resultDescription, receipt, payment.id])
+      await client.query("INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, payment_method, payment_reference) VALUES ($1, $2, $3, $4, $5, 'mpesa', $6)", [randomUUID(), payment.workspace_id, payment.invoice_id, payment.amount, nairobiToday(), receipt])
+      await insertJournal(client, { workspaceId: String(payment.workspace_id), userId: null, date: nairobiToday(), description: `M-Pesa receipt ${receipt}`, sourceType: 'mpesa_payment', sourceId: String(payment.invoice_id), lines: [{ accountCode: '1000', debit: Number(payment.amount), credit: 0 }, { accountCode: '1100', debit: 0, credit: Number(payment.amount) }] })
+      await recordAudit(client, { workspaceId: String(payment.workspace_id), actorUserId: null, eventType: 'mpesa.payment_verified', entityType: 'mpesa_payment', entityId: String(payment.id), eventData: { invoiceId: String(payment.invoice_id), receiptNumber: receipt, amount: String(payment.amount), verification: 'transaction_status' } })
+      await client.query('COMMIT')
+      response.status(200).json({ ResultCode: 0, ResultDesc: 'M-Pesa receipt verified and recorded.' })
+    } catch (error) { await client.query('ROLLBACK'); next(error) }
+    finally { client.release() }
   } catch (error) { next(error) }
 })
 
@@ -5471,7 +5644,7 @@ app.post('/v1/integrations/mpesa/callback', requirePool, rateLimit({ windowMs: 6
       await client.query('UPDATE mpesa_payment_requests SET status = $1, result_code = $2, result_description = $3, mpesa_receipt_number = $4, callback_received_at = now() WHERE id = $5', ['paid', '0', resultDescription, String(metadata.MpesaReceiptNumber), payment.id])
       const invoice = await client.query("UPDATE invoices SET amount_paid = amount_paid + $1, status = CASE WHEN amount_paid + $1 >= amount THEN 'paid' ELSE 'unpaid' END WHERE id = $2 AND workspace_id = $3 AND status = 'unpaid' AND amount_paid + $1 <= amount RETURNING customer, description", [payment.amount, payment.invoice_id, payment.workspace_id])
       if (!invoice.rowCount) throw new Error('Invoice was already paid or changed before this payment callback; review this payment against the bank statement.')
-      await client.query("INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, payment_method) VALUES ($1, $2, $3, $4, $5, 'mpesa')", [randomUUID(), payment.workspace_id, payment.invoice_id, payment.amount, nairobiToday()])
+      await client.query("INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, payment_method, payment_reference) VALUES ($1, $2, $3, $4, $5, 'mpesa', $6)", [randomUUID(), payment.workspace_id, payment.invoice_id, payment.amount, nairobiToday(), String(metadata.MpesaReceiptNumber)])
       await insertJournal(client, { workspaceId: String(payment.workspace_id), userId: null, date: nairobiToday(), description: `M-Pesa receipt ${String(metadata.MpesaReceiptNumber)}`, sourceType: 'mpesa_payment', sourceId: String(payment.invoice_id), lines: [{ accountCode: '1000', debit: Number(payment.amount), credit: 0 }, { accountCode: '1100', debit: 0, credit: Number(payment.amount) }] })
       await recordAudit(client, { workspaceId: String(payment.workspace_id), actorUserId: null, eventType: 'mpesa.payment_verified', entityType: 'mpesa_payment', entityId: String(payment.id), eventData: { invoiceId: String(payment.invoice_id), receiptNumber: String(metadata.MpesaReceiptNumber), amount: String(payment.amount) } })
       await client.query('COMMIT')

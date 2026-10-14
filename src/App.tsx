@@ -137,7 +137,7 @@ type Employee = { id: string; employeeNumber: string; fullName: string; email?: 
 type PayrollRun = { id: string; period: string; status: 'draft' | 'posted' | 'partially_paid' | 'paid'; rule_set: string; employee_count: number; gross_total: string; net_total: string; paid_total?: string; outstanding_total?: string; paye_total: string; shif_total: string }
 type Remittance = { id: string; remittance_type: string; amount: string; status: string; payment_reference?: string; payroll_run_id: string }
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
-type InvoiceMpesaPayment = { id: string; status: string; amount: string; result_description?: string | null; mpesa_receipt_number?: string | null; created_at: string }
+type InvoiceMpesaPayment = { id: string; origin?: 'stk' | 'manual'; mpesa_reference?: string | null; status: string; amount: string; result_description?: string | null; mpesa_receipt_number?: string | null; created_at: string }
 type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number; kind: 'item' | 'service' }
 // Every workspace export the API supports, in the order the Settings buttons list them.
 const EXPORT_TYPES = ['customers', 'suppliers', 'inventory', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit'] as const
@@ -168,7 +168,7 @@ type RetailReport = { locations: InventoryLocation[]; stockLevels: Array<{ itemI
 type OnlineStoreConfig = { slug: string; title: string; description: string; enabled: boolean }
 type StoreOrder = { id: string; status: string; source: string; external_order_id?: string | null; customer_name: string; customer_email: string; customer_phone: string; total: string; invoice_id?: string | null; created_at: string }
 type WooConnection = { store_url: string; enabled: boolean; last_synced_at?: string | null; credentialsConfigured: boolean }
-type DarajaConnection = { shortcode: string; callback_url: string; environment: 'sandbox' | 'production'; transaction_type: 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline'; enabled: boolean; updated_at?: string | null; credentialsConfigured: boolean }
+type DarajaConnection = { shortcode: string; callback_url: string; environment: 'sandbox' | 'production'; transaction_type: 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline'; initiator_name?: string | null; transactionStatusConfigured?: boolean; enabled: boolean; updated_at?: string | null; credentialsConfigured: boolean }
 type MemberPermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
 
 // Grouped permission catalogue for role building. Every available permission is listed so admins
@@ -290,7 +290,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function requestInvoiceMpesaPayment(invoiceId: string, phone: string, amount?: number) {
-  return request<{ customerMessage: string }>(`/v1/invoices/${invoiceId}/payments/mpesa`, {
+  return request<{ payment: { id: string; status: string }; customerMessage: string }>(`/v1/invoices/${invoiceId}/payments/mpesa`, {
     method: 'POST',
     // `amount` is sent only for a split payment so the STK Push collects the dedicated
     // M-Pesa portion rather than the whole outstanding invoice balance.
@@ -879,6 +879,8 @@ function App() {
   const [estimateLines, setEstimateLines] = useState<DraftLine[]>([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])
   const [billLines, setBillLines] = useState<DraftLine[]>([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0', recoverableTaxAmount: '0' }])
   const [paymentAmounts, setPaymentAmounts] = useState<Record<string, string>>({})
+  const [invoiceMpesaReferences, setInvoiceMpesaReferences] = useState<Record<string, string>>({})
+  const [invoiceMpesaAmounts, setInvoiceMpesaAmounts] = useState<Record<string, string>>({})
   const [invoiceMpesaPhones, setInvoiceMpesaPhones] = useState<Record<string, string>>({})
   const [invoiceMpesaPayments, setInvoiceMpesaPayments] = useState<Record<string, InvoiceMpesaPayment[]>>({})
   const [mpesaPromptInvoiceId, setMpesaPromptInvoiceId] = useState<string | null>(null)
@@ -898,7 +900,7 @@ function App() {
   // Shared M-Pesa confirmation watcher used by every prompt site.
   const mpesaPoll = useRef<ReturnType<typeof setInterval> | null>(null)
   const mpesaPollStarted = useRef(0)
-  const mpesaWatchRef = useRef<{ invoiceId: string; amount: number; label: string; phase: 'waiting' | 'paid' | 'unpaid' | 'failed'; receipt: string; message: string; onPaid?: () => void; onUnpaid?: () => void } | null>(null)
+  const mpesaWatchRef = useRef<{ invoiceId: string; amount: number; label: string; phase: 'waiting' | 'paid' | 'unpaid' | 'failed'; receipt: string; message: string; onPaid?: () => void; onUnpaid?: () => void; paymentIds?: string[] } | null>(null)
   const [posCart, setPosCart] = useState<PosCartLine[]>([])
   const [posCustomer, setPosCustomer] = useState('')
   const [posCustomerType, setPosCustomerType] = useState<'walk_in' | 'remote'>('walk_in')
@@ -968,7 +970,7 @@ function App() {
   // A shared M-Pesa confirmation watcher used by every prompt site (POS, invoices, services and
   // recurring). While it is open it polls Daraja for the receipt, confirms the payment when it
   // arrives, and warns the user when no payment is received in time.
-  const [mpesaWatch, setMpesaWatch] = useState<{ invoiceId: string; amount: number; label: string; phase: 'waiting' | 'paid' | 'unpaid' | 'failed'; receipt: string; message: string; onPaid?: () => void; onUnpaid?: () => void } | null>(null)
+  const [mpesaWatch, setMpesaWatch] = useState<{ invoiceId: string; amount: number; label: string; phase: 'waiting' | 'paid' | 'unpaid' | 'failed'; receipt: string; message: string; onPaid?: () => void; onUnpaid?: () => void; paymentIds?: string[] } | null>(null)
   const [supplierPaymentInput, setSupplierPaymentInput] = useState({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' as 'none' | 'monthly' | 'quarterly' | 'annually' })
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
@@ -979,7 +981,7 @@ function App() {
   const [wooCredentials, setWooCredentials] = useState({ storeUrl: '', consumerKey: '', consumerSecret: '' })
   const [darajaConnection, setDarajaConnection] = useState<DarajaConnection | null>(null)
   const [darajaEncryptionReady, setDarajaEncryptionReady] = useState(false)
-  const [darajaCredentials, setDarajaCredentials] = useState({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', callbackUrl: '', environment: 'sandbox' as 'sandbox' | 'production', transactionType: 'CustomerPayBillOnline' as 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline' })
+  const [darajaCredentials, setDarajaCredentials] = useState({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', initiatorName: '', transactionStatusSecurityCredential: '', callbackUrl: '', environment: 'sandbox' as 'sandbox' | 'production', transactionType: 'CustomerPayBillOnline' as 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline' })
   const [teamMembers, setTeamMembers] = useState<WorkspaceMember[]>([])
   const [memberPermissionDrafts, setMemberPermissionDrafts] = useState<Record<string, MemberPermission[]>>({})
   const [memberRoleDrafts, setMemberRoleDrafts] = useState<Record<string, string>>({})
@@ -1476,7 +1478,7 @@ function App() {
       if (account.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin') {
         void request<{ connection: DarajaConnection | null; encryptionReady: boolean }>('/v1/integrations/daraja').then((result) => {
           setDarajaConnection(result.connection); setDarajaEncryptionReady(result.encryptionReady)
-          if (result.connection) setDarajaCredentials((current) => ({ ...current, shortcode: result.connection!.shortcode, callbackUrl: result.connection!.callback_url, environment: result.connection!.environment, transactionType: result.connection!.transaction_type }))
+          if (result.connection) setDarajaCredentials((current) => ({ ...current, shortcode: result.connection!.shortcode, callbackUrl: result.connection!.callback_url, initiatorName: result.connection!.initiator_name ?? '', environment: result.connection!.environment, transactionType: result.connection!.transaction_type }))
         }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load this business’s Daraja settings.'))
       }
     }
@@ -1563,7 +1565,7 @@ function App() {
     event.preventDefault(); setBusy(true); setError('')
     try {
       const result = await request<{ connection: DarajaConnection }>('/v1/integrations/daraja', { method: 'PUT', body: JSON.stringify(darajaCredentials) })
-      setDarajaConnection(result.connection); setDarajaCredentials((current) => ({ ...current, consumerKey: '', consumerSecret: '', passkey: '' }))
+      setDarajaConnection(result.connection); setDarajaCredentials((current) => ({ ...current, consumerKey: '', consumerSecret: '', passkey: '', transactionStatusSecurityCredential: '' }))
       notify(`Daraja / M-Pesa credentials encrypted and saved for ${account?.workspace.name ?? 'this business'}.`)
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save Daraja credentials.') }
     finally { setBusy(false) }
@@ -1992,7 +1994,7 @@ function App() {
     setSwitchingBusiness(true); setError(''); setBusinessMenuOpen(false); setSidebarOpen(false)
     setDarajaConnection(null)
     setDarajaEncryptionReady(false)
-    setDarajaCredentials({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', callbackUrl: '', environment: 'sandbox', transactionType: 'CustomerPayBillOnline' })
+    setDarajaCredentials({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', initiatorName: '', transactionStatusSecurityCredential: '', callbackUrl: '', environment: 'sandbox', transactionType: 'CustomerPayBillOnline' })
     try {
       await request(`/v1/workspaces/${workspaceId}/activate`, { method: 'POST' })
       const signedIn = await request<Account>('/v1/auth/me')
@@ -2568,10 +2570,12 @@ async function createCameraReader(): Promise<CameraReader> {
         // M-Pesa requests run after any cash is applied and carry the exact M-Pesa split
         // amount, so a part-cash sale can still raise an STK Push for the M-Pesa portion.
         let mpesaPrompted = 0
+        const mpesaPaymentIds: string[] = []
         for (const split of mpesaSplits) {
           try {
-            await requestInvoiceMpesaPayment(created.invoice.id, split.phone.trim(), Number(split.amount))
+            const result = await requestInvoiceMpesaPayment(created.invoice.id, split.phone.trim(), Number(split.amount))
             mpesaPrompted += Number(split.amount)
+            mpesaPaymentIds.push(result.payment.id)
           } catch (reason) {
             failures.push(`M-Pesa ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not requested'}`)
           }
@@ -2583,7 +2587,7 @@ async function createCameraReader(): Promise<CameraReader> {
         if (failures.length) setError(`Sale saved as invoice ${created.invoice.id.slice(0, 8)}, but some split payments were not recorded: ${failures.join('; ')}`)
         else notify('Sale completed. Stock and split payments recorded.')
         // Wait for Daraja to confirm the M-Pesa portion so the user can see the sale is paid.
-        if (mpesaPrompted > 0) watchMpesaPayment(created.invoice.id, mpesaPrompted, `Point of sale · ${customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid for the M-Pesa ${money(mpesaPrompted)}`; setPosReceipt({ ...receipt }) })
+        if (mpesaPrompted > 0) watchMpesaPayment(created.invoice.id, mpesaPrompted, `Point of sale · ${customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid for the M-Pesa ${money(mpesaPrompted)}`; setPosReceipt({ ...receipt }) }, mpesaPaymentIds)
       } else if (posPaymentMethod === 'cash') {
         try {
           await request(`/v1/invoices/${created.invoice.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: total, paymentDate: today, paymentMethod: 'cash' }) })
@@ -2600,7 +2604,7 @@ async function createCameraReader(): Promise<CameraReader> {
           const result = await requestInvoiceMpesaPayment(created.invoice.id, posPaymentPhone.trim())
           receipt.status = 'M-Pesa request started · confirm payment status before releasing goods'
           notify(result.customerMessage)
-          watchMpesaPayment(created.invoice.id, total, `Point of sale · ${customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid for the M-Pesa ${money(total)}`; setPosReceipt({ ...receipt }) })
+          watchMpesaPayment(created.invoice.id, total, `Point of sale · ${customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid for the M-Pesa ${money(total)}`; setPosReceipt({ ...receipt }) }, [result.payment.id])
         } catch (reason) {
           receipt.status = 'Unpaid · M-Pesa request did not start'
           setError(`Sale and stock were saved as invoice ${created.invoice.id.slice(0, 8)}, but the M-Pesa request did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try from Sales.'}`)
@@ -2698,7 +2702,7 @@ async function createCameraReader(): Promise<CameraReader> {
         try {
           const result = await requestInvoiceMpesaPayment(created.invoice.id, mobileNumber)
           notify(`Invoice saved. ${result.customerMessage}`)
-          watchMpesaPayment(created.invoice.id, Number(invoiceLines.reduce((sum, line) => sum + Number(line.quantity) * Number(line.unitPrice), 0).toFixed(2)) || Number(invoice.amount || 0), `Invoice · ${customerName}`, () => { void refreshAfterMpesaPaid(created.invoice.id) })
+          watchMpesaPayment(created.invoice.id, Number(invoiceLines.reduce((sum, line) => sum + Number(line.quantity) * Number(line.unitPrice), 0).toFixed(2)) || Number(invoice.amount || 0), `Invoice · ${customerName}`, () => { void refreshAfterMpesaPaid(created.invoice.id) }, undefined, [result.payment.id])
         } catch (reason) {
           notify(`Invoice saved; M-Pesa request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
         }
@@ -2811,10 +2815,42 @@ async function createCameraReader(): Promise<CameraReader> {
   async function payInvoice(invoiceRow: InvoiceRecord) {
     setBusy(true); setError('')
     try {
-      await request(`/v1/invoices/${invoiceRow.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: Number(paymentAmounts[invoiceRow.id]), paymentDate: today, paymentMethod: 'cash' }) })
-      const result = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
-      setInvoicesList(result.invoices); setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: '' })); await refresh(); notify('Invoice payment recorded in the ledger.')
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not record invoice payment.') }
+      const cashAmount = Number(paymentAmounts[invoiceRow.id] ?? 0)
+      const mpesaReference = invoiceMpesaReferences[invoiceRow.id]?.trim() ?? ''
+      const mpesaAmountText = invoiceMpesaAmounts[invoiceRow.id]?.trim() ?? ''
+      if (mpesaAmountText && !mpesaReference) throw new Error('Enter the M-Pesa receipt reference so Daraja can verify its amount.')
+      if (mpesaReference) {
+        const result = await request<{ payment: { id: string; amount: string; status: string }; message: string }>(`/v1/invoices/${invoiceRow.id}/payments/mpesa/manual`, {
+          method: 'POST',
+          body: JSON.stringify({ mpesaReference, mpesaAmount: mpesaAmountText ? Number(mpesaAmountText) : undefined, cashAmount, paymentDate: today }),
+        })
+        setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: '' }))
+        setInvoiceMpesaReferences((values) => ({ ...values, [invoiceRow.id]: '' }))
+        setInvoiceMpesaAmounts((values) => ({ ...values, [invoiceRow.id]: '' }))
+        setMpesaPromptInvoiceId(invoiceRow.id)
+        await loadInvoiceMpesaPayments(invoiceRow.id)
+        await refresh()
+        notify(`${cashAmount > 0 ? `Cash ${money(cashAmount)} recorded. ` : ''}M-Pesa receipt ${mpesaReference} is awaiting Daraja verification; it is not in income yet.`)
+        watchMpesaPayment(invoiceRow.id, Number(result.payment.amount), `Invoice · ${invoiceRow.customer}`, () => { void refreshAfterMpesaPaid(invoiceRow.id) }, undefined, [result.payment.id])
+      } else {
+        if (!(cashAmount > 0)) throw new Error('Enter a cash payment amount or an M-Pesa receipt reference.')
+        await request(`/v1/invoices/${invoiceRow.id}/payments`, { method: 'POST', body: JSON.stringify({ amount: cashAmount, paymentDate: today, paymentMethod: 'cash' }) })
+        setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: '' }))
+        const result = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+        setInvoicesList(result.invoices); await refresh(); notify('Invoice payment recorded in the ledger.')
+      }
+    } catch (reason) {
+      if (invoiceMpesaReferences[invoiceRow.id]?.trim()) {
+        if (reason instanceof Error && reason.message.startsWith('Cash was recorded,')) {
+          setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: '' }))
+          setInvoiceMpesaReferences((values) => ({ ...values, [invoiceRow.id]: '' }))
+          setInvoiceMpesaAmounts((values) => ({ ...values, [invoiceRow.id]: '' }))
+        }
+        await loadInvoiceMpesaPayments(invoiceRow.id)
+        await refresh()
+      }
+      setError(reason instanceof Error ? reason.message : 'Could not record invoice payment.')
+    }
     finally { setBusy(false) }
   }
 
@@ -2839,9 +2875,13 @@ async function createCameraReader(): Promise<CameraReader> {
           failures.push(`Cash ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not recorded'}`)
         }
       }
+      let mpesaTotal = 0
+      const mpesaPaymentIds: string[] = []
       for (const split of splits.filter((item) => item.method === 'mpesa')) {
         try {
-          await requestInvoiceMpesaPayment(invoiceRow.id, split.phone.trim(), Number(split.amount))
+          const result = await requestInvoiceMpesaPayment(invoiceRow.id, split.phone.trim(), Number(split.amount))
+          mpesaTotal += Number(split.amount)
+          mpesaPaymentIds.push(result.payment.id)
         } catch (reason) {
           failures.push(`M-Pesa ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not requested'}`)
         }
@@ -2850,8 +2890,7 @@ async function createCameraReader(): Promise<CameraReader> {
       setInvoicesList(result.invoices)
       setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: [] }))
       await refresh()
-      const mpesaTotal = splits.filter((item) => item.method === 'mpesa').reduce((sum, item) => sum + Number(item.amount), 0)
-      if (mpesaTotal > 0) watchMpesaPayment(invoiceRow.id, mpesaTotal, `Invoice · ${invoiceRow.customer}`, () => { void refreshAfterMpesaPaid(invoiceRow.id) })
+      if (mpesaTotal > 0) watchMpesaPayment(invoiceRow.id, mpesaTotal, `Invoice · ${invoiceRow.customer}`, () => { void refreshAfterMpesaPaid(invoiceRow.id) }, undefined, mpesaPaymentIds)
       if (failures.length) setError(`Some split payments were not recorded: ${failures.join('; ')}`)
       else notify(splits.some((split) => split.method === 'mpesa') ? 'Split payments started. The invoice stays unpaid until Daraja confirms the M-Pesa amount.' : 'Split cash payments recorded in the ledger.')
     } catch (reason) {
@@ -2879,7 +2918,7 @@ async function createCameraReader(): Promise<CameraReader> {
       await loadInvoiceMpesaPayments(invoiceRow.id)
       notify(result.customerMessage)
       const due = Number(invoiceRow.amount_due ?? invoiceRow.amount)
-      watchMpesaPayment(invoiceRow.id, due, `Invoice · ${invoiceRow.customer}`, () => { void refreshAfterMpesaPaid(invoiceRow.id) })
+      watchMpesaPayment(invoiceRow.id, due, `Invoice · ${invoiceRow.customer}`, () => { void refreshAfterMpesaPaid(invoiceRow.id) }, undefined, [result.payment.id])
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not start the M-Pesa prompt. The invoice remains unpaid.')
       await loadInvoiceMpesaPayments(invoiceRow.id)
@@ -3114,7 +3153,7 @@ async function createCameraReader(): Promise<CameraReader> {
           const prompt = await requestInvoiceMpesaPayment(result.invoice.id, phone, mpesaAmount)
           await refresh()
           notify(`${isNewBill ? 'Bill created' : 'Cash payment recorded'} for ${subscription.customer_name}. An M-Pesa prompt for ${money(mpesaAmount)} was sent; confirm it before releasing the service. ${prompt.customerMessage}`)
-          watchMpesaPayment(result.invoice.id, mpesaAmount, `Service · ${subscription.customer_name}`, () => { void refreshAfterMpesaPaid(result.invoice.id) })
+          watchMpesaPayment(result.invoice.id, mpesaAmount, `Service · ${subscription.customer_name}`, () => { void refreshAfterMpesaPaid(result.invoice.id) }, undefined, [prompt.payment.id])
         } catch (reason) {
           await refresh()
           setError(`Bill saved${cashAmount > 0 ? ` with ${money(cashAmount)} cash recorded` : ''} for ${subscription.customer_name}, but the M-Pesa prompt did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try again.'} Nothing was added to income for the M-Pesa part.`)
@@ -3164,10 +3203,10 @@ async function createCameraReader(): Promise<CameraReader> {
   // Watch a prompted M-Pesa payment across every prompt site. This polls Daraja through the
   // invoice M-Pesa status endpoint, shows a waiting screen, confirms the payment when Daraja
   // returns the receipt, and warns the user when no payment arrives in time.
-  function watchMpesaPayment(invoiceId: string, amount: number, label: string, onPaid?: () => void, onUnpaid?: () => void) {
+  function watchMpesaPayment(invoiceId: string, amount: number, label: string, onPaid?: () => void, onUnpaid?: () => void, paymentIds?: string[]) {
     if (mpesaPoll.current) { clearInterval(mpesaPoll.current); mpesaPoll.current = null }
     mpesaPollStarted.current = Date.now()
-    const next = { invoiceId, amount, label, phase: 'waiting' as const, receipt: '', message: '', onPaid, onUnpaid }
+    const next = { invoiceId, amount, label, phase: 'waiting' as const, receipt: '', message: '', onPaid, onUnpaid, paymentIds }
     // Update the ref before starting the poll so the first status check sees the new watch.
     mpesaWatchRef.current = next
     setMpesaWatch(next)
@@ -3180,14 +3219,21 @@ async function createCameraReader(): Promise<CameraReader> {
     if (!watch || watch.phase !== 'waiting') return
     try {
       const result = await request<{ payments: InvoiceMpesaPayment[] }>(`/v1/invoices/${watch.invoiceId}/payments/mpesa`)
-      const paid = result.payments.find((payment) => payment.status === 'paid')
-      if (paid) {
+      const watchedPayments = watch.paymentIds?.length
+        ? result.payments.filter((payment) => watch.paymentIds!.includes(payment.id))
+        : result.payments
+      const paidPayments = watchedPayments.filter((payment) => payment.status === 'paid')
+      const allWatchedPaid = watch.paymentIds?.length
+        ? paidPayments.length === watch.paymentIds.length
+        : paidPayments.length > 0
+      if (allWatchedPaid) {
         stopMpesaWatch()
-        setMpesaWatch((current) => current ? { ...current, phase: 'paid', receipt: paid.mpesa_receipt_number ?? '', message: '' } : current)
+        const receipts = paidPayments.map((payment) => payment.mpesa_receipt_number).filter(Boolean).join(', ')
+        setMpesaWatch((current) => current ? { ...current, phase: 'paid', receipt: receipts, message: '' } : current)
         watch.onPaid?.()
         return
       }
-      const failed = result.payments.find((payment) => payment.status === 'failed')
+      const failed = watchedPayments.find((payment) => payment.status === 'failed')
       if (failed) {
         stopMpesaWatch()
         setMpesaWatch((current) => current ? { ...current, phase: 'failed', message: failed.result_description ?? 'Daraja reported the request was not completed.' } : current)
@@ -3428,7 +3474,7 @@ async function createCameraReader(): Promise<CameraReader> {
         try {
           const payment = await requestInvoiceMpesaPayment(run.generatedId, template.customer_phone)
           notify(`Recurring invoice created. ${payment.customerMessage}`)
-          watchMpesaPayment(run.generatedId, Number(template.amount ?? 0), `Recurring invoice · ${template.counterparty}`, () => { void refreshAfterMpesaPaid(run.generatedId!) })
+          watchMpesaPayment(run.generatedId, Number(template.amount ?? 0), `Recurring invoice · ${template.counterparty}`, () => { void refreshAfterMpesaPaid(run.generatedId!) }, undefined, [payment.payment.id])
         } catch (reason) {
           notify(`Recurring invoice created; Daraja request not started: ${reason instanceof Error ? reason.message : 'check Daraja setup.'}`)
         }
@@ -4397,7 +4443,7 @@ async function createCameraReader(): Promise<CameraReader> {
   useEffect(() => {
     setDarajaConnection(null)
     setDarajaEncryptionReady(false)
-    setDarajaCredentials({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', callbackUrl: '', environment: 'sandbox', transactionType: 'CustomerPayBillOnline' })
+    setDarajaCredentials({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', initiatorName: '', transactionStatusSecurityCredential: '', callbackUrl: '', environment: 'sandbox', transactionType: 'CustomerPayBillOnline' })
   }, [account?.workspace.id])
   const multiMethodEnabled = Boolean(settings.multiMethodPayments)
 
@@ -4630,11 +4676,11 @@ async function createCameraReader(): Promise<CameraReader> {
           <h2>{mpesaWatch.phase === 'failed' ? 'Payment failed' : 'Payment not received'}</h2>
           <p className="mpesa-confirm-amount">{money(mpesaWatch.amount)}</p>
           <p className="mpesa-confirm-subject">{mpesaWatch.label}</p>
-          <p className="mpesa-confirm-body">{mpesaWatch.phase === 'failed' ? mpesaWatch.message || 'Daraja reported this M-Pesa request was not completed.' : 'No confirmed M-Pesa payment has arrived yet and nothing was added to income.'} Do you want to send it to the invoice and mark it as not paid?</p>
+          <p className="mpesa-confirm-body">{mpesaWatch.phase === 'failed' ? mpesaWatch.message || 'Daraja reported this M-Pesa request was not completed.' : 'No confirmed M-Pesa payment has arrived yet, so no M-Pesa amount was added to income.'} Any cash already recorded stays on the invoice. Keep its unpaid or partially paid status until Daraja confirms?</p>
           <p className="dialog-note">If the customer has already paid, wait and check again. Amounts are only recognised once Daraja confirms the receipt.</p>
           <div className="button-row">
-            <button type="button" className="button button-primary" onClick={() => { closeMpesaWatch() }}>Keep marked as not paid</button>
-            <button type="button" className="button button-small" onClick={() => { const watch = mpesaWatchRef.current; if (watch) watchMpesaPayment(watch.invoiceId, watch.amount, watch.label, watch.onPaid, watch.onUnpaid) }}>Check again</button>
+            <button type="button" className="button button-primary" onClick={() => { closeMpesaWatch() }}>Keep M-Pesa unrecorded</button>
+            <button type="button" className="button button-small" onClick={() => { const watch = mpesaWatchRef.current; if (watch) watchMpesaPayment(watch.invoiceId, watch.amount, watch.label, watch.onPaid, watch.onUnpaid, watch.paymentIds) }}>Check again</button>
           </div>
         </>}
       </div>
@@ -5287,13 +5333,15 @@ async function createCameraReader(): Promise<CameraReader> {
           <section className="module-card" aria-labelledby="daraja-business-settings-heading">
             <div className="panel-header"><div><h2 id="daraja-business-settings-heading">Safaricom Daraja · {account?.workspace.name}</h2><p>Connect this business’s own merchant account. Every business can use different Daraja credentials.</p></div><Smartphone size={20} /></div>
             {isActiveWorkspaceAdmin ? <>
-              <p>Consumer keys and the STK Push passkey are encrypted by the API and never shown again after saving. Credentials are stored separately for this business.</p>
-              {darajaConnection && <p role="status">Saved for this business · shortcode {darajaConnection.shortcode} · {darajaConnection.environment} · {darajaConnection.transaction_type}{darajaConnection.updated_at ? ` · updated ${new Date(darajaConnection.updated_at).toLocaleString()}` : ''}</p>}
+              <p>Consumer keys, the STK Push passkey, and any Transaction Status credential are encrypted by the API and never shown again after saving. Credentials are stored separately for this business.</p>
+              {darajaConnection && <p role="status">Saved for this business · shortcode {darajaConnection.shortcode} · {darajaConnection.environment} · {darajaConnection.transaction_type} · receipt verification {darajaConnection.transactionStatusConfigured ? 'configured' : 'needs setup'}{darajaConnection.updated_at ? ` · updated ${new Date(darajaConnection.updated_at).toLocaleString()}` : ''}</p>}
               {!darajaEncryptionReady && <p className="form-error" role="alert">Secure credential storage is not configured on the API server. Set <code>ONLINE_COMMERCE_ENCRYPTION_KEY</code> before saving credentials.</p>}
               {!darajaConnection && <p className="dialog-note">No Daraja credentials are saved for {account?.workspace.name}. Add this business’s merchant account to enable its M-Pesa payments.</p>}
               <form className="record-form-grid" onSubmit={saveDaraja}>
                 <div className="field-row"><label className="field-label">Daraja consumer key<input required autoComplete="off" value={darajaCredentials.consumerKey} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, consumerKey: event.target.value })} /></label><label className="field-label">Daraja consumer secret<input required type="password" autoComplete="new-password" value={darajaCredentials.consumerSecret} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, consumerSecret: event.target.value })} /></label></div>
                 <div className="field-row"><label className="field-label">PayBill / Till shortcode<input required autoComplete="off" placeholder="174379" value={darajaCredentials.shortcode} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, shortcode: event.target.value })} /></label><label className="field-label">STK Push passkey<input required type="password" autoComplete="new-password" value={darajaCredentials.passkey} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, passkey: event.target.value })} /></label></div>
+                <div className="field-row"><label className="field-label">M-Pesa API initiator name (receipt verification)<input autoComplete="off" value={darajaCredentials.initiatorName} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, initiatorName: event.target.value })} /></label><label className="field-label">Encrypted Transaction Status security credential<input type="password" autoComplete="new-password" value={darajaCredentials.transactionStatusSecurityCredential} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, transactionStatusSecurityCredential: event.target.value })} /></label></div>
+                <p className="dialog-note">These two fields are optional for STK prompts and required to verify a typed receipt reference. Paste the encrypted SecurityCredential from Daraja for the selected environment, not the plaintext API operator password. The saved credential is kept when its field is blank; enter a new one if you change the environment or initiator name.</p>
                 <label className="field-label">Public callback URL<input required type="url" placeholder="https://your-api-domain.example/v1/integrations/mpesa/callback" value={darajaCredentials.callbackUrl} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, callbackUrl: event.target.value })} /><small>Must be reachable by Safaricom over the public internet. Production requires HTTPS.</small></label>
                 <div className="field-row"><label className="field-label">Environment<select value={darajaCredentials.environment} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, environment: event.target.value as 'sandbox' | 'production' })}><option value="sandbox">Sandbox (testing)</option><option value="production">Production (live)</option></select></label><label className="field-label">Transaction type<select value={darajaCredentials.transactionType} onChange={(event) => setDarajaCredentials({ ...darajaCredentials, transactionType: event.target.value as 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline' })}><option value="CustomerPayBillOnline">CustomerPayBillOnline (PayBill)</option><option value="CustomerBuyGoodsOnline">CustomerBuyGoodsOnline (Till)</option></select></label></div>
                 <div className="button-row"><button className="button button-primary" disabled={busy || !darajaEncryptionReady}>{busy ? 'Saving…' : 'Save encrypted credentials'}</button></div>
@@ -5627,8 +5675,10 @@ async function createCameraReader(): Promise<CameraReader> {
                     {invoiceRow.status === 'unpaid' && <button className="button button-small" disabled={busy || !invoiceRow.customer_email} title={!invoiceRow.customer_email ? 'Add a customer email to this invoice first.' : undefined} onClick={() => void sendInvoiceReminder(invoiceRow)}>Send reminder</button>}
                     {invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}
                     {invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <>
-                      <label className="field-label">Payment (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
-                      <button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record payment</button>
+                      <label className="field-label">Cash / manual amount (KSh)<input min="0" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
+                      <label className="field-label">M-Pesa receipt reference<input maxLength={100} autoComplete="off" placeholder="e.g. QGH7K2P9" value={invoiceMpesaReferences[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaReferences((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
+                      <label className="field-label">M-Pesa amount (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" placeholder="Defaults to balance after cash" value={invoiceMpesaAmounts[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
+                      <button className="button button-small" disabled={busy || (!paymentAmounts[invoiceRow.id] && !invoiceMpesaReferences[invoiceRow.id]?.trim())} onClick={() => void payInvoice(invoiceRow)}>Record payment</button>
                       {multiMethodEnabled && <button className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: current[invoiceRow.id]?.length ? [] : [{ method: 'cash', amount: '', phone: '', reference: '' }] }))}>{paymentSplits[invoiceRow.id]?.length ? 'Hide split payment' : 'Split payment'}</button>}
                       <button className="button button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting} title={!mpesaConfigured ? 'Daraja M-Pesa is not configured for this business.' : undefined} onClick={() => {
                         if (promptOpen) { setMpesaPromptInvoiceId(null); return }
@@ -5636,7 +5686,7 @@ async function createCameraReader(): Promise<CameraReader> {
                         if (!(invoiceRow.id in invoiceMpesaPayments)) void loadInvoiceMpesaPayments(invoiceRow.id)
                       }}>M-Pesa prompt{!mpesaConfigured && ' · setup needed'}</button>
                     </>}
-                    {latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}</span>}
+                    {latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}{(latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference) ? ` · ${latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference}` : ''}</span>}
                   </div>
                   {Boolean(paymentSplits[invoiceRow.id]?.length) && <div className="payment-split-editor">
                     <div className="panel-header"><div><h3>Split payment for {invoiceRow.customer}</h3><p>Record part cash and part M-Pesa against invoice {invoiceRow.id.slice(0, 8)}. Amounts are recorded and verified separately.</p></div><button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: [...(current[invoiceRow.id] ?? []), { method: 'cash', amount: '', phone: '', reference: '' }] }))}><Plus size={14} /> Add method</button></div>
