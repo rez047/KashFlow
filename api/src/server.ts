@@ -600,7 +600,8 @@ async function requireSession(request: AuthedRequest, response: express.Response
         response.status(403).json({ error: 'Your workspace role does not have permission to add customers.' })
         return
       }
-      const requiredPermissions = selfServiceRoute
+      const invoicePaymentRoute = routePath === '/v1/invoices/:invoiceId/payments' || routePath === '/v1/invoices/:invoiceId/payments/mpesa/manual'
+      const requiredPermissions = selfServiceRoute || invoicePaymentRoute
         ? []
         : customerCreationRoute
           ? []
@@ -808,6 +809,14 @@ function requireWorkspaceRole(allowedRoles: Array<'admin' | 'accountant' | 'staf
 }
 const requireWorkspaceWriter = requireWorkspaceRole(['admin', 'accountant', 'staff'])
 const requireAccountingRole = requireWorkspaceRole(['admin', 'accountant'])
+function requireInvoicePaymentAccess(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
+  const permissions = request.workspacePermissions ?? []
+  if (!permissions.includes('sales.write') && !permissions.includes('accounting.write')) {
+    response.status(403).json({ error: 'Your workspace role needs sales.write or accounting.write permission to record invoice payments.' })
+    return
+  }
+  next()
+}
 function requireWorkspaceProviderPreference(preference: 'monoEnabled' | 'darajaEnabled' | 'kraEtimsLiveEnabled', productionOnly = false) {
   return async (request: AuthedRequest, response: express.Response, next: express.NextFunction) => {
     if (productionOnly && env.KRA_ETIMS_ENV !== 'production') { next(); return }
@@ -3980,7 +3989,7 @@ app.patch('/v1/invoices/:invoiceId/status', requirePool, verifyOrigin, requireSe
   } catch (error) { next(error) }
 })
 
-app.post('/v1/invoices/:invoiceId/payments', requirePool, verifyOrigin, requireSession, requireAccountingRole, async (request: AuthedRequest, response, next) => {
+app.post('/v1/invoices/:invoiceId/payments', requirePool, verifyOrigin, requireSession, requireInvoicePaymentAccess, async (request: AuthedRequest, response, next) => {
   const input = z.object({ amount: z.coerce.number().finite().positive().max(999999999999), paymentDate: z.string().date(), paymentMethod: z.enum(['cash', 'mpesa', 'manual']).default('manual') }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a positive payment amount and valid payment date.' }); return }
   // M-Pesa money is only booked after Daraja confirms it through the STK or Transaction Status
@@ -5665,7 +5674,7 @@ app.get('/v1/invoices/:invoiceId/payments/mpesa', requirePool, requireSession, a
 
 // Verify a customer-supplied receipt asynchronously through Daraja. Cash is recorded
 // immediately, but the M-Pesa portion is posted only from the status-result callback.
-app.post('/v1/invoices/:invoiceId/payments/mpesa/manual', requirePool, verifyOrigin, requireSession, requireAccountingRole, requireWorkspaceProviderPreference('darajaEnabled'), rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request: AuthedRequest, response, next) => {
+app.post('/v1/invoices/:invoiceId/payments/mpesa/manual', requirePool, verifyOrigin, requireSession, requireInvoicePaymentAccess, requireWorkspaceProviderPreference('darajaEnabled'), rateLimit({ windowMs: 15 * 60_000, limit: 5 }), async (request: AuthedRequest, response, next) => {
   const input = z.object({
     mpesaReference: z.string().trim().min(3).max(100),
     mpesaAmount: z.coerce.number().finite().positive().max(999999999999).optional(),
