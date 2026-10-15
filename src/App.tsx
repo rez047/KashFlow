@@ -53,8 +53,8 @@ function overviewPeriod(range: OverviewRange, from: string, to: string) {
 // cannot use. Entries with no permission are always visible (read-only screens).
 const groups = [
   { title: 'WORKSPACE', items: [['Overview', LayoutDashboard, null], ['Banking', Landmark, 'banking.write'], ['Expenses', ArrowDownLeft, 'accounting.write'], ['Payroll', Users, 'payroll.manage']] },
-  { title: 'Point of sale', items: [['Point of sale', ShoppingBag, 'sales.write'], ['Networking', ArrowUpRight, 'sales.write']] },
-  { title: 'MANAGE', items: [['Customers', Users, 'operations.write'], ['Suppliers', ShoppingBag, 'inventory.write'], ['Inventory', Package, 'inventory.write'], ['Services', Sparkles, 'inventory.write'], ['Projects', BriefcaseBusiness, 'operations.write'], ['Accounting', BookOpen, 'accounting.write']] },
+  { title: 'Point of sale', items: [['Point of sale', ShoppingBag, 'sales.write'], ['Networking', ArrowUpRight, 'sales.write'], ['Services', Sparkles, 'sales.write']] },
+  { title: 'MANAGE', items: [['Customers', Users, 'operations.write'], ['Suppliers', ShoppingBag, 'inventory.write'], ['Inventory', Package, 'inventory.write'], ['Projects', BriefcaseBusiness, 'operations.write'], ['Accounting', BookOpen, 'accounting.write']] },
   { title: 'INSIGHTS', items: [['Reports', Activity, null], ['Kenya compliance', ShieldCheck, 'integrations.manage'], ['Documents', FileText, 'operations.write']] },
 ] as const
 
@@ -182,7 +182,7 @@ const PAGE_PERMISSION_REQUIREMENTS: Record<string, MemberPermission | MemberPerm
   Customers: 'operations.write',
   Suppliers: 'inventory.write',
   Inventory: 'inventory.write',
-  Services: 'inventory.write',
+  Services: ['inventory.write', 'sales.write'],
   Projects: 'operations.write',
   Accounting: 'accounting.write',
   Reports: ['accounting.write', 'inventory.write'],
@@ -1740,6 +1740,7 @@ function App() {
     if (page === 'Point of sale') {
       void Promise.all([
         request<{ records: WorkspaceRecord[] }>('/v1/records/inventory').then((result) => setRecords((current) => ({ ...current, inventory: result.records }))),
+        request<{ records: WorkspaceRecord[] }>('/v1/records/services').then((result) => setRecords((current) => ({ ...current, services: result.records }))),
         request<{ records: WorkspaceRecord[] }>('/v1/records/customers').then((result) => setRecords((current) => ({ ...current, customers: result.records }))),
         request<{ locations: InventoryLocation[]; defaultLocationId: string }>('/v1/inventory/locations').then((result) => { setInventoryLocations(result.locations); setPosLocationId((current) => current || result.defaultLocationId) }),
         request<{ stock: InventoryLocationStock[] }>('/v1/inventory/location-stock').then((result) => setInventoryLocationStock(result.stock)),
@@ -1786,11 +1787,17 @@ function App() {
     }
     const recordType = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Services: 'services', Projects: 'projects' } as Record<string, string>)[page]
     if (page === 'Services') {
-      void Promise.all([
+      const serviceLoads: Array<Promise<{ records: WorkspaceRecord[] }>> = [
         request<{ records: WorkspaceRecord[] }>('/v1/records/services'),
         request<{ records: WorkspaceRecord[] }>('/v1/records/customers'),
-        request<{ records: WorkspaceRecord[] }>('/v1/records/suppliers'),
-      ]).then(([services, customers, suppliers]) => setRecords((current) => ({ ...current, services: services.records, customers: customers.records, suppliers: suppliers.records })))
+      ]
+      if (canUse('inventory.write')) serviceLoads.push(request<{ records: WorkspaceRecord[] }>('/v1/records/suppliers'))
+      void Promise.all(serviceLoads).then(([services, customers, suppliers]) => setRecords((current) => ({
+        ...current,
+        services: services.records,
+        customers: customers.records,
+        ...(suppliers ? { suppliers: suppliers.records } : {}),
+      })))
         .catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load services, saved customers, and suppliers.'))
     } else if (recordType) void request<{ records: WorkspaceRecord[] }>(`/v1/records/${recordType}`).then((result) => setRecords((current) => ({ ...current, [recordType]: result.records }))).catch((reason) => setError(reason instanceof Error ? reason.message : `Could not load ${page.toLowerCase()}.`))
     if (page === 'Suppliers' && canUse('accounting.write')) void request<{ bills: VendorBill[] }>('/v1/bills').then((result) => setBills(result.bills)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load supplier bills.'))
@@ -5278,6 +5285,7 @@ async function createCameraReader(): Promise<CameraReader> {
         </section> : ['Customers', 'Suppliers', 'Inventory', 'Services', 'Projects'].includes(page) ? (() => {
           const type = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Services: 'services', Projects: 'projects' } as Record<string, 'customers' | 'suppliers' | 'inventory' | 'services' | 'projects'>)[page]
           const recordLabel = type === 'inventory' ? 'inventory item' : type === 'services' ? 'service' : page.slice(0, -1).toLowerCase()
+          const canManageServiceCatalog = canUse('inventory.write')
           const fields: Record<string, Array<{ name: string; label: string; kind?: string }>> = {
             customers: [{ name: 'name', label: 'Customer name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
             suppliers: [{ name: 'name', label: 'Supplier name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
@@ -5302,8 +5310,9 @@ async function createCameraReader(): Promise<CameraReader> {
             { status: 'medium', title: 'Medium stock · watch', description: 'Above the low limit and at or below the configured medium limit.', items: inventoryHealth.filter((item) => item.status === 'medium') },
             { status: 'healthy', title: 'Healthy stock', description: 'Above the configured medium-stock limit.', items: inventoryHealth.filter((item) => item.status === 'healthy') },
           ]
-          return <section className="module-page"><div className="eyebrow"><span className="live-dot" /> {page.toUpperCase()} · WORKSPACE DATABASE</div><h1>{page}</h1><p className="welcome-subtitle">Create and maintain records for {dashboard?.workspaceName}. Data is private to this business.</p>
+          return <section className="module-page"><div className="eyebrow"><span className="live-dot" /> {page.toUpperCase()} · WORKSPACE DATABASE</div><h1>{page}</h1><p className="welcome-subtitle">{type === 'services' && !canManageServiceCatalog ? "Browse this business's saved services, manage customer subscriptions, and add services to a counter sale. Catalog and supplier details are maintained by inventory managers." : `Create and maintain records for ${dashboard?.workspaceName}. Data is private to this business.`}</p>
             {error && <p className="form-error" role="alert">{error}</p>}
+            {(type !== 'services' || canManageServiceCatalog) && <>
             <form className="module-card" onSubmit={(event) => void saveWorkspaceRecord(event, type)}><h2>{editingRecordId ? 'Edit' : 'Add'} {recordLabel}</h2><div className="record-form-grid">{fields[type].map((field) => <label className="field-label" key={field.name}>{field.label}{type === 'services' && field.name === 'category' ? <input required list="service-category-list" maxLength={80} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} placeholder="Wifi, Security, Shoe shining, Cleaning…" /> : field.kind === 'status' ? <select value={recordForm[field.name] ?? 'planned'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="planned">Planned</option><option value="active">Active</option><option value="on_hold">On hold</option><option value="completed">Completed</option></select> : <input required={field.name === 'name'} type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : field.kind ?? 'text'} min={field.kind === 'number' ? '0' : undefined} step={field.kind === 'number' ? '0.01' : undefined} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} />}</label>)}</div>
               {type === 'services' && <>
                 <datalist id="service-category-list"><option value="Wifi" /><option value="Security" /><option value="Shoe shining" /><option value="Cleaning" /><option value="Laundry" /><option value="Plumbing" /><option value="Electrical" /><option value="Catering" /><option value="Transport" /><option value="Consulting" /></datalist>
@@ -5317,6 +5326,7 @@ async function createCameraReader(): Promise<CameraReader> {
                 <p className="dialog-note">The customer charge is billed through subscriber records. Supplier cost is optional; saving it can also record a supplier payment and post it to expenses.</p>
               </>}
               {type === 'suppliers' && <fieldset className="module-card supplier-items-fieldset"><legend>Inventory items supplied (optional)</legend><p className="dialog-note">Link one or more items this supplier provides. These are reference links only; they do not change stock or purchase orders.</p>{supplierItemIds.map((itemId, index) => <div className="field-row" key={`supplier-item-${index}`}><label className="field-label">Inventory item<select aria-label={`Supplier inventory item ${index + 1}`} value={itemId} onChange={(event) => setSupplierItemIds((current) => current.map((value, row) => row === index ? event.target.value : value))}><option value="">Choose item (optional)</option>{records.inventory.filter((item) => !supplierItemIds.includes(item.id) || item.id === itemId).map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')}{item.data.sku ? ` · ${item.data.sku}` : ''}</option>)}</select></label>{supplierItemIds.length > 1 && <button type="button" className="button button-small" aria-label="Remove supplier item row" onClick={() => setSupplierItemIds((current) => current.filter((_, row) => row !== index))}>Remove</button>}</div>)}<button type="button" className="button button-secondary" onClick={() => setSupplierItemIds((current) => [...current, ''])}>Add another item</button></fieldset>}<div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : `${editingRecordId ? 'Update' : 'Save'} ${recordLabel}`}</button>{editingRecordId && <button type="button" className="button button-secondary" onClick={() => { setEditingRecordId(''); setRecordForm({}); setSupplierItemIds(['']) }}>Cancel edit</button>}</div></form>
+            </>}
             {type === 'inventory' && <article className="module-card stock-health-panel">
               <div className="panel-header"><div><h2>Stock health &amp; reorder reminders</h2><p>Health uses each item’s saved reorder point; location quantities are combined for the business total.</p></div><span className="task-count">{inventoryHealth.filter((item) => item.status === 'low').length} low</span></div>
               <div className="stock-health-grid">{healthGroups.map((group) => <section className={`stock-health-card stock-health-${group.status}`} key={group.status}>
@@ -5348,7 +5358,7 @@ async function createCameraReader(): Promise<CameraReader> {
                       {type === 'inventory'
                         ? `SKU ${record.data.sku || '—'} · Price ${money(Number(record.data.price ?? 0))} · Qty ${record.data.quantity} ${record.data.unit}`
                         : type === 'services'
-                          ? `${record.data.category || 'General service'} · Customer charge ${money(Number(record.data.charge ?? 0))} · Supplier cost ${money(Number(record.data.supplierRate ?? 0))} · ${serviceBillingLabel(String(record.data.billingUnit ?? 'fixed'))}${record.data.providerName ? ` · Provider: ${record.data.providerName}` : ''}`
+                          ? `${record.data.category || 'General service'} · Customer charge ${money(Number(record.data.charge ?? 0))}${canManageServiceCatalog ? ` · Supplier cost ${money(Number(record.data.supplierRate ?? 0))}${record.data.providerName ? ` · Provider: ${record.data.providerName}` : ''}` : ''} · ${serviceBillingLabel(String(record.data.billingUnit ?? 'fixed'))}`
                           : type === 'projects'
                           ? `${record.data.status} · ${record.data.customer || 'No customer'} · Budget ${money(record.data.budget || 0)}`
                           : type === 'suppliers'
@@ -5378,7 +5388,7 @@ async function createCameraReader(): Promise<CameraReader> {
                     {type === 'services' && (
                       <button className="button button-small" disabled={!canUse('sales.write')} title="Add this service to the counter sale" onClick={() => { addServiceLine(record); notify(`${String(record.data.name ?? 'Service')} added to the current sale.`) }}>Add to counter sale</button>
                     )}
-                    {type !== 'inventory' && (
+                    {type !== 'inventory' && (type !== 'services' || canManageServiceCatalog) && (
                       <button
                         className="button button-small"
                         onClick={() => {
@@ -5398,7 +5408,7 @@ async function createCameraReader(): Promise<CameraReader> {
                         Edit
                       </button>
                     )}
-                    {type !== 'inventory' && (
+                    {type !== 'inventory' && (type !== 'services' || canManageServiceCatalog) && (
                       <button className="button button-small" onClick={() => void deleteWorkspaceRecord(type, record.id)}>
                         Delete
                       </button>
@@ -5431,9 +5441,9 @@ async function createCameraReader(): Promise<CameraReader> {
                 {!bills.length && <div className="empty-state">No bills yet.</div>}
               </article>
             </>}
-            {type === 'services' && <article className="module-card">
+            {type === 'services' && canUse('sales.write') && <article className="module-card">
               <div className="panel-header"><div><h2>Service subscribers</h2><p>Every customer subscribed to a service, the rate that applies to them, their billing cycle, and how they prefer to pay.</p></div><span className="task-count">{records.services.length} services</span></div>
-              {!records.services.length && <div className="empty-state">Add a service above, then subscribe customers to it here.</div>}
+              {!records.services.length && <div className="empty-state">{canManageServiceCatalog ? 'Add a service above, then subscribe customers to it here.' : 'No services are configured for this business yet. Ask an inventory manager to add them.'}</div>}
               {records.services.map((service) => {
                 const subscribers = serviceSubscriptions[service.id] ?? []
                 const open = serviceDetailId === service.id
@@ -5451,7 +5461,7 @@ async function createCameraReader(): Promise<CameraReader> {
                   <button type="button" className="service-detail-toggle" aria-expanded={open} onClick={() => open ? setServiceDetailId('') : void loadServiceSubscriptions(service.id)}>
                     <span className="service-detail-name"><strong>{String(service.data.name ?? 'Service')}</strong><small>{String(service.data.category ?? 'General service')}{service.data.sku ? ` · SKU ${service.data.sku}` : ''}</small></span>
                     <span className="service-detail-rates">
-                      <small>Supplier {money(supplierRate)}</small>
+                      {canManageServiceCatalog && <small>Supplier {money(supplierRate)}</small>}
                       <small>Consumer {money(consumerRate)}</small>
                       <small>Renewal {money(renewalRate)}</small>
                       {supplierRate > 0 && <span className={`status-pill ${margin > 0 ? 'green' : 'amber'}`}>Margin {money(margin)}</span>}
@@ -5461,13 +5471,13 @@ async function createCameraReader(): Promise<CameraReader> {
                   </button>
                   {service.data.description ? <p className="service-detail-desc">{String(service.data.description)}</p> : null}
                   {open && <div className="service-detail-body">
-                    <div className="service-supplier-summary">
+                    {canManageServiceCatalog && <div className="service-supplier-summary">
                       <span><strong>Supplier</strong><small>{supplierName} · Cost {money(supplierRate)}{service.data.supplierRecurring ? ` · ${String(service.data.supplierBillingCycle ?? 'monthly')} renewal` : ''}</small></span>
                       <span><strong>Last supplier payment</strong><small>{lastSupplierPayment ? `${lastSupplierPayment.payment_date} · ${money(lastSupplierPayment.amount)}` : 'No supplier payment recorded'}</small></span>
                       {service.data.supplierRecurring && lastSupplierPayment?.covered_until && <span><strong>Supplier renewal</strong><small>{supplierDays !== null && supplierDays > 0 ? `${supplierDays} days left · renew by ${lastSupplierPayment.covered_until}` : supplierDays === 0 ? `Due today · renew supplier subscription` : `Overdue · renew supplier subscription (covered through ${lastSupplierPayment.covered_until})`}</small></span>}
                       {(service.data.supplierId || service.data.providerName || supplierRate > 0) && <button type="button" className="button button-small" disabled={busy || !canUse('inventory.write')} onClick={() => setSupplierPaymentInput({ serviceId: service.id, amount: String(supplierRate || ''), paymentDate: today, billingCycle: service.data.supplierRecurring ? String(service.data.supplierBillingCycle ?? 'monthly') as 'monthly' | 'quarterly' | 'annually' : 'none' })}>Record supplier payment</button>}
-                    </div>
-                    {supplierPaymentInput.serviceId === service.id && <form className="record-form-grid module-card" onSubmit={(event) => { event.preventDefault(); void recordServiceSupplierPayment(service) }}>
+                    </div>}
+                    {canManageServiceCatalog && supplierPaymentInput.serviceId === service.id && <form className="record-form-grid module-card" onSubmit={(event) => { event.preventDefault(); void recordServiceSupplierPayment(service) }}>
                       <h3>Supplier payment · {supplierName}</h3>
                       <label className="field-label">Amount paid (KSh)<input required type="number" min="0.01" step="0.01" value={supplierPaymentInput.amount} onChange={(event) => setSupplierPaymentInput({ ...supplierPaymentInput, amount: event.target.value })} /></label>
                       <label className="field-label">Payment date<input required type="date" value={supplierPaymentInput.paymentDate} onChange={(event) => setSupplierPaymentInput({ ...supplierPaymentInput, paymentDate: event.target.value })} /></label>
@@ -5790,9 +5800,11 @@ async function createCameraReader(): Promise<CameraReader> {
           {canUse('accounting.write') && <Suspense fallback={<div className="dashboard-grid"><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-label="Loading reports charts" /><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-hidden="true" /></div>}>
             <ReportCharts data={chart} rangeLabel={overviewRangeNames[overviewRange]} money={money} />
           </Suspense>}
-          {canUse('accounting.write') && <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.income ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.expenses ?? 0)}</strong></div><div className="transaction-row"><span>Net movement · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.net ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices, for the period chosen in the Overview toolbar. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>}
+          {canUse('accounting.write') && <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.income ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.expenses ?? 0)}</strong></div><div className="transaction-row"><span>Net movement · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.net ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices, for the period chosen in the Overview toolbar. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
+}
           {canUse('inventory.write') && retailReport && <article className="module-card"><h2>Retail and inventory insights</h2><div className="transaction-row"><span>Inventory valuation at recorded unit cost</span><strong>{money(retailReport.totalValuation)}</strong></div><h3>Reorder alerts</h3>{retailReport.reorderAlerts.map((item) => <div className="transaction-row" key={`${item.itemId}-${item.locationId}`}><span><strong>{item.name} · {item.location}</strong><small>{item.quantity} {item.unit} on hand · alert at {item.reorderPoint}</small></span><span className="status-pill amber">Reorder</span></div>)}{!retailReport.reorderAlerts.length && <p>No items are at or below their configured reorder points.</p>}<h3>Best sellers</h3>{retailReport.bestSellers.map((item) => <div className="transaction-row" key={item.itemId}><span><strong>{item.name}</strong><small>{item.quantitySold.toLocaleString('en-KE')} sold · revenue {money(item.revenue)} · cost estimate {money(item.cost)}</small></span><strong>Gross profit est. {money(item.grossProfit)}</strong></div>)}{!retailReport.bestSellers.length && <div className="empty-state">Post product sales to see best sellers and gross profit estimates.</div>}<p className="dialog-note">Inventory value uses current average item cost; product margins are management estimates and do not replace reviewed accounting valuation.</p></article>}
-          {canUse('accounting.write') && <article className="module-card"><h2>Cash-flow outlook</h2><p>Three-month estimate based on the average monthly posted ledger activity available over the last six months; not a cash guarantee.</p>{forecast.map((row) => <div className="transaction-row" key={row.period}><span><strong>{row.period}</strong><small>Historical-average estimate</small></span><span>Income {money(row.income)} · Expenses {money(row.expenses)}</span><strong>Net {money(row.income - row.expenses)}</strong></div>)}</article>}
+          {canUse('accounting.write') && <article className="module-card"><h2>Cash-flow outlook</h2><p>Three-month estimate based on the average monthly posted ledger activity available over the last six months; not a cash guarantee.</p>{forecast.map((row) => <div className="transaction-row" key={row.period}><span><strong>{row.period}</strong><small>Historical-average estimate</small></span><span>Income {money(row.income)} · Expenses {money(row.expenses)}</span><strong>Net {money(row.income - row.expenses)}</strong></div>)}</article>
+}
           {canUse('accounting.write') && <article className="module-card"><h2>Budget by account</h2><form className="record-form-grid" onSubmit={saveBudget}><label className="field-label">Account<select required value={budgetInput.accountCode} onChange={(event) => setBudgetInput({ ...budgetInput, accountCode: event.target.value })}><option value="">Choose account</option>{accounts.map((accountRow) => <option value={accountRow.code} key={accountRow.code}>{accountRow.code} · {accountRow.name}</option>)}</select></label><label className="field-label">Period<input required type="month" value={budgetInput.period} onChange={(event) => setBudgetInput({ ...budgetInput, period: event.target.value })} /></label><label className="field-label">Budget (KSh)<input required min="0" step="0.01" type="number" value={budgetInput.amount} onChange={(event) => setBudgetInput({ ...budgetInput, amount: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Save budget</button></form>
             {budgets.map((budget) => <div className="transaction-row" key={budget.id}><span><strong>{budget.period} · {budget.account_code} {budget.account_name}</strong><small>Budget {money(budget.budget)} · actual {money(budget.actual)}</small></span><strong>Variance {money(budget.variance)}</strong></div>)}
           </article>}

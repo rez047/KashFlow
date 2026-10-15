@@ -594,8 +594,16 @@ async function requireSession(request: AuthedRequest, response: express.Response
     } else if (!['OPTIONS'].includes(request.method)) {
       const routePath = String(request.route?.path ?? '')
       const selfServiceRoute = routePath === '/v1/workspaces/:workspaceId/activate' || routePath === '/v1/workspaces/:workspaceId/archive' || routePath === '/v1/auth/account' || routePath === '/v1/auth/change-password' || routePath.startsWith('/v1/auth/two-factor/')
+      const customerCreationRoute = routePath === '/v1/records/:type' && request.method === 'POST' && String(request.params.type ?? '') === 'customers'
+      const customerCreationPermissions: WorkspacePermission[] = ['operations.write', 'inventory.write', 'sales.write']
+      if (customerCreationRoute && request.workspaceRole !== 'admin' && !customerCreationPermissions.some((permission) => request.workspacePermissions?.includes(permission))) {
+        response.status(403).json({ error: 'Your workspace role does not have permission to add customers.' })
+        return
+      }
       const requiredPermissions = selfServiceRoute
         ? []
+        : customerCreationRoute
+          ? []
         : routePath === '/v1/invoices/:invoiceId/payments/mpesa/manual'
           ? ['accounting.write', 'integrations.manage'] as WorkspacePermission[]
           : routePath === '/v1/recurring' && request.body?.type === 'expense'
@@ -626,6 +634,7 @@ function permissionForRequest(request: AuthedRequest): WorkspacePermission | nul
   if (routePath.startsWith('/v1/purchase-orders')) return 'inventory.write'
   if (routePath.startsWith('/v1/inventory')) return 'inventory.write'
   if (routePath.startsWith('/v1/projects')) return 'operations.write'
+  if (routePath === '/v1/services/:serviceId/subscriptions' || routePath.startsWith('/v1/service-subscriptions/')) return 'sales.write'
   if (routePath.startsWith('/v1/services/')) return 'inventory.write'
   if (routePath.startsWith('/v1/reports/retail')) return 'inventory.write'
   if (routePath.startsWith('/v1/reports/')) return 'accounting.write'
@@ -665,11 +674,15 @@ function readPermissionsForRequest(request: AuthedRequest): WorkspacePermission[
   if (routePath.startsWith('/v1/store/orders')) return ['sales.write', 'store.manage']
   // These catalog reads are also used by the sales workflow. Inventory management pages
   // remain separately gated in the client, and mutation routes still require inventory access.
-  if (routePath === '/v1/records/:type' && ['inventory', 'customers'].includes(String(request.params.type ?? ''))) {
-    return String(request.params.type) === 'inventory'
+  if (routePath === '/v1/records/:type' && ['inventory', 'customers', 'services'].includes(String(request.params.type ?? ''))) {
+    const type = String(request.params.type)
+    return type === 'inventory'
       ? ['inventory.write', 'sales.write']
-      : ['operations.write', 'inventory.write', 'sales.write']
+      : type === 'customers'
+        ? ['operations.write', 'inventory.write', 'sales.write']
+        : ['inventory.write', 'sales.write']
   }
+  if (routePath === '/v1/services/:serviceId/subscriptions') return ['inventory.write', 'sales.write']
   if (routePath === '/v1/inventory/locations' || routePath === '/v1/inventory/location-stock') return ['inventory.write', 'sales.write']
   if (routePath === '/v1/records/:type') {
     const type = String(request.params.type ?? '')
@@ -772,8 +785,21 @@ async function requireWorkspaceAdmin(request: AuthedRequest, response: express.R
 function requireWorkspaceRole(allowedRoles: Array<'admin' | 'accountant' | 'staff'>) {
   return async (request: AuthedRequest, response: express.Response, next: express.NextFunction) => {
     const role = request.workspaceRole ?? ''
-    const required = allowedRoles.includes('accountant') && !allowedRoles.includes('staff') ? 'accounting.write' : 'operations.write'
-    if (role !== 'admin' && !request.workspacePermissions?.includes(required)) {
+    const routePath = String(request.route?.path ?? '')
+    const customerCreationRoute = routePath === '/v1/records/:type' && request.method === 'POST' && String(request.params.type ?? '') === 'customers'
+    const genericWriter = allowedRoles.includes('staff')
+    const requiredPermissions: WorkspacePermission[] = customerCreationRoute
+      ? ['operations.write', 'inventory.write', 'sales.write']
+      : genericWriter
+        ? routePath === '/v1/recurring' && request.body?.type === 'expense'
+          ? ['accounting.write']
+          : [permissionForRequest(request) ?? 'operations.write']
+        : [allowedRoles.includes('accountant') ? 'accounting.write' : 'operations.write']
+    const hasPermission = customerCreationRoute
+      ? requiredPermissions.some((permission) => request.workspacePermissions?.includes(permission))
+      : requiredPermissions.every((permission) => request.workspacePermissions?.includes(permission))
+    if (role !== 'admin' && !hasPermission) {
+      const required = customerCreationRoute ? 'sales.write, inventory.write, or operations.write' : requiredPermissions.join(' and ')
       response.status(403).json({ error: `Your workspace role does not have the ${required} permission.` })
       return
     }
@@ -1886,10 +1912,16 @@ app.get('/v1/records/:type', requirePool, requireSession, async (request: Authed
   if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
   try {
     const result = await pool!.query('SELECT id, data, created_at, updated_at FROM workspace_records WHERE workspace_id = $1 AND record_type = $2 ORDER BY updated_at DESC', [request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
-      const records = type === 'inventory' && !request.workspacePermissions?.includes('inventory.write')
+    const records = type === 'inventory' && !request.workspacePermissions?.includes('inventory.write')
         ? result.rows.map((row: Record<string, unknown>) => {
           const data = row.data as Record<string, unknown>
           const saleCatalogFields = ['name', 'sku', 'barcode', 'price', 'unit', 'category', 'description']
+          return { ...row, data: Object.fromEntries(saleCatalogFields.filter((field) => data[field] !== undefined).map((field) => [field, data[field]])) }
+        })
+      : type === 'services' && !request.workspacePermissions?.includes('inventory.write')
+        ? result.rows.map((row: Record<string, unknown>) => {
+          const data = row.data as Record<string, unknown>
+          const saleCatalogFields = ['name', 'category', 'description', 'billingUnit', 'charge', 'consumerRate', 'renewalRate']
           return { ...row, data: Object.fromEntries(saleCatalogFields.filter((field) => data[field] !== undefined).map((field) => [field, data[field]])) }
         })
         : result.rows
@@ -6212,13 +6244,18 @@ app.get('/v1/services/:serviceId/subscriptions', requirePool, requireSession, as
         (SELECT COALESCE(SUM(p.amount), 0)::text FROM invoice_payments p JOIN invoices i ON i.id = p.invoice_id WHERE i.workspace_id = s.workspace_id AND i.service_subscription_id = s.id) AS total_paid
       FROM service_subscriptions s
       WHERE s.workspace_id = $1 AND s.service_id = $2 ORDER BY s.created_at DESC`, [request.session!.workspaceId, request.params.serviceId])
+    const inventoryAccess = request.workspacePermissions?.includes('inventory.write') ?? false
     const subscriptions = request.workspacePermissions?.includes('sales.write') ? result.rows.map((row: Record<string, unknown>) => ({
       ...row,
       start_date: dateOnly(row.start_date),
       next_invoice_date: row.next_invoice_date ? dateOnly(row.next_invoice_date) : null,
       last_paid_at: row.last_paid_at ? dateOnly(row.last_paid_at) : null,
     })) : []
-    response.json({ service: service.rows[0].data, supplierPayments: supplierPayments.rows, subscriptions })
+    const serviceData = service.rows[0].data as Record<string, unknown>
+    const visibleService = inventoryAccess
+      ? serviceData
+      : Object.fromEntries(['name', 'category', 'description', 'billingUnit', 'charge', 'consumerRate', 'renewalRate'].filter((field) => serviceData[field] !== undefined).map((field) => [field, serviceData[field]]))
+    response.json({ service: visibleService, supplierPayments: inventoryAccess ? supplierPayments.rows : [], subscriptions })
   } catch (error) { next(error) }
 })
 
