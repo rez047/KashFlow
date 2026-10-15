@@ -228,7 +228,7 @@ type InvitationPreview = { email: string | null; phone: string | null; role: str
 type StoredDocument = { id: string; file_name: string; mime_type: string; file_size: number; created_at: string }
 type ComplianceDraft = { id: string; integration_type: 'kra_etims' | 'statutory_filing'; source_type: 'invoice' | 'payroll_run'; source_id: string; payload_version: string; draft_payload: Record<string, unknown>; workflow_status: 'draft' | 'reviewed' | 'cancelled'; provider_status: string; external_invoice_number?: string; fiscal_receipt_signature?: string; reviewer_name?: string; reviewer_qualification?: string; reviewer_registration?: string; reviewer_reference?: string; provider_result?: Record<string, unknown> | null; created_at: string }
 type OnboardingMilestone = { integration_type: 'kra_etims' | 'bank_feeds' | 'statutory_filing'; milestone: string; self_reported_note: string; details?: Record<string, string | boolean>; updated_at: string }
-type KraEtimsConfig = { configured: boolean; environment: 'sandbox' | 'production'; liveSubmissionsEnabled: boolean; initialized: boolean; device: { deviceId: string | null; sdcId: string | null; mrcNo: string | null; initializedAt: string } | null; credentialsEncryptionReady: boolean; apiBase: string }
+type KraEtimsConfig = { configured: boolean; environment: 'sandbox' | 'production'; liveSubmissionsEnabled: boolean; workspaceEnabled: boolean; initialized: boolean; device: { deviceId: string | null; sdcId: string | null; mrcNo: string | null; initializedAt: string } | null; credentialsEncryptionReady: boolean; apiBase: string }
 type MonoBankConfig = { enabled: boolean; publicKey: string | null; provider: string; countryCoverage: string; setupRequired: string[] }
 type ConnectedBankAccount = { id: string; provider: string; account_name: string; account_number_masked: string; institution_name: string; currency: string; account_type: string; data_status: string; connection_status: string; last_synced_at: string | null }
 type BankFeedTransaction = { id: string; connected_account_id: string; transaction_date: string; narration: string; amount: string; direction: 'income' | 'expense'; currency: string; review_status: 'needs_review' | 'ignored' | 'posted'; institution_name: string; account_name: string }
@@ -1356,6 +1356,7 @@ function App() {
     if (previousPermissionScope.current && previousPermissionScope.current !== permissionScopeKey) {
       setModal(null)
       setMpesaWatch(null)
+      setIntegrationReadiness(null)
       setSearchOpen(false)
       setSearchResults([])
       setSearch('')
@@ -1692,7 +1693,13 @@ function App() {
 
   useEffect(() => {
     if (!account || !canOpenPage(page)) return
-    if (canUse('integrations.manage')) void request<IntegrationReadiness>('/v1/integrations/readiness').then(setIntegrationReadiness).catch(() => undefined)
+    if (canUse('integrations.manage') || canUse('sales.write') || canUse('accounting.write') || canUse('banking.write')) {
+      void request<IntegrationReadiness>('/v1/integrations/readiness').then((result) => {
+        setIntegrationReadiness(result)
+        const splitPaymentFeature = result.integrations.find((item) => item.id === 'multi_method_payments')
+        if (splitPaymentFeature) setSettings((current) => ({ ...current, multiMethodPayments: splitPaymentFeature.status === 'workspace_enabled_split_capture' }))
+      }).catch(() => undefined)
+    }
     if (page === 'Expenses') {
       setExpenses(null)
       void request<{ expenses: Transaction[] }>('/v1/expenses')
@@ -1770,7 +1777,7 @@ function App() {
         request<{ invoices: InvoiceRecord[] }>('/v1/invoices').then((result) => setInvoicesList(result.invoices)),
         request<KraEtimsConfig>('/v1/integrations/etims/config').then((result) => setKraEtimsConfig(result)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load integration preparation records.'))
-      if (account.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin') {
+      if (canUse('integrations.manage')) {
         void request<{ connection: DarajaConnection | null; encryptionReady: boolean }>('/v1/integrations/daraja').then((result) => {
           setDarajaConnection(result.connection); setDarajaEncryptionReady(result.encryptionReady)
           if (result.connection) setDarajaCredentials((current) => ({ ...current, shortcode: result.connection!.shortcode, callbackUrl: result.connection!.callback_url, initiatorName: result.connection!.initiator_name ?? '', environment: result.connection!.environment, transactionType: result.connection!.transaction_type }))
@@ -3990,38 +3997,11 @@ async function createCameraReader(): Promise<CameraReader> {
     finally { setBusy(false) }
   }
 
-  // One guided action that removes the hidden gates a normal user would otherwise hit:
-  // 1) switch on the live KRA preference for this business (otherwise KRA calls return 403),
-  // 2) save the encrypted taxpayer/device details, then
-  // 3) initialize the KRA device and report exactly what happened.
+  // Use the workspace's saved KRA permission, then save and initialize this business's device.
   async function runKraQuickSetup() {
-    setBusy(true); setError(''); setKraSetupStep('connecting'); setKraSetupMessage('Enabling KRA for this business…')
+    setBusy(true); setError(''); setKraSetupStep('connecting'); setKraSetupMessage('Checking KRA access for this business…')
     try {
-      if (!settings.kraEtimsLiveEnabled) {
-        // The settings endpoint validates every field strictly, so send an explicitly typed copy
-        // rather than spreading whatever the server happened to return.
-        await request('/v1/settings', { method: 'PUT', body: JSON.stringify({
-          businessName: settings.businessName || dashboard?.workspaceName || 'This business',
-          currency: settings.currency,
-          timezone: settings.timezone,
-          invoiceTerms: settings.invoiceTerms,
-          emailAlerts: settings.emailAlerts,
-          auditTrail: settings.auditTrail,
-          twoFactor: settings.twoFactor,
-          backupSchedule: settings.backupSchedule,
-          inventoryLowStockThreshold: Number(settings.inventoryLowStockThreshold),
-          inventoryMediumStockThreshold: Number(settings.inventoryMediumStockThreshold),
-          monoEnabled: settings.monoEnabled,
-          darajaEnabled: settings.darajaEnabled,
-          kraEtimsLiveEnabled: true,
-          statutoryFilingsEnabled: settings.statutoryFilingsEnabled,
-          shifEnabled: settings.shifEnabled,
-          nssfEnabled: settings.nssfEnabled,
-            ahlEnabled: settings.ahlEnabled,
-            multiMethodPayments: settings.multiMethodPayments,
-          }) })
-            setSettings((current) => ({ ...current, kraEtimsLiveEnabled: true }))
-      }
+      if (!kraEtimsConfig?.workspaceEnabled) throw new Error('A workspace administrator must permit KRA eTIMS in Business settings before this business can contact KRA.')
       setKraSetupMessage('Saving your KRA details securely…')
       await request('/v1/integrations/etims/device', { method: 'PUT', body: JSON.stringify(kraDeviceInput) })
       let config = await request<KraEtimsConfig>('/v1/integrations/etims/config')
@@ -4835,8 +4815,8 @@ async function createCameraReader(): Promise<CameraReader> {
   })), [dashboard])
   const mpesaStatus = integrationReadiness?.integrations.find((item) => item.id === 'mpesa')?.status ?? 'daraja_credentials_and_callback_required'
   const mpesaConfigured = mpesaStatus.startsWith('configured_')
-  const emailStatus = integrationReadiness?.integrations.find((item) => item.id === 'email')?.status ?? 'resend_api_key_and_verified_sender_required'
-  const emailConfigured = emailStatus === 'resend_configured'
+  const emailStatus = integrationReadiness?.integrations.find((item) => item.id === 'email')?.status ?? 'brevo_api_key_and_verified_sender_required'
+  const emailConfigured = emailStatus === 'brevo_configured'
   const bankFeedStatus = integrationReadiness?.integrations.find((item) => item.id === 'bank_feeds')?.status ?? 'mono_business_approval_and_server_keys_required'
   const monoConfigured = bankFeedStatus === 'mono_configured_consent_required'
 
@@ -5002,7 +4982,7 @@ async function createCameraReader(): Promise<CameraReader> {
     </aside>
     {sidebarOpen && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={() => setSidebarOpen(false)} />}
     {switchingBusiness && <div className="workspace-switching-overlay" role="status" aria-live="polite"><span>Switching business…</span></div>}
-    {mpesaWatch && canUse('integrations.manage') && <div className="mpesa-confirm-overlay" role="dialog" aria-modal="true" aria-live="assertive">
+    {mpesaWatch && canUse('sales.write') && <div className="mpesa-confirm-overlay" role="dialog" aria-modal="true" aria-live="assertive">
       <div className={`mpesa-confirm-card is-${mpesaWatch.phase}`}>
         {mpesaWatch.phase === 'waiting' ? <>
           <div className="mpesa-spinner" aria-hidden="true" />
@@ -5688,7 +5668,7 @@ async function createCameraReader(): Promise<CameraReader> {
 
           <section className="module-card" aria-labelledby="daraja-business-settings-heading">
             <div className="panel-header"><div><h2 id="daraja-business-settings-heading">Safaricom Daraja · {account?.workspace.name}</h2><p>Connect this business’s own merchant account. Every business can use different Daraja credentials.</p></div><Smartphone size={20} /></div>
-            {isActiveWorkspaceAdmin ? <>
+            {canUse('integrations.manage') ? <>
               <p>Consumer keys, the STK Push passkey, and any Transaction Status credential are encrypted by the API and never shown again after saving. Credentials are stored separately for this business.</p>
               {darajaConnection && <p role="status">Saved for this business · shortcode {darajaConnection.shortcode} · {darajaConnection.environment} · {darajaConnection.transaction_type} · receipt verification {darajaConnection.transactionStatusConfigured ? 'configured' : 'needs setup'}{darajaConnection.updated_at ? ` · updated ${new Date(darajaConnection.updated_at).toLocaleString()}` : ''}</p>}
               {!darajaEncryptionReady && <p className="form-error" role="alert">Secure credential storage is not configured on the API server. Set <code>ONLINE_COMMERCE_ENCRYPTION_KEY</code> before saving credentials.</p>}
@@ -5712,14 +5692,14 @@ async function createCameraReader(): Promise<CameraReader> {
               <div>
                 <span className="section-eyebrow"><ShieldCheck size={14} /> KRA eTIMS · GUIDED SETUP</span>
                 <h2>Connect KRA in one step</h2>
-                <p>Enter your KRA PIN and device serial once. We will switch on live KRA for this business, save your details encrypted, and connect to KRA for you — no environment variables or technical settings to touch.</p>
+                <p>Enter your KRA PIN and device serial once. If a workspace administrator has permitted eTIMS for this business, we save your details encrypted and connect to KRA for you.</p>
               </div>
               <span className={`status-pill ${kraEtimsConfig?.initialized ? 'green' : 'amber'}`}>{kraEtimsConfig?.initialized ? 'Connected' : 'Not connected yet'}</span>
             </div>
 
             <ol className="kra-steps">
               <li className={kraEtimsConfig?.configured ? 'kra-step-done' : ''}><span className="kra-step-num">{kraEtimsConfig?.configured ? <Check size={14} /> : 1}</span><div><strong>KRA system is ready</strong><small>{kraEtimsConfig?.configured ? `Server connected to KRA ${kraEtimsConfig.environment}.` : 'Waiting for the server KRA configuration.'}</small></div></li>
-              <li className={kraEtimsConfig?.initialized ? 'kra-step-done' : ''}><span className="kra-step-num">{kraEtimsConfig?.initialized ? <Check size={14} /> : 2}</span><div><strong>Your business is switched on</strong><small>{settings.kraEtimsLiveEnabled ? 'Live KRA enabled for this business.' : 'This will be switched on automatically below.'}</small></div></li>
+              <li className={kraEtimsConfig?.workspaceEnabled ? 'kra-step-done' : ''}><span className="kra-step-num">{kraEtimsConfig?.workspaceEnabled ? <Check size={14} /> : 2}</span><div><strong>Workspace permission</strong><small>{kraEtimsConfig?.workspaceEnabled ? 'KRA eTIMS is permitted for this business.' : 'A workspace administrator must permit KRA eTIMS in Business settings.'}</small></div></li>
               <li className={kraEtimsConfig?.initialized ? 'kra-step-done' : ''}><span className="kra-step-num">{kraEtimsConfig?.initialized ? <Check size={14} /> : 3}</span><div><strong>Device connected</strong><small>{kraEtimsConfig?.device?.sdcId ? `SDC ${kraEtimsConfig.device.sdcId} · MRC ${kraEtimsConfig.device.mrcNo || '—'}` : 'Enter your details and click Connect.'}</small></div></li>
             </ol>
 
@@ -5740,7 +5720,7 @@ async function createCameraReader(): Promise<CameraReader> {
                   <small>Leave as 00 for a single-branch business. Use 01, 02… only if KRA registered separate branches.</small>
                 </label>
               </details>
-              <button className="button button-primary button-xl kra-connect" disabled={busy || !/^[A-Z0-9]{11}$/.test(kraDeviceInput.taxpayerPin) || !kraDeviceInput.deviceSerial.trim()}>{busy ? 'Connecting to KRA…' : 'Connect KRA now'}</button>
+              <button className="button button-primary button-xl kra-connect" disabled={busy || !kraEtimsConfig?.workspaceEnabled || !/^[A-Z0-9]{11}$/.test(kraDeviceInput.taxpayerPin) || !kraDeviceInput.deviceSerial.trim()}>{busy ? 'Connecting to KRA…' : 'Connect KRA now'}</button>
               <p className="kra-reassure"><ShieldCheck size={14} /> Your PIN and serial are encrypted on the server (AES-256-GCM) and never shown in messages or logs.</p>
             </form>}
 
@@ -6041,26 +6021,26 @@ async function createCameraReader(): Promise<CameraReader> {
                         </>}
                         {multiMethodEnabled && <button className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: current[invoiceRow.id]?.length ? [] : [{ method: 'cash', amount: '', phone: '', reference: '' }] }))}>{paymentSplits[invoiceRow.id]?.length ? 'Hide split payment' : 'Split payment'}</button>}
                       </>}
-                      {canUse('integrations.manage') && <button className="button button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting} title={!mpesaConfigured ? 'Daraja M-Pesa is not configured for this business.' : undefined} onClick={() => {
+                      {canUse('sales.write') && <button className="button button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting} title={!mpesaConfigured ? 'Daraja M-Pesa is not configured for this business.' : undefined} onClick={() => {
                         if (promptOpen) { setMpesaPromptInvoiceId(null); return }
                         setMpesaPromptInvoiceId(invoiceRow.id)
                         if (!(invoiceRow.id in invoiceMpesaPayments)) void loadInvoiceMpesaPayments(invoiceRow.id)
                       }}>M-Pesa prompt{!mpesaConfigured && ' · setup needed'}</button>}
                     </>}
-                    {canUse('integrations.manage') && latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}{(latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference) ? ` · ${latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference}` : ''}</span>}
+                    {canUse('sales.write') && latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}{(latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference) ? ` · ${latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference}` : ''}</span>}
                   </div>
                   {canUse('accounting.write') && Boolean(paymentSplits[invoiceRow.id]?.length) && <div className="payment-split-editor">
                     <div className="panel-header"><div><h3>Split payment for {invoiceRow.customer}</h3><p>Record part cash and part M-Pesa against invoice {invoiceRow.id.slice(0, 8)}. Amounts are recorded and verified separately.</p></div><button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: [...(current[invoiceRow.id] ?? []), { method: 'cash', amount: '', phone: '', reference: '' }] }))}><Plus size={14} /> Add method</button></div>
                     {(paymentSplits[invoiceRow.id] ?? []).map((split, index) => <div className="field-row payment-split-row" key={index}>
-                      <label className="field-label">Method<select value={split.method} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, method: event.target.value as 'cash' | 'mpesa' } : item) }))}><option value="cash">Cash / manual</option>{canUse('integrations.manage') && <option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option>}</select></label>
+                      <label className="field-label">Method<select value={split.method} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, method: event.target.value as 'cash' | 'mpesa' } : item) }))}><option value="cash">Cash / manual</option>{canUse('sales.write') && <option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option>}</select></label>
                       <label className="field-label">Amount (KSh)<input type="number" min="0" step="0.01" value={split.amount} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, amount: event.target.value } : item) }))} /></label>
-                      {canUse('integrations.manage') && split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="0712345678" value={split.phone} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, phone: event.target.value } : item) }))} /></label>}
+                      {canUse('sales.write') && split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="0712345678" value={split.phone} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, phone: event.target.value } : item) }))} /></label>}
                       <button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).filter((_, row) => row !== index) }))}>Remove</button>
                     </div>)}
                     <p className="dialog-note">Split total {money((paymentSplits[invoiceRow.id] ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0))} · outstanding {money(invoiceRow.amount_due ?? invoiceRow.amount)}.</p>
                     <button className="button button-primary button-small" disabled={busy} onClick={() => void payInvoiceSplit(invoiceRow)}>Record split payment</button>
                   </div>}
-                  {canUse('integrations.manage') && promptOpen && invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <div className="invoice-mpesa-prompt">
+                  {canUse('sales.write') && promptOpen && invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <div className="invoice-mpesa-prompt">
                     <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="0712345678" value={invoiceMpesaPhones[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaPhones((current) => ({ ...current, [invoiceRow.id]: event.target.value }))} /></label>
                     <button className="button button-primary button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting || !invoiceMpesaPhones[invoiceRow.id]?.trim() || ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment?.status ?? '')} onClick={() => void sendInvoiceMpesaPrompt(invoiceRow)}>{mpesaPromptSubmitting ? 'Sending…' : 'Send prompt'}</button>
                     {latestMpesaPayment && ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment.status) && <p className="dialog-note">A request is already {latestMpesaPayment.status.replaceAll('_', ' ')} for this invoice. Refresh its status before sending another prompt.</p>}
@@ -6425,7 +6405,7 @@ async function createCameraReader(): Promise<CameraReader> {
           <h2>Invoice</h2><div className="invoice-preview-grid"><span>Bill to<strong>{invoicePreview.customer}</strong><small>{invoicePreview.customer_email || 'No email address added'}</small></span><span>Due date<strong>{invoicePreview.due_date}</strong><small>Status: {invoicePreview.status || 'Draft'}</small></span></div>
           <div className="invoice-preview-line"><span>{invoicePreview.description}</span><strong>{money(invoicePreview.amount)}</strong></div><div className="invoice-preview-total"><span>Total due</span><strong>{money(invoicePreview.amount)}</strong></div>
           <label className="field-label invoice-email-body-field">Editable email message<textarea autoFocus rows={5} maxLength={5000} placeholder="Write a message for your customer" value={invoiceEmailBody} onChange={(event) => setInvoiceEmailBody(event.target.value)} /><small>Edit this text before sending; the invoice description, amount, due date, and disclaimer stay attached.</small></label>
-          <p className="dialog-note"><ShieldCheck size={15} /> Internal business invoice preview—not an eTIMS fiscal tax invoice. {emailConfigured ? 'Send uses the configured Resend provider; accepted does not guarantee recipient delivery.' : 'Outbound provider delivery is not configured; the email-draft option opens your mail application.'}</p>
+          <p className="dialog-note"><ShieldCheck size={15} /> Internal business invoice preview—not an eTIMS fiscal tax invoice. {emailConfigured ? 'Send uses the configured email provider; accepted does not guarantee recipient delivery.' : 'Outbound provider delivery is not configured; the email-draft option opens your mail application.'}</p>
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => { setInvoicePreview(null); setModal(invoicePreview.id ? null : 'invoice') }}>{invoicePreview.id ? 'Close preview' : 'Edit invoice'}</button><button type="button" className="button button-secondary" onClick={() => window.print()}>Print</button>{invoicePreview.id && invoicePreview.customer_email && (emailConfigured ? <button type="button" className="button button-primary" disabled={busy} onClick={() => void sendInvoiceEmail(invoicePreview.id, invoiceEmailBody)}>{busy ? 'Sending…' : 'Send invoice email'}</button> : <a className="button button-primary" href={`mailto:${encodeURIComponent(invoicePreview.customer_email)}?subject=${encodeURIComponent(`Invoice ${invoicePreview.id.slice(0, 8)} from ${dashboard?.workspaceName}`)}&body=${encodeURIComponent(invoiceEmailDraftBody(invoicePreview, invoiceEmailBody))}`}>Open email draft</a>)}</div>
         </article> : null}
         {modal === 'invoice' && !invoicePreview ? <form onSubmit={saveInvoice}>
@@ -6436,11 +6416,11 @@ async function createCameraReader(): Promise<CameraReader> {
           <DraftLineEditor lines={invoiceLines} inventoryItems={records.inventory} onChange={(index, key, value) => setInvoiceLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setInvoiceLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])} onRemove={(index) => setInvoiceLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} />
           <p className="dialog-note">Invoice total: <strong>{money(draftDocumentTotal(invoiceLines))}</strong></p>
           <label className="field-label">Due date<input required type="date" value={invoice.dueDate} onChange={(event) => setInvoice({ ...invoice, dueDate: event.target.value })} /></label>
-          {canUse('integrations.manage') && <label className="field-label">M-Pesa phone (optional)
+          {canUse('sales.write') && <label className="field-label">M-Pesa phone (optional)
             <input type="tel" autoComplete="tel" placeholder="0712345678" value={paymentPhone} onChange={(event) => setPaymentPhone(event.target.value)} />
             <small>If Daraja is configured, saving sends an STK Push request for the invoice total. Amounts with fractional shillings may not be accepted by the provider.</small>
           </label>}
-          <p className="dialog-note"><ShieldCheck size={15} /> The invoice itself is not emailed and is not a KRA/eTIMS tax invoice.{canUse('integrations.manage') ? ' An optional phone number sends a separate M-Pesa payment prompt.' : ''}</p>
+          <p className="dialog-note"><ShieldCheck size={15} /> The invoice itself is not emailed and is not a KRA/eTIMS tax invoice.{canUse('sales.write') ? ' An optional phone number sends a separate M-Pesa payment prompt.' : ''}</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button type="button" className="button button-secondary" onClick={() => { const preview = { id: '', customer: invoice.customer, customer_email: invoice.customerEmail, description: invoiceLines.map((line) => line.description).filter(Boolean).join('; '), amount: String(draftDocumentTotal(invoiceLines)), due_date: invoice.dueDate, status: 'Draft' }; setInvoicePreview(preview); setInvoiceEmailBody(defaultInvoiceEmailMessage(preview, dashboard?.workspaceName ?? 'your business')) }}>Preview</button><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save invoice'}</button></div>
         </form> : null}

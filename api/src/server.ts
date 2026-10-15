@@ -633,7 +633,9 @@ function permissionForRequest(request: AuthedRequest): WorkspacePermission | nul
   if (routePath === '/v1/expenses' || routePath.startsWith('/v1/transactions')) return 'accounting.write'
   if (routePath.startsWith('/v1/invoices')) {
     if (routePath.endsWith('/payments/mpesa/manual')) return 'accounting.write'
-    if (routePath.includes('/payments/mpesa')) return 'integrations.manage'
+    // M-Pesa prompts and payment status are part of working an invoice. The
+    // workspace admin controls whether Daraja is enabled and supplies its keys.
+    if (routePath.includes('/payments/mpesa')) return 'sales.write'
     return routePath.endsWith('/payments') || routePath.endsWith('/returns') ? 'accounting.write' : 'sales.write'
   }
   if (routePath.startsWith('/v1/estimates') || routePath.startsWith('/v1/sales-orders') || routePath.startsWith('/v1/recurring')) return 'sales.write'
@@ -653,6 +655,9 @@ function readPermissionsForRequest(request: AuthedRequest): WorkspacePermission[
   if (routePath === '/v1/auth/me' || routePath === '/v1/auth/two-factor/status' || routePath === '/v1/auth/account-deletion/preview') return null
   // These aggregate endpoints project or filter their results to the caller's permissions.
   if (routePath === '/v1/dashboard' || routePath === '/v1/search') return null
+  // Provider readiness contains no credentials. Only return each provider's status to
+  // members who can use that workflow; the handler filters the response by permission.
+  if (routePath === '/v1/integrations/readiness') return ['integrations.manage', 'sales.write', 'accounting.write', 'banking.write']
   if (routePath === '/v1/recurring') return ['sales.write', 'accounting.write']
   if (routePath.startsWith('/v1/accounting/reconciliations')) return ['accounting.write', 'banking.write']
   // Sales and store managers can review customer order requests; each receives only a
@@ -5883,9 +5888,12 @@ function assertKraSuccess(result: Record<string, unknown>) {
 }
 app.get('/v1/integrations/etims/config', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT environment, device_id, sdc_id, mrc_no, initialized_at, updated_at FROM kra_oscu_workspaces WHERE workspace_id = $1', [request.session!.workspaceId])
+    const [result, settings] = await Promise.all([
+      pool!.query('SELECT environment, device_id, sdc_id, mrc_no, initialized_at, updated_at FROM kra_oscu_workspaces WHERE workspace_id = $1', [request.session!.workspaceId]),
+      pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId]),
+    ])
     const row = result.rows[0]
-    response.json({ configured: Boolean(row), environment: env.KRA_ETIMS_ENV, liveSubmissionsEnabled: kraEtimsLiveEnabled, initialized: Boolean(row?.initialized_at), device: row ? { deviceId: row.device_id, sdcId: row.sdc_id, mrcNo: row.mrc_no, initializedAt: row.initialized_at } : null, credentialsEncryptionReady: Boolean(env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY), apiBase: kraEtimsApiBase })
+    response.json({ configured: Boolean(row), environment: env.KRA_ETIMS_ENV, liveSubmissionsEnabled: kraEtimsLiveEnabled, workspaceEnabled: env.KRA_ETIMS_ENV !== 'production' || settings.rows[0]?.preferences?.kraEtimsLiveEnabled === true, initialized: Boolean(row?.initialized_at), device: row ? { deviceId: row.device_id, sdcId: row.sdc_id, mrcNo: row.mrc_no, initializedAt: row.initialized_at } : null, credentialsEncryptionReady: Boolean(env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY), apiBase: kraEtimsApiBase })
   } catch (error) { next(error) }
 })
 app.put('/v1/integrations/etims/device', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, requireWorkspaceProviderPreference('kraEtimsLiveEnabled', true), async (request: AuthedRequest, response, next) => {
@@ -6126,7 +6134,7 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
     const mpesaReady = Boolean(settings.darajaEnabled && daraja && callbackIsSecure)
     const kraReady = Boolean(settings.kraEtimsLiveEnabled && env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY && kraEtimsLiveEnabled)
     const monoReady = Boolean(settings.monoEnabled && monoConfigured)
-    response.json({ mode: mpesaReady ? 'mpesa_configured' : 'setup_required', integrations: [
+    const integrations = [
       { id: 'kra_etims', status: kraReady ? 'oscu_production_switches_enabled_approval_and_device_still_required' : settings.kraEtimsLiveEnabled ? `oscu_${env.KRA_ETIMS_ENV}_live_disabled` : 'oscu_workspace_disabled' },
       { id: 'mpesa', status: mpesaReady ? `configured_${daraja!.environment}` : settings.darajaEnabled ? 'daraja_credentials_and_callback_required' : 'workspace_daraja_disabled' },
       { id: 'bank_feeds', status: monoReady ? 'mono_configured_consent_required' : settings.monoEnabled ? 'mono_business_approval_and_server_keys_required' : 'workspace_mono_disabled' },
@@ -6134,7 +6142,19 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
       { id: 'payroll', status: `encrypted_internal_runs_${env.PAYROLL_DATA_ENCRYPTION_KEY ? 'configured' : 'encryption_key_required'}_statutory_filing_not_implemented` },
       { id: 'paye_shif_nssf_ahl_filing', status: 'statutory_filing_not_implemented' },
       { id: 'multi_method_payments', status: settings.multiMethodPayments ? 'workspace_enabled_split_capture' : 'workspace_disabled' },
-    ], note: `Workspace preferences are enforced on Daraja payment initiation, Mono linking/sync, and production KRA OSCU operations. Every business must save its own encrypted Daraja app credentials on the Kenya compliance page before M-Pesa payments can be requested. KRA readiness here only reports that operator/workspace switches and encryption config are present; KRA approval, certification, initialized production device, fiscal mapping review, and reconciliation are still required. Statutory filing adapters are not implemented, regardless of saved preferences. Payroll estimates remain internal and are not certified.` })
+    ]
+    const permissions = new Set(request.workspacePermissions ?? [])
+    const canManageIntegrations = permissions.has('integrations.manage')
+    const visibleIntegrations = integrations.filter((integration) => canManageIntegrations
+      || integration.id === 'mpesa' && permissions.has('sales.write')
+      || integration.id === 'email' && permissions.has('sales.write')
+      || integration.id === 'multi_method_payments' && (permissions.has('sales.write') || permissions.has('accounting.write'))
+      || integration.id === 'bank_feeds' && permissions.has('banking.write'))
+    response.json({
+      ...(canManageIntegrations || permissions.has('sales.write') ? { mode: mpesaReady ? 'mpesa_configured' : 'setup_required' } : {}),
+      integrations: visibleIntegrations,
+      ...(canManageIntegrations ? { note: `Workspace preferences are enforced on Daraja payment initiation, Mono linking/sync, and production KRA OSCU operations. Every business must save its own encrypted Daraja app credentials on the Kenya compliance page before M-Pesa payments can be requested. KRA readiness here only reports that operator/workspace switches and encryption config are present; KRA approval, certification, initialized production device, fiscal mapping review, and reconciliation are still required. Statutory filing adapters are not implemented, regardless of saved preferences. Payroll estimates remain internal and are not certified.` } : {}),
+    })
   } catch (error) { next(error) }
 })
 // ---------------------------------------------------------------------------
