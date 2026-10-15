@@ -531,8 +531,9 @@ function safeAuditValue(value: unknown, depth = 0): unknown {
   return value
 }
 async function recordAutomaticUserActivity(context: RequestAuditContext, statusCode: number) {
-  if (!pool || !context.request.session) return
   const request = context.request
+  const session = request.session
+  if (!pool || !session) return
   const routePath = String(request.route?.path ?? request.path).slice(0, 300)
   const params = safeAuditValue(request.params)
   const query = safeAuditValue(request.query)
@@ -547,7 +548,7 @@ async function recordAutomaticUserActivity(context: RequestAuditContext, statusC
   const eventData = { method: request.method, route: routePath, params, query, input: body, statusCode }
   await pool.query(`INSERT INTO audit_events (id, workspace_id, actor_user_id, actor_display, event_type, entity_type, entity_id, event_data)
     VALUES ($1, $2, $3, (SELECT COALESCE(NULLIF(email, ''), phone) FROM users WHERE id = $3), 'activity.recorded', $4, $5, $6::jsonb)`,
-  [randomUUID(), request.session.workspaceId, request.session.userId, entityType, entityId, JSON.stringify(eventData)])
+  [randomUUID(), session.workspaceId, session.userId, entityType, entityId, JSON.stringify(eventData)])
 }
 async function insertJournal(client: PoolClient, input: { workspaceId: string; userId: string | null; date: string; description: string; sourceType: string; sourceId?: string; reversalOf?: string; correctionReason?: string; lines: JournalLineInput[] }) {
   const debitCents = input.lines.reduce((sum, line) => sum + Math.round(line.debit * 100), 0)
