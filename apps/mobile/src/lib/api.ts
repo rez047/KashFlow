@@ -36,8 +36,14 @@ export async function api<T>(path: string, token?: string, options: { method?: s
 }
 
 export async function refreshCatalog(token: string, userEmail: string) {
-  const [me, itemResult, locationResult, stockResult] = await Promise.all([
-    api<{ workspace: { id: string; name: string }; workspaces?: BusinessWorkspace[] }>('/v1/auth/me', token),
+  const me = await api<{ workspace: { id: string; name: string; permissions?: string[] }; workspaces?: BusinessWorkspace[] }>('/v1/auth/me', token)
+  const permissions = me.workspace.permissions ?? []
+  if (!permissions.includes('inventory.write')) {
+    const workspaces = me.workspaces?.length ? me.workspaces : [{ ...me.workspace, role: 'member' }]
+    const refreshedAt = await saveSnapshot({ workspaceId: me.workspace.id, workspaceName: me.workspace.name, userEmail, permissions, items: [], locations: [], stock: [], workspaces })
+    return { workspace: me.workspace, permissions, refreshedAt, itemCount: 0 }
+  }
+  const [itemResult, locationResult, stockResult] = await Promise.all([
     api<{ records: { id: string; data: Record<string, unknown> }[] }>('/v1/records/inventory', token),
     api<{ locations: InventoryLocation[] }>('/v1/inventory/locations', token),
     api<{ stock: { item_id: string; location_id: string; quantity: string }[] }>('/v1/inventory/location-stock', token),
@@ -53,9 +59,9 @@ export async function refreshCatalog(token: string, userEmail: string) {
   }))
   const locations = locationResult.locations.map((location) => ({ ...location, is_default: Boolean(location.is_default), active: Boolean(location.active) }))
   const stock = stockResult.stock.map((row) => ({ ...row, quantity: Number(row.quantity) }))
-  const workspaces = me.workspaces?.length ? me.workspaces : [{ ...me.workspace, role: 'admin' }]
-  const refreshedAt = await saveSnapshot({ workspaceId: me.workspace.id, workspaceName: me.workspace.name, userEmail, items, locations, stock, workspaces })
-  return { workspace: me.workspace, refreshedAt, itemCount: items.length }
+  const workspaces = me.workspaces?.length ? me.workspaces : [{ ...me.workspace, role: 'member' }]
+  const refreshedAt = await saveSnapshot({ workspaceId: me.workspace.id, workspaceName: me.workspace.name, userEmail, permissions, items, locations, stock, workspaces })
+  return { workspace: me.workspace, permissions, refreshedAt, itemCount: items.length }
 }
 
 export function activateBusiness(token: string, workspaceId: string) {

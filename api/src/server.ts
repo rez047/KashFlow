@@ -585,14 +585,25 @@ async function requireSession(request: AuthedRequest, response: express.Response
       : Array.isArray(overrides)
         ? overrides.filter((permission: unknown): permission is WorkspacePermission => workspacePermissionNames.includes(permission as WorkspacePermission))
         : rolePermissionDefaults[request.workspaceRole] ?? (await pool!.query('SELECT permissions FROM custom_workspace_roles WHERE workspace_id = $1 AND role_key = $2', [request.session!.workspaceId, request.workspaceRole])).rows[0]?.permissions ?? []
-    if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
+    if (['GET', 'HEAD'].includes(request.method)) {
+      const requiredPermissions = readPermissionsForRequest(request)
+      if (requiredPermissions && !requiredPermissions.some((permission) => request.workspacePermissions?.includes(permission))) {
+        response.status(403).json({ error: `Your workspace role does not have access to this screen.` })
+        return
+      }
+    } else if (!['OPTIONS'].includes(request.method)) {
       const routePath = String(request.route?.path ?? '')
       const selfServiceRoute = routePath === '/v1/workspaces/:workspaceId/activate' || routePath === '/v1/workspaces/:workspaceId/archive' || routePath === '/v1/auth/account' || routePath === '/v1/auth/change-password' || routePath.startsWith('/v1/auth/two-factor/')
-      const permission = selfServiceRoute
-        ? null
-        : permissionForRequest(request) ?? 'operations.write'
-      if (permission && !(request.workspacePermissions ?? []).includes(permission)) {
-        response.status(403).json({ error: `Your workspace role does not have the ${permission} permission.` })
+      const requiredPermissions = selfServiceRoute
+        ? []
+        : routePath === '/v1/invoices/:invoiceId/payments/mpesa/manual'
+          ? ['accounting.write', 'integrations.manage'] as WorkspacePermission[]
+          : routePath === '/v1/recurring' && request.body?.type === 'expense'
+            ? ['accounting.write'] as WorkspacePermission[]
+            : [permissionForRequest(request) ?? 'operations.write']
+      const missingPermission = requiredPermissions.find((permission) => !(request.workspacePermissions ?? []).includes(permission))
+      if (missingPermission) {
+        response.status(403).json({ error: `Your workspace role does not have the ${missingPermission} permission.` })
         return
       }
     }
@@ -609,20 +620,58 @@ function permissionForRequest(request: AuthedRequest): WorkspacePermission | nul
   if (routePath.startsWith('/v1/payroll') || routePath.startsWith('/v1/integrations/statutory')) return 'payroll.manage'
   if (routePath.startsWith('/v1/integrations')) return 'integrations.manage'
   if (routePath.startsWith('/v1/settings')) return 'workspace.manage'
+  if (routePath.startsWith('/v1/platform/backups') || routePath.startsWith('/v1/exports')) return 'workspace.manage'
+  if (routePath === '/v1/messaging/status') return 'integrations.manage'
   if (routePath.startsWith('/v1/banking')) return 'banking.write'
   if (routePath.startsWith('/v1/purchase-orders')) return 'inventory.write'
-  if (routePath.startsWith('/v1/accounting') || routePath.startsWith('/v1/bills')) return 'accounting.write'
   if (routePath.startsWith('/v1/inventory')) return 'inventory.write'
+  if (routePath.startsWith('/v1/projects')) return 'operations.write'
+  if (routePath.startsWith('/v1/services/')) return 'inventory.write'
+  if (routePath.startsWith('/v1/reports/retail')) return 'inventory.write'
+  if (routePath.startsWith('/v1/reports/')) return 'accounting.write'
+  if (routePath.startsWith('/v1/accounting') || routePath.startsWith('/v1/bills')) return 'accounting.write'
+  if (routePath === '/v1/expenses' || routePath.startsWith('/v1/transactions')) return 'accounting.write'
   if (routePath.startsWith('/v1/invoices')) {
+    if (routePath.endsWith('/payments/mpesa/manual')) return 'accounting.write'
     if (routePath.includes('/payments/mpesa')) return 'integrations.manage'
     return routePath.endsWith('/payments') || routePath.endsWith('/returns') ? 'accounting.write' : 'sales.write'
   }
-  if (routePath.startsWith('/v1/estimates') || routePath.startsWith('/v1/sales-orders')) return 'sales.write'
-  if (routePath.startsWith('/v1/records')) return request.params.type === 'inventory' ? 'inventory.write' : 'operations.write'
+  if (routePath.startsWith('/v1/estimates') || routePath.startsWith('/v1/sales-orders') || routePath.startsWith('/v1/recurring')) return 'sales.write'
+  if (routePath.startsWith('/v1/records')) {
+    if (routePath.includes('/sales-history')) return 'sales.write'
+    const type = String(request.params.type ?? '')
+    return ['inventory', 'suppliers', 'services'].includes(type) ? 'inventory.write' : 'operations.write'
+  }
   if (routePath.startsWith('/v1/documents')) return 'operations.write'
   if (routePath.startsWith('/v1/store')) return routePath.includes('settings') ? 'store.manage' : 'sales.write'
   if (routePath.startsWith('/v1/workspaces')) return 'workspace.manage'
   return null
+}
+function readPermissionsForRequest(request: AuthedRequest): WorkspacePermission[] | null {
+  const routePath = String(request.route?.path ?? '')
+  // Session and account-security reads do not expose workspace business records.
+  if (routePath === '/v1/auth/me' || routePath === '/v1/auth/two-factor/status' || routePath === '/v1/auth/account-deletion/preview') return null
+  // These aggregate endpoints project or filter their results to the caller's permissions.
+  if (routePath === '/v1/dashboard' || routePath === '/v1/search') return null
+  if (routePath === '/v1/recurring') return ['sales.write', 'accounting.write']
+  if (routePath.startsWith('/v1/accounting/reconciliations')) return ['accounting.write', 'banking.write']
+  // Sales and store managers can review customer order requests; each receives only a
+  // workspace-scoped order list through this endpoint.
+  if (routePath.startsWith('/v1/store/orders')) return ['sales.write', 'store.manage']
+  // These catalog reads are also used by the sales workflow. Inventory management pages
+  // remain separately gated in the client, and mutation routes still require inventory access.
+  if (routePath === '/v1/records/:type' && ['inventory', 'customers'].includes(String(request.params.type ?? ''))) {
+    return String(request.params.type) === 'inventory'
+      ? ['inventory.write', 'sales.write']
+      : ['operations.write', 'inventory.write', 'sales.write']
+  }
+  if (routePath === '/v1/inventory/locations' || routePath === '/v1/inventory/location-stock') return ['inventory.write', 'sales.write']
+  if (routePath === '/v1/records/:type') {
+    const type = String(request.params.type ?? '')
+    return ['inventory', 'suppliers', 'services'].includes(type) ? ['inventory.write'] : ['operations.write']
+  }
+  const requiredPermission = permissionForRequest(request)
+  return [requiredPermission ?? 'operations.write']
 }
 function idempotentMutationHandler(handler: express.RequestHandler): express.RequestHandler {
   return async (request, response, next) => {
@@ -1534,9 +1583,21 @@ app.get('/v1/dashboard', requirePool, requireSession, async (request: AuthedRequ
       [workspaceId, query.data.from, query.data.to, monthStart, today]),
     ])
     const asDateString = (value: unknown) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10)
+    const canReadAccounting = request.workspacePermissions?.includes('accounting.write') ?? false
+    const canReadSales = request.workspacePermissions?.includes('sales.write') ?? false
     const income = Number(totals.rows[0].income) + Number(invoiceIncome.rows[0].income)
     const monthIncome = Number(totals.rows[0].month_income) + Number(invoiceIncome.rows[0].month_income)
-    response.json({ workspaceName: workspace.rows[0]?.name ?? '', period: query.data, totals: { income: income.toFixed(2), expenses: totals.rows[0].expenses, net: (income - Number(totals.rows[0].expenses)).toFixed(2), monthIncome: monthIncome.toFixed(2), monthExpenses: totals.rows[0].month_expenses }, transactions: transactions.rows.map((row: Record<string, unknown>) => ({ ...row, transaction_date: asDateString(row.transaction_date) })), cashflow: cashflow.rows.map((row: Record<string, unknown>) => ({ ...row, date: asDateString(row.date) })), invoices: invoices.rows[0] })
+    const expenses = Number(totals.rows[0].expenses)
+    response.json({
+      workspaceName: workspace.rows[0]?.name ?? '',
+      period: query.data,
+      totals: canReadAccounting
+        ? { income: income.toFixed(2), expenses: totals.rows[0].expenses, net: (income - expenses).toFixed(2), monthIncome: monthIncome.toFixed(2), monthExpenses: totals.rows[0].month_expenses }
+        : { income: '0.00', expenses: '0.00', net: '0.00', monthIncome: '0.00', monthExpenses: '0.00' },
+      transactions: canReadAccounting ? transactions.rows.map((row: Record<string, unknown>) => ({ ...row, transaction_date: asDateString(row.transaction_date) })) : [],
+      cashflow: canReadAccounting ? cashflow.rows.map((row: Record<string, unknown>) => ({ ...row, date: asDateString(row.date) })) : [],
+      invoices: canReadSales ? invoices.rows[0] : { count: 0, unpaid_amount: '0.00' },
+    })
   } catch (error) { next(error) }
 })
 
@@ -1651,7 +1712,7 @@ app.get('/v1/search', requirePool, requireSession, async (request: AuthedRequest
       SELECT * FROM (
         SELECT id::text AS id, 'record'::text AS type, COALESCE(data->>'name', data->>'description', record_type) AS title,
           concat_ws(' ', record_type, data->>'sku', data->>'description', data->>'category') AS details, NULL::text AS amount, updated_at::date::text AS date,
-          ''::text AS status, CASE record_type WHEN 'inventory' THEN 'Inventory' WHEN 'supplier' THEN 'Suppliers' WHEN 'project' THEN 'Projects' WHEN 'service' THEN 'Services' ELSE 'Networking' END AS page, updated_at AS sort_date
+          ''::text AS status, CASE record_type WHEN 'inventory' THEN 'Inventory' WHEN 'supplier' THEN 'Suppliers' WHEN 'project' THEN 'Projects' WHEN 'service' THEN 'Services' WHEN 'customer' THEN 'Customers' ELSE 'Networking' END AS page, updated_at AS sort_date
         FROM workspace_records WHERE workspace_id = $1 AND position($2 in lower(concat_ws(' ', id::text, record_type, data::text))) > 0
         UNION ALL
         SELECT id::text, 'transaction', description, concat_ws(' ', account, direction), amount::text, transaction_date::text, direction, CASE WHEN direction = 'expense' THEN 'Expenses' ELSE 'Accounting' END, transaction_date::timestamptz
@@ -1703,7 +1764,16 @@ app.get('/v1/search', requirePool, requireSession, async (request: AuthedRequest
         SELECT bp.id::text, 'bill payment', vb.supplier, concat_ws(' ', vb.description, 'payment'), bp.amount::text, bp.payment_date::text, 'recorded', 'Expenses', bp.created_at
         FROM bill_payments bp JOIN vendor_bills vb ON vb.id = bp.bill_id AND vb.workspace_id = bp.workspace_id
         WHERE bp.workspace_id = $1 AND position($2 in lower(concat_ws(' ', bp.id::text, vb.supplier, vb.description, bp.amount::text, bp.payment_date::text))) > 0
-      ) matches ORDER BY sort_date DESC NULLS LAST, id DESC LIMIT 100 OFFSET $3`, [workspaceId, term, parsed.data.offset])
+      ) matches
+      WHERE CASE
+        WHEN page = 'Banking' THEN 'banking.write'
+        WHEN page IN ('Inventory', 'Suppliers', 'Services') THEN 'inventory.write'
+        WHEN page IN ('Customers', 'Projects') THEN 'operations.write'
+        WHEN page IN ('Accounting', 'Expenses') THEN 'accounting.write'
+        WHEN page = 'Networking' THEN 'sales.write'
+        ELSE 'operations.write'
+      END = ANY($4::text[])
+      ORDER BY sort_date DESC NULLS LAST, id DESC LIMIT 100 OFFSET $3`, [workspaceId, term, parsed.data.offset, request.workspacePermissions ?? []])
     const results = result.rows.map((row: Record<string, unknown>) => {
       const { sort_date: _sortDate, ...publicResult } = row
       return publicResult
@@ -1811,7 +1881,14 @@ app.get('/v1/records/:type', requirePool, requireSession, async (request: Authed
   if (!type) { response.status(404).json({ error: 'Unknown record type.' }); return }
   try {
     const result = await pool!.query('SELECT id, data, created_at, updated_at FROM workspace_records WHERE workspace_id = $1 AND record_type = $2 ORDER BY updated_at DESC', [request.session!.workspaceId, workspaceRecordDatabaseTypes[type]])
-    response.json({ records: result.rows })
+      const records = type === 'inventory' && !request.workspacePermissions?.includes('inventory.write')
+        ? result.rows.map((row: Record<string, unknown>) => {
+          const data = row.data as Record<string, unknown>
+          const saleCatalogFields = ['name', 'sku', 'barcode', 'price', 'unit', 'category', 'description']
+          return { ...row, data: Object.fromEntries(saleCatalogFields.filter((field) => data[field] !== undefined).map((field) => [field, data[field]])) }
+        })
+        : result.rows
+      response.json({ records })
   } catch (error) { next(error) }
 })
 app.get('/v1/records/customers/:customerId/sales-history', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
@@ -3012,7 +3089,10 @@ app.get('/v1/reports/cash-flow-forecast', requirePool, requireSession, async (re
 
 app.get('/v1/recurring', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
-    const result = await pool!.query('SELECT id, template_type, description, counterparty, customer_email, customer_phone, amount::text, account, frequency, next_date, active FROM recurring_templates WHERE workspace_id = $1 ORDER BY next_date', [request.session!.workspaceId])
+    const result = await pool!.query(`SELECT id, template_type, description, counterparty, customer_email, customer_phone, amount::text, account, frequency, next_date, active
+      FROM recurring_templates WHERE workspace_id = $1
+        AND ((template_type = 'invoice' AND $2::boolean) OR (template_type = 'expense' AND $3::boolean))
+      ORDER BY next_date`, [request.session!.workspaceId, request.workspacePermissions?.includes('sales.write') ?? false, request.workspacePermissions?.includes('accounting.write') ?? false])
     response.json({ templates: result.rows })
   } catch (error) { next(error) }
 })
@@ -6112,12 +6192,12 @@ app.get('/v1/services/:serviceId/subscriptions', requirePool, requireSession, as
         (SELECT COALESCE(SUM(p.amount), 0)::text FROM invoice_payments p JOIN invoices i ON i.id = p.invoice_id WHERE i.workspace_id = s.workspace_id AND i.service_subscription_id = s.id) AS total_paid
       FROM service_subscriptions s
       WHERE s.workspace_id = $1 AND s.service_id = $2 ORDER BY s.created_at DESC`, [request.session!.workspaceId, request.params.serviceId])
-    const subscriptions = result.rows.map((row: Record<string, unknown>) => ({
+    const subscriptions = request.workspacePermissions?.includes('sales.write') ? result.rows.map((row: Record<string, unknown>) => ({
       ...row,
       start_date: dateOnly(row.start_date),
       next_invoice_date: row.next_invoice_date ? dateOnly(row.next_invoice_date) : null,
       last_paid_at: row.last_paid_at ? dateOnly(row.last_paid_at) : null,
-    }))
+    })) : []
     response.json({ service: service.rows[0].data, supplierPayments: supplierPayments.rows, subscriptions })
   } catch (error) { next(error) }
 })

@@ -20,6 +20,7 @@ type DesktopVault = {
   userEmail: string
   workspaceId: string
   workspaceName: string
+  permissions: string[]
   workspaces: Array<{ id: string; name: string; role: string }>
   refreshedAt: string
   items: Array<{ id: string; name: string; sku: string; category: string; unit: string; cost: number; quantity: number }>

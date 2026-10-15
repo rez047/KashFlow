@@ -27,6 +27,7 @@ export type OfflineSnapshot = {
   workspaceName: string
   userEmail: string
   refreshedAt: string
+  permissions: string[]
   workspaces: BusinessWorkspace[]
   items: InventoryItem[]
   locations: InventoryLocation[]
@@ -57,7 +58,8 @@ async function database() {
       await db.execAsync(`
         CREATE TABLE IF NOT EXISTS workspace_snapshot (
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1), workspace_id TEXT NOT NULL,
-          workspace_name TEXT NOT NULL, user_email TEXT NOT NULL, refreshed_at TEXT NOT NULL
+          workspace_name TEXT NOT NULL, user_email TEXT NOT NULL, refreshed_at TEXT NOT NULL,
+          permissions TEXT NOT NULL DEFAULT '[]'
         );
         CREATE TABLE IF NOT EXISTS workspace_access (
           workspace_id TEXT PRIMARY KEY, workspace_name TEXT NOT NULL, role TEXT NOT NULL
@@ -84,6 +86,10 @@ async function database() {
       if (!countColumns.some((column) => column.name === 'workspace_id')) {
         await db.execAsync('ALTER TABLE count_queue ADD COLUMN workspace_id TEXT;')
       }
+      const workspaceColumns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(workspace_snapshot)')
+      if (!workspaceColumns.some((column) => column.name === 'permissions')) {
+        await db.execAsync("ALTER TABLE workspace_snapshot ADD COLUMN permissions TEXT NOT NULL DEFAULT '[]';")
+      }
       await db.runAsync('UPDATE count_queue SET workspace_id = (SELECT workspace_id FROM workspace_snapshot WHERE singleton = 1) WHERE workspace_id IS NULL')
       return db
     } catch (error) {
@@ -107,6 +113,7 @@ export async function saveSnapshot(input: {
   workspaceId: string
   workspaceName: string
   userEmail: string
+  permissions?: string[]
   items: InventoryItem[]
   locations: InventoryLocation[]
   stock: LocationStock[]
@@ -115,7 +122,7 @@ export async function saveSnapshot(input: {
   const db = await database()
   const refreshedAt = new Date().toISOString()
   await db.withTransactionAsync(async () => {
-    await db.runAsync('INSERT OR REPLACE INTO workspace_snapshot (singleton, workspace_id, workspace_name, user_email, refreshed_at) VALUES (1, ?, ?, ?, ?)', input.workspaceId, input.workspaceName, input.userEmail, refreshedAt)
+    await db.runAsync('INSERT OR REPLACE INTO workspace_snapshot (singleton, workspace_id, workspace_name, user_email, refreshed_at, permissions) VALUES (1, ?, ?, ?, ?, ?)', input.workspaceId, input.workspaceName, input.userEmail, refreshedAt, JSON.stringify(input.permissions ?? []))
     await db.execAsync('DELETE FROM workspace_access;')
     for (const workspace of input.workspaces) await db.runAsync('INSERT OR REPLACE INTO workspace_access (workspace_id, workspace_name, role) VALUES (?, ?, ?)', workspace.id, workspace.name, workspace.role)
     await db.execAsync('DELETE FROM inventory_items; DELETE FROM inventory_locations; DELETE FROM location_stock;')
@@ -144,7 +151,7 @@ export async function rebaseCount(key: string, serverQuantity: number) {
 
 export async function getOfflineSnapshot(): Promise<OfflineSnapshot | null> {
   const db = await database()
-  const workspace = await db.getFirstAsync<{ workspace_id: string; workspace_name: string; user_email: string; refreshed_at: string }>('SELECT workspace_id, workspace_name, user_email, refreshed_at FROM workspace_snapshot WHERE singleton = 1')
+  const workspace = await db.getFirstAsync<{ workspace_id: string; workspace_name: string; user_email: string; refreshed_at: string; permissions: string }>('SELECT workspace_id, workspace_name, user_email, refreshed_at, permissions FROM workspace_snapshot WHERE singleton = 1')
   if (!workspace) return null
   const [rawItems, rawLocations, rawStock, rawCounts, rawWorkspaces] = await Promise.all([
     db.getAllAsync<InventoryItem>('SELECT * FROM inventory_items ORDER BY name COLLATE NOCASE'),
@@ -172,7 +179,9 @@ export async function getOfflineSnapshot(): Promise<OfflineSnapshot | null> {
     createdAt: count.created_at,
   }))
   const workspaces = rawWorkspaces.length ? rawWorkspaces : [{ id: workspace.workspace_id, name: workspace.workspace_name, role: 'admin' }]
-  return { workspaceId: workspace.workspace_id, workspaceName: workspace.workspace_name, userEmail: workspace.user_email, refreshedAt: workspace.refreshed_at, workspaces, items, locations, stock: rawStock.map((row) => ({ ...row, quantity: Number(row.quantity) })), counts: counts.filter((count) => count.workspaceId === workspace.workspace_id) }
+  let permissions: string[] = []
+  try { const parsed = JSON.parse(workspace.permissions); if (Array.isArray(parsed)) permissions = parsed.filter((permission): permission is string => typeof permission === 'string') } catch { permissions = [] }
+  return { workspaceId: workspace.workspace_id, workspaceName: workspace.workspace_name, userEmail: workspace.user_email, refreshedAt: workspace.refreshed_at, permissions, workspaces, items, locations, stock: rawStock.map((row) => ({ ...row, quantity: Number(row.quantity) })), counts: counts.filter((count) => count.workspaceId === workspace.workspace_id) }
 }
 
 export async function getCountsToSync(workspaceId: string) {

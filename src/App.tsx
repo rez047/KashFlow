@@ -172,6 +172,33 @@ type WooConnection = { store_url: string; enabled: boolean; last_synced_at?: str
 type DarajaConnection = { shortcode: string; callback_url: string; environment: 'sandbox' | 'production'; transaction_type: 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline'; initiator_name?: string | null; transactionStatusConfigured?: boolean; enabled: boolean; updated_at?: string | null; credentialsConfigured: boolean }
 type MemberPermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
 
+const PAGE_PERMISSION_REQUIREMENTS: Record<string, MemberPermission | MemberPermission[] | null> = {
+  Overview: null,
+  Banking: 'banking.write',
+  Expenses: 'accounting.write',
+  Payroll: 'payroll.manage',
+  'Point of sale': 'sales.write',
+  Networking: 'sales.write',
+  Customers: 'operations.write',
+  Suppliers: 'inventory.write',
+  Inventory: 'inventory.write',
+  Services: 'inventory.write',
+  Projects: 'operations.write',
+  Accounting: 'accounting.write',
+  Reports: ['accounting.write', 'inventory.write'],
+  'Kenya compliance': 'integrations.manage',
+  Documents: 'operations.write',
+  Settings: null,
+  Help: null,
+}
+
+function canAccessPage(page: string, permissions: MemberPermission[]) {
+  if (!Object.hasOwn(PAGE_PERMISSION_REQUIREMENTS, page)) return false
+  const required = PAGE_PERMISSION_REQUIREMENTS[page]
+  if (!required) return true
+  return Array.isArray(required) ? required.some((permission) => permissions.includes(permission)) : permissions.includes(required)
+}
+
 // Grouped permission catalogue for role building. Every available permission is listed so admins
 // can see the complete set of control areas rather than a partial selection.
 const ROLE_PERMISSION_GROUPS: Array<{ title: string; permissions: Array<[MemberPermission, string]> }> = [
@@ -926,6 +953,21 @@ function App() {
   const [switchingBusiness, setSwitchingBusiness] = useState(false)
   const [statusOpen, setStatusOpen] = useState(false)
   const [account, setAccount] = useState<Account | null>(null)
+  const effectivePermissions = useMemo<MemberPermission[]>(() => {
+    if (!account) return []
+    const role = account.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role
+    return role === 'admin'
+      ? ROLE_PERMISSION_GROUPS.flatMap((group) => group.permissions.map(([permission]) => permission))
+      : account.workspace.permissions ?? []
+  }, [account])
+  const canUse = useCallback((permission: MemberPermission | null) => !permission || effectivePermissions.includes(permission), [effectivePermissions])
+  const canOpenPage = useCallback((nextPage: string) => canAccessPage(nextPage, effectivePermissions), [effectivePermissions])
+  const visibleSearchResults = useMemo(() => searchResults.filter((result) => canOpenPage(result.page)), [searchResults, canOpenPage])
+  const modalPermission = modal === 'business' ? 'workspace.manage' : modal === 'invite' ? 'team.manage' : modal === 'return' || modal === 'transaction' ? 'accounting.write' : modal === 'invoice' ? 'sales.write' : null
+  const canViewModal = !modal || canUse(modalPermission)
+  const isActiveWorkspaceAdmin = account?.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin'
+  const permissionScopeKey = `${account?.user.id ?? ''}:${account?.workspace.id ?? ''}:${[...effectivePermissions].sort().join(',')}`
+  const previousPermissionScope = useRef('')
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
   const [expenses, setExpenses] = useState<Transaction[] | null>(null)
   const [integrationReadiness, setIntegrationReadiness] = useState<IntegrationReadiness | null>(null)
@@ -1106,6 +1148,9 @@ function App() {
   const [invoicesList, setInvoicesList] = useState<InvoiceRecord[]>([])
   const [estimates, setEstimates] = useState<EstimateRecord[]>([])
   const [recurringTemplates, setRecurringTemplates] = useState<RecurringTemplate[]>([])
+  const visibleRecurringTemplates = useMemo(() => recurringTemplates.filter((template) => template.template_type === 'invoice'
+    ? canUse('sales.write')
+    : canUse('accounting.write')), [recurringTemplates, canUse])
   const [recurringInput, setRecurringInput] = useState({ type: 'invoice' as 'invoice' | 'expense', description: '', counterparty: '', customerEmail: '', customerPhone: '', amount: '', frequency: 'monthly' as 'monthly' | 'quarterly' | 'annually', nextDate: today })
   const [bills, setBills] = useState<VendorBill[]>([])
   const [reconciliations, setReconciliations] = useState<Reconciliation[]>([])
@@ -1233,6 +1278,14 @@ function App() {
     function handlePopState(event: PopStateEvent) {
       const state = event.state as { kashflowNavigationKey?: string; kashflowNavigationIndex?: number; kashflowPage?: string } | null
       if (state?.kashflowNavigationKey === pageHistoryKey.current && Number.isInteger(state.kashflowNavigationIndex) && typeof state.kashflowPage === 'string') {
+        if (!canOpenPage(state.kashflowPage)) {
+          pageHistoryIndex.current = 0
+          pageHistoryPages.current = ['Overview']
+          setPageHistory([])
+          setPage('Overview')
+          window.history.replaceState({ kashflowNavigationKey: pageHistoryKey.current, kashflowNavigationIndex: 0, kashflowPage: 'Overview' }, '')
+          return
+        }
         const targetIndex = Math.max(0, state.kashflowNavigationIndex!)
         pageHistoryPages.current[targetIndex] = state.kashflowPage
         pageHistoryIndex.current = targetIndex
@@ -1247,10 +1300,10 @@ function App() {
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [])
+  }, [canOpenPage])
 
   function navigateTo(nextPage: string) {
-    if (nextPage === page) return
+    if (!canOpenPage(nextPage) || nextPage === page) return
     const nextIndex = pageHistoryIndex.current + 1
     pageHistoryPages.current = pageHistoryPages.current.slice(0, nextIndex)
     pageHistoryPages.current[nextIndex] = nextPage
@@ -1265,6 +1318,7 @@ function App() {
   }
 
   function openSearchResult(result: GlobalSearchResult) {
+    if (!canOpenPage(result.page)) { setSearchOpen(false); return }
     if (result.page === 'Networking') setNetworkingTab(['sales order', 'estimate'].includes(result.type) ? 'sales' : 'transactions')
     navigateTo(result.page)
     setSearchOpen(false)
@@ -1283,6 +1337,41 @@ function App() {
     setPageHistory(pageHistoryPages.current.slice(0, pageHistoryIndex.current))
     setPage(previous)
   }
+
+  useEffect(() => {
+    if (!account || canOpenPage(page)) return
+    setModal(null)
+    setMpesaWatch(null)
+    setSearchOpen(false)
+    setSearchResults([])
+    pageHistoryIndex.current = 0
+    pageHistoryPages.current = ['Overview']
+    setPageHistory([])
+    setPage('Overview')
+    window.history.replaceState({ kashflowNavigationKey: pageHistoryKey.current, kashflowNavigationIndex: 0, kashflowPage: 'Overview' }, '')
+  }, [account, canOpenPage, page])
+
+  useEffect(() => {
+    if (!account) { previousPermissionScope.current = ''; return }
+    if (previousPermissionScope.current && previousPermissionScope.current !== permissionScopeKey) {
+      setModal(null)
+      setMpesaWatch(null)
+      setSearchOpen(false)
+      setSearchResults([])
+      setSearch('')
+      setPaymentPhone('')
+      setMpesaPromptInvoiceId(null)
+      setInvoiceMpesaPayments({})
+      setPaymentAmounts({})
+      setInvoiceMpesaReferences({})
+      setInvoiceMpesaAmounts({})
+      setPaymentSplits({})
+      if (!effectivePermissions.includes('accounting.write')) {
+        setRecurringInput((current) => current.type === 'expense' ? { ...current, type: 'invoice' } : current)
+      }
+    }
+    previousPermissionScope.current = permissionScopeKey
+  }, [account, effectivePermissions, permissionScopeKey])
 
   useEffect(() => {
     if (page !== 'Settings') return
@@ -1466,8 +1555,10 @@ function App() {
           await acceptPendingInvitation()
           const data = await request<Dashboard>('/v1/dashboard')
           if (active) setDashboard(data)
-          const preferences = await request<{ settings: Partial<typeof settings> }>('/v1/settings')
-          if (active) setSettings((current) => ({ ...current, ...preferences.settings, businessName: preferences.settings.businessName ?? data.workspaceName ?? current.businessName }))
+          if (signedIn.workspace.permissions?.includes('workspace.manage')) {
+            const preferences = await request<{ settings: Partial<typeof settings> }>('/v1/settings')
+            if (active) setSettings((current) => ({ ...current, ...preferences.settings, businessName: preferences.settings.businessName ?? data.workspaceName ?? current.businessName }))
+          }
         } catch (authError) {
           if (authError instanceof TypeError) throw authError
         }
@@ -1600,8 +1691,8 @@ function App() {
   }, [records.inventory, inventoryLocations, inventoryLocationStock, account?.workspace.id, account?.user.id])
 
   useEffect(() => {
-    if (!account) return
-    void request<IntegrationReadiness>('/v1/integrations/readiness').then(setIntegrationReadiness).catch(() => undefined)
+    if (!account || !canOpenPage(page)) return
+    if (canUse('integrations.manage')) void request<IntegrationReadiness>('/v1/integrations/readiness').then(setIntegrationReadiness).catch(() => undefined)
     if (page === 'Expenses') {
       setExpenses(null)
       void request<{ expenses: Transaction[] }>('/v1/expenses')
@@ -1656,13 +1747,13 @@ function App() {
     ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load inventory and location records.'))
     if (page === 'Reports') {
       const period = today.slice(0, 7)
-      void Promise.all([
+      if (canUse('accounting.write')) void Promise.all([
         request<{ budgets: BudgetLine[] }>(`/v1/reports/budgets?from=${period}&to=${period}`).then((result) => setBudgets(result.budgets)),
         request<{ forecast: Array<{ period: string; income: number; expenses: number; source: string }> }>('/v1/reports/cash-flow-forecast').then((result) => setForecast(result.forecast)),
         request<AgingReport>(`/v1/reports/aging?asOf=${today}`).then(setAgingReport),
         request<{ accounts: AccountSummary[] }>('/v1/accounting/chart').then((result) => setAccounts(result.accounts)),
-        request<RetailReport>('/v1/reports/retail').then(setRetailReport),
-      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load management reports.'))
+      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load accounting reports.'))
+      if (canUse('inventory.write')) void request<RetailReport>('/v1/reports/retail').then(setRetailReport).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load inventory reports.'))
     }
     if (page === 'Banking') {
       void Promise.all([
@@ -1695,20 +1786,25 @@ function App() {
       ]).then(([services, customers, suppliers]) => setRecords((current) => ({ ...current, services: services.records, customers: customers.records, suppliers: suppliers.records })))
         .catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load services, saved customers, and suppliers.'))
     } else if (recordType) void request<{ records: WorkspaceRecord[] }>(`/v1/records/${recordType}`).then((result) => setRecords((current) => ({ ...current, [recordType]: result.records }))).catch((reason) => setError(reason instanceof Error ? reason.message : `Could not load ${page.toLowerCase()}.`))
-    if (page === 'Suppliers') void request<{ bills: VendorBill[] }>('/v1/bills').then((result) => setBills(result.bills)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load supplier bills.'))
-    if (page === 'Documents' || page === 'Overview') void request<{ documents: StoredDocument[] }>('/v1/documents').then((result) => setStoredDocuments(result.documents)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load stored documents.'))
+    if (page === 'Suppliers' && canUse('accounting.write')) void request<{ bills: VendorBill[] }>('/v1/bills').then((result) => setBills(result.bills)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load supplier bills.'))
+    if ((page === 'Documents' || page === 'Overview') && canUse('operations.write')) void request<{ documents: StoredDocument[] }>('/v1/documents').then((result) => setStoredDocuments(result.documents)).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load stored documents.'))
     if (page === 'Settings') {
-      void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
-      void Promise.all([
+      if (canUse('workspace.manage')) void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
+      const settingsLoads: Promise<unknown>[] = []
+      if (canUse('store.manage')) settingsLoads.push(
         request<{ store: OnlineStoreConfig | null }>('/v1/store/settings').then(({ store }) => {
           const slug = dashboard?.workspaceName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'my-store'
           setStoreConfig(store ?? { slug, title: dashboard?.workspaceName ?? '', description: '', enabled: false })
         }),
         request<{ orders: StoreOrder[] }>('/v1/store/orders').then((result) => setStoreOrders(result.orders)),
+      )
+      if (canUse('integrations.manage')) settingsLoads.push(
         request<{ connection: WooConnection | null; encryptionReady: boolean }>('/v1/integrations/woocommerce').then((result) => {
           setWooConnection(result.connection); setWooEncryptionReady(result.encryptionReady)
           if (result.connection) setWooCredentials((current) => ({ ...current, storeUrl: result.connection!.store_url }))
         }),
+      )
+      if (canUse('team.manage')) settingsLoads.push(
         request<{ members: WorkspaceMember[] }>(`/v1/workspaces/${account.workspace.id}/members`).then((result) => {
           setTeamMembers(result.members)
           setMemberPermissionDrafts(Object.fromEntries(result.members.map((member) => [member.userId, member.permissions ?? member.defaultPermissions])))
@@ -1716,10 +1812,10 @@ function App() {
           setMemberPermissionOverrides(Object.fromEntries(result.members.map((member) => [member.userId, member.permissions !== null])))
         }),
         request<{ roles: CustomRole[] }>(`/v1/workspaces/${account.workspace.id}/roles`).then((result) => setCustomRoles(result.roles)),
-      ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load store, WooCommerce, or team settings.'))
+      )
+      if (settingsLoads.length) void Promise.all(settingsLoads).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load the settings available to this role.'))
     }
-    else if (account) void request<{ settings: Partial<typeof settings> }>('/v1/settings').then((result) => setSettings((current) => ({ ...current, ...result.settings, businessName: result.settings.businessName ?? dashboard?.workspaceName ?? current.businessName }))).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load workspace settings.'))
-  }, [account, dashboard?.workspaceName, page, offlineSyncRevision])
+  }, [account, canOpenPage, canUse, dashboard?.workspaceName, page, offlineSyncRevision])
 
   async function saveStoreSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
@@ -1987,7 +2083,8 @@ function App() {
         setBusy(false)
         return
       }
-      setAccount(signedIn as Account); setShowSetupFlow(false); await refresh()
+      const authorizedAccount = await request<Account>('/v1/auth/me')
+      setAccount(authorizedAccount); setShowSetupFlow(false); await refresh()
       await acceptPendingInvitation()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not sign in.')
@@ -1999,8 +2096,9 @@ function App() {
     event.preventDefault(); setBusy(true); setError('')
     if (!twoFactorChallenge) { setBusy(false); return }
     try {
-      const signedIn = await request<Account>('/v1/auth/two-factor/verify-login', { method: 'POST', body: JSON.stringify({ challengeToken: twoFactorChallenge.token, code: twoFactorChallenge.code }) })
-      setAccount(signedIn)
+      await request<Account>('/v1/auth/two-factor/verify-login', { method: 'POST', body: JSON.stringify({ challengeToken: twoFactorChallenge.token, code: twoFactorChallenge.code }) })
+      const authorizedAccount = await request<Account>('/v1/auth/me')
+      setAccount(authorizedAccount)
       setTwoFactorChallenge(null)
       setShowSetupFlow(false)
       setCredentials({ identifier: '', password: '', businessName: '' })
@@ -2115,11 +2213,10 @@ function App() {
     setBusy(true); setError('')
     try {
       const demoCredentials = { identifier: DEMO_ACCOUNT.identifier, password: DEMO_ACCOUNT.password }
-      let demoAccount: Account
       try {
-        demoAccount = await request<Account>('/v1/auth/login', { method: 'POST', body: JSON.stringify(demoCredentials) })
+        await request<Account>('/v1/auth/login', { method: 'POST', body: JSON.stringify(demoCredentials) })
       } catch {
-        demoAccount = await request<Account>('/v1/auth/bootstrap', {
+        await request<Account>('/v1/auth/bootstrap', {
           method: 'POST',
           body: JSON.stringify({ ...demoCredentials, businessName: DEMO_ACCOUNT.businessName }),
         }).catch(async (reason) => {
@@ -2129,7 +2226,8 @@ function App() {
           throw reason
         })
       }
-      setAccount(demoAccount)
+      const authorizedAccount = await request<Account>('/v1/auth/me')
+      setAccount(authorizedAccount)
       setShowSetupFlow(false); setAuthPanelOpen(false)
       await refresh()
       await acceptPendingInvitation()
@@ -2175,7 +2273,7 @@ function App() {
       const created = await request<{ workspace: { id: string; name: string; role: string } }>('/v1/workspaces', { method: 'POST', body: JSON.stringify({ name: businessName }) })
       const nextAccount = account ? { ...account, workspace: { id: created.workspace.id, name: created.workspace.name }, workspaces: [...(account.workspaces ?? []), { id: created.workspace.id, name: created.workspace.name, role: created.workspace.role }] } : null
       setAccount(nextAccount)
-      await reloadWorkspaceData()
+      await reloadWorkspaceData(nextAccount)
       setBusinessName(''); setModal(null); notify(`Business “${created.workspace.name}” added.`)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not create business.')
@@ -2183,13 +2281,15 @@ function App() {
   }
 
   // Reload the workspace-scoped data the shell shows, after a business is created or switched to.
-  async function reloadWorkspaceData() {
+  async function reloadWorkspaceData(authorizedAccount: Account | null = account) {
     const period = overviewPeriod(overviewRange, overviewFrom, overviewTo)
     const query = new URLSearchParams(period)
     const data = await request<Dashboard>(`/v1/dashboard?${query}`)
     setDashboard(data)
-    const preferences = await request<{ settings: Partial<typeof settings> }>('/v1/settings')
-    setSettings((current) => ({ ...current, ...preferences.settings, businessName: preferences.settings.businessName ?? data.workspaceName ?? current.businessName }))
+    if (authorizedAccount?.workspace.permissions?.includes('workspace.manage')) {
+      const preferences = await request<{ settings: Partial<typeof settings> }>('/v1/settings')
+      setSettings((current) => ({ ...current, ...preferences.settings, businessName: preferences.settings.businessName ?? data.workspaceName ?? current.businessName }))
+    }
   }
 
   // Switch the active business/workspace. The server re-issues the session cookie for the chosen
@@ -2204,7 +2304,7 @@ function App() {
       await request(`/v1/workspaces/${workspaceId}/activate`, { method: 'POST' })
       const signedIn = await request<Account>('/v1/auth/me')
       setAccount(signedIn)
-      await reloadWorkspaceData()
+      await reloadWorkspaceData(signedIn)
       notify(`Switched to “${signedIn.workspace.name}”.`)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not switch business.')
@@ -4685,23 +4785,6 @@ async function createCameraReader(): Promise<CameraReader> {
     })
   }, [helpResources, helpSearch, helpCategory])
 
-  // Effective access for the signed-in member. Administrators always keep full access; every
-  // other member uses their saved override, or the defaults of their assigned role.
-  const currentMember = useMemo(() => account ? teamMembers.find((member) => member.userId === account.user.email) ?? null : null, [teamMembers, account])
-  const isWorkspaceAdmin = useMemo(() => {
-    if (!account) return false
-    const membership = account.workspaces?.find((workspace) => workspace.id === account.workspace.id)
-    if (membership?.role === 'admin') return true
-    return teamMembers.some((member) => member.role === 'admin' && (member.userId === account.user.email || member.isAdmin === true)) || teamMembers.length === 0
-  }, [account, teamMembers])
-  const isActiveWorkspaceAdmin = account?.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin'
-  const effectivePermissions = useMemo<MemberPermission[]>(() => {
-    if (isWorkspaceAdmin) return ROLE_PERMISSION_GROUPS.flatMap((group) => group.permissions.map(([permission]) => permission))
-    if (currentMember) return currentMember.permissions ?? currentMember.defaultPermissions
-    if (account?.workspace.permissions?.length) return account.workspace.permissions
-    return []
-  }, [isWorkspaceAdmin, account, currentMember])
-  const canUse = useCallback((permission: MemberPermission | null) => !permission || effectivePermissions.includes(permission), [effectivePermissions])
   useEffect(() => {
     setDarajaConnection(null)
     setDarajaEncryptionReady(false)
@@ -4867,6 +4950,8 @@ async function createCameraReader(): Promise<CameraReader> {
     return <Suspense fallback={<div className="auth-screen landing-loading"><Brand /><p>Loading your store…</p></div>}><OnlineStoreApp apiBase={API_BASE} pathname={window.location.pathname} /></Suspense>
   }
 
+  if (!canOpenPage(page)) return <div className="auth-screen landing-loading"><Brand /><p>Returning to your available workspace...</p></div>
+
   return <div className="app-shell">
     <aside id="workspace-sidebar" className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
       <div className="brand-row"><div className="brand-mark">K</div><div className="brand-name">Kash<span>Flow</span><small>{t('BUSINESS SUITE')}</small></div>
@@ -4893,7 +4978,7 @@ async function createCameraReader(): Promise<CameraReader> {
       <button className="nav-link bottom-link" onClick={() => { setModal('business'); setSidebarOpen(false) }}><Plus size={18} /> {t('Add business')}</button>
       <nav className="side-nav" aria-label="Main navigation">
         {groups.map((group) => {
-        const visibleItems = group.items.filter(([, , permission]) => canUse(permission as MemberPermission | null))
+        const visibleItems = group.items.filter(([name]) => canOpenPage(name))
         if (!visibleItems.length) return null
         return <div className="nav-group" key={group.title}><p className="nav-heading">{t(group.title)}</p>
           {visibleItems.map(([name, Icon]) => <button key={name} className={`nav-link ${page === name ? 'active' : ''}`} onClick={() => { navigateTo(name); setSidebarOpen(false) }}>
@@ -4910,14 +4995,14 @@ async function createCameraReader(): Promise<CameraReader> {
           <button className={`nav-link bottom-link ${page === 'Help' ? 'active' : ''}`} onClick={() => { navigateTo('Help'); setSidebarOpen(false) }}><LifeBuoy size={18} /> {t('Help & support')}</button>
         </div>
         <div className="profile-row"><div className="profile-avatar">{account.user.email.slice(0, 1).toUpperCase()}</div>
-          <div className="profile-copy"><strong>{account.user.email}</strong><small>{account.workspaces?.length ? `Business admin • ${account.workspaces.length} businesses` : 'Workspace admin'}</small></div>
+          <div className="profile-copy"><strong>{account.user.email}</strong><small>{account.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role ?? 'Workspace member'}</small></div>
           <button className="icon-button" onClick={() => void logout()} aria-label="Sign out"><LogOut size={16} /></button>
         </div>
       </div>
     </aside>
     {sidebarOpen && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={() => setSidebarOpen(false)} />}
     {switchingBusiness && <div className="workspace-switching-overlay" role="status" aria-live="polite"><span>Switching business…</span></div>}
-    {mpesaWatch && <div className="mpesa-confirm-overlay" role="dialog" aria-modal="true" aria-live="assertive">
+    {mpesaWatch && canUse('integrations.manage') && <div className="mpesa-confirm-overlay" role="dialog" aria-modal="true" aria-live="assertive">
       <div className={`mpesa-confirm-card is-${mpesaWatch.phase}`}>
         {mpesaWatch.phase === 'waiting' ? <>
           <div className="mpesa-spinner" aria-hidden="true" />
@@ -4964,9 +5049,9 @@ async function createCameraReader(): Promise<CameraReader> {
               <button type="submit" className="search-submit">Search</button>
             </form>
             {searchOpen && search.trim().length > 0 && <div className="global-search-results" role="listbox" aria-label="Workspace search results" aria-live="polite">
-              {search.trim().length < 2 ? <p className="search-result-message">Enter at least two characters to search saved records.</p> : searchLoading && !searchResults.length ? <p className="search-result-message">Searching saved records…</p> : searchError ? <p className="search-result-message search-result-error">{searchError}</p> : searchResults.length ? <>
-                <p className="search-result-heading">{searchHasMore ? `${searchResults.length} results loaded` : `${searchResults.length} matching records`}</p>
-                {searchResults.map((result) => <button type="button" role="option" className="global-search-result" key={`${result.type}-${result.id}`} onMouseDown={(event) => event.preventDefault()} onClick={() => openSearchResult(result)}>
+              {search.trim().length < 2 ? <p className="search-result-message">Enter at least two characters to search saved records.</p> : searchLoading && !visibleSearchResults.length ? <p className="search-result-message">Searching saved records…</p> : searchError ? <p className="search-result-message search-result-error">{searchError}</p> : visibleSearchResults.length ? <>
+                <p className="search-result-heading">{searchHasMore ? `${visibleSearchResults.length} results loaded` : `${visibleSearchResults.length} matching records`}</p>
+                {visibleSearchResults.map((result) => <button type="button" role="option" className="global-search-result" key={`${result.type}-${result.id}`} onMouseDown={(event) => event.preventDefault()} onClick={() => openSearchResult(result)}>
                   <span className="global-search-result-main"><strong>{result.title || result.type}</strong><small>{result.type}{result.details ? ` · ${result.details}` : ''}</small></span>
                   <span className="global-search-result-meta">{result.amount ? money(result.amount) : ''}{result.date ? <small>{result.date}</small> : null}{result.status ? <small>{result.status}</small> : null}</span>
                 </button>)}
@@ -4977,8 +5062,8 @@ async function createCameraReader(): Promise<CameraReader> {
           <button className="icon-button notification-button" aria-label={offlineWorkCount ? `Workspace status, ${offlineWorkCount} offline changes` : 'Workspace status'} onClick={() => setStatusOpen((open) => !open)}><Bell size={18} />{offlineWorkCount > 0 && <span className="offline-queue-count">{offlineWorkCount}</span>}</button>
           <button className="top-help" onClick={() => navigateTo('Help')}><CircleHelp size={17} /><span>Help</span></button>
         </div>
-        {statusOpen && <div className="notification-popover"><strong>{offlineWorkCount ? `${offlineWorkCount} offline change${offlineWorkCount === 1 ? '' : 's'}` : mpesaConfigured ? 'Daraja STK Push configured' : 'Connect your payment providers'}</strong>
-          {offlineWorkCount ? <><p>Changes are stored on this device. They become available to your other devices after sync.</p><div className="offline-queue-list">{offlineMutations.slice(0, 5).map((item) => <div key={item.id} className={item.state === 'attention' ? 'needs-review' : ''}><strong>{item.method} {item.path}</strong><small>{item.state === 'attention' ? item.message : new Date(item.createdAt).toLocaleString('en-KE')}</small></div>)}{workspaceOfflinePosDrafts.slice(0, Math.max(0, 5 - offlineMutations.length)).map((draft) => <div key={draft.id}><strong>POS sale · {money(draft.amount)}</strong><small>{draft.paymentMethod === 'mpesa' || draft.paymentSplits?.some((split) => split.method === 'mpesa') ? 'Invoice and M-Pesa prompt queued' : 'Invoice queued'} · {new Date(draft.createdAt).toLocaleString('en-KE')}</small></div>)}</div>{offlineWorkCount > 5 && <small>{offlineWorkCount - 5} more saved changes</small>}<button className="button button-primary button-small" disabled={!isOnline || offlineSyncing || offlineWorkCount === offlineMutations.filter((item) => item.state === 'attention').length} onClick={() => void syncAllOfflineWork()}>{offlineSyncing ? 'Syncing…' : isOnline ? 'Sync pending changes' : 'Reconnect to sync'}</button></> : <p>Your records are always available in this workspace. Open Kenya compliance to manage this business’s Daraja account, KRA eTIMS, bank feeds, and payroll tax preparation.</p>}
+        {statusOpen && <div className="notification-popover"><strong>{offlineWorkCount ? `${offlineWorkCount} offline change${offlineWorkCount === 1 ? '' : 's'}` : canUse('integrations.manage') && mpesaConfigured ? 'Daraja STK Push configured' : 'Workspace status'}</strong>
+          {offlineWorkCount ? <><p>Changes are stored on this device. They become available to your other devices after sync.</p><div className="offline-queue-list">{offlineMutations.slice(0, 5).map((item) => <div key={item.id} className={item.state === 'attention' ? 'needs-review' : ''}><strong>{item.method} {item.path}</strong><small>{item.state === 'attention' ? item.message : new Date(item.createdAt).toLocaleString('en-KE')}</small></div>)}{workspaceOfflinePosDrafts.slice(0, Math.max(0, 5 - offlineMutations.length)).map((draft) => <div key={draft.id}><strong>POS sale · {money(draft.amount)}</strong><small>{canUse('integrations.manage') && (draft.paymentMethod === 'mpesa' || draft.paymentSplits?.some((split) => split.method === 'mpesa')) ? 'Invoice and M-Pesa prompt queued' : 'Invoice queued'} · {new Date(draft.createdAt).toLocaleString('en-KE')}</small></div>)}</div>{offlineWorkCount > 5 && <small>{offlineWorkCount - 5} more saved changes</small>}<button className="button button-primary button-small" disabled={!isOnline || offlineSyncing || offlineWorkCount === offlineMutations.filter((item) => item.state === 'attention').length} onClick={() => void syncAllOfflineWork()}>{offlineSyncing ? 'Syncing…' : isOnline ? 'Sync pending changes' : 'Reconnect to sync'}</button></> : <p>{canUse('integrations.manage') ? 'Your records are available in this workspace. Open Kenya compliance to manage its payment and statutory connections.' : 'Your workspace connection is ready.'}</p>}
           <button onClick={() => setStatusOpen(false)}>Close</button></div>}
       </header>
 
@@ -4991,14 +5076,14 @@ async function createCameraReader(): Promise<CameraReader> {
         {page !== 'Overview' && <div className="page-navigation"><button className="button button-secondary" onClick={navigateBack}><ArrowLeft size={15} /> Back</button></div>}
         {page === 'Overview' ? <>
           <section className="welcome-row"><div><div className="eyebrow"><span className="live-dot" /> PRIVATE WORKSPACE</div>
-            <h1>{dashboard?.workspaceName}</h1><p className="welcome-subtitle">Review income and expense totals for the period you choose.</p>
+            <h1>{dashboard?.workspaceName}</h1><p className="welcome-subtitle">Open the workspace areas available to your role.</p>
           </div><div className="welcome-actions">
-            <button className="button button-secondary" onClick={() => { setError(''); setModal('transaction') }}><Plus size={16} /> {t('Add transaction')}</button>
-            <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}><Plus size={17} /> {t('Create invoice')}</button>
-            <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={16} /> {t('Invite member')}</button>
+            {canUse('accounting.write') && <button className="button button-secondary" onClick={() => { setError(''); setModal('transaction') }}><Plus size={16} /> {t('Add transaction')}</button>}
+            {canUse('sales.write') && <button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}><Plus size={17} /> {t('Create invoice')}</button>}
+            {canUse('team.manage') && <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={16} /> {t('Invite member')}</button>}
           </div></section>
 
-          <section className="overview-period-toolbar" aria-label="Overview date range">
+          {canUse('accounting.write') && <section className="overview-period-toolbar" aria-label="Overview date range">
             <label className="field-label">Overview period
               <select value={overviewRange} disabled={overviewLoading} onChange={(event) => {
                 const range = event.target.value as OverviewRange
@@ -5010,16 +5095,16 @@ async function createCameraReader(): Promise<CameraReader> {
             </label>
             {overviewRange === 'custom' && <><label className="field-label">From<input type="date" max={overviewTo || today} value={overviewFrom} onChange={(event) => setOverviewFrom(event.target.value)} /></label><label className="field-label">To<input type="date" min={overviewFrom} max={today} value={overviewTo} onChange={(event) => setOverviewTo(event.target.value)} /></label><button className="button button-primary overview-apply" disabled={overviewLoading || !overviewFrom || !overviewTo || overviewFrom > overviewTo} onClick={() => void loadOverviewPeriod('custom')}>{overviewLoading ? 'Updating…' : 'Apply dates'}</button></>}
             <span className="overview-period-caption">{dashboard?.period ? `${dashboard.period.from} – ${dashboard.period.to}` : 'Loading selected period…'}</span>
-          </section>
+          </section>}
           {error && <p className="form-error" role="alert">{error}</p>}
           <section className="metric-grid" aria-label="Saved business totals for selected period">
-            {metricCards.map(({ title, value, Icon, tone, destination }) =>             <button type="button" className="metric-card metric-card-link" key={title} onClick={() => navigateTo(destination)} aria-label={`${t('Open')} ${t(title)} ${t('details')}`}>
+            {metricCards.filter(({ destination }) => canOpenPage(destination)).map(({ title, value, Icon, tone, destination }) =>             <button type="button" className="metric-card metric-card-link" key={title} onClick={() => navigateTo(destination)} aria-label={`${t('Open')} ${t(title)} ${t('details')}`}>
                 <div className="metric-top"><span>{t(title)}</span><span className={`metric-icon ${tone}`}><Icon size={17} /></span></div>
                 <div className="metric-value">{money(value)}</div><div className="metric-foot"><span>{t('View related records')} <ArrowRight size={12} /></span></div>
             </button>)}
           </section>
 
-          <section className="panel intake-panel" aria-label="Document and bank intake">
+          {canUse('operations.write') && <section className="panel intake-panel" aria-label="Document and bank intake">
             <div className="panel-header"><div><h2>Receipts, documents, and bank intake</h2><p>Store supporting files here; import and review CSV transactions from Banking.</p></div><span className="task-count">{storedDocuments.length}</span></div>
             <div className="upload-row">
               <label className="upload-zone">
@@ -5039,10 +5124,10 @@ async function createCameraReader(): Promise<CameraReader> {
               </div>) : <div className="empty-state">No uploaded receipts, bank statements, or supporting documents yet.</div>}
             </div>
             <p className="upload-note"><ShieldCheck size={15} /> Documents are stored in the workspace database (maximum 5 MB each). Banking supports manual CSV review; automatic bank feeds, KRA eTIMS, and statutory filing require separately approved and configured providers.</p>
-          </section>
+          </section>}
 
           <section className="dashboard-grid">
-            <article className="panel cashflow-panel">
+            {canUse('accounting.write') && <article className="panel cashflow-panel">
               <div className="panel-header"><div><h2>Recorded cash flow</h2><p>Daily saved income and expenses, including recorded payroll payments</p></div>
                 <span className="period-select"><CalendarDays size={14} /> {overviewRangeNames[overviewRange]}</span>
               </div>
@@ -5051,12 +5136,12 @@ async function createCameraReader(): Promise<CameraReader> {
                 <OverviewCashflowChart data={chart} money={money} />
               </Suspense></div> : <div className="empty-chart">No transactions recorded this month. Add one to see cash flow.</div>}
               <div className="chart-footer"><span><span className="status-dot" /> Database-backed records</span><button onClick={() => navigateTo('Reports')}>View reports <ArrowRight size={14} /></button></div>
-            </article>
+            </article>}
 
           </section>
 
           <section className="bottom-grid">
-            <article className="panel transactions-panel">
+            {canUse('accounting.write') && <article className="panel transactions-panel">
               <div className="panel-header"><div><h2>Saved transactions</h2><p>{dashboard?.transactions.length ?? 0} recent records</p></div>
                 <button className="button button-small" onClick={() => { setError(''); setModal('transaction') }}><Plus size={14} /> Add transaction</button>
               </div>
@@ -5071,11 +5156,11 @@ async function createCameraReader(): Promise<CameraReader> {
                 </div>)}
                 {filtered.length === 0 && <div className="empty-state">{search ? 'No saved transactions match your search.' : 'No transactions yet. Add an income or expense record to get started.'}</div>}
               </div>
-            </article>
-            <article className="panel tasks-panel"><div className="panel-header"><div><h2>Invoices</h2><p>Totals from saved records</p></div><span className="task-count">{dashboard?.invoices.count ?? 0}</span></div>
+            </article>}
+            {canUse('sales.write') && <article className="panel tasks-panel"><div className="panel-header"><div><h2>Invoices</h2><p>Totals from saved records</p></div><span className="task-count">{dashboard?.invoices.count ?? 0}</span></div>
               <div className="invoice-summary"><span>Unpaid invoice value</span><strong>{money(dashboard?.invoices.unpaid_amount ?? '0')}</strong><p>{dashboard?.invoices.count ?? 0} total invoices recorded</p></div>
               <button className="task-footer" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice <ArrowRight size={14} /></button>
-            </article>
+            </article>}
           </section>
           <footer className="page-footer"><span>© 2026 KashFlow Technologies</span><span><i className="secure-dot" /> Private workspace</span><button onClick={() => void logout()}>Sign out</button></footer>
         </> : page === 'Payroll' ? <section className="module-page">
@@ -5343,7 +5428,7 @@ async function createCameraReader(): Promise<CameraReader> {
               ))}
               {!records[type].length && <div className="empty-state">No {page.toLowerCase()} saved yet.</div>}
             </article>
-            {type === 'suppliers' && <>
+            {type === 'suppliers' && canUse('accounting.write') && <>
               <article className="module-card"><h2>Vendor bills and payments</h2><p>Record itemized bills and tax amounts verified for your business. Tax entries are bookkeeping inputs, not statutory determinations.</p><form className="record-form-grid" onSubmit={saveBill}><label className="field-label">Supplier<select value={billSupplierMode === 'saved' ? billSupplierId : 'new'} onChange={(event) => {
                 const nextValue = event.target.value
                 if (nextValue === 'new') {
@@ -5391,7 +5476,7 @@ async function createCameraReader(): Promise<CameraReader> {
                       <small>Renewal {money(renewalRate)}</small>
                       {supplierRate > 0 && <span className={`status-pill ${margin > 0 ? 'green' : 'amber'}`}>Margin {money(margin)}</span>}
                     </span>
-                    <span className="status-pill">{subscribers.length} subscriber{subscribers.length === 1 ? '' : 's'}</span>
+                      {canUse('sales.write') && <span className="status-pill">{subscribers.length} subscriber{subscribers.length === 1 ? '' : 's'}</span>}
                     <ChevronRight size={15} className={open ? 'service-detail-caret open' : 'service-detail-caret'} />
                   </button>
                   {service.data.description ? <p className="service-detail-desc">{String(service.data.description)}</p> : null}
@@ -5410,12 +5495,12 @@ async function createCameraReader(): Promise<CameraReader> {
                       <p className="dialog-note">You will be asked whether this supplier payment should also be posted to the expense ledger.</p>
                       <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save supplier payment'}</button><button type="button" className="button button-small" onClick={() => setSupplierPaymentInput({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' })}>Cancel</button></div>
                     </form>}
-                    <div className="service-subscribe-bar">
+                    {canUse('sales.write') && <div className="service-subscribe-bar">
                       <button type="button" className="button button-primary button-small" disabled={busy || !canUse('sales.write')} onClick={() => beginSubscription(service.id)}><Plus size={14} /> Add subscriber</button>
                       <button type="button" className="button button-small" disabled={busy} onClick={() => void loadServiceSubscriptions(service.id)}>Refresh subscribers</button>
-                    </div>
+                    </div>}
 
-                    {serviceDetailId === service.id && <form className="record-form-grid module-card service-subscribe-form" onSubmit={(event) => void subscribeCustomer(event, service.id)}>
+                    {canUse('sales.write') && serviceDetailId === service.id && <form className="record-form-grid module-card service-subscribe-form" onSubmit={(event) => void subscribeCustomer(event, service.id)}>
                       <h3>Subscribe a customer to {String(service.data.name ?? 'this service')}</h3>
                       <label className="field-label">Customer source<select value={subscriptionInput.customerMode} onChange={(event) => setSubscriptionInput({ ...subscriptionInput, customerMode: event.target.value as 'saved' | 'new', customerId: '' })}><option value="saved">Existing saved customer</option><option value="new">New customer</option></select></label>
                       {subscriptionInput.customerMode === 'saved'
@@ -5431,7 +5516,7 @@ async function createCameraReader(): Promise<CameraReader> {
                       <div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Subscribe customer'}</button></div>
                     </form>}
 
-                    {subscribers.length ? subscribers.map((subscription) => {
+                    {canUse('sales.write') && (subscribers.length ? subscribers.map((subscription) => {
                       const subscriberCharge = subscription.rate_source === 'custom' ? Number(subscription.custom_rate) : subscription.rate_source === 'renewal' ? renewalRate || consumerRate : consumerRate
                       const billingOpen = subscriptionBillingId === subscription.id
                       return <div className="service-subscriber-row" key={subscription.id}>
@@ -5498,7 +5583,7 @@ async function createCameraReader(): Promise<CameraReader> {
                         <div className="button-row"><button type="button" className="button button-primary button-small" disabled={subscriptionMpesaChecking} onClick={() => void confirmSubscriptionMpesa()}>{subscriptionMpesaChecking ? 'Checking…' : 'Confirm M-Pesa payment'}</button></div>
                         <p className="dialog-note">If the customer has not paid, keep this bill marked as not paid. It will not be added to income unless Daraja confirms the payment.</p>
                       </div>}
-                    </div>}) : <div className="empty-state">No customers subscribed to this service yet.</div>}
+                    </div>}) : <div className="empty-state">No customers subscribed to this service yet.</div>)}
                   </div>}
                 </div>
               })}
@@ -5722,16 +5807,16 @@ async function createCameraReader(): Promise<CameraReader> {
             {storedDocuments.map((item) => <div className="transaction-row" key={item.id}><span><strong>{item.file_name}</strong><small>{item.mime_type} · {formatAttachmentSize(item.file_size)} · {new Date(item.created_at).toLocaleDateString('en-KE')}</small></span><div className="button-row"><button className="button button-small" onClick={() => void downloadDocument(item.id)}>Download</button><button className="button button-small" onClick={() => void deleteDocument(item.id)}>Delete</button></div></div>)}{!storedDocuments.length && <div className="empty-state">No stored documents yet.</div>}</article>
         </section> : page === 'Reports' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> REPORTS · WORKSPACE RECORDS</div><h1>Business reports</h1><p className="welcome-subtitle">Visual summaries from saved transactions and invoices. These are management views, not audited financial statements.</p>
-          <Suspense fallback={<div className="dashboard-grid"><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-label="Loading reports charts" /><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-hidden="true" /></div>}>
+          {canUse('accounting.write') && <Suspense fallback={<div className="dashboard-grid"><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-label="Loading reports charts" /><div className="module-card chart-loading" style={{ minHeight: 260 }} aria-hidden="true" /></div>}>
             <ReportCharts data={chart} rangeLabel={overviewRangeNames[overviewRange]} money={money} />
-          </Suspense>
-          <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.income ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.expenses ?? 0)}</strong></div><div className="transaction-row"><span>Net movement · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.net ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices, for the period chosen in the Overview toolbar. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
-          {retailReport && <article className="module-card"><h2>Retail and inventory insights</h2><div className="transaction-row"><span>Inventory valuation at recorded unit cost</span><strong>{money(retailReport.totalValuation)}</strong></div><h3>Reorder alerts</h3>{retailReport.reorderAlerts.map((item) => <div className="transaction-row" key={`${item.itemId}-${item.locationId}`}><span><strong>{item.name} · {item.location}</strong><small>{item.quantity} {item.unit} on hand · alert at {item.reorderPoint}</small></span><span className="status-pill amber">Reorder</span></div>)}{!retailReport.reorderAlerts.length && <p>No items are at or below their configured reorder points.</p>}<h3>Best sellers</h3>{retailReport.bestSellers.map((item) => <div className="transaction-row" key={item.itemId}><span><strong>{item.name}</strong><small>{item.quantitySold.toLocaleString('en-KE')} sold · revenue {money(item.revenue)} · cost estimate {money(item.cost)}</small></span><strong>Gross profit est. {money(item.grossProfit)}</strong></div>)}{!retailReport.bestSellers.length && <div className="empty-state">Post product sales to see best sellers and gross profit estimates.</div>}<p className="dialog-note">Inventory value uses current average item cost; product margins are management estimates and do not replace reviewed accounting valuation.</p></article>}
-          <article className="module-card"><h2>Cash-flow outlook</h2><p>Three-month estimate based on the average monthly posted ledger activity available over the last six months; not a cash guarantee.</p>{forecast.map((row) => <div className="transaction-row" key={row.period}><span><strong>{row.period}</strong><small>Historical-average estimate</small></span><span>Income {money(row.income)} · Expenses {money(row.expenses)}</span><strong>Net {money(row.income - row.expenses)}</strong></div>)}</article>
-          <article className="module-card"><h2>Budget by account</h2><form className="record-form-grid" onSubmit={saveBudget}><label className="field-label">Account<select required value={budgetInput.accountCode} onChange={(event) => setBudgetInput({ ...budgetInput, accountCode: event.target.value })}><option value="">Choose account</option>{accounts.map((accountRow) => <option value={accountRow.code} key={accountRow.code}>{accountRow.code} · {accountRow.name}</option>)}</select></label><label className="field-label">Period<input required type="month" value={budgetInput.period} onChange={(event) => setBudgetInput({ ...budgetInput, period: event.target.value })} /></label><label className="field-label">Budget (KSh)<input required min="0" step="0.01" type="number" value={budgetInput.amount} onChange={(event) => setBudgetInput({ ...budgetInput, amount: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Save budget</button></form>
+          </Suspense>}
+          {canUse('accounting.write') && <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.income ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.expenses ?? 0)}</strong></div><div className="transaction-row"><span>Net movement · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.net ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices, for the period chosen in the Overview toolbar. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>}
+          {canUse('inventory.write') && retailReport && <article className="module-card"><h2>Retail and inventory insights</h2><div className="transaction-row"><span>Inventory valuation at recorded unit cost</span><strong>{money(retailReport.totalValuation)}</strong></div><h3>Reorder alerts</h3>{retailReport.reorderAlerts.map((item) => <div className="transaction-row" key={`${item.itemId}-${item.locationId}`}><span><strong>{item.name} · {item.location}</strong><small>{item.quantity} {item.unit} on hand · alert at {item.reorderPoint}</small></span><span className="status-pill amber">Reorder</span></div>)}{!retailReport.reorderAlerts.length && <p>No items are at or below their configured reorder points.</p>}<h3>Best sellers</h3>{retailReport.bestSellers.map((item) => <div className="transaction-row" key={item.itemId}><span><strong>{item.name}</strong><small>{item.quantitySold.toLocaleString('en-KE')} sold · revenue {money(item.revenue)} · cost estimate {money(item.cost)}</small></span><strong>Gross profit est. {money(item.grossProfit)}</strong></div>)}{!retailReport.bestSellers.length && <div className="empty-state">Post product sales to see best sellers and gross profit estimates.</div>}<p className="dialog-note">Inventory value uses current average item cost; product margins are management estimates and do not replace reviewed accounting valuation.</p></article>}
+          {canUse('accounting.write') && <article className="module-card"><h2>Cash-flow outlook</h2><p>Three-month estimate based on the average monthly posted ledger activity available over the last six months; not a cash guarantee.</p>{forecast.map((row) => <div className="transaction-row" key={row.period}><span><strong>{row.period}</strong><small>Historical-average estimate</small></span><span>Income {money(row.income)} · Expenses {money(row.expenses)}</span><strong>Net {money(row.income - row.expenses)}</strong></div>)}</article>}
+          {canUse('accounting.write') && <article className="module-card"><h2>Budget by account</h2><form className="record-form-grid" onSubmit={saveBudget}><label className="field-label">Account<select required value={budgetInput.accountCode} onChange={(event) => setBudgetInput({ ...budgetInput, accountCode: event.target.value })}><option value="">Choose account</option>{accounts.map((accountRow) => <option value={accountRow.code} key={accountRow.code}>{accountRow.code} · {accountRow.name}</option>)}</select></label><label className="field-label">Period<input required type="month" value={budgetInput.period} onChange={(event) => setBudgetInput({ ...budgetInput, period: event.target.value })} /></label><label className="field-label">Budget (KSh)<input required min="0" step="0.01" type="number" value={budgetInput.amount} onChange={(event) => setBudgetInput({ ...budgetInput, amount: event.target.value })} /></label><button className="button button-primary" disabled={busy}>Save budget</button></form>
             {budgets.map((budget) => <div className="transaction-row" key={budget.id}><span><strong>{budget.period} · {budget.account_code} {budget.account_name}</strong><small>Budget {money(budget.budget)} · actual {money(budget.actual)}</small></span><strong>Variance {money(budget.variance)}</strong></div>)}
-          </article>
-          {agingReport && <article className="module-card"><h2>Receivables and payables aging as at {agingReport.asOf}</h2><div className="dashboard-grid"><div><h3>Customer invoices</h3>{Object.entries(agingReport.receivables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ar-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div><div><h3>Supplier bills</h3>{Object.entries(agingReport.payables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ap-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div></div></article>}
+          </article>}
+          {canUse('accounting.write') && agingReport && <article className="module-card"><h2>Receivables and payables aging as at {agingReport.asOf}</h2><div className="dashboard-grid"><div><h3>Customer invoices</h3>{Object.entries(agingReport.receivables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ar-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div><div><h3>Supplier bills</h3>{Object.entries(agingReport.payables.buckets).map(([bucket, amount]) => <div className="transaction-row" key={`ap-${bucket}`}><span>{bucket === 'current' ? 'Not overdue' : bucket.replace('days', 'Days ')}</span><strong>{money(amount)}</strong></div>)}</div></div></article>}
         </section> : page === 'Point of sale' ? <section className="module-page pos-page">
           <div className="eyebrow"><span className="live-dot" /> POINT OF SALE · {dashboard?.workspaceName}</div>
           <h1>{t('Counter checkout')}</h1>
@@ -5897,9 +5982,9 @@ async function createCameraReader(): Promise<CameraReader> {
             </div>
             <article className="module-card">
               <h2>Recurring transactions</h2>
-              <p>Create an invoice or expense schedule. KashFlow never posts a recurring transaction automatically; an admin must run each due item.</p>
+              <p>{canUse('accounting.write') ? 'Create an invoice or expense schedule.' : 'Create an invoice schedule.'} KashFlow never posts a recurring transaction automatically; an admin must run each due item.</p>
               <form className="record-form-grid" onSubmit={saveRecurring}>
-                <label className="field-label">Type<select value={recurringInput.type} onChange={(event) => setRecurringInput({ ...recurringInput, type: event.target.value as 'invoice' | 'expense' })}><option value="invoice">Invoice</option><option value="expense">Expense</option></select></label>
+                <label className="field-label">Type<select value={recurringInput.type} onChange={(event) => setRecurringInput({ ...recurringInput, type: event.target.value as 'invoice' | 'expense' })}><option value="invoice">Invoice</option>{canUse('accounting.write') && <option value="expense">Expense</option>}</select></label>
                 <label className="field-label">Description<input required value={recurringInput.description} onChange={(event) => setRecurringInput({ ...recurringInput, description: event.target.value })} /></label>
                 {recurringInput.type === 'invoice' && <>
                   <label className="field-label">Customer source<select value={recurringCustomerMode} onChange={(event) => setRecurringCustomerMode(event.target.value as typeof recurringCustomerMode)}><option value="saved">Saved customer</option><option value="new">Create new customer</option></select></label>
@@ -5927,7 +6012,7 @@ async function createCameraReader(): Promise<CameraReader> {
                 <label className="field-label">Next run date<input required type="date" value={recurringInput.nextDate} onChange={(event) => setRecurringInput({ ...recurringInput, nextDate: event.target.value })} /></label>
                 <button className="button button-primary" disabled={busy}>Save recurring entry</button>
               </form>
-              {recurringTemplates.length ? <div className="transaction-list">{recurringTemplates.map((template) => <div className="transaction-row" key={template.id}><span><strong>{template.template_type} · {template.description}</strong><small>{template.frequency} · next {template.next_date} · {template.active ? 'active' : 'paused'}</small></span><strong>{money(template.amount)}</strong><button className="button button-small" disabled={busy || !template.active || template.next_date > today} onClick={() => void runRecurring(template)}>Run due entry</button></div>)}</div> : <div className="empty-state">No recurring transactions yet.</div>}
+              {visibleRecurringTemplates.length ? <div className="transaction-list">{visibleRecurringTemplates.map((template) => <div className="transaction-row" key={template.id}><span><strong>{template.template_type} · {template.description}</strong><small>{template.frequency} · next {template.next_date} · {template.active ? 'active' : 'paused'}</small></span><strong>{money(template.amount)}</strong><button className="button button-small" disabled={busy || !template.active || template.next_date > today} onClick={() => void runRecurring(template)}>Run due entry</button></div>)}</div> : <div className="empty-state">No recurring transactions yet.</div>}
             </article>
             <article className="module-card">
               <div className="panel-header"><div><h2>Invoices</h2><p>Internal invoices are not KRA/eTIMS fiscal tax invoices.</p></div><button className="button button-primary" onClick={() => { setError(''); setPaymentPhone(''); setModal('invoice') }}>Create invoice</button></div>
@@ -5944,33 +6029,38 @@ async function createCameraReader(): Promise<CameraReader> {
                     <button className="button button-small" onClick={() => { setInvoicePreview(invoiceRow); setInvoiceEmailBody(defaultInvoiceEmailMessage(invoiceRow, dashboard?.workspaceName ?? 'your business')); setModal('invoice') }}>Preview / email draft</button>
                     {invoiceRow.status !== 'void' && <button className="button button-small" disabled={busy} onClick={() => void shareInvoice(invoiceRow)}>Share invoice</button>}
                     {invoiceRow.status === 'unpaid' && <button className="button button-small" disabled={busy || !invoiceRow.customer_email} title={!invoiceRow.customer_email ? 'Add a customer email to this invoice first.' : undefined} onClick={() => void sendInvoiceReminder(invoiceRow)}>Send reminder</button>}
-                    {invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}
+                    {canUse('accounting.write') && invoiceRow.status !== 'void' && <button className="button button-small" onClick={() => void openSalesReturn(invoiceRow)}>Return / credit</button>}
                     {invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <>
-                      <label className="field-label">Cash / manual amount (KSh)<input min="0" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
-                      <label className="field-label">M-Pesa receipt reference<input maxLength={100} autoComplete="off" placeholder="e.g. QGH7K2P9" value={invoiceMpesaReferences[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaReferences((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
-                      <label className="field-label">M-Pesa amount (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" placeholder="Defaults to balance after cash" value={invoiceMpesaAmounts[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
-                      <button className="button button-small" disabled={busy || (!paymentAmounts[invoiceRow.id] && !invoiceMpesaReferences[invoiceRow.id]?.trim())} onClick={() => void payInvoice(invoiceRow)}>Record payment</button>
-                      {multiMethodEnabled && <button className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: current[invoiceRow.id]?.length ? [] : [{ method: 'cash', amount: '', phone: '', reference: '' }] }))}>{paymentSplits[invoiceRow.id]?.length ? 'Hide split payment' : 'Split payment'}</button>}
-                      <button className="button button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting} title={!mpesaConfigured ? 'Daraja M-Pesa is not configured for this business.' : undefined} onClick={() => {
+                      {canUse('accounting.write') && <>
+                        <label className="field-label">Cash / manual amount (KSh)<input min="0" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" value={paymentAmounts[invoiceRow.id] ?? ''} onChange={(event) => setPaymentAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
+                        <button className="button button-small" disabled={busy || !paymentAmounts[invoiceRow.id]} onClick={() => void payInvoice(invoiceRow)}>Record cash payment</button>
+                        {canUse('integrations.manage') && <>
+                          <label className="field-label">M-Pesa receipt reference<input maxLength={100} autoComplete="off" placeholder="e.g. QGH7K2P9" value={invoiceMpesaReferences[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaReferences((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
+                          <label className="field-label">M-Pesa amount (KSh)<input min="0.01" max={invoiceRow.amount_due ?? invoiceRow.amount} step="0.01" type="number" placeholder="Defaults to balance after cash" value={invoiceMpesaAmounts[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaAmounts((values) => ({ ...values, [invoiceRow.id]: event.target.value }))} /></label>
+                          <button className="button button-small" disabled={busy || !invoiceMpesaReferences[invoiceRow.id]?.trim()} onClick={() => void payInvoice(invoiceRow)}>Verify M-Pesa receipt</button>
+                        </>}
+                        {multiMethodEnabled && <button className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: current[invoiceRow.id]?.length ? [] : [{ method: 'cash', amount: '', phone: '', reference: '' }] }))}>{paymentSplits[invoiceRow.id]?.length ? 'Hide split payment' : 'Split payment'}</button>}
+                      </>}
+                      {canUse('integrations.manage') && <button className="button button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting} title={!mpesaConfigured ? 'Daraja M-Pesa is not configured for this business.' : undefined} onClick={() => {
                         if (promptOpen) { setMpesaPromptInvoiceId(null); return }
                         setMpesaPromptInvoiceId(invoiceRow.id)
                         if (!(invoiceRow.id in invoiceMpesaPayments)) void loadInvoiceMpesaPayments(invoiceRow.id)
-                      }}>M-Pesa prompt{!mpesaConfigured && ' · setup needed'}</button>
+                      }}>M-Pesa prompt{!mpesaConfigured && ' · setup needed'}</button>}
                     </>}
-                    {latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}{(latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference) ? ` · ${latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference}` : ''}</span>}
+                    {canUse('integrations.manage') && latestMpesaPayment && <span className={`status-pill ${latestMpesaPayment.status === 'paid' ? 'green' : 'amber'}`}>M-Pesa {latestMpesaPayment.status === 'paid' ? 'paid' : latestMpesaPayment.status.replaceAll('_', ' ')}{(latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference) ? ` · ${latestMpesaPayment.mpesa_receipt_number ?? latestMpesaPayment.mpesa_reference}` : ''}</span>}
                   </div>
-                  {Boolean(paymentSplits[invoiceRow.id]?.length) && <div className="payment-split-editor">
+                  {canUse('accounting.write') && Boolean(paymentSplits[invoiceRow.id]?.length) && <div className="payment-split-editor">
                     <div className="panel-header"><div><h3>Split payment for {invoiceRow.customer}</h3><p>Record part cash and part M-Pesa against invoice {invoiceRow.id.slice(0, 8)}. Amounts are recorded and verified separately.</p></div><button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: [...(current[invoiceRow.id] ?? []), { method: 'cash', amount: '', phone: '', reference: '' }] }))}><Plus size={14} /> Add method</button></div>
                     {(paymentSplits[invoiceRow.id] ?? []).map((split, index) => <div className="field-row payment-split-row" key={index}>
-                      <label className="field-label">Method<select value={split.method} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, method: event.target.value as 'cash' | 'mpesa' } : item) }))}><option value="cash">Cash / manual</option><option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option></select></label>
+                      <label className="field-label">Method<select value={split.method} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, method: event.target.value as 'cash' | 'mpesa' } : item) }))}><option value="cash">Cash / manual</option>{canUse('integrations.manage') && <option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option>}</select></label>
                       <label className="field-label">Amount (KSh)<input type="number" min="0" step="0.01" value={split.amount} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, amount: event.target.value } : item) }))} /></label>
-                      {split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="0712345678" value={split.phone} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, phone: event.target.value } : item) }))} /></label>}
+                      {canUse('integrations.manage') && split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="0712345678" value={split.phone} onChange={(event) => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).map((item, row) => row === index ? { ...item, phone: event.target.value } : item) }))} /></label>}
                       <button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, [invoiceRow.id]: (current[invoiceRow.id] ?? []).filter((_, row) => row !== index) }))}>Remove</button>
                     </div>)}
                     <p className="dialog-note">Split total {money((paymentSplits[invoiceRow.id] ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0))} · outstanding {money(invoiceRow.amount_due ?? invoiceRow.amount)}.</p>
                     <button className="button button-primary button-small" disabled={busy} onClick={() => void payInvoiceSplit(invoiceRow)}>Record split payment</button>
                   </div>}
-                  {promptOpen && invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <div className="invoice-mpesa-prompt">
+                  {canUse('integrations.manage') && promptOpen && invoiceRow.status !== 'paid' && invoiceRow.status !== 'void' && <div className="invoice-mpesa-prompt">
                     <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="0712345678" value={invoiceMpesaPhones[invoiceRow.id] ?? ''} onChange={(event) => setInvoiceMpesaPhones((current) => ({ ...current, [invoiceRow.id]: event.target.value }))} /></label>
                     <button className="button button-primary button-small" disabled={!mpesaConfigured || mpesaPromptSubmitting || !invoiceMpesaPhones[invoiceRow.id]?.trim() || ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment?.status ?? '')} onClick={() => void sendInvoiceMpesaPrompt(invoiceRow)}>{mpesaPromptSubmitting ? 'Sending…' : 'Send prompt'}</button>
                     {latestMpesaPayment && ['initiating', 'pending', 'verification_required'].includes(latestMpesaPayment.status) && <p className="dialog-note">A request is already {latestMpesaPayment.status.replaceAll('_', ' ')} for this invoice. Refresh its status before sending another prompt.</p>}
@@ -6091,7 +6181,7 @@ async function createCameraReader(): Promise<CameraReader> {
                 </div>
               </div>}
             </section>
-            <section className="module-card">
+            {canUse('workspace.manage') && <section className="module-card">
               <h2>Backups and safety copies</h2>
               <p>The automatic-backup setting is saved with this workspace. When at least one workspace has enabled it and the API operator has attached S3-compatible storage, full-database snapshots run every hour. Each off-site snapshot includes all workspaces on this API. Business exports below remain available even when automatic backups are off or storage is not configured.</p>
               <div className="button-row">
@@ -6111,27 +6201,27 @@ async function createCameraReader(): Promise<CameraReader> {
                 </form>
               </details>
               <p className="dialog-note">For day-to-day safety, export your business data under Settings. Exports need no key and contain this business only.</p>
-            </section>
-            <section className="module-card">
+            </section>}
+            {canUse('workspace.manage') && <section className="module-card">
               <h2>Export workspace data</h2>
               <p>Download business-scoped CSV files for reporting, migration, or accountant review. Exports are limited to 50,000 rows and require administrator access.</p>
               {error && <p className="form-error" role="alert">{error}</p>}
               <div className="button-row">{EXPORT_TYPES.map((type) => <button key={type} className="button button-secondary" disabled={exportBusy} onClick={() => void exportWorkspaceData(type)}>{exportBusy ? 'Preparing…' : `Export ${type}`}</button>)}<button className="button button-primary" disabled={exportBusy} onClick={() => void exportAllWorkspaceData()}>{exportBusy ? 'Preparing…' : 'Export all data'}</button></div>
               <p className="dialog-note">“Export all data” downloads each of the {EXPORT_TYPES.length} CSV files above in one action. Your browser may ask to allow multiple downloads.</p>
-            </section>
-            <section className="module-card">
+            </section>}
+            {canUse('workspace.manage') && <section className="module-card">
               <h2>Import records from CSV</h2>
               <p>Preview and check up to 500 customers, suppliers, inventory items, or projects before importing. Existing names and repeated rows are skipped. Inventory opening quantity and cost create stock movements and a balanced opening journal. This does not import invoices, payroll, bank transactions, attachments, or supplier item links.</p>
               <div className="field-row"><label className="field-label">Record type<select value={recordImportType} disabled={busy} onChange={(event) => { setRecordImportType(event.target.value as ImportType); setRecordImportPreview(null); setRecordImportRows([]) }}><option value="customers">Customers</option><option value="suppliers">Suppliers</option><option value="inventory">Inventory</option><option value="projects">Projects</option></select></label><label className="field-label">CSV file<input type="file" accept=".csv,text/csv" disabled={busy} onChange={(event) => { const file = event.target.files?.[0]; if (file) void previewRecordImport(file); event.target.value = '' }} /></label></div>
               <p className="dialog-note">Use a <code>name</code> header, followed by supported fields for the selected type (for example <code>email,phone,address,taxPin,notes</code> or inventory <code>sku,barcode,quantity,unit,cost,price,reorderPoint</code>). Exported KashFlow CSVs include system IDs and timestamps; imports create new records and do not restore IDs.</p>
               {recordImportPreview && <div className="transaction-row"><span><strong>Preview: {recordImportPreview.wouldImport} new records</strong><small>{recordImportPreview.totalRows} valid rows · {recordImportPreview.duplicateRows.length} duplicate rows will be skipped{recordImportPreview.duplicateRows.length ? ` (CSV row ${recordImportPreview.duplicateRows.join(', ')})` : ''}</small></span><div className="button-row"><button className="button button-secondary" disabled={busy} onClick={() => { setRecordImportPreview(null); setRecordImportRows([]) }}>Discard preview</button><button className="button button-primary" disabled={busy || !recordImportPreview.wouldImport} onClick={() => void commitRecordImport()}>{busy ? 'Importing…' : `Import ${recordImportPreview.wouldImport} records`}</button></div></div>}
-            </section>
-            <section className="module-card">
+            </section>}
+            {canUse('accounting.write') && <section className="module-card">
               <div className="panel-header"><div><h2>Audit activity</h2><p>Recent supported accounting events are retained for internal review. This is an application log, not an independently certified audit.</p></div><button className="button button-secondary" disabled={busy} onClick={() => void loadAuditEvents()}>{busy ? 'Loading…' : 'Load audit log'}</button></div>
               {auditEvents.map((event) => <div className="transaction-row" key={event.id}><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><small>{event.entity_type}{event.entity_id ? ` · ${event.entity_id.slice(0, 8)}` : ''} · {new Date(event.created_at).toLocaleString('en-KE')}</small></span><small>{JSON.stringify(event.event_data)}</small></div>)}
               {!auditEvents.length && <p className="dialog-note">Load recent supported events. Not all record reads or edits are currently audited.</p>}
-            </section>
-            <section className="module-card">
+            </section>}
+            {canUse('store.manage') && <section className="module-card">
               <h2>{t('Online store and customer orders')}</h2>
               <p>Publish a simple product catalog and accept order requests. Customers do not pay online here; verify stock, shipping, tax, and payment before fulfillment.</p>
               <form className="record-form-grid" onSubmit={saveStoreSettings}>
@@ -6144,8 +6234,8 @@ async function createCameraReader(): Promise<CameraReader> {
               <h3>{t('Customer order requests')} ({storeOrders.filter((order) => order.source !== 'woocommerce').length})</h3>
               {storeOrders.map((order) => <div className="transaction-row" key={order.id}><span><strong>{order.customer_name} · {money(order.total)}</strong><small>{order.source === 'woocommerce' ? `WooCommerce #${order.external_order_id ?? ''} · ` : ''}{order.customer_email}{order.customer_phone ? ` · ${order.customer_phone}` : ''} · {t(order.status)} · {new Date(order.created_at).toLocaleDateString('en-KE')}</small></span><div className="button-row">{order.status === 'pending_review' && <><button className="button button-small" disabled={busy} onClick={() => void updateStoreOrder(order, 'accepted')}>{t('Accept')}</button><button className="button button-small" disabled={busy} onClick={() => void updateStoreOrder(order, 'rejected')}>{t('Reject')}</button></>}{order.status === 'accepted' && !order.invoice_id && <button className="button button-small" disabled={busy} onClick={() => void convertStoreOrder(order)}>{t('Convert to invoice')}</button>}{order.status === 'invoiced' && order.invoice_id && <button className="button button-small" disabled={busy} onClick={() => void updateStoreOrder(order, 'fulfilled')}>{t('Mark fulfilled')}</button>}{order.invoice_id && <small>Invoice {order.invoice_id.slice(0, 8)}</small>}</div></div>)}
               {!storeOrders.length && <div className="empty-state">No online order requests yet.</div>}
-            </section>
-            <section className="module-card">
+            </section>}
+            {canUse('integrations.manage') && <section className="module-card">
               <h2>{t('WooCommerce')}</h2>
               <p>Connect a WooCommerce REST API key to synchronize products and import orders as pending review. Configure <code>ONLINE_COMMERCE_ENCRYPTION_KEY</code> on the API server. Connection is not a payment integration.</p>
               {wooConnection && <p role="status">Connected to {wooConnection.store_url} · {wooConnection.enabled ? 'enabled' : 'disabled'}{wooConnection.last_synced_at ? ` · last sync ${new Date(wooConnection.last_synced_at).toLocaleString()}` : ''}</p>}
@@ -6156,8 +6246,8 @@ async function createCameraReader(): Promise<CameraReader> {
                 <label className="field-label">REST API consumer secret<input required type="password" autoComplete="new-password" value={wooCredentials.consumerSecret} onChange={(event) => setWooCredentials({ ...wooCredentials, consumerSecret: event.target.value })} /></label>
                 <div className="button-row"><button className="button button-primary" disabled={busy || !wooEncryptionReady}>{t('Save encrypted connection')}</button><button type="button" className="button button-secondary" disabled={busy || !wooConnection?.enabled} onClick={() => void syncWooCommerce('products')}>{t('Sync products')}</button><button type="button" className="button button-secondary" disabled={busy || !wooConnection?.enabled} onClick={() => void syncWooCommerce('orders')}>{t('Import new orders')}</button></div>
               </form>
-            </section>
-            <section className="module-card" id="team-permissions">
+            </section>}
+            {canUse('team.manage') && <section className="module-card" id="team-permissions">
               <h2>Team &amp; Permissions</h2>
               <p>Add workspace users even when they are not employees. Invitations create business access only; they do not create payroll or employee records. Assign built-in or custom roles and edit each person’s effective access here.</p>
               <button className="button button-secondary" onClick={() => { setError(''); setInviteLink(''); setModal('invite') }}><Users size={15} /> Add user (not an employee)</button>
@@ -6225,7 +6315,7 @@ async function createCameraReader(): Promise<CameraReader> {
                   </div>
                 })}
               </div>
-            </section>
+            </section>}
         </section> : page === 'Help' ? <section className="module-page help-centre">
           <div className="help-hero">
             <div className="eyebrow"><span className="live-dot" /> HELP & SUPPORT</div>
@@ -6288,7 +6378,7 @@ async function createCameraReader(): Promise<CameraReader> {
       </div>
     </main>
 
-    {modal && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget && !busy) setModal(null) }}>
+    {modal && canViewModal && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget && !busy) setModal(null) }}>
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
         <div className="dialog-head"><div><div className="eyebrow">{dashboard?.workspaceName}</div><h2 id="dialog-title">{modal === 'invoice' ? invoicePreview ? 'Invoice preview' : 'Create an invoice' : modal === 'business' ? 'Add a business' : modal === 'invite' ? 'Invite workspace user' : modal === 'return' ? 'Record a return or credit' : 'Add a transaction'}</h2></div>
           <button className="icon-button" aria-label="Close dialog" onClick={() => setModal(null)}><X size={19} /></button>
@@ -6346,11 +6436,11 @@ async function createCameraReader(): Promise<CameraReader> {
           <DraftLineEditor lines={invoiceLines} inventoryItems={records.inventory} onChange={(index, key, value) => setInvoiceLines((lines) => lines.map((line, lineIndex) => lineIndex === index ? { ...line, [key]: value } : line))} onAdd={() => setInvoiceLines((lines) => [...lines, { description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0' }])} onRemove={(index) => setInvoiceLines((lines) => lines.filter((_, lineIndex) => lineIndex !== index))} />
           <p className="dialog-note">Invoice total: <strong>{money(draftDocumentTotal(invoiceLines))}</strong></p>
           <label className="field-label">Due date<input required type="date" value={invoice.dueDate} onChange={(event) => setInvoice({ ...invoice, dueDate: event.target.value })} /></label>
-          <label className="field-label">M-Pesa phone (optional)
+          {canUse('integrations.manage') && <label className="field-label">M-Pesa phone (optional)
             <input type="tel" autoComplete="tel" placeholder="0712345678" value={paymentPhone} onChange={(event) => setPaymentPhone(event.target.value)} />
             <small>If Daraja is configured, saving sends an STK Push request for the invoice total. Amounts with fractional shillings may not be accepted by the provider.</small>
-          </label>
-          <p className="dialog-note"><ShieldCheck size={15} /> The invoice itself is not emailed and is not a KRA/eTIMS tax invoice. An optional phone number sends a separate M-Pesa payment prompt.</p>
+          </label>}
+          <p className="dialog-note"><ShieldCheck size={15} /> The invoice itself is not emailed and is not a KRA/eTIMS tax invoice.{canUse('integrations.manage') ? ' An optional phone number sends a separate M-Pesa payment prompt.' : ''}</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="dialog-actions"><button type="button" className="button button-secondary" onClick={() => setModal(null)}>Cancel</button><button type="button" className="button button-secondary" onClick={() => { const preview = { id: '', customer: invoice.customer, customer_email: invoice.customerEmail, description: invoiceLines.map((line) => line.description).filter(Boolean).join('; '), amount: String(draftDocumentTotal(invoiceLines)), due_date: invoice.dueDate, status: 'Draft' }; setInvoicePreview(preview); setInvoiceEmailBody(defaultInvoiceEmailMessage(preview, dashboard?.workspaceName ?? 'your business')) }}>Preview</button><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save invoice'}</button></div>
         </form> : null}

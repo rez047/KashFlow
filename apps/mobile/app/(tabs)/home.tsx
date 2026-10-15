@@ -3,6 +3,7 @@ import { router } from 'expo-router'
 import { useMemo } from 'react'
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native'
 import { useKashFlow } from '../../src/components/KashFlowProvider'
+import { InventoryAccessNotice } from '../../src/components/InventoryAccessNotice'
 
 function greeting() {
   const hour = new Date().getHours()
@@ -10,12 +11,14 @@ function greeting() {
 }
 
 export default function HomeScreen() {
-  const { online, loading, syncing, snapshot, refresh, syncNow } = useKashFlow()
+  const { online, loading, syncing, snapshot, refresh, syncNow, canUseInventory } = useKashFlow()
   const queued = snapshot?.counts.filter((count) => count.state === 'pending').length ?? 0
   const conflicts = snapshot?.counts.filter((count) => count.state === 'conflict').length ?? 0
   const itemCount = snapshot?.items.length ?? 0
   const locationCount = snapshot?.locations.filter((location) => location.active).length ?? 0
   const recentCounts = useMemo(() => snapshot?.counts.slice(0, 3) ?? [], [snapshot?.counts])
+
+  if (!canUseInventory) return <InventoryAccessNotice />
 
   return <View style={styles.screen}>
     <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>

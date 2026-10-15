@@ -3,12 +3,13 @@ import { router } from 'expo-router'
 import { useMemo, useState } from 'react'
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native'
 import { useKashFlow } from '../../src/components/KashFlowProvider'
+import { InventoryAccessNotice } from '../../src/components/InventoryAccessNotice'
 
 type Filter = 'all' | 'pending' | 'review' | 'synced'
 const filters: { key: Filter; label: string }[] = [{ key: 'all', label: 'All activity' }, { key: 'pending', label: 'To sync' }, { key: 'review', label: 'Review' }, { key: 'synced', label: 'Synced' }]
 
 export default function SyncScreen() {
-  const { online, syncing, snapshot, syncNow, refresh } = useKashFlow()
+  const { online, syncing, snapshot, syncNow, refresh, canUseInventory } = useKashFlow()
   const [filter, setFilter] = useState<Filter>('all')
   const counts = useMemo(() => snapshot?.counts ?? [], [snapshot?.counts])
   const pending = counts.filter((count) => count.state === 'pending').length
@@ -20,6 +21,8 @@ export default function SyncScreen() {
     if (filter === 'synced') return count.state === 'synced' || count.state === 'superseded'
     return true
   }), [counts, filter])
+
+  if (!canUseInventory) return <InventoryAccessNotice />
 
   return <View style={styles.screen}><ScrollView contentContainerStyle={styles.page} showsVerticalScrollIndicator={false}>
     <View style={styles.head}><View><Text style={styles.kicker}>DEVICE ACTIVITY</Text><Text style={styles.title}>Sync & review</Text></View><View style={[styles.network, online ? styles.networkOnline : styles.networkOffline]}><View style={[styles.networkDot, online ? styles.dotOnline : styles.dotOffline]} /><Text style={[styles.networkText, online ? styles.textOnline : styles.textOffline]}>{online ? 'CONNECTED' : 'OFFLINE'}</Text></View></View>

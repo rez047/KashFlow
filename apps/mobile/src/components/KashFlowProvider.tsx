@@ -10,6 +10,7 @@ type AppState = {
   online: boolean
   loading: boolean
   syncing: boolean
+  canUseInventory: boolean
   snapshot: OfflineSnapshot | null
   reloadLocal: () => Promise<void>
   refresh: () => Promise<void>
@@ -32,14 +33,18 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
   const [snapshot, setSnapshot] = useState<OfflineSnapshot | null>(null)
+  const [authorizationChecked, setAuthorizationChecked] = useState(false)
+  const canUseInventory = Boolean(authorizationChecked && snapshot?.permissions.includes('inventory.write'))
   const lastOnline = useRef<boolean | null>(null)
 
   const refresh = useCallback(async () => {
     if (!token) return
+    setAuthorizationChecked(false)
     try {
       const cached = await getOfflineSnapshot()
       await refreshCatalog(token, cached?.userEmail ?? '')
       setSnapshot(await getOfflineSnapshot())
+      setAuthorizationChecked(true)
     } catch (error) {
       Alert.alert('Refresh paused', error instanceof Error ? error.message : 'Your last saved inventory is still available offline. Try again when the connection is stable.')
     }
@@ -51,14 +56,17 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
     if (!nextToken) {
       await SecureStore.deleteItemAsync('kashflow.access-token')
       setToken(null)
+      setAuthorizationChecked(false)
       return
     }
     await SecureStore.setItemAsync('kashflow.access-token', nextToken, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY })
     setToken(nextToken)
+    setAuthorizationChecked(false)
     try {
       const cached = await getOfflineSnapshot()
       await refreshCatalog(nextToken, cached?.userEmail ?? '')
       setSnapshot(await getOfflineSnapshot())
+      setAuthorizationChecked(true)
     } catch { /* Keep the last encrypted inventory snapshot until a refresh succeeds. */ }
   }, [])
 
@@ -73,9 +81,11 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
     const nextToken = activated.accessToken
     await SecureStore.setItemAsync('kashflow.access-token', nextToken)
     setToken(nextToken)
+    setAuthorizationChecked(false)
     try {
       await refreshCatalog(nextToken, snapshot?.userEmail ?? '')
       setSnapshot(await getOfflineSnapshot())
+      setAuthorizationChecked(true)
     } catch (error) {
       let rolledBack = false
       if (snapshot?.workspaceId) {
@@ -84,6 +94,9 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
           if (!rollback.accessToken) throw new Error('The original business session could not be restored.')
           await SecureStore.setItemAsync('kashflow.access-token', rollback.accessToken)
           setToken(rollback.accessToken)
+          await refreshCatalog(rollback.accessToken, snapshot?.userEmail ?? '')
+          setSnapshot(await getOfflineSnapshot())
+          setAuthorizationChecked(true)
           rolledBack = true
         } catch { /* If the service is unreachable, save a safe empty snapshot for the newly active business below. */ }
       }
@@ -101,6 +114,10 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
       if (showMessage) Alert.alert('Sign in required', 'Connect to the internet and sign in to sync this device.')
       return
     }
+    if (!canUseInventory) {
+      if (showMessage) Alert.alert('Inventory access unavailable', 'This business role does not allow inventory screens or count syncing.')
+      return
+    }
     if (!online) {
       if (showMessage) Alert.alert('You are offline', 'Your counts are safely saved on this device. Sync will be available when your connection returns.')
       return
@@ -114,13 +131,14 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
       const result = await syncQueuedCounts(token, snapshot.workspaceId)
       await refreshCatalog(token, snapshot.userEmail)
       setSnapshot(await getOfflineSnapshot())
+      setAuthorizationChecked(true)
       if (showMessage) Alert.alert('Sync complete', `${result.synced} count${result.synced === 1 ? '' : 's'} synced${result.conflicts ? ` · ${result.conflicts} need review` : ''}${result.failed ? ` · ${result.failed} still pending` : ''}.`)
     } catch (error) {
       if (showMessage) Alert.alert('Could not sync', error instanceof Error ? error.message : 'Your saved counts are still on this device. Try again when the connection is stable.')
     } finally {
       setSyncing(false)
     }
-  }, [online, snapshot, token])
+  }, [canUseInventory, online, snapshot, token])
 
   const refreshRef = useRef(refresh)
   const syncRef = useRef(syncNow)
@@ -150,11 +168,14 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
           const current = await getOfflineSnapshot()
           if (active) {
             setSnapshot(current)
+            setAuthorizationChecked(true)
             if (current?.counts.some((count) => count.state === 'pending')) {
               setTimeout(() => Alert.alert('Back online', 'Your saved inventory counts are ready to sync.', [{ text: 'Later', style: 'cancel' }, { text: 'Sync now', onPress: () => { void syncRef.current() } }]), 500)
             }
           }
-        } catch { /* Keep the last encrypted snapshot available offline. */ }
+        } catch { /* Protected screens stay hidden until the current workspace role can be checked. */ }
+      } else {
+        setAuthorizationChecked(true)
       }
       if (active) setLoading(false)
     }
@@ -165,6 +186,7 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
       const wasOnline = lastOnline.current
       lastOnline.current = connected
       if (connected && wasOnline === false) {
+        setAuthorizationChecked(false)
         void getOfflineSnapshot().then((cached) => {
           if (!cached?.counts.some((count) => count.state === 'pending')) {
             Alert.alert('Connection restored', 'Your workspace can refresh now.', [{ text: 'Later', style: 'cancel' }, { text: 'Refresh', onPress: () => { void refreshRef.current() } }])
@@ -177,6 +199,6 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
     return () => { active = false; subscription.remove() }
   }, [])
 
-  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness }), [token, online, loading, syncing, snapshot, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness])
+  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness }), [token, online, loading, syncing, snapshot, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness])
   return <AppContext.Provider value={context}>{children}</AppContext.Provider>
 }

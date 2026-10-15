@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react'
 import { Alert, Keyboard, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 import { createLocalCountKey, queueCount, updateCount } from '../../src/lib/offline'
 import { useKashFlow } from '../../src/components/KashFlowProvider'
+import { InventoryAccessNotice } from '../../src/components/InventoryAccessNotice'
 
 function nairobiToday() {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date())
@@ -12,7 +13,7 @@ function nairobiToday() {
 }
 
 export default function CountScreen() {
-  const { online, snapshot, syncNow, reloadLocal } = useKashFlow()
+  const { online, snapshot, syncNow, reloadLocal, canUseInventory } = useKashFlow()
   const params = useLocalSearchParams<{ itemId?: string; locationId?: string; supersedes?: string }>()
   const [query, setQuery] = useState('')
   const [itemSelection, setItemSelection] = useState<{ id: string; routeId?: string }>({ id: '' })
@@ -51,6 +52,8 @@ export default function CountScreen() {
       Alert.alert('Could not save count', error instanceof Error ? error.message : 'Make some space on the device and try again.')
     } finally { setSaving(false) }
   }
+
+  if (!canUseInventory) return <InventoryAccessNotice />
 
   return <View style={styles.screen}><ScrollView contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
     <View style={styles.top}><View><Text style={styles.eyebrow}>INVENTORY CONTROL</Text><Text style={styles.title}>Count a shelf</Text></View><View style={[styles.mode, online ? styles.modeOnline : styles.modeOffline]}><View style={[styles.modeDot, online ? styles.modeDotOnline : styles.modeDotOffline]} /><Text style={[styles.modeText, online ? styles.modeTextOnline : styles.modeTextOffline]}>{online ? 'ONLINE' : 'OFFLINE'}</Text></View></View>

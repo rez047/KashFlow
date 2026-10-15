@@ -2,9 +2,10 @@ import { Ionicons } from '@expo/vector-icons'
 import { useMemo, useState } from 'react'
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 import { useKashFlow } from '../../src/components/KashFlowProvider'
+import { InventoryAccessNotice } from '../../src/components/InventoryAccessNotice'
 
 export default function StockScreen() {
-  const { online, snapshot, loading, syncing, refresh } = useKashFlow()
+  const { online, snapshot, loading, syncing, refresh, canUseInventory } = useKashFlow()
   const [query, setQuery] = useState('')
   const [locationId, setLocationId] = useState('all')
   const items = useMemo(() => (snapshot?.items ?? []).filter((item) => {
@@ -15,6 +16,8 @@ export default function StockScreen() {
   const totalUnits = items.reduce((sum, item) => sum + (locationId === 'all'
     ? (snapshot?.stock.filter((stock) => stock.item_id === item.id).reduce((qty, stock) => qty + stock.quantity, 0) ?? 0)
     : (snapshot?.stock.find((stock) => stock.item_id === item.id && stock.location_id === locationId)?.quantity ?? 0)), 0)
+
+  if (!canUseInventory) return <InventoryAccessNotice />
 
   return <View style={styles.screen}>
     <ScrollView contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
