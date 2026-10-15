@@ -243,7 +243,8 @@ type FinancialStatements = {
 type Modal = 'invoice' | 'transaction' | 'business' | 'invite' | 'return' | null
 type ReturnLine = { id: string; item_id?: string | null; description: string; quantity: string; returned_quantity: string; unit_price: string; discount_amount: string; tax_amount: string }
 type AccountingPeriod = { period: string; status: 'open' | 'closed'; closed_at?: string }
-type AuditEvent = { id: string; actor_user_id?: string | null; event_type: string; entity_type: string; entity_id?: string | null; event_data: Record<string, unknown>; created_at: string }
+type AuditEvent = { id: string; actor_user_id?: string | null; actor_display?: string | null; event_type: string; entity_type: string; entity_id?: string | null; event_data: Record<string, unknown>; created_at: string }
+const AUDIT_EVENT_PAGE_SIZE = 50
 type DatabaseBackup = { key: string; lastModified: string | null; size: number }
 type ImportType = 'customers' | 'suppliers' | 'inventory' | 'projects'
 type RecordImportPreview = { type: ImportType; totalRows: number; wouldImport: number; duplicateRows: number[] }
@@ -968,6 +969,9 @@ function App() {
   const isActiveWorkspaceAdmin = account?.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role === 'admin'
   const permissionScopeKey = `${account?.user.id ?? ''}:${account?.workspace.id ?? ''}:${[...effectivePermissions].sort().join(',')}`
   const previousPermissionScope = useRef('')
+  const auditScopeRef = useRef(permissionScopeKey)
+  auditScopeRef.current = permissionScopeKey
+  const auditRequestSequence = useRef(0)
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
   const [expenses, setExpenses] = useState<Transaction[] | null>(null)
   const [integrationReadiness, setIntegrationReadiness] = useState<IntegrationReadiness | null>(null)
@@ -1163,6 +1167,14 @@ function App() {
   const [trialTotals, setTrialTotals] = useState({ debit: '0', credit: '0' })
   const [accountingPeriods, setAccountingPeriods] = useState<AccountingPeriod[]>([])
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([])
+  const [auditActors, setAuditActors] = useState<Array<{ id: string; label: string }>>([])
+  const [auditUserFilter, setAuditUserFilter] = useState('')
+  const [auditFromFilter, setAuditFromFilter] = useState('')
+  const [auditToFilter, setAuditToFilter] = useState('')
+  const [auditSearch, setAuditSearch] = useState('')
+  const [auditPage, setAuditPage] = useState(1)
+  const [auditTotal, setAuditTotal] = useState(0)
+  const [auditBusy, setAuditBusy] = useState(false)
   const [databaseBackups, setDatabaseBackups] = useState<DatabaseBackup[]>([])
   // Restore is a platform-wide, destructive action: it overwrites every business in the
   // database, so it requires the operator token AND an exact confirmation phrase.
@@ -1258,6 +1270,16 @@ function App() {
 
   useEffect(() => {
     if (!account) {
+      auditRequestSequence.current += 1
+      setAuditEvents([])
+      setAuditActors([])
+      setAuditTotal(0)
+      setAuditPage(1)
+      setAuditUserFilter('')
+      setAuditFromFilter('')
+      setAuditToFilter('')
+      setAuditSearch('')
+      setAuditBusy(false)
       pageHistoryIndex.current = 0
       pageHistoryPages.current = ['Overview']
       setPageHistory([])
@@ -1354,6 +1376,7 @@ function App() {
   useEffect(() => {
     if (!account) { previousPermissionScope.current = ''; return }
     if (previousPermissionScope.current && previousPermissionScope.current !== permissionScopeKey) {
+      auditRequestSequence.current += 1
       setModal(null)
       setMpesaWatch(null)
       setIntegrationReadiness(null)
@@ -1367,6 +1390,15 @@ function App() {
       setInvoiceMpesaReferences({})
       setInvoiceMpesaAmounts({})
       setPaymentSplits({})
+      setAuditEvents([])
+      setAuditActors([])
+      setAuditTotal(0)
+      setAuditPage(1)
+      setAuditUserFilter('')
+      setAuditFromFilter('')
+      setAuditToFilter('')
+      setAuditSearch('')
+      setAuditBusy(false)
       if (!effectivePermissions.includes('accounting.write')) {
         setRecurringInput((current) => current.type === 'expense' ? { ...current, type: 'invoice' } : current)
       }
@@ -4438,7 +4470,7 @@ async function createCameraReader(): Promise<CameraReader> {
         timezone: settings.timezone,
         invoiceTerms: settings.invoiceTerms,
         emailAlerts: settings.emailAlerts,
-        auditTrail: settings.auditTrail,
+        auditTrail: true,
         twoFactor: settings.twoFactor,
         backupSchedule: settings.backupSchedule,
         inventoryLowStockThreshold: Number(settings.inventoryLowStockThreshold),
@@ -4544,14 +4576,29 @@ async function createCameraReader(): Promise<CameraReader> {
     } finally { setBusy(false) }
   }
 
-  async function loadAuditEvents() {
-    setBusy(true); setError('')
+  async function loadAuditEvents(page = 1, filterOverride?: { userId: string; from: string; to: string; search: string }) {
+    const requestSequence = ++auditRequestSequence.current
+    const requestScope = permissionScopeKey
+    setAuditBusy(true); setError('')
     try {
-      const result = await request<{ events: AuditEvent[] }>('/v1/accounting/audit-events')
+      const filters = filterOverride ?? { userId: auditUserFilter, from: auditFromFilter, to: auditToFilter, search: auditSearch }
+      const query = new URLSearchParams({ page: String(page) })
+      if (filters.userId) query.set('userId', filters.userId)
+      if (filters.from) query.set('from', filters.from)
+      if (filters.to) query.set('to', filters.to)
+      if (filters.search.trim()) query.set('search', filters.search.trim())
+      const result = await request<{ events: AuditEvent[]; total: number; page: number; actors: Array<{ id: string; label: string }> }>(`/v1/accounting/audit-events?${query.toString()}`)
+      if (requestSequence !== auditRequestSequence.current || requestScope !== auditScopeRef.current) return
       setAuditEvents(result.events)
+      setAuditActors(result.actors)
+      setAuditTotal(result.total)
+      setAuditPage(result.page)
     } catch (reason) {
+      if (requestSequence !== auditRequestSequence.current || requestScope !== auditScopeRef.current) return
       setError(reason instanceof Error ? reason.message : 'Could not load the audit log.')
-    } finally { setBusy(false) }
+    } finally {
+      if (requestSequence === auditRequestSequence.current && requestScope === auditScopeRef.current) setAuditBusy(false)
+    }
   }
 
   async function loadDatabaseBackups() {
@@ -6071,7 +6118,7 @@ async function createCameraReader(): Promise<CameraReader> {
           {canUse('workspace.manage') && <form onSubmit={saveSettings} className="module-card">
             <div className="field-row"><label className="field-label">Business name<input value={settings.businessName || dashboard?.workspaceName || ''} onChange={(event) => setSettings({ ...settings, businessName: event.target.value })} /></label><label className="field-label">Currency<select value={settings.currency} onChange={(event) => setSettings({ ...settings, currency: event.target.value })}><option value="KES">KES</option><option value="USD">USD</option><option value="GBP">GBP</option></select></label></div>
             <div className="field-row"><label className="field-label">Timezone<select value={settings.timezone} onChange={(event) => setSettings({ ...settings, timezone: event.target.value })}><option value="Africa/Nairobi">Africa/Nairobi</option><option value="UTC">UTC</option><option value="Africa/Kampala">Africa/Kampala</option></select></label><label className="field-label">Default invoice terms<select value={settings.invoiceTerms} onChange={(event) => setSettings({ ...settings, invoiceTerms: event.target.value })}><option value="Net 7">Net 7</option><option value="Net 14">Net 14</option><option value="Net 30">Net 30</option></select></label></div>
-            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.emailAlerts} onChange={(event) => setSettings({ ...settings, emailAlerts: event.target.checked })} /> Email alert preference (delivery not configured)</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.auditTrail} onChange={(event) => setSettings({ ...settings, auditTrail: event.target.checked })} /> Audit log preference (supported events are recorded)</label></div>
+            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.emailAlerts} onChange={(event) => setSettings({ ...settings, emailAlerts: event.target.checked })} /> Email alert preference (delivery not configured)</label><p className="dialog-note">Workspace activity logging stays enabled for administrator accountability.</p></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.backupSchedule !== 'Manual only'} onChange={(event) => setSettings({ ...settings, backupSchedule: event.target.checked ? 'Daily automatic' : 'Manual only' })} /> Enable automatic backups and safety copies for this workspace</label></div>
             <p className="dialog-note">Save settings to apply this choice. Off-site copies also require the API operator to configure S3-compatible storage.</p>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.monoEnabled} onChange={(event) => setSettings({ ...settings, monoEnabled: event.target.checked })} /> Allow Mono bank-feed connections for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.darajaEnabled} onChange={(event) => setSettings({ ...settings, darajaEnabled: event.target.checked })} /> Allow Daraja / M-Pesa for this business</label></div>
@@ -6208,10 +6255,23 @@ async function createCameraReader(): Promise<CameraReader> {
               <p className="dialog-note">Use a <code>name</code> header, followed by supported fields for the selected type (for example <code>email,phone,address,taxPin,notes</code> or inventory <code>sku,barcode,quantity,unit,cost,price,reorderPoint</code>). Exported KashFlow CSVs include system IDs and timestamps; imports create new records and do not restore IDs.</p>
               {recordImportPreview && <div className="transaction-row"><span><strong>Preview: {recordImportPreview.wouldImport} new records</strong><small>{recordImportPreview.totalRows} valid rows · {recordImportPreview.duplicateRows.length} duplicate rows will be skipped{recordImportPreview.duplicateRows.length ? ` (CSV row ${recordImportPreview.duplicateRows.join(', ')})` : ''}</small></span><div className="button-row"><button className="button button-secondary" disabled={busy} onClick={() => { setRecordImportPreview(null); setRecordImportRows([]) }}>Discard preview</button><button className="button button-primary" disabled={busy || !recordImportPreview.wouldImport} onClick={() => void commitRecordImport()}>{busy ? 'Importing…' : `Import ${recordImportPreview.wouldImport} records`}</button></div></div>}
             </section>}
-            {canUse('accounting.write') && <section className="module-card">
-              <div className="panel-header"><div><h2>Audit activity</h2><p>Recent supported accounting events are retained for internal review. This is an application log, not an independently certified audit.</p></div><button className="button button-secondary" disabled={busy} onClick={() => void loadAuditEvents()}>{busy ? 'Loading…' : 'Load audit log'}</button></div>
-              {auditEvents.map((event) => <div className="transaction-row" key={event.id}><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><small>{event.entity_type}{event.entity_id ? ` · ${event.entity_id.slice(0, 8)}` : ''} · {new Date(event.created_at).toLocaleString('en-KE')}</small></span><small>{JSON.stringify(event.event_data)}</small></div>)}
-              {!auditEvents.length && <p className="dialog-note">Load recent supported events. Not all record reads or edits are currently audited.</p>}
+            {isActiveWorkspaceAdmin && <section className="module-card">
+              <div className="panel-header"><div><h2>Workspace activity and audit trail</h2><p>Review activity by team member, date, action, record, or any searchable detail. New successful changes are recorded with safe request details; earlier activity is available where the system already retained an event.</p></div></div>
+              <form className="record-form-grid" onSubmit={(event) => { event.preventDefault(); void loadAuditEvents(1) }}>
+                <div className="field-row">
+                  <label className="field-label">User<select value={auditUserFilter} onChange={(event) => setAuditUserFilter(event.target.value)}><option value="">All users</option>{auditActors.map((actor) => <option key={actor.id} value={actor.id}>{actor.label}</option>)}</select></label>
+                  <label className="field-label">From date<input type="date" value={auditFromFilter} onChange={(event) => setAuditFromFilter(event.target.value)} /></label>
+                  <label className="field-label">Through date<input type="date" value={auditToFilter} onChange={(event) => setAuditToFilter(event.target.value)} /></label>
+                </div>
+                <label className="field-label">Search activity and details<input maxLength={200} placeholder="User, action, record ID, amount, or submitted field value" value={auditSearch} onChange={(event) => setAuditSearch(event.target.value)} /></label>
+                <div className="button-row"><button className="button button-primary" disabled={auditBusy}>{auditBusy ? 'Searching…' : 'Search activity'}</button><button type="button" className="button button-secondary" disabled={auditBusy} onClick={() => { setAuditUserFilter(''); setAuditFromFilter(''); setAuditToFilter(''); setAuditSearch(''); void loadAuditEvents(1, { userId: '', from: '', to: '', search: '' }) }}>Clear filters</button></div>
+              </form>
+              <div className="panel-header"><div><h3>{auditTotal.toLocaleString('en-KE')} activity event{auditTotal === 1 ? '' : 's'}</h3><p>{auditTotal ? `Showing ${(auditPage - 1) * AUDIT_EVENT_PAGE_SIZE + 1}–${Math.min(auditPage * AUDIT_EVENT_PAGE_SIZE, auditTotal)} of ${auditTotal.toLocaleString('en-KE')}, newest first.` : 'Search to load the available activity history.'}</p></div><div className="button-row"><button className="button button-small" disabled={auditBusy || auditPage <= 1} onClick={() => void loadAuditEvents(auditPage - 1)}>Previous</button><button className="button button-small" disabled={auditBusy || auditPage >= Math.max(1, Math.ceil(auditTotal / AUDIT_EVENT_PAGE_SIZE))} onClick={() => void loadAuditEvents(auditPage + 1)}>Next</button></div></div>
+              {auditEvents.map((event) => <div className="transaction-row" key={event.id}>
+                <span><strong>{event.actor_display ?? (event.actor_user_id ? 'Former user' : 'System or anonymized account')}</strong><small>{event.event_type.replaceAll('.', ' ')} · {event.entity_type}{event.entity_id ? ` · ${event.entity_id}` : ''}</small><small>{new Date(event.created_at).toLocaleString('en-KE')}</small></span>
+                <details><summary>View details</summary><pre>{JSON.stringify(event.event_data, null, 2)}</pre></details>
+              </div>)}
+              {!auditEvents.length && auditTotal === 0 && <p className="dialog-note">No matching events. Previously unrecorded actions cannot be reconstructed; new successful workspace changes are captured going forward.</p>}
             </section>}
             {canUse('store.manage') && <section className="module-card">
               <h2>{t('Online store and customer orders')}</h2>

@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { lookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
 import { Readable } from 'node:stream'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { promisify } from 'node:util'
 import cors from 'cors'
 import express from 'express'
@@ -172,6 +173,9 @@ const phoneSchema = z.string().trim().min(7).max(30).transform((value) => value.
 type Session = { userId: string; workspaceId: string; expiresAt: number; sessionVersion?: number }
 type WorkspacePermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
 type AuthedRequest = express.Request & { session?: Session; workspaceRole?: string; workspacePermissions?: WorkspacePermission[] }
+type RequestAuditContext = { request: AuthedRequest; eventRecorded: boolean }
+const requestAuditStorage = new AsyncLocalStorage<RequestAuditContext>()
+const auditSensitiveField = /password|secret|credential|token|authorization|cookie|passkey|private.?key|(?:api|consumer|client|encryption|signing).?key|security.?code|otp|recovery.?code|tax.?pin|pin$|bank.*(?:account|number)|(?:account|card).*number|file.?data|attachment|document.?data|payload/i
 const workspacePermissionNames: WorkspacePermission[] = ['operations.write', 'sales.write', 'inventory.write', 'accounting.write', 'banking.write', 'payroll.manage', 'integrations.manage', 'workspace.manage', 'team.manage', 'store.manage']
 const rolePermissionDefaults: Record<string, WorkspacePermission[]> = {
   admin: workspacePermissionNames,
@@ -511,7 +515,39 @@ async function ensureDefaultAccounts(workspaceId: string) {
 }
 type JournalLineInput = { accountCode: string; description?: string; debit: number; credit: number }
 async function recordAudit(client: PoolClient, input: { workspaceId: string; actorUserId: string | null; eventType: string; entityType: string; entityId?: string; eventData?: Record<string, unknown> }) {
-  await client.query('INSERT INTO audit_events (id, workspace_id, actor_user_id, event_type, entity_type, entity_id, event_data) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)', [randomUUID(), input.workspaceId, input.actorUserId, input.eventType, input.entityType, input.entityId ?? null, JSON.stringify(input.eventData ?? {})])
+  await client.query(`INSERT INTO audit_events (id, workspace_id, actor_user_id, actor_display, event_type, entity_type, entity_id, event_data)
+    VALUES ($1, $2, $3, (SELECT COALESCE(NULLIF(email, ''), phone) FROM users WHERE id = $3), $4, $5, $6, $7::jsonb)`, [randomUUID(), input.workspaceId, input.actorUserId, input.eventType, input.entityType, input.entityId ?? null, JSON.stringify(input.eventData ?? {})])
+  const context = requestAuditStorage.getStore()
+  if (context?.request.session?.workspaceId === input.workspaceId
+    && (context.request.session.userId === input.actorUserId || input.eventType === 'account.deleted')) context.eventRecorded = true
+}
+function safeAuditValue(value: unknown, depth = 0): unknown {
+  if (depth > 5) return '[nested values omitted]'
+  if (typeof value === 'string') return value.length > 500 ? `${value.slice(0, 500)}…` : value
+  if (Array.isArray(value)) return value.slice(0, 40).map((item) => safeAuditValue(item, depth + 1))
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).slice(0, 60).map(([key, item]) => [key, auditSensitiveField.test(key) ? '[redacted]' : safeAuditValue(item, depth + 1)]))
+  }
+  return value
+}
+async function recordAutomaticUserActivity(context: RequestAuditContext, statusCode: number) {
+  if (!pool || !context.request.session) return
+  const request = context.request
+  const routePath = String(request.route?.path ?? request.path).slice(0, 300)
+  const params = safeAuditValue(request.params)
+  const query = safeAuditValue(request.query)
+  const sensitiveWorkflow = /^\/v1\/(?:auth|payroll|integrations|platform\/backups)(?:\/|$)/.test(routePath)
+  let body: unknown = sensitiveWorkflow ? '[details withheld for a sensitive workflow]' : safeAuditValue(request.body ?? {})
+  const serializedBody = JSON.stringify(body)
+  if (serializedBody.length > 8_000) body = { truncated: true, preview: serializedBody.slice(0, 8_000) }
+  const paramsRecord = request.params as Record<string, string>
+  const entityId = Object.values(paramsRecord).find((value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) ?? null
+  const routeParts = routePath.split('/').filter(Boolean)
+  const entityType = (routeParts[1] ?? 'api_action').slice(0, 80)
+  const eventData = { method: request.method, route: routePath, params, query, input: body, statusCode }
+  await pool.query(`INSERT INTO audit_events (id, workspace_id, actor_user_id, actor_display, event_type, entity_type, entity_id, event_data)
+    VALUES ($1, $2, $3, (SELECT COALESCE(NULLIF(email, ''), phone) FROM users WHERE id = $3), 'activity.recorded', $4, $5, $6::jsonb)`,
+  [randomUUID(), request.session.workspaceId, request.session.userId, entityType, entityId, JSON.stringify(eventData)])
 }
 async function insertJournal(client: PoolClient, input: { workspaceId: string; userId: string | null; date: string; description: string; sourceType: string; sourceId?: string; reversalOf?: string; correctionReason?: string; lines: JournalLineInput[] }) {
   const debitCents = input.lines.reduce((sum, line) => sum + Math.round(line.debit * 100), 0)
@@ -616,7 +652,16 @@ async function requireSession(request: AuthedRequest, response: express.Response
         return
       }
     }
-    next()
+    const activityContext: RequestAuditContext = { request, eventRecorded: false }
+    const shouldRecordActivity = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)
+    requestAuditStorage.run(activityContext, () => {
+      if (shouldRecordActivity) response.once('finish', () => {
+        if (response.statusCode < 400 && !activityContext.eventRecorded) {
+          void recordAutomaticUserActivity(activityContext, response.statusCode).catch((error) => console.error('Could not record workspace activity:', error))
+        }
+      })
+      next()
+    })
   } catch (error) { next(error) }
 }
 function permissionForRequest(request: AuthedRequest): WorkspacePermission | null {
@@ -1725,6 +1770,7 @@ app.delete('/v1/auth/account', requirePool, verifyOrigin, rateLimit({ windowMs: 
     for (const membership of memberships.rows) {
       await recordAudit(client, { workspaceId: String(membership.workspace_id), actorUserId: null, eventType: 'account.deleted', entityType: 'account', eventData: {} })
     }
+    await client.query('UPDATE audit_events SET actor_display = NULL WHERE actor_user_id = $1', [request.session!.userId])
     await client.query(`UPDATE workspace_invitations SET
         email = CASE WHEN $1::text IS NOT NULL AND lower(email) = lower($1) THEN NULL ELSE email END,
         phone = CASE WHEN $2::text IS NOT NULL AND phone = $2 THEN NULL ELSE phone END,
@@ -3415,9 +3461,9 @@ app.get('/v1/exports/:type', requirePool, requireSession, requireWorkspaceAdmin,
         WHERE e.workspace_id = $1 ORDER BY e.entry_date, e.id, a.code LIMIT 50000`, [workspaceId])
       rows = result.rows.map((row: Record<string, unknown>) => ({ journalId: row.id, date: row.entry_date, description: row.description, sourceType: row.source_type, accountCode: row.code, accountName: row.account_name, lineDescription: row.line_description, debit: row.debit, credit: row.credit }))
     } else {
-      headers = ['id', 'actorUserId', 'eventType', 'entityType', 'entityId', 'eventData', 'createdAt']
-      const result = await pool!.query('SELECT id, actor_user_id, event_type, entity_type, entity_id, event_data, created_at FROM audit_events WHERE workspace_id = $1 ORDER BY created_at LIMIT 50000', [workspaceId])
-      rows = result.rows.map((row: Record<string, unknown>) => ({ id: row.id, actorUserId: row.actor_user_id, eventType: row.event_type, entityType: row.entity_type, entityId: row.entity_id, eventData: row.event_data, createdAt: row.created_at }))
+      headers = ['id', 'actorUserId', 'actorDisplay', 'eventType', 'entityType', 'entityId', 'eventData', 'createdAt']
+      const result = await pool!.query('SELECT id, actor_user_id, actor_display, event_type, entity_type, entity_id, event_data, created_at FROM audit_events WHERE workspace_id = $1 ORDER BY created_at LIMIT 50000', [workspaceId])
+      rows = result.rows.map((row: Record<string, unknown>) => ({ id: row.id, actorUserId: row.actor_user_id, actorDisplay: row.actor_display, eventType: row.event_type, entityType: row.entity_type, entityId: row.entity_id, eventData: row.event_data, createdAt: row.created_at }))
     }
     const csv = [headers, ...rows.map((row) => headers.map((header) => row[header] ?? row[header.charAt(0).toLowerCase() + header.slice(1)] ?? ''))]
       .map((line) => line.map(csvValue).join(',')).join('\r\n')
@@ -4901,23 +4947,7 @@ This is an internal accounting document and not a KRA/eTIMS fiscal tax invoice.
       request.session!.userId,
     ])
 
-    await pool!.query(`
-      INSERT INTO audit_events
-        (id, workspace_id, actor_user_id, event_type, entity_type, entity_id, event_data)
-      VALUES
-        ($1, $2, $3, $4, $5, $6, $7::jsonb)
-    `, [
-      randomUUID(),
-      request.session!.workspaceId,
-      request.session!.userId,
-      'vendor_bill.email_sent',
-      'vendor_bill',
-      bill.id,
-      JSON.stringify({
-        recipient: emailInput.data.recipient,
-        providerMessageId: billEmail.messageId ?? null,
-      }),
-    ])
+    await recordAudit(pool!, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'vendor_bill.email_sent', entityType: 'vendor_bill', entityId: String(bill.id), eventData: { recipient: emailInput.data.recipient, providerMessageId: billEmail.messageId ?? null } })
 
     response.status(202).json({
       delivery: {
@@ -5275,10 +5305,67 @@ app.get('/v1/accounting/periods', requirePool, requireSession, async (request: A
   } catch (error) { next(error) }
 })
 
-app.get('/v1/accounting/audit-events', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+function requireWorkspaceAdministrator(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
+  if (request.workspaceRole !== 'admin') { response.status(403).json({ error: 'Only a workspace administrator can review the activity log.' }); return }
+  next()
+}
+
+app.get('/v1/accounting/audit-events', requirePool, requireSession, requireWorkspaceAdministrator, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    userId: z.string().trim().max(300).optional(),
+    from: z.string().date().optional(),
+    to: z.string().date().optional(),
+    search: z.string().trim().max(200).default(''),
+    page: z.coerce.number().int().min(1).max(1_000_000).default(1),
+  }).safeParse(request.query)
+  if (!input.success) { response.status(400).json({ error: 'Enter a valid activity user, date range, search term, and page.' }); return }
+  if (input.data.userId && !input.data.userId.startsWith('removed:') && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.data.userId)) {
+    response.status(400).json({ error: 'Choose a user from this workspace activity log.' }); return
+  }
+  if (input.data.from && input.data.to && input.data.from > input.data.to) { response.status(400).json({ error: 'The start date must be on or before the end date.' }); return }
   try {
-    const result = await pool!.query('SELECT id, actor_user_id, event_type, entity_type, entity_id, event_data, created_at FROM audit_events WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 200', [request.session!.workspaceId])
-    response.json({ events: result.rows })
+    const pageSize = 50
+    const settings = await pool!.query("SELECT preferences->>'timezone' AS timezone FROM workspace_settings WHERE workspace_id = $1", [request.session!.workspaceId])
+    const storedTimezone = String(settings.rows[0]?.timezone ?? 'Africa/Nairobi')
+    const workspaceTimezone = ['Africa/Nairobi', 'Africa/Kampala', 'UTC'].includes(storedTimezone) ? storedTimezone : 'Africa/Nairobi'
+    const values: unknown[] = [request.session!.workspaceId]
+    const bind = (value: unknown) => { values.push(value); return `$${values.length}` }
+    const filters = ['a.workspace_id = $1']
+    if (input.data.userId?.startsWith('removed:')) {
+      filters.push(`a.actor_user_id IS NULL AND a.actor_display = ${bind(input.data.userId.slice('removed:'.length))}`)
+    } else if (input.data.userId) filters.push(`a.actor_user_id = ${bind(input.data.userId)}`)
+    if (input.data.from) filters.push(`a.created_at >= (${bind(input.data.from)}::date::timestamp AT TIME ZONE ${bind(workspaceTimezone)})`)
+    if (input.data.to) filters.push(`a.created_at < ((${bind(input.data.to)}::date + 1)::timestamp AT TIME ZONE ${bind(workspaceTimezone)})`)
+    if (input.data.search) {
+      const search = bind(`%${input.data.search}%`)
+      filters.push(`(a.event_type ILIKE ${search} OR a.entity_type ILIKE ${search} OR COALESCE(a.entity_id::text, '') ILIKE ${search}
+        OR a.event_data::text ILIKE ${search} OR COALESCE(a.actor_display, NULLIF(u.email, ''), u.phone, '') ILIKE ${search})`)
+    }
+    const where = filters.join(' AND ')
+    const pageValues = [...values, pageSize, (input.data.page - 1) * pageSize]
+    const [count, events, actors] = await Promise.all([
+      pool!.query(`SELECT count(*)::text AS total FROM audit_events a LEFT JOIN users u ON u.id = a.actor_user_id WHERE ${where}`, values),
+      pool!.query(`SELECT a.id, a.actor_user_id, COALESCE(a.actor_display, NULLIF(u.email, ''), u.phone, CASE WHEN a.actor_user_id IS NULL THEN 'System or anonymized account' ELSE 'Former user' END) AS actor_display,
+          a.event_type, a.entity_type, a.entity_id, a.event_data, a.created_at
+        FROM audit_events a LEFT JOIN users u ON u.id = a.actor_user_id
+        WHERE ${where} ORDER BY a.created_at DESC, a.id DESC LIMIT $${pageValues.length - 1} OFFSET $${pageValues.length}`, pageValues),
+      pool!.query(`SELECT user_key AS id, COALESCE(MAX(actor_display), 'Former user') AS label FROM (
+        SELECT COALESCE(actor_id::text, 'removed:' || actor_display) AS user_key, actor_display
+        FROM (
+          SELECT wm.user_id AS actor_id, COALESCE(NULLIF(u.email, ''), u.phone) AS actor_display
+            FROM workspace_members wm JOIN users u ON u.id = wm.user_id WHERE wm.workspace_id = $1
+          UNION ALL
+          SELECT a.actor_user_id AS actor_id, COALESCE(a.actor_display, NULLIF(u.email, ''), u.phone) AS actor_display
+            FROM audit_events a LEFT JOIN users u ON u.id = a.actor_user_id
+            WHERE a.workspace_id = $1 AND a.actor_user_id IS NOT NULL
+          UNION ALL
+          SELECT NULL::uuid AS actor_id, a.actor_display
+            FROM audit_events a WHERE a.workspace_id = $1 AND a.actor_user_id IS NULL AND a.actor_display IS NOT NULL
+        ) source_identities
+      ) identities GROUP BY user_key
+        ORDER BY label`, [request.session!.workspaceId]),
+    ])
+    response.json({ events: events.rows, total: Number(count.rows[0]?.total ?? 0), page: input.data.page, pageSize, actors: actors.rows })
   } catch (error) { next(error) }
 })
 
@@ -6528,6 +6615,10 @@ async function start() {
       if (migration.split(/\r?\n/).some((line) => line.trim() && !line.trim().startsWith('--'))) await pool.query(migration)
     }
     if (env.DATABASE_URL) {
+      // Snapshot actor labels for historical events so former workspace members remain
+      // identifiable in audit searches. Self-deletion clears these labels explicitly.
+      await pool.query(`UPDATE audit_events a SET actor_display = COALESCE(NULLIF(u.email, ''), u.phone)
+        FROM users u WHERE a.actor_user_id = u.id AND a.actor_display IS NULL`)
       // PostgreSQL supports this legacy service/invoice backfill; pg-mem does not support
       // correlated UPDATE ... FROM expressions, and its seed database has no old invoices.
       await pool.query(`UPDATE invoices i SET service_subscription_id = s.id
