@@ -3,7 +3,7 @@ import { languages, useTranslation, type LanguageCode } from './i18n'
 import {
   Activity, AlertCircle, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
   BriefcaseBusiness, CalendarDays, Camera, Check, ChevronRight, CircleHelp,
-  FileText, Filter, Gauge, Landmark, LayoutDashboard,
+  Eye, EyeOff, FileText, Filter, Gauge, Landmark, LayoutDashboard,
   LifeBuoy, LogOut, Mail, Menu, MessageCircle, Minus, Package, Phone, Plus, Printer, QrCode,
   ScanBarcode, Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Sparkles, Star, Trash2, Users, Volume2, Wallet, X, Laptop, MonitorDown, Download,
 } from 'lucide-react'
@@ -1007,6 +1007,7 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [credentials, setCredentials] = useState({ identifier: '', password: '', businessName: '' })
+  const [signInPasswordVisible, setSignInPasswordVisible] = useState(false)
   const [twoFactorChallenge, setTwoFactorChallenge] = useState<{ token: string; code: string } | null>(null)
   const [twoFactorStatus, setTwoFactorStatus] = useState<{ available: boolean; enabled: boolean; recoveryCodesRemaining: number } | null>(null)
   const [twoFactorSetup, setTwoFactorSetup] = useState<{ secret: string; otpauthUri: string; recoveryCodes: string[] } | null>(null)
@@ -4966,7 +4967,10 @@ async function createCameraReader(): Promise<CameraReader> {
           <input type="text" required autoComplete="username" value={credentials.identifier} onChange={(event) => setCredentials({ ...credentials, identifier: event.target.value })} />
         </label>
         <label className="field-label">Password
-          <input type="password" required autoComplete="current-password" value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
+          <span className="auth-password-wrap">
+            <input type={signInPasswordVisible ? 'text' : 'password'} required autoComplete="current-password" value={credentials.password} onChange={(event) => setCredentials({ ...credentials, password: event.target.value })} />
+            <button type="button" className="auth-password-toggle" aria-label={signInPasswordVisible ? 'Hide password' : 'Show password'} aria-pressed={signInPasswordVisible} onClick={() => setSignInPasswordVisible((visible) => !visible)}>{signInPasswordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button>
+          </span>
         </label>
         <p className="auth-forgot-row"><button type="button" className="auth-link" onClick={() => { setAuthMode('forgot'); setError(''); setResetStatus('') }}>Forgot password?</button></p>
         <button className="button button-primary auth-submit" disabled={busy}>{busy ? 'Please wait…' : 'Sign in'}</button>

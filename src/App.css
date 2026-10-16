@@ -348,6 +348,11 @@ html[dir=rtl] .sidebar{border-right:0;border-left:1px solid #ececf2}html[dir=rtl
 .auth-close:hover{background:#e9e2fd;color:var(--kf-purple-dark)}
 .auth-intro{color:#5b5877;font-size:14px;font-weight:600;margin:0 0 14px;line-height:1.5}
 .auth-card .field-label{margin-top:10px}
+.auth-password-wrap{position:relative;display:block}
+.auth-password-wrap input{padding-right:46px}
+.auth-password-toggle{position:absolute;top:50%;right:5px;width:36px;height:36px;display:grid;place-items:center;transform:translateY(-50%);border:0;border-radius:8px;background:transparent;color:#77758b;cursor:pointer}
+.auth-password-toggle:hover{background:#f4f1fe;color:var(--kf-purple-dark)}
+.auth-password-toggle:focus-visible{outline:2px solid var(--kf-purple);outline-offset:1px}
 .auth-submit{margin-top:18px;padding:13px}
 .auth-cta-wrap{margin-top:14px;text-align:center}
 .auth-link{background:none;border:0;color:var(--kf-purple);font-weight:700;cursor:pointer;font-size:13px;padding:0}
