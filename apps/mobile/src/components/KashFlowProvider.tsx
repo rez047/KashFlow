@@ -1,7 +1,7 @@
 import * as Network from 'expo-network'
 import * as SecureStore from 'expo-secure-store'
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Alert } from 'react-native'
+import { Alert, AppState } from 'react-native'
 import { activateBusiness, refreshCatalog, syncQueuedCounts } from '../lib/api'
 import { getOfflineSnapshot, saveSnapshot, type OfflineSnapshot } from '../lib/offline'
 
@@ -34,7 +34,7 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
   const [syncing, setSyncing] = useState(false)
   const [snapshot, setSnapshot] = useState<OfflineSnapshot | null>(null)
   const [authorizationChecked, setAuthorizationChecked] = useState(false)
-  const canUseInventory = Boolean(authorizationChecked && snapshot?.permissions.includes('inventory.write'))
+  const canUseInventory = Boolean(token && authorizationChecked && snapshot?.permissions.includes('inventory.write'))
   const lastOnline = useRef<boolean | null>(null)
 
   const refresh = useCallback(async () => {
@@ -147,6 +147,14 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
     refreshRef.current = refresh
     syncRef.current = syncNow
   }, [refresh, syncNow])
+
+  useEffect(() => {
+    if (!token || !online) return
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') void refreshRef.current()
+    })
+    return () => subscription.remove()
+  }, [online, token])
 
   useEffect(() => {
     let active = true
