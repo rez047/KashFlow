@@ -36,7 +36,8 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
   const [syncing, setSyncing] = useState(false)
   const [snapshot, setSnapshot] = useState<OfflineSnapshot | null>(null)
   const [authorizationChecked, setAuthorizationChecked] = useState(false)
-  const canUseInventory = Boolean(token && authorizationChecked && snapshot?.permissions.includes('inventory.write'))
+  const activeWorkspaceRole = snapshot?.workspaces.find((workspace) => workspace.id === snapshot?.workspaceId)?.role
+  const canUseInventory = Boolean(token && authorizationChecked && activeWorkspaceRole === 'admin' && snapshot?.permissions.includes('inventory.write'))
   const lastOnline = useRef<boolean | null>(null)
 
   const refresh = useCallback(async () => {
@@ -62,22 +63,25 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
         setAuthorizationChecked(false)
         return
       }
-      const permissionsUnchanged = access.permissions.length === cached.permissions.length && access.permissions.every((permission) => cached.permissions.includes(permission))
+      const cachedWorkspaceRole = cached.workspaces.find((workspace) => workspace.id === cached.workspaceId)?.role
+      const permissionsUnchanged = access.workspaceRole === cachedWorkspaceRole && access.permissions.length === cached.permissions.length && access.permissions.every((permission) => cached.permissions.includes(permission))
       if (permissionsUnchanged) {
         setAuthorizationChecked(true)
         return
       }
-      const hadInventoryAccess = cached.permissions.includes('inventory.write')
-      const hasInventoryAccess = access.permissions.includes('inventory.write')
+      const hadInventoryAccess = cached.permissions.includes('inventory.write') && cachedWorkspaceRole === 'admin'
+      const hasInventoryAccess = access.permissions.includes('inventory.write') && access.workspaceRole === 'admin'
       if (hadInventoryAccess && !hasInventoryAccess) {
-        await saveSnapshot({ workspaceId: cached.workspaceId, workspaceName: cached.workspaceName, userEmail: cached.userEmail, permissions: access.permissions, items: [], locations: [], stock: [], workspaces: cached.workspaces })
+        await saveSnapshot({ workspaceId: cached.workspaceId, workspaceName: cached.workspaceName, userEmail: cached.userEmail, permissions: access.permissions, items: [], locations: [], stock: [], workspaces: access.workspaces })
         setSnapshot(await getOfflineSnapshot())
       } else if (!hadInventoryAccess && hasInventoryAccess) {
         await refreshCatalog(token, cached.userEmail)
         setSnapshot(await getOfflineSnapshot())
       } else {
         await updateWorkspacePermissions(access.workspaceId, access.permissions)
-        setSnapshot({ ...cached, permissions: access.permissions })
+        const updated = { ...cached, permissions: access.permissions, workspaces: access.workspaces }
+        await saveSnapshot({ ...updated, items: cached.items, locations: cached.locations, stock: cached.stock })
+        setSnapshot(await getOfflineSnapshot())
       }
       setAuthorizationChecked(true)
     } catch {

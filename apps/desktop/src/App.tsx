@@ -47,7 +47,8 @@ export default function App() {
   const [permissionsValidated, setPermissionsValidated] = useState(false)
   const workspaceViewport = useRef<HTMLDivElement>(null)
   const refreshedSessionKey = useRef('')
-  const canUseInventory = Boolean(vault.token && permissionsValidated && vault.permissions.includes('inventory.write'))
+  const activeWorkspaceRole = vault.workspaces.find((workspace) => workspace.id === vault.workspaceId)?.role
+  const canUseInventory = Boolean(vault.token && permissionsValidated && activeWorkspaceRole === 'admin' && vault.permissions.includes('inventory.write'))
   const activeCounts = vault.counts.filter((count) => count.workspaceId === vault.workspaceId)
 
   const currentItem = vault.items.find((item) => item.id === itemId)
@@ -84,8 +85,10 @@ export default function App() {
     }
     const me = await call<{ workspace: { id: string; name: string; permissions?: string[] }; workspaces?: DesktopVault['workspaces'] }>('/v1/auth/me')
     const permissions = me.workspace.permissions ?? []
-    if (!permissions.includes('inventory.write')) {
-      const next: DesktopVault = { ...baseVault, token, userEmail, workspaceId: me.workspace.id, workspaceName: me.workspace.name, permissions, workspaces: me.workspaces ?? [], refreshedAt: new Date().toISOString(), items: [], locations: [], stock: [] }
+    const workspaces = me.workspaces ?? [{ id: me.workspace.id, name: me.workspace.name, role: 'member' }]
+    const isAdmin = workspaces.find((workspace) => workspace.id === me.workspace.id)?.role === 'admin'
+    if (!isAdmin || !permissions.includes('inventory.write')) {
+      const next: DesktopVault = { ...baseVault, token, userEmail, workspaceId: me.workspace.id, workspaceName: me.workspace.name, permissions, workspaces, refreshedAt: new Date().toISOString(), items: [], locations: [], stock: [] }
       await persistVault(next)
       return next
     }
@@ -101,7 +104,7 @@ export default function App() {
       workspaceId: me.workspace.id,
       workspaceName: me.workspace.name,
       permissions,
-      workspaces: me.workspaces ?? [{ id: me.workspace.id, name: me.workspace.name, role: 'admin' }],
+      workspaces,
       refreshedAt: new Date().toISOString(),
       items: recordResult.records.map(({ id, data }) => ({ id, name: String(data.name ?? data.description ?? 'Untitled item'), sku: String(data.sku ?? ''), category: String(data.category ?? ''), unit: String(data.unit ?? 'units'), cost: Number(data.cost ?? 0), quantity: Number(data.quantity ?? 0) })),
       locations: locationsResult.locations,
@@ -201,17 +204,20 @@ export default function App() {
       try {
         const response = await window.kashflowDesktop.request('/v1/auth/me', vault.token)
         if (!response.ok) throw new Error('Could not verify workspace permissions.')
-        const me = response.data as { workspace: { id: string; permissions?: string[] } }
+        const me = response.data as { workspace: { id: string; permissions?: string[] }; workspaces?: DesktopVault['workspaces'] }
         if (me.workspace.id !== vault.workspaceId) throw new Error('The active business session changed.')
         const permissions = me.workspace.permissions ?? []
-        const hadInventoryAccess = vault.permissions.includes('inventory.write')
-        const hasInventoryAccess = permissions.includes('inventory.write')
+        const workspaces = me.workspaces ?? [{ id: me.workspace.id, name: vault.workspaceName, role: 'member' }]
+        const hadInventoryAccess = vault.permissions.includes('inventory.write') && vault.workspaces.find((workspace) => workspace.id === vault.workspaceId)?.role === 'admin'
+        const hasInventoryAccess = permissions.includes('inventory.write') && workspaces.find((workspace) => workspace.id === me.workspace.id)?.role === 'admin'
         if (hadInventoryAccess && !hasInventoryAccess) {
-          await persistVault({ ...vault, permissions, items: [], locations: [], stock: [] })
+          await persistVault({ ...vault, permissions, workspaces, items: [], locations: [], stock: [] })
         } else if (!hadInventoryAccess && hasInventoryAccess) {
           await refreshCatalog(vault.token, vault.userEmail)
         } else if (permissions.some((permission) => !vault.permissions.includes(permission)) || vault.permissions.some((permission) => !permissions.includes(permission))) {
-          await persistVault({ ...vault, permissions })
+          await persistVault({ ...vault, permissions, workspaces })
+        } else if (workspaces.some((workspace) => workspace.role !== vault.workspaces.find((saved) => saved.id === workspace.id)?.role)) {
+          await persistVault({ ...vault, workspaces })
         }
         setPermissionsValidated(true)
       } catch {
@@ -294,17 +300,19 @@ export default function App() {
       try {
         const response = await window.kashflowDesktop.request('/v1/auth/me', vault.token)
         if (!response.ok) throw new Error('Could not verify workspace permissions.')
-        const me = response.data as { workspace: { id: string; permissions?: string[] } }
+        const me = response.data as { workspace: { id: string; permissions?: string[] }; workspaces?: DesktopVault['workspaces'] }
         if (me.workspace.id !== vault.workspaceId) throw new Error('The active business session changed.')
         const permissions = me.workspace.permissions ?? []
-        if (!permissions.includes('inventory.write')) {
-          await persistVault({ ...vault, permissions, items: [], locations: [], stock: [] })
+        const workspaces = me.workspaces ?? [{ id: me.workspace.id, name: vault.workspaceName, role: 'member' }]
+        const isAdmin = workspaces.find((workspace) => workspace.id === me.workspace.id)?.role === 'admin'
+        if (!isAdmin || !permissions.includes('inventory.write')) {
+          await persistVault({ ...vault, permissions, workspaces, items: [], locations: [], stock: [] })
           setPage('settings')
           window.history.replaceState({ page: 'settings' }, '', '#settings')
           return
         }
         if (permissions.some((permission) => !vault.permissions.includes(permission)) || vault.permissions.some((permission) => !permissions.includes(permission))) {
-          await persistVault({ ...vault, permissions })
+          await persistVault({ ...vault, permissions, workspaces })
         }
         setPermissionsValidated(true)
       } catch (error) {

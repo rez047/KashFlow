@@ -38,8 +38,9 @@ export async function api<T>(path: string, token?: string, options: { method?: s
 export async function refreshCatalog(token: string, userEmail: string) {
   const me = await api<{ workspace: { id: string; name: string; permissions?: string[] }; workspaces?: BusinessWorkspace[] }>('/v1/auth/me', token)
   const permissions = me.workspace.permissions ?? []
-  if (!permissions.includes('inventory.write')) {
-    const workspaces = me.workspaces?.length ? me.workspaces : [{ ...me.workspace, role: 'member' }]
+  const workspaces = me.workspaces?.length ? me.workspaces : [{ ...me.workspace, role: 'member' }]
+  const isAdmin = workspaces.find((workspace) => workspace.id === me.workspace.id)?.role === 'admin'
+  if (!isAdmin || !permissions.includes('inventory.write')) {
     const refreshedAt = await saveSnapshot({ workspaceId: me.workspace.id, workspaceName: me.workspace.name, userEmail, permissions, items: [], locations: [], stock: [], workspaces })
     return { workspace: me.workspace, permissions, refreshedAt, itemCount: 0 }
   }
@@ -59,14 +60,15 @@ export async function refreshCatalog(token: string, userEmail: string) {
   }))
   const locations = locationResult.locations.map((location) => ({ ...location, is_default: Boolean(location.is_default), active: Boolean(location.active) }))
   const stock = stockResult.stock.map((row) => ({ ...row, quantity: Number(row.quantity) }))
-  const workspaces = me.workspaces?.length ? me.workspaces : [{ ...me.workspace, role: 'member' }]
   const refreshedAt = await saveSnapshot({ workspaceId: me.workspace.id, workspaceName: me.workspace.name, userEmail, permissions, items, locations, stock, workspaces })
   return { workspace: me.workspace, permissions, refreshedAt, itemCount: items.length }
 }
 
 export async function getWorkspacePermissions(token: string) {
-  const me = await api<{ workspace: { id: string; permissions?: string[] } }>('/v1/auth/me', token)
-  return { workspaceId: me.workspace.id, permissions: me.workspace.permissions ?? [] }
+  const me = await api<{ workspace: { id: string; permissions?: string[] }; workspaces?: BusinessWorkspace[] }>('/v1/auth/me', token)
+  const workspaces = me.workspaces ?? []
+  const workspaceRole = workspaces.find((workspace) => workspace.id === me.workspace.id)?.role ?? 'member'
+  return { workspaceId: me.workspace.id, workspaceRole, workspaces, permissions: me.workspace.permissions ?? [] }
 }
 
 export function activateBusiness(token: string, workspaceId: string) {
