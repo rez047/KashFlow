@@ -10,6 +10,7 @@ import { getOfflineSnapshot } from '../src/lib/offline'
 export default function SignInScreen() {
   const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
+  const [passwordVisible, setPasswordVisible] = useState(false)
   const [code, setCode] = useState('')
   const [challengeToken, setChallengeToken] = useState('')
   const [busy, setBusy] = useState(false)
@@ -67,7 +68,7 @@ export default function SignInScreen() {
         <Text style={styles.label}>EMAIL OR PHONE</Text>
         <TextInput autoCapitalize="none" autoComplete="username" keyboardType="email-address" placeholder="you@business.co.ke" placeholderTextColor="#9aa4a7" style={styles.input} value={identifier} onChangeText={setIdentifier} returnKeyType="next" />
         <Text style={[styles.label, styles.passwordLabel]}>PASSWORD</Text>
-        <TextInput secureTextEntry autoComplete="current-password" placeholder="Your password" placeholderTextColor="#9aa4a7" style={styles.input} value={password} onChangeText={setPassword} onSubmitEditing={() => void signIn()} returnKeyType="go" />
+        <View style={styles.passwordInputWrap}><TextInput secureTextEntry={!passwordVisible} autoComplete="current-password" placeholder="Your password" placeholderTextColor="#9aa4a7" style={[styles.input, styles.passwordInput]} value={password} onChangeText={setPassword} onSubmitEditing={() => void signIn()} returnKeyType="go" /><Pressable accessibilityRole="button" accessibilityLabel={passwordVisible ? 'Hide password' : 'Show password'} accessibilityState={{ pressed: passwordVisible }} onPress={() => setPasswordVisible((visible) => !visible)} style={styles.passwordToggle}><Ionicons name={passwordVisible ? 'eye-off-outline' : 'eye-outline'} size={19} color="#75847f" /></Pressable></View>
       </>}
       {challengeToken && <><Text style={styles.label}>AUTHENTICATOR OR RECOVERY CODE</Text><TextInput autoCapitalize="characters" keyboardType="number-pad" placeholder="6 digit code" placeholderTextColor="#9aa4a7" style={styles.input} value={code} onChangeText={setCode} onSubmitEditing={() => void signIn()} returnKeyType="go" /></>}
       {error ? <Text accessibilityRole="alert" style={styles.error}>{error}</Text> : null}
@@ -110,6 +111,9 @@ const styles = StyleSheet.create({
   label: { color: '#62716e', fontSize: 12, fontWeight: '800', letterSpacing: 1.3, marginBottom: 8 },
   passwordLabel: { marginTop: 16 },
   input: { borderWidth: 1, borderColor: '#e2e5df', backgroundColor: '#fff', color: '#17252b', borderRadius: 13, paddingHorizontal: 15, height: 51, fontSize: 14 },
+  passwordInputWrap: { position: 'relative', justifyContent: 'center' },
+  passwordInput: { paddingRight: 50 },
+  passwordToggle: { position: 'absolute', right: 4, width: 44, height: 44, alignItems: 'center', justifyContent: 'center', borderRadius: 11 },
   error: { color: '#b3443f', fontSize: 12, lineHeight: 18, marginTop: 12 },
   submit: { height: 53, borderRadius: 14, marginTop: 20, backgroundColor: '#108c70', alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 9, shadowColor: '#0b684f', shadowOpacity: 0.16, shadowRadius: 12, shadowOffset: { width: 0, height: 6 }, elevation: 3 },
   submitText: { fontSize: 13, color: '#fff', fontWeight: '800' },

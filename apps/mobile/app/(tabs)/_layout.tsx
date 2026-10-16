@@ -19,10 +19,10 @@ function WorkspaceTabs() {
       tabBarLabelStyle: { fontSize: 13, fontWeight: '700', letterSpacing: 0.2 },
     }}>
       <Tabs.Screen name="workspace" options={{ title: 'Business', tabBarIcon: ({ color, size }) => <Ionicons name="business-outline" size={size} color={color} /> }} />
-      <Tabs.Screen name="home" options={{ href: canUseInventory ? undefined : null, title: 'Today', tabBarIcon: ({ color, size }) => <Ionicons name="grid-outline" size={size} color={color} /> }} />
-      <Tabs.Screen name="stock" options={{ href: canUseInventory ? undefined : null, title: 'Stock', tabBarIcon: ({ color, size }) => <Ionicons name="cube-outline" size={size} color={color} /> }} />
-      <Tabs.Screen name="count" options={{ href: canUseInventory ? undefined : null, title: 'Count', tabBarIcon: ({ color, size }) => <Ionicons name="scan-outline" size={size} color={color} /> }} />
-      <Tabs.Screen name="sync" options={{ href: canUseInventory ? undefined : null, title: 'Sync', tabBarIcon: ({ color, size }) => <Ionicons name="sync-outline" size={size} color={color} /> }} />
+      <Tabs.Screen name="home" options={{ href: canUseInventory ? undefined : null, tabBarButton: canUseInventory ? undefined : () => null, title: 'Today', tabBarIcon: ({ color, size }) => <Ionicons name="grid-outline" size={size} color={color} /> }} />
+      <Tabs.Screen name="stock" options={{ href: canUseInventory ? undefined : null, tabBarButton: canUseInventory ? undefined : () => null, title: 'Stock', tabBarIcon: ({ color, size }) => <Ionicons name="cube-outline" size={size} color={color} /> }} />
+      <Tabs.Screen name="count" options={{ href: canUseInventory ? undefined : null, tabBarButton: canUseInventory ? undefined : () => null, title: 'Count', tabBarIcon: ({ color, size }) => <Ionicons name="scan-outline" size={size} color={color} /> }} />
+      <Tabs.Screen name="sync" options={{ href: canUseInventory ? undefined : null, tabBarButton: canUseInventory ? undefined : () => null, title: 'Sync', tabBarIcon: ({ color, size }) => <Ionicons name="sync-outline" size={size} color={color} /> }} />
       <Tabs.Screen name="settings" options={{ href: null }} />
       <Tabs.Screen name="account-deletion" options={{ href: null }} />
     </Tabs>

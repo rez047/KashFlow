@@ -1,6 +1,6 @@
 import {
   Activity, ArrowLeft, ArrowRight, ArrowUpRight, Check, CheckCircle2,
-  ChevronDown, ChevronRight, CircleAlert, Cloud, CloudOff, CloudUpload, Globe2,
+  ChevronDown, ChevronRight, CircleAlert, Cloud, CloudOff, CloudUpload, Eye, EyeOff, Globe2,
   Home, Layers3, LockKeyhole, LogOut, Minus, Package, Plus, RefreshCw, Search, Settings2,
   ShieldCheck, Sparkles, Store, Wifi, WifiOff,
 } from 'lucide-react'
@@ -37,6 +37,7 @@ export default function App() {
   const [supersedesKey, setSupersedesKey] = useState('')
   const [loginIdentifier, setLoginIdentifier] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
+  const [loginPasswordVisible, setLoginPasswordVisible] = useState(false)
   const [twoFactorChallenge, setTwoFactorChallenge] = useState('')
   const [twoFactorCode, setTwoFactorCode] = useState('')
   const [loginError, setLoginError] = useState('')
@@ -195,15 +196,33 @@ export default function App() {
 
   useEffect(() => {
     if (!loaded || !online || !vault.token) return
-    const validatePermissions = () => {
-      setPermissionsValidated(false)
-      void refreshCatalog(vault.token, vault.userEmail)
-        .then(() => setPermissionsValidated(true))
-        .catch(() => setPermissionsValidated(false))
+    const validatePermissions = async (hideUntilChecked = false) => {
+      if (hideUntilChecked) setPermissionsValidated(false)
+      try {
+        const response = await window.kashflowDesktop.request('/v1/auth/me', vault.token)
+        if (!response.ok) throw new Error('Could not verify workspace permissions.')
+        const me = response.data as { workspace: { id: string; permissions?: string[] } }
+        if (me.workspace.id !== vault.workspaceId) throw new Error('The active business session changed.')
+        const permissions = me.workspace.permissions ?? []
+        const hadInventoryAccess = vault.permissions.includes('inventory.write')
+        const hasInventoryAccess = permissions.includes('inventory.write')
+        if (hadInventoryAccess && !hasInventoryAccess) {
+          await persistVault({ ...vault, permissions, items: [], locations: [], stock: [] })
+        } else if (!hadInventoryAccess && hasInventoryAccess) {
+          await refreshCatalog(vault.token, vault.userEmail)
+        } else if (permissions.some((permission) => !vault.permissions.includes(permission)) || vault.permissions.some((permission) => !permissions.includes(permission))) {
+          await persistVault({ ...vault, permissions })
+        }
+        setPermissionsValidated(true)
+      } catch {
+        setPermissionsValidated(false)
+      }
     }
-    window.addEventListener('focus', validatePermissions)
-    return () => window.removeEventListener('focus', validatePermissions)
-  }, [loaded, online, vault.token, vault.userEmail, refreshCatalog])
+    const handleFocus = () => { void validatePermissions(true) }
+    window.addEventListener('focus', handleFocus)
+    const interval = window.setInterval(() => { void validatePermissions() }, 30000)
+    return () => { window.removeEventListener('focus', handleFocus); window.clearInterval(interval) }
+  }, [loaded, online, vault.token, vault.workspaceId, vault.userEmail, vault.permissions, persistVault, refreshCatalog])
 
   useEffect(() => {
     if (!loaded || !online || !vault.token || !canUseInventory) { if (!online || !canUseInventory) promptedForQueue.current = false; return }
@@ -390,7 +409,7 @@ export default function App() {
 
   if (!loaded) return <div className="loading-screen"><div className="brand-mark"><Layers3 size={20} /></div><span>Opening your secure workspace…</span></div>
   if (vaultError) return <div className="error-screen"><div className="error-mark"><LockKeyhole size={23} /></div><h1>Secure storage unavailable</h1><p>{vaultError}</p><small>KashFlow won’t fall back to saving business data in plain text.</small></div>
-  if (!vault.token) return <LoginPage identifier={loginIdentifier} setIdentifier={setLoginIdentifier} password={loginPassword} setPassword={setLoginPassword} challenge={twoFactorChallenge} code={twoFactorCode} setCode={setTwoFactorCode} error={loginError} busy={busy} onSubmit={signIn} onCancelChallenge={() => { setTwoFactorChallenge(''); setTwoFactorCode(''); setLoginError('') }} online={online} />
+  if (!vault.token) return <LoginPage identifier={loginIdentifier} setIdentifier={setLoginIdentifier} password={loginPassword} setPassword={setLoginPassword} passwordVisible={loginPasswordVisible} setPasswordVisible={setLoginPasswordVisible} challenge={twoFactorChallenge} code={twoFactorCode} setCode={setTwoFactorCode} error={loginError} busy={busy} onSubmit={signIn} onCancelChallenge={() => { setTwoFactorChallenge(''); setTwoFactorCode(''); setLoginError('') }} online={online} />
 
   const title = page === 'home' ? 'Today' : page === 'inventory' ? 'Stock' : page === 'count' ? 'Count' : page === 'sync' ? 'Sync' : page === 'business' ? 'Business' : 'Settings'
 
@@ -529,6 +548,6 @@ function EmptyState({ icon, title, detail }: { icon: ReactNode; title: string; d
   return <div className="empty-state"><span>{icon}</span><strong>{title}</strong><p>{detail}</p></div>
 }
 
-function LoginPage({ identifier, setIdentifier, password, setPassword, challenge, code, setCode, error, busy, onSubmit, onCancelChallenge, online }: { identifier: string; setIdentifier: (value: string) => void; password: string; setPassword: (value: string) => void; challenge: string; code: string; setCode: (value: string) => void; error: string; busy: boolean; onSubmit: (event: FormEvent) => void; onCancelChallenge: () => void; online: boolean }) {
-  return <main className="login-shell"><div className="login-brand"><span className="brand-mark"><Layers3 size={19} /></span><span><strong>KashFlow<span>.</span></strong><small>FIELD EDITION</small></span></div><div className="login-grid"><section className="login-story"><div className="story-kicker"><span /> BUILT FOR THE SHOP FLOOR</div><h1>Count with<br /><em>confidence.</em></h1><p>Your business, one tap away. Keep stock moving even when the network doesn’t.</p><div className="story-art"><div className="story-orbit story-orbit-one" /><div className="story-orbit story-orbit-two" /><div className="story-cube"><Layers3 size={32} /></div><div className="story-tag"><CheckCircle2 size={14} /> FIELD READY</div><div className="story-tag second"><LockKeyhole size={13} /> ENCRYPTED</div></div><div className="story-bottom"><span>01</span> OFFLINE INVENTORY <i /> KENYA FIRST</div></section><section className="login-card"><span className="login-eyebrow">WELCOME BACK</span><h2>{challenge ? 'Verify it’s you' : 'Sign in to KashFlow'}</h2><p>{challenge ? 'Use your authenticator app or a recovery code to continue.' : 'Your saved stock and counts stay on this computer when you’re offline.'}</p><form onSubmit={onSubmit}>{!challenge ? <><label>Email or phone number<input autoComplete="username" autoCapitalize="none" value={identifier} onChange={(event) => setIdentifier(event.target.value)} placeholder="you@business.co.ke" required /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Your password" required /></label></> : <label>Authenticator or recovery code<input autoCapitalize="characters" value={code} onChange={(event) => setCode(event.target.value)} placeholder="Enter your code" required /></label>}{error && <div className="login-error">{error}</div>}<button className="button button-primary login-submit" disabled={busy}>{busy ? <><span className="mini-spinner white" /> Please wait…</> : <>{challenge ? 'Verify & continue' : 'Continue to your business'} <ArrowRight size={15} /></>}</button></form>{challenge && <button type="button" onClick={onCancelChallenge} className="cancel-challenge">Use a different account</button>}<div className="login-security"><ShieldCheck size={16} /><span>OS-encrypted local vault · Secure sign-in · Offline ready</span></div><div className="login-connect"><span className={`side-status-dot ${online ? 'connected' : ''}`} />{online ? 'KashFlow service is reachable' : 'Connect to sign in; saved workspace data remains available offline'}</div></section></div><footer className="login-footer"><span><LockKeyhole size={12} /> Secure offline workspace</span><span>KashFlow Field · Desktop</span></footer></main>
+function LoginPage({ identifier, setIdentifier, password, setPassword, passwordVisible, setPasswordVisible, challenge, code, setCode, error, busy, onSubmit, onCancelChallenge, online }: { identifier: string; setIdentifier: (value: string) => void; password: string; setPassword: (value: string) => void; passwordVisible: boolean; setPasswordVisible: (visible: boolean) => void; challenge: string; code: string; setCode: (value: string) => void; error: string; busy: boolean; onSubmit: (event: FormEvent) => void; onCancelChallenge: () => void; online: boolean }) {
+  return <main className="login-shell"><div className="login-brand"><span className="brand-mark"><Layers3 size={19} /></span><span><strong>KashFlow<span>.</span></strong><small>FIELD EDITION</small></span></div><div className="login-grid"><section className="login-story"><div className="story-kicker"><span /> BUILT FOR THE SHOP FLOOR</div><h1>Count with<br /><em>confidence.</em></h1><p>Your business, one tap away. Keep stock moving even when the network doesn’t.</p><div className="story-art"><div className="story-orbit story-orbit-one" /><div className="story-orbit story-orbit-two" /><div className="story-cube"><Layers3 size={32} /></div><div className="story-tag"><CheckCircle2 size={14} /> FIELD READY</div><div className="story-tag second"><LockKeyhole size={13} /> ENCRYPTED</div></div><div className="story-bottom"><span>01</span> OFFLINE INVENTORY <i /> KENYA FIRST</div></section><section className="login-card"><span className="login-eyebrow">WELCOME BACK</span><h2>{challenge ? 'Verify it’s you' : 'Sign in to KashFlow'}</h2><p>{challenge ? 'Use your authenticator app or a recovery code to continue.' : 'Your saved stock and counts stay on this computer when you’re offline.'}</p><form onSubmit={onSubmit}>{!challenge ? <><label>Email or phone number<input autoComplete="username" autoCapitalize="none" value={identifier} onChange={(event) => setIdentifier(event.target.value)} placeholder="you@business.co.ke" required /></label><label>Password<span className="login-password-wrap"><input type={passwordVisible ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Your password" required /><button type="button" className="login-password-toggle" aria-label={passwordVisible ? 'Hide password' : 'Show password'} aria-pressed={passwordVisible} onClick={() => setPasswordVisible(!passwordVisible)}>{passwordVisible ? <EyeOff size={16} /> : <Eye size={16} />}</button></span></label></> : <label>Authenticator or recovery code<input autoCapitalize="characters" value={code} onChange={(event) => setCode(event.target.value)} placeholder="Enter your code" required /></label>}{error && <div className="login-error">{error}</div>}<button className="button button-primary login-submit" disabled={busy}>{busy ? <><span className="mini-spinner white" /> Please wait…</> : <>{challenge ? 'Verify & continue' : 'Continue to your business'} <ArrowRight size={15} /></>}</button></form>{challenge && <button type="button" onClick={onCancelChallenge} className="cancel-challenge">Use a different account</button>}<div className="login-security"><ShieldCheck size={16} /><span>OS-encrypted local vault · Secure sign-in · Offline ready</span></div><div className="login-connect"><span className={`side-status-dot ${online ? 'connected' : ''}`} />{online ? 'KashFlow service is reachable' : 'Connect to sign in; saved workspace data remains available offline'}</div></section></div><footer className="login-footer"><span><LockKeyhole size={12} /> Secure offline workspace</span><span>KashFlow Field · Desktop</span></footer></main>
 }

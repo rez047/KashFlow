@@ -2,8 +2,8 @@ import * as Network from 'expo-network'
 import * as SecureStore from 'expo-secure-store'
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Alert, AppState } from 'react-native'
-import { activateBusiness, refreshCatalog, syncQueuedCounts } from '../lib/api'
-import { getOfflineSnapshot, saveSnapshot, type OfflineSnapshot } from '../lib/offline'
+import { activateBusiness, getWorkspacePermissions, refreshCatalog, syncQueuedCounts } from '../lib/api'
+import { getOfflineSnapshot, saveSnapshot, updateWorkspacePermissions, type OfflineSnapshot } from '../lib/offline'
 
 type AppState = {
   token: string | null
@@ -49,6 +49,39 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
       Alert.alert('Refresh paused', error instanceof Error ? error.message : 'Your last saved inventory is still available offline. Try again when the connection is stable.')
     }
   }, [token])
+
+  const validatePermissions = useCallback(async (hideUntilChecked = false) => {
+    if (!token || !online) return
+    if (hideUntilChecked) setAuthorizationChecked(false)
+    try {
+      const access = await getWorkspacePermissions(token)
+      const cached = await getOfflineSnapshot()
+      if (!cached || cached.workspaceId !== access.workspaceId) {
+        setAuthorizationChecked(false)
+        return
+      }
+      const permissionsUnchanged = access.permissions.length === cached.permissions.length && access.permissions.every((permission) => cached.permissions.includes(permission))
+      if (permissionsUnchanged) {
+        setAuthorizationChecked(true)
+        return
+      }
+      const hadInventoryAccess = cached.permissions.includes('inventory.write')
+      const hasInventoryAccess = access.permissions.includes('inventory.write')
+      if (hadInventoryAccess && !hasInventoryAccess) {
+        await saveSnapshot({ workspaceId: cached.workspaceId, workspaceName: cached.workspaceName, userEmail: cached.userEmail, permissions: access.permissions, items: [], locations: [], stock: [], workspaces: cached.workspaces })
+        setSnapshot(await getOfflineSnapshot())
+      } else if (!hadInventoryAccess && hasInventoryAccess) {
+        await refreshCatalog(token, cached.userEmail)
+        setSnapshot(await getOfflineSnapshot())
+      } else {
+        await updateWorkspacePermissions(access.workspaceId, access.permissions)
+        setSnapshot({ ...cached, permissions: access.permissions })
+      }
+      setAuthorizationChecked(true)
+    } catch {
+      setAuthorizationChecked(false)
+    }
+  }, [online, token])
 
   const reloadLocal = useCallback(async () => { setSnapshot(await getOfflineSnapshot()) }, [])
 
@@ -151,10 +184,11 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!token || !online) return
     const subscription = AppState.addEventListener('change', (state) => {
-      if (state === 'active') void refreshRef.current()
+      if (state === 'active') void validatePermissions(true)
     })
-    return () => subscription.remove()
-  }, [online, token])
+    const interval = setInterval(() => void validatePermissions(), 30_000)
+    return () => { subscription.remove(); clearInterval(interval) }
+  }, [online, token, validatePermissions])
 
   useEffect(() => {
     let active = true

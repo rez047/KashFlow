@@ -64,6 +64,11 @@ export async function refreshCatalog(token: string, userEmail: string) {
   return { workspace: me.workspace, permissions, refreshedAt, itemCount: items.length }
 }
 
+export async function getWorkspacePermissions(token: string) {
+  const me = await api<{ workspace: { id: string; permissions?: string[] } }>('/v1/auth/me', token)
+  return { workspaceId: me.workspace.id, permissions: me.workspace.permissions ?? [] }
+}
+
 export function activateBusiness(token: string, workspaceId: string) {
   return api<{ workspace: BusinessWorkspace; accessToken?: string }>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/activate`, token, { method: 'POST', body: {} })
 }

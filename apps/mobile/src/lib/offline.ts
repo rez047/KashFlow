@@ -138,6 +138,11 @@ export async function queueCount(input: Omit<QueuedCount, 'itemName' | 'location
   await db.runAsync('INSERT INTO count_queue (idempotency_key, workspace_id, item_id, location_id, counted_quantity, expected_quantity, count_date, reference, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, \'pending\', ?)', input.idempotencyKey, input.workspaceId, input.itemId, input.locationId, input.countedQuantity, input.expectedQuantity, input.date, input.reference, new Date().toISOString())
 }
 
+export async function updateWorkspacePermissions(workspaceId: string, permissions: string[]) {
+  const db = await database()
+  await db.runAsync('UPDATE workspace_snapshot SET permissions = ? WHERE singleton = 1 AND workspace_id = ?', JSON.stringify(permissions), workspaceId)
+}
+
 export async function updateCount(key: string, state: QueuedCount['state'], message = '', serverQuantity: number | null = null) {
   const db = await database()
   await db.runAsync('UPDATE count_queue SET state = ?, message = ?, server_quantity = ?, synced_at = CASE WHEN ? = \'synced\' THEN ? ELSE synced_at END WHERE idempotency_key = ?', state, message, serverQuantity, state, new Date().toISOString(), key)
