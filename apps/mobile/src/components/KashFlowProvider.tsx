@@ -186,7 +186,7 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
     const subscription = AppState.addEventListener('change', (state) => {
       if (state === 'active') void validatePermissions(true)
     })
-    const interval = setInterval(() => void validatePermissions(), 30_000)
+    const interval = setInterval(() => void validatePermissions(), 10_000)
     return () => { subscription.remove(); clearInterval(interval) }
   }, [online, token, validatePermissions])
 

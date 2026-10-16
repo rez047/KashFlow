@@ -33,7 +33,7 @@ export default function CountScreen() {
   const matches = useMemo(() => (snapshot?.items ?? []).filter((item) => {
     const q = query.trim().toLowerCase()
     return !q || item.name.toLowerCase().includes(q) || item.sku.toLowerCase().includes(q) || item.category.toLowerCase().includes(q)
-  }).slice(0, 6), [query, snapshot?.items])
+  }), [query, snapshot?.items])
   const numericQuantity = Number(quantity)
   const valid = Boolean(snapshot && itemId && effectiveLocationId && quantity.trim() !== '' && Number.isFinite(numericQuantity) && numericQuantity >= 0 && numericQuantity <= 1_000_000)
 
@@ -65,7 +65,7 @@ export default function CountScreen() {
       <Text style={styles.sectionLabel}>1 · SELECT PRODUCT</Text>
       {selectedItem ? <View style={styles.selectedCard}><View style={styles.selectedIcon}><Ionicons name="cube-outline" size={20} color="#138b70" /></View><View style={styles.selectedCopy}><Text numberOfLines={1} style={styles.selectedName}>{selectedItem.name}</Text><Text style={styles.selectedMeta}>{selectedItem.sku ? `SKU ${selectedItem.sku}` : selectedItem.category || 'Inventory item'}</Text></View><Pressable accessibilityLabel="Choose a different item" style={styles.changeButton} onPress={() => { setItemSelection({ id: '', routeId: params.itemId }); setQuery('') }}><Text style={styles.changeText}>Change</Text></Pressable></View> : <>
         <View style={styles.search}><Ionicons name="search-outline" size={16} color="#929d97" /><TextInput value={query} onChangeText={setQuery} placeholder="Search by name or scan SKU" placeholderTextColor="#a4ada7" style={styles.searchInput} autoCorrect={false} /></View>
-        <View style={styles.matches}>{matches.slice(0, query ? 6 : 3).map((item) => <Pressable key={item.id} onPress={() => { setItemSelection({ id: item.id, routeId: params.itemId }); setQuery(item.name) }} style={styles.match}><View style={styles.matchMark}><Text style={styles.matchInitial}>{item.name.slice(0, 1).toUpperCase()}</Text></View><View style={styles.matchCopy}><Text numberOfLines={1} style={styles.matchName}>{item.name}</Text><Text style={styles.matchMeta}>{item.sku ? `SKU ${item.sku}` : item.category || 'Inventory item'}</Text></View><Ionicons name="chevron-forward" size={16} color="#9ba59f" /></Pressable>)}{matches.length === 0 && <Text style={styles.noMatches}>No matching item in the saved catalog.</Text>}</View>
+        <View style={styles.matches}>{matches.map((item) => <Pressable key={item.id} onPress={() => { setItemSelection({ id: item.id, routeId: params.itemId }); setQuery(item.name) }} style={styles.match}><View style={styles.matchMark}><Text style={styles.matchInitial}>{item.name.slice(0, 1).toUpperCase()}</Text></View><View style={styles.matchCopy}><Text numberOfLines={1} style={styles.matchName}>{item.name}</Text><Text style={styles.matchMeta}>{item.sku ? `SKU ${item.sku}` : item.category || 'Inventory item'}</Text></View><Ionicons name="chevron-forward" size={16} color="#9ba59f" /></Pressable>)}{matches.length === 0 && <Text style={styles.noMatches}>No matching item in the saved catalog.</Text>}</View>
       </>}
 
       {itemId && <>
