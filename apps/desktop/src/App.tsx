@@ -165,7 +165,7 @@ export default function App() {
     }).catch((error: unknown) => {
       if (mounted) { setVaultError(error instanceof Error ? error.message : 'The encrypted business vault could not be opened.'); setLoaded(true) }
     })
-    void window.kashflowDesktop.ping().then((connected) => { if (mounted) { onlineState.current = connected; setOnline(connected); setPermissionsValidated(!connected) } })
+    void window.kashflowDesktop.ping().then((connected) => { if (mounted) { onlineState.current = connected; setOnline(connected); setPermissionsValidated(false) } })
     void window.kashflowDesktop.version().then(setAppVersion).catch(() => undefined)
     return () => { mounted = false }
   }, [])
@@ -178,7 +178,7 @@ export default function App() {
       if (!connected) setPermissionsValidated(true)
       else if (!wasOnline) { setPermissionsValidated(false); refreshedSessionKey.current = '' }
     }) }
-    const goOffline = () => { onlineState.current = false; promptedForQueue.current = false; setOnline(false); setPermissionsValidated(true); notify('You are offline. Counting and saving remain available.') }
+    const goOffline = () => { onlineState.current = false; promptedForQueue.current = false; setOnline(false); notify('You are offline. Counting and saving remain available.') }
     window.addEventListener('online', goOnline)
     window.addEventListener('offline', goOffline)
     const interval = window.setInterval(goOnline, 30000)
@@ -287,8 +287,32 @@ export default function App() {
     }
   }, [page, workspaceOpened, vault.token])
 
-  function navigate(next: Page) {
-    if (!canUseInventory && ['home', 'inventory', 'count', 'sync'].includes(next)) return
+  async function navigate(next: Page) {
+    const inventoryPage = ['home', 'inventory', 'count', 'sync'].includes(next)
+    if (inventoryPage && online && vault.token) {
+      setPermissionsValidated(false)
+      try {
+        const response = await window.kashflowDesktop.request('/v1/auth/me', vault.token)
+        if (!response.ok) throw new Error('Could not verify workspace permissions.')
+        const me = response.data as { workspace: { id: string; permissions?: string[] } }
+        if (me.workspace.id !== vault.workspaceId) throw new Error('The active business session changed.')
+        const permissions = me.workspace.permissions ?? []
+        if (!permissions.includes('inventory.write')) {
+          await persistVault({ ...vault, permissions, items: [], locations: [], stock: [] })
+          setPage('settings')
+          window.history.replaceState({ page: 'settings' }, '', '#settings')
+          return
+        }
+        if (permissions.some((permission) => !vault.permissions.includes(permission)) || vault.permissions.some((permission) => !permissions.includes(permission))) {
+          await persistVault({ ...vault, permissions })
+        }
+        setPermissionsValidated(true)
+      } catch (error) {
+        setPermissionsValidated(false)
+        notify(error instanceof Error ? error.message : 'Could not verify workspace permissions.')
+        return
+      }
+    } else if (inventoryPage && !canUseInventory) return
     if (next === page) return
     window.history.pushState({ page: next }, '', `#${next}`)
     setPage(next)

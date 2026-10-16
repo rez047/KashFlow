@@ -1,5 +1,6 @@
 import * as Network from 'expo-network'
 import * as SecureStore from 'expo-secure-store'
+import { useFocusEffect } from 'expo-router'
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Alert, AppState } from 'react-native'
 import { activateBusiness, getWorkspacePermissions, refreshCatalog, syncQueuedCounts } from '../lib/api'
@@ -17,6 +18,7 @@ type AppState = {
   syncNow: (showMessage?: boolean) => Promise<void>
   updateSessionToken: (nextToken: string | null) => Promise<void>
   switchBusiness: (workspaceId: string) => Promise<void>
+  revalidatePermissions: () => Promise<void>
 }
 
 const AppContext = createContext<AppState | null>(null)
@@ -217,7 +219,7 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
           }
         } catch { /* Protected screens stay hidden until the current workspace role can be checked. */ }
       } else {
-        setAuthorizationChecked(true)
+        setAuthorizationChecked(false)
       }
       if (active) setLoading(false)
     }
@@ -241,6 +243,14 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
     return () => { active = false; subscription.remove() }
   }, [])
 
-  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness }), [token, online, loading, syncing, snapshot, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness])
+  const revalidatePermissions = useCallback(() => validatePermissions(true), [validatePermissions])
+  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness, revalidatePermissions }), [token, online, loading, syncing, snapshot, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness, revalidatePermissions])
   return <AppContext.Provider value={context}>{children}</AppContext.Provider>
+}
+
+export function useRevalidatePermissionsOnFocus() {
+  const { online, token, revalidatePermissions } = useKashFlow()
+  useFocusEffect(useCallback(() => {
+    if (online && token) void revalidatePermissions()
+  }, [online, token, revalidatePermissions]))
 }

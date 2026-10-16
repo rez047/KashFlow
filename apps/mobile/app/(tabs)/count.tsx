@@ -3,7 +3,7 @@ import { router, useLocalSearchParams } from 'expo-router'
 import { useMemo, useState } from 'react'
 import { Alert, Keyboard, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 import { createLocalCountKey, queueCount, updateCount } from '../../src/lib/offline'
-import { useKashFlow } from '../../src/components/KashFlowProvider'
+import { useKashFlow, useRevalidatePermissionsOnFocus } from '../../src/components/KashFlowProvider'
 import { InventoryAccessNotice } from '../../src/components/InventoryAccessNotice'
 
 function nairobiToday() {
@@ -13,6 +13,7 @@ function nairobiToday() {
 }
 
 export default function CountScreen() {
+  useRevalidatePermissionsOnFocus()
   const { online, snapshot, syncNow, reloadLocal, canUseInventory } = useKashFlow()
   const params = useLocalSearchParams<{ itemId?: string; locationId?: string; supersedes?: string }>()
   const [query, setQuery] = useState('')

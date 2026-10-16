@@ -2,13 +2,14 @@ import { Ionicons } from '@expo/vector-icons'
 import { router } from 'expo-router'
 import { useMemo, useState } from 'react'
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native'
-import { useKashFlow } from '../../src/components/KashFlowProvider'
+import { useKashFlow, useRevalidatePermissionsOnFocus } from '../../src/components/KashFlowProvider'
 import { InventoryAccessNotice } from '../../src/components/InventoryAccessNotice'
 
 type Filter = 'all' | 'pending' | 'review' | 'synced'
 const filters: { key: Filter; label: string }[] = [{ key: 'all', label: 'All activity' }, { key: 'pending', label: 'To sync' }, { key: 'review', label: 'Review' }, { key: 'synced', label: 'Synced' }]
 
 export default function SyncScreen() {
+  useRevalidatePermissionsOnFocus()
   const { online, syncing, snapshot, syncNow, refresh, canUseInventory } = useKashFlow()
   const [filter, setFilter] = useState<Filter>('all')
   const counts = useMemo(() => snapshot?.counts ?? [], [snapshot?.counts])

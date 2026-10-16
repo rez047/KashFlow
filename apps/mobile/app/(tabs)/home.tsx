@@ -2,7 +2,7 @@ import { Ionicons } from '@expo/vector-icons'
 import { router } from 'expo-router'
 import { useMemo } from 'react'
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native'
-import { useKashFlow } from '../../src/components/KashFlowProvider'
+import { useKashFlow, useRevalidatePermissionsOnFocus } from '../../src/components/KashFlowProvider'
 import { InventoryAccessNotice } from '../../src/components/InventoryAccessNotice'
 
 function greeting() {
@@ -11,6 +11,7 @@ function greeting() {
 }
 
 export default function HomeScreen() {
+  useRevalidatePermissionsOnFocus()
   const { online, loading, syncing, snapshot, refresh, syncNow, canUseInventory } = useKashFlow()
   const queued = snapshot?.counts.filter((count) => count.state === 'pending').length ?? 0
   const conflicts = snapshot?.counts.filter((count) => count.state === 'conflict').length ?? 0
