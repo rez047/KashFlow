@@ -46,7 +46,7 @@ export default function App() {
   const [permissionsValidated, setPermissionsValidated] = useState(false)
   const workspaceViewport = useRef<HTMLDivElement>(null)
   const refreshedSessionKey = useRef('')
-  const canUseInventory = permissionsValidated && vault.permissions.includes('inventory.write')
+  const canUseInventory = Boolean(vault.token && permissionsValidated && vault.permissions.includes('inventory.write'))
   const activeCounts = vault.counts.filter((count) => count.workspaceId === vault.workspaceId)
 
   const currentItem = vault.items.find((item) => item.id === itemId)
@@ -192,6 +192,18 @@ export default function App() {
     setPermissionsValidated(false)
     void refreshCatalog(vault.token, vault.userEmail).then(() => setPermissionsValidated(true)).catch(() => undefined)
   }, [loaded, online, vault.token, vault.workspaceId, vault.userEmail, refreshCatalog])
+
+  useEffect(() => {
+    if (!loaded || !online || !vault.token) return
+    const validatePermissions = () => {
+      setPermissionsValidated(false)
+      void refreshCatalog(vault.token, vault.userEmail)
+        .then(() => setPermissionsValidated(true))
+        .catch(() => setPermissionsValidated(false))
+    }
+    window.addEventListener('focus', validatePermissions)
+    return () => window.removeEventListener('focus', validatePermissions)
+  }, [loaded, online, vault.token, vault.userEmail, refreshCatalog])
 
   useEffect(() => {
     if (!loaded || !online || !vault.token || !canUseInventory) { if (!online || !canUseInventory) promptedForQueue.current = false; return }
