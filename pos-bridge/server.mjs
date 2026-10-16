@@ -47,18 +47,13 @@ function buildReceipt(input) {
   const balanceDue = Number(input.balanceDue ?? Math.max(0, amount - amountPaid))
   if (!Number.isFinite(amountPaid) || amountPaid < 0 || amountPaid > amount + 0.02 || !Number.isFinite(balanceDue) || balanceDue < 0 || Math.abs(amountPaid + balanceDue - amount) > 0.02) throw new Error('Receipt payment totals are invalid.')
   const paymentMethod = clean(input.paymentMethod || 'unrecorded', 40)
-  const paymentStatus = clean(input.status || 'Payment not recorded', 120)
   const date = clean(input.createdAt ? new Date(input.createdAt).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }) : new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }), 60)
-  const email = clean(input.customerEmail, 100)
-  const phone = clean(input.customerPhone, 40)
 
   const chunks = [esc(0x1b, 0x40), esc(0x1b, 0x61, 1)]
   chunks.push(Buffer.from(`${receiptBusinessName}\n`, 'ascii'))
-  chunks.push(Buffer.from('INTERNAL SALES RECEIPT\n', 'ascii'))
+  chunks.push(Buffer.from('SALES RECEIPT\n', 'ascii'))
   chunks.push(esc(0x1b, 0x61, 0))
-  chunks.push(Buffer.from(`Receipt date: ${date}\nInvoice: ${invoiceId}\nCustomer: ${customer}\n`, 'ascii'))
-  if (email) chunks.push(Buffer.from(`Email: ${email}\n`, 'ascii'))
-  if (phone) chunks.push(Buffer.from(`Phone: ${phone}\n`, 'ascii'))
+  chunks.push(Buffer.from(`Receipt: ${invoiceId.slice(0, 8).toUpperCase()}\n${date}\nCustomer: ${customer}\n`, 'ascii'))
   chunks.push(Buffer.from('--------------------------------\n', 'ascii'))
   for (const line of lines) {
     const total = (line.quantity * line.unitPrice).toFixed(2)
@@ -69,8 +64,10 @@ function buildReceipt(input) {
   chunks.push(esc(0x1b, 0x61, 2))
   chunks.push(Buffer.from(`TOTAL  KSh ${amount.toFixed(2)}\n`, 'ascii'))
   chunks.push(esc(0x1b, 0x61, 0))
-  chunks.push(Buffer.from(`Payment: ${paymentMethod}\nPaid: KSh ${amountPaid.toFixed(2)}\nBalance due: KSh ${balanceDue.toFixed(2)}\nStatus: ${paymentStatus}\n`, 'ascii'))
-  chunks.push(Buffer.from('\nCustomer receipt. Internal record only; not an eTIMS tax invoice.\n\n\n', 'ascii'))
+  chunks.push(Buffer.from(`Payment: ${paymentMethod}\nPaid: KSh ${amountPaid.toFixed(2)}\n`, 'ascii'))
+  if (balanceDue > 0.02) chunks.push(Buffer.from(`BALANCE DUE: KSh ${balanceDue.toFixed(2)}\n`, 'ascii'))
+  else chunks.push(Buffer.from('PAID IN FULL\n', 'ascii'))
+  chunks.push(Buffer.from('\nThank you for your business.\nInternal receipt only; not an eTIMS tax invoice.\n\n\n', 'ascii'))
   chunks.push(esc(0x1d, 0x56, 0))
   return Buffer.concat(chunks)
 }
