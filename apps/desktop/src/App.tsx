@@ -246,7 +246,7 @@ export default function App() {
     }
     const handleFocus = () => { void validatePermissions(true) }
     window.addEventListener('focus', handleFocus)
-    const interval = window.setInterval(() => { void validatePermissions() }, 10000)
+    const interval = window.setInterval(() => { void validatePermissions() }, 5000)
     return () => { window.removeEventListener('focus', handleFocus); window.clearInterval(interval) }
   }, [loaded, online, vault.token, vault.workspaceId, vault.userEmail, vault.permissions, persistVault, refreshCatalog])
 
