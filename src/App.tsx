@@ -960,9 +960,12 @@ function printDocument(kind: PrintDocumentKind) {
   document.body.classList.remove('printing-pos', 'printing-invoice', 'printing-kra')
   document.body.classList.add(`printing-${kind}`)
   let receiptPageStyle: HTMLStyleElement | undefined
+  let receiptClone: HTMLElement | undefined
   if (kind === 'pos') {
     const receipt = document.querySelector<HTMLElement>('.pos-receipt-print')
     if (receipt) {
+      receiptClone = receipt.cloneNode(true) as HTMLElement
+      document.body.appendChild(receiptClone)
       receiptPageStyle = document.createElement('style')
       receiptPageStyle.textContent = `@page posreceipt{size:80mm ${getReceiptPageHeightMm(receipt)}mm;margin:0}`
       document.head.appendChild(receiptPageStyle)
@@ -971,6 +974,7 @@ function printDocument(kind: PrintDocumentKind) {
   window.addEventListener('afterprint', () => {
     document.body.classList.remove(`printing-${kind}`)
     receiptPageStyle?.remove()
+    receiptClone?.remove()
   }, { once: true })
   window.print()
 }
