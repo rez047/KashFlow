@@ -11,7 +11,6 @@ type AppState = {
   online: boolean
   loading: boolean
   syncing: boolean
-  isWorkspaceAdmin: boolean
   canUseInventory: boolean
   snapshot: OfflineSnapshot | null
   reloadLocal: () => Promise<void>
@@ -38,7 +37,6 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<OfflineSnapshot | null>(null)
   const [authorizationChecked, setAuthorizationChecked] = useState(false)
   const activeWorkspaceRole = snapshot?.workspaces.find((workspace) => workspace.id === snapshot?.workspaceId)?.role
-  const isWorkspaceAdmin = Boolean(token && authorizationChecked && activeWorkspaceRole === 'admin')
   const canUseInventory = Boolean(token && authorizationChecked && activeWorkspaceRole === 'admin' && snapshot?.permissions.includes('inventory.write'))
   const lastOnline = useRef<boolean | null>(null)
 
@@ -250,7 +248,7 @@ export function KashFlowProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const revalidatePermissions = useCallback(() => validatePermissions(true), [validatePermissions])
-  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, isWorkspaceAdmin, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness, revalidatePermissions }), [token, online, loading, syncing, snapshot, isWorkspaceAdmin, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness, revalidatePermissions])
+  const context = useMemo(() => ({ token, online, loading, syncing, snapshot, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness, revalidatePermissions }), [token, online, loading, syncing, snapshot, canUseInventory, reloadLocal, refresh, syncNow, updateSessionToken, switchBusiness, revalidatePermissions])
   return <AppContext.Provider value={context}>{children}</AppContext.Provider>
 }
 

@@ -48,7 +48,6 @@ export default function App() {
   const workspaceViewport = useRef<HTMLDivElement>(null)
   const refreshedSessionKey = useRef('')
   const activeWorkspaceRole = vault.workspaces.find((workspace) => workspace.id === vault.workspaceId)?.role
-  const isWorkspaceAdmin = Boolean(vault.token && permissionsValidated && activeWorkspaceRole === 'admin')
   const canUseInventory = Boolean(vault.token && permissionsValidated && activeWorkspaceRole === 'admin' && vault.permissions.includes('inventory.write'))
   const activeCounts = vault.counts.filter((count) => count.workspaceId === vault.workspaceId)
 
@@ -452,7 +451,7 @@ export default function App() {
       <div className="workspace-picker"><button type="button" className="workspace-switch" aria-haspopup="menu" aria-expanded={workspaceMenuOpen} disabled={vault.workspaces.length < 2 || busy} onClick={() => setWorkspaceMenuOpen((open) => !open)}><div className="workspace-monogram">{vault.workspaceName.slice(0, 1).toUpperCase() || 'K'}</div><div className="workspace-info"><span>WORKING IN</span><strong title={vault.workspaceName}>{vault.workspaceName || 'Your business'}</strong></div><ChevronDown size={14} /></button>{workspaceMenuOpen && vault.workspaces.length > 1 && <div className="workspace-menu" role="menu" aria-label="Switch business">{vault.workspaces.map((workspace) => <button type="button" role="menuitem" key={workspace.id} className={workspace.id === vault.workspaceId ? 'selected' : ''} disabled={busy || workspace.id === vault.workspaceId} onClick={() => { setWorkspaceMenuOpen(false); void switchBusiness(workspace.id) }}><span className="workspace-menu-monogram">{workspace.name.slice(0, 1).toUpperCase()}</span><span>{workspace.name}</span>{workspace.id === vault.workspaceId && <Check size={14} />}</button>)}</div>}</div>
       <div className="side-section-label">WORKSPACE</div>
       <nav className="side-nav" aria-label="Workspace pages">
-        {isWorkspaceAdmin && <>
+        {canUseInventory && <>
           <NavButton page="home" active={page === 'home'} icon={<Home size={17} />} label="Today" onClick={navigate} />
           <NavButton page="inventory" active={page === 'inventory'} icon={<Package size={17} />} label="Stock" onClick={navigate} />
           <NavButton page="count" active={page === 'count'} icon={<Layers3 size={17} />} label="Count" onClick={navigate} />
