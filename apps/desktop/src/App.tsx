@@ -136,6 +136,20 @@ export default function App() {
     let synced = 0, conflicts = 0, failed = 0
     let current = vault
     try {
+      const accessResponse = await window.kashflowDesktop.request('/v1/auth/me', vault.token)
+      if (!accessResponse.ok) throw new Error(typeof accessResponse.data.error === 'string' ? accessResponse.data.error : 'Could not verify workspace permissions.')
+      const access = accessResponse.data as { workspace: { id: string; permissions?: string[] }; workspaces?: DesktopVault['workspaces'] }
+      const role = access.workspaces?.find((workspace) => workspace.id === access.workspace.id)?.role
+      if (access.workspace.id !== vault.workspaceId) throw new Error('The active business changed. Refresh this computer before syncing saved counts.')
+      if (role !== 'admin' || !access.workspace.permissions?.includes('inventory.write')) {
+        const permissions = access.workspace.permissions ?? []
+        const workspaces = access.workspaces ?? []
+        current = { ...vault, permissions, workspaces, items: [], locations: [], stock: [] }
+        await persistVault(current)
+        setPermissionsValidated(true)
+        setPage('settings')
+        throw new Error('Only a workspace administrator can view inventory or sync counts.')
+      }
       for (const count of queue) {
         const response = await window.kashflowDesktop.request('/v1/inventory/counts', vault.token, { method: 'POST', body: { itemId: count.itemId, locationId: count.locationId, countedQuantity: count.countedQuantity, expectedQuantity: count.expectedQuantity, idempotencyKey: count.idempotencyKey, date: count.date, reference: count.reference } })
         if (response.ok) {
@@ -144,7 +158,13 @@ export default function App() {
         } else if (response.status === 409 && response.data.conflict === true) {
           current = { ...current, counts: current.counts.map((item) => item.idempotencyKey === count.idempotencyKey ? { ...item, state: 'conflict', serverQuantity: typeof response.data.serverQuantity === 'number' ? response.data.serverQuantity : null, message: typeof response.data.error === 'string' ? response.data.error : 'Stock changed after this count began.' } : item) }
           conflicts += 1
-        } else failed += 1
+        } else {
+          failed += 1
+          if (response.status === 401 || response.status === 403) {
+            const reason = typeof response.data.error === 'string' ? response.data.error : 'Workspace permission was denied.'
+            throw new Error(reason)
+          }
+        }
         await window.kashflowDesktop.saveVault(current)
       }
       setVault(current)

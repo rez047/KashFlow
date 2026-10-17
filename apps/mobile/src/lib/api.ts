@@ -95,9 +95,12 @@ export function deleteAccount(token: string, currentPassword: string) {
 
 export async function syncQueuedCounts(token: string, workspaceId: string) {
   if (!workspaceId) throw new Error('Refresh a business inventory before syncing saved counts.')
-  const session = await api<{ workspace: { id: string } }>('/v1/auth/me', token)
-  if (session.workspace.id !== workspaceId) {
+  const access = await getWorkspacePermissions(token)
+  if (access.workspaceId !== workspaceId) {
     throw new ApiError(409, { error: 'This sign-in belongs to a different business than the saved counts. Switch back to the original business before syncing them.' })
+  }
+  if (access.workspaceRole !== 'admin' || !access.permissions.includes('inventory.write')) {
+    throw new ApiError(403, { error: 'Only a workspace administrator can view inventory or sync counts.' })
   }
   const queued = await getCountsToSync(workspaceId)
   let synced = 0
@@ -124,6 +127,8 @@ export async function syncQueuedCounts(token: string, workspaceId: string) {
         const latest = typeof error.data.serverQuantity === 'number' ? error.data.serverQuantity : null
         await updateCount(count.idempotencyKey, 'conflict', error.message, latest)
         conflicts += 1
+      } else if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+        throw error
       } else {
         failed += 1
       }
