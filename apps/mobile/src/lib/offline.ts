@@ -183,7 +183,7 @@ export async function getOfflineSnapshot(): Promise<OfflineSnapshot | null> {
     message: count.message,
     createdAt: count.created_at,
   }))
-  const workspaces = rawWorkspaces.length ? rawWorkspaces : [{ id: workspace.workspace_id, name: workspace.workspace_name, role: 'admin' }]
+  const workspaces = rawWorkspaces.length ? rawWorkspaces : [{ id: workspace.workspace_id, name: workspace.workspace_name, role: 'member' }]
   let permissions: string[] = []
   try { const parsed = JSON.parse(workspace.permissions); if (Array.isArray(parsed)) permissions = parsed.filter((permission): permission is string => typeof permission === 'string') } catch { permissions = [] }
   return { workspaceId: workspace.workspace_id, workspaceName: workspace.workspace_name, userEmail: workspace.user_email, refreshedAt: workspace.refreshed_at, permissions, workspaces, items, locations, stock: rawStock.map((row) => ({ ...row, quantity: Number(row.quantity) })), counts: counts.filter((count) => count.workspaceId === workspace.workspace_id) }
