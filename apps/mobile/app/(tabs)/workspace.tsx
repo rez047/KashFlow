@@ -140,7 +140,10 @@ export default function WorkspaceScreen() {
       } else if (payload.type === 'workspace-print' && typeof payload.html === 'string' && ['pos', 'invoice', 'kra'].includes(String(payload.kind))) {
         const cleanHtml = payload.html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
         const html = cleanHtml.replace(/<head([^>]*)>/i, `<head$1><base href="${WORKSPACE_URL}/">`)
-        void Print.printAsync({ html }).catch(() => Alert.alert('Print unavailable', 'Open the full workspace in your browser to print this page.'))
+        const printOptions = payload.kind === 'pos' && Number.isFinite(payload.pageWidth) && Number.isFinite(payload.pageHeight)
+          ? { html, width: Number(payload.pageWidth), height: Number(payload.pageHeight) }
+          : { html }
+        void Print.printAsync(printOptions).catch(() => Alert.alert('Print unavailable', 'Open the full workspace in your browser to print this page.'))
       }
     } catch { /* Ignore malformed messages from the workspace page. */ }
   }

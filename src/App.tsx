@@ -928,6 +928,19 @@ function draftDocumentTotal(lines: DraftLine[]) {
 }
 
 type PrintDocumentKind = 'pos' | 'invoice' | 'kra'
+function getReceiptPageHeightMm(receipt: HTMLElement) {
+  const previousStyle = receipt.getAttribute('style')
+  Object.assign(receipt.style, {
+    display: 'block', position: 'fixed', left: '-10000px', top: '0', width: '72mm', maxWidth: 'none',
+    boxSizing: 'border-box', padding: '4mm', margin: '0', font: '10px/1.35 Arial,sans-serif', visibility: 'hidden',
+  })
+  const heightPx = receipt.getBoundingClientRect().height
+  if (previousStyle === null) receipt.removeAttribute('style')
+  else receipt.setAttribute('style', previousStyle)
+  // Clearance covers print-engine rounding and the mobile receipt's slightly roomier padding.
+  return Math.ceil(heightPx * 25.4 / 96 + 12)
+}
+
 function printDocument(kind: PrintDocumentKind) {
   if (kind === 'pos') {
     const nativePrint = (window as Window & { ReactNativeWebView?: { postMessage: (message: string) => void } }).ReactNativeWebView
@@ -937,15 +950,28 @@ function printDocument(kind: PrintDocumentKind) {
         nativePrint.postMessage(JSON.stringify({ type: 'workspace-print-error' }))
         return
       }
-      const receiptStyles = '@page{size:80mm auto;margin:0}*{box-sizing:border-box}html,body{width:80mm;margin:0;padding:0;background:#fff;color:#172321;font:10px/1.4 Arial,sans-serif}.pos-receipt-print{display:block!important;width:72mm;margin:0 auto;padding:5mm 4mm;background:#fff;color:#172321;font:10px/1.4 Arial,sans-serif}.pos-receipt-brand{display:flex;flex-direction:column;align-items:center;gap:3px;padding:0 0 8px;border-bottom:2px solid #254e46;text-align:center}.pos-receipt-brand strong{font-size:17px;line-height:1.2;font-weight:800;letter-spacing:.02em}.pos-receipt-brand span{font-size:8px;color:#596c67;letter-spacing:.08em;text-transform:uppercase}.pos-receipt-print h2{margin:12px 0 8px;text-align:center;font-size:12px;letter-spacing:.16em}.pos-receipt-meta{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-top:1px solid #d9dfdc;border-bottom:1px solid #d9dfdc;font-size:8px}.pos-receipt-customer{margin:8px 0;font-size:9px}.pos-receipt-print hr{border:0;border-top:1px dashed #8d9a96;margin:8px 0}.pos-receipt-columns,.pos-receipt-line{display:grid;grid-template-columns:minmax(0,1fr) 22px auto;align-items:start;gap:5px;margin:6px 0;font-size:9px}.pos-receipt-columns{padding-bottom:4px;border-bottom:1px solid #9da9a5;font-size:8px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.pos-receipt-columns span:last-child,.pos-receipt-line>strong{text-align:right}.pos-receipt-line>span:first-child{overflow-wrap:anywhere}.pos-receipt-line>span small{display:block;margin-top:2px;font-size:8px;color:#59645f}.pos-receipt-line>strong{white-space:nowrap}.pos-receipt-line.pos-receipt-total{grid-template-columns:1fr auto;margin:8px 0;padding-top:7px;border-top:1px solid #263b36;font-size:12px}.pos-receipt-payment{display:flex;flex-direction:column;gap:4px;padding:7px 0;border-top:1px dashed #8d9a96;font-size:9px}.pos-receipt-payment strong{text-align:right}.pos-receipt-print footer{margin-top:9px;padding-top:8px;border-top:1px solid #d9dfdc;text-align:center;font-size:9px}.pos-receipt-print footer small{display:block;margin-top:5px;font-size:8px;color:#59645f}.pos-receipt-print,.pos-receipt-print *{break-inside:avoid;page-break-inside:avoid;-webkit-print-color-adjust:exact;print-color-adjust:exact}'
+      const pageHeightMm = getReceiptPageHeightMm(receipt)
+      const receiptStyles = `@page{size:80mm ${pageHeightMm}mm;margin:0}*{box-sizing:border-box}html,body{width:80mm;margin:0;padding:0;background:#fff;color:#172321;font:10px/1.4 Arial,sans-serif}.pos-receipt-print{display:block!important;width:72mm;margin:0 auto;padding:5mm 4mm;background:#fff;color:#172321;font:10px/1.4 Arial,sans-serif}.pos-receipt-brand{display:flex;flex-direction:column;align-items:center;gap:3px;padding:0 0 8px;border-bottom:2px solid #254e46;text-align:center}.pos-receipt-brand strong{font-size:17px;line-height:1.2;font-weight:800;letter-spacing:.02em}.pos-receipt-brand span{font-size:8px;color:#596c67;letter-spacing:.08em;text-transform:uppercase}.pos-receipt-print h2{margin:12px 0 8px;text-align:center;font-size:12px;letter-spacing:.16em}.pos-receipt-meta{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-top:1px solid #d9dfdc;border-bottom:1px solid #d9dfdc;font-size:8px}.pos-receipt-customer{margin:8px 0;font-size:9px}.pos-receipt-print hr{border:0;border-top:1px dashed #8d9a96;margin:8px 0}.pos-receipt-columns,.pos-receipt-line{display:grid;grid-template-columns:minmax(0,1fr) 22px auto;align-items:start;gap:5px;margin:6px 0;font-size:9px}.pos-receipt-columns{padding-bottom:4px;border-bottom:1px solid #9da9a5;font-size:8px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.pos-receipt-columns span:last-child,.pos-receipt-line>strong{text-align:right}.pos-receipt-line>span:first-child{overflow-wrap:anywhere}.pos-receipt-line>span small{display:block;margin-top:2px;font-size:8px;color:#59645f}.pos-receipt-line>strong{white-space:nowrap}.pos-receipt-line.pos-receipt-total{grid-template-columns:1fr auto;margin:8px 0;padding-top:7px;border-top:1px solid #263b36;font-size:12px}.pos-receipt-payment{display:flex;flex-direction:column;gap:4px;padding:7px 0;border-top:1px dashed #8d9a96;font-size:9px}.pos-receipt-payment strong{text-align:right}.pos-receipt-print footer{margin-top:9px;padding-top:8px;border-top:1px solid #d9dfdc;text-align:center;font-size:9px}.pos-receipt-print footer small{display:block;margin-top:5px;font-size:8px;color:#59645f}.pos-receipt-print,.pos-receipt-print *{break-inside:avoid;page-break-inside:avoid;-webkit-print-color-adjust:exact;print-color-adjust:exact}`
       const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sale receipt</title><style>${receiptStyles}</style></head><body>${receipt.outerHTML}</body></html>`
-      nativePrint.postMessage(JSON.stringify({ type: 'workspace-print', html, title: 'Sale receipt', kind: 'pos' }))
+      nativePrint.postMessage(JSON.stringify({ type: 'workspace-print', html, title: 'Sale receipt', kind: 'pos', pageWidth: Math.round(80 * 72 / 25.4), pageHeight: Math.ceil(pageHeightMm * 72 / 25.4) }))
       return
     }
   }
   document.body.classList.remove('printing-pos', 'printing-invoice', 'printing-kra')
   document.body.classList.add(`printing-${kind}`)
-  window.addEventListener('afterprint', () => document.body.classList.remove(`printing-${kind}`), { once: true })
+  let receiptPageStyle: HTMLStyleElement | undefined
+  if (kind === 'pos') {
+    const receipt = document.querySelector<HTMLElement>('.pos-receipt-print')
+    if (receipt) {
+      receiptPageStyle = document.createElement('style')
+      receiptPageStyle.textContent = `@page posreceipt{size:80mm ${getReceiptPageHeightMm(receipt)}mm;margin:0}`
+      document.head.appendChild(receiptPageStyle)
+    }
+  }
+  window.addEventListener('afterprint', () => {
+    document.body.classList.remove(`printing-${kind}`)
+    receiptPageStyle?.remove()
+  }, { once: true })
   window.print()
 }
 
