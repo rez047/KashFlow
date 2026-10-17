@@ -149,6 +149,7 @@ const defaultWorkspaceSettings = {
   monoEnabled: false,
   darajaEnabled: false,
   kraEtimsLiveEnabled: false,
+  kraEtimsAutoSubmitPos: false,
   statutoryFilingsEnabled: false,
   shifEnabled: false,
   nssfEnabled: false,
@@ -3243,6 +3244,88 @@ app.post('/v1/recurring/:templateId/run', requirePool, verifyOrigin, requireSess
   } finally { client.release() }
 })
 
+app.get('/v1/reports/vat-draft', requirePool, requireSession, requireAccountingRole, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ period: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/) }).safeParse(request.query)
+  if (!input.success) { response.status(400).json({ error: 'Choose a VAT period in YYYY-MM format.' }); return }
+  const periodStart = `${input.data.period}-01`
+  const year = Number(input.data.period.slice(0, 4))
+  const month = Number(input.data.period.slice(5, 7))
+  const nextPeriod = month === 12 ? `${year + 1}-01-01` : `${year}-${String(month + 1).padStart(2, '0')}-01`
+  const periodEnd = new Date(`${nextPeriod}T00:00:00.000Z`).toISOString().slice(0, 10)
+  try {
+    const [sales, returns, purchases, manualTransactions] = await Promise.all([
+      pool!.query(`SELECT il.vat_treatment AS treatment, COUNT(*)::int AS line_count,
+        COALESCE(SUM(il.quantity * il.unit_price - il.discount_amount), 0)::text AS supply_value,
+        COALESCE(SUM(il.tax_amount), 0)::text AS tax_amount
+        FROM invoice_lines il JOIN invoices i ON i.id = il.invoice_id
+        WHERE i.workspace_id = $1 AND i.status <> 'void'
+          AND (i.created_at AT TIME ZONE 'Africa/Nairobi')::date >= $2::date
+          AND (i.created_at AT TIME ZONE 'Africa/Nairobi')::date < $3::date
+        GROUP BY il.vat_treatment ORDER BY il.vat_treatment`, [request.session!.workspaceId, periodStart, periodEnd]),
+      pool!.query(`SELECT il.vat_treatment AS treatment, COUNT(*)::int AS line_count,
+        COALESCE(SUM(ROUND((il.quantity * il.unit_price - il.discount_amount) * srl.quantity / il.quantity, 2)), 0)::text AS supply_value,
+        COALESCE(SUM(ROUND(il.tax_amount * srl.quantity / il.quantity, 2)), 0)::text AS tax_amount
+        FROM sales_return_lines srl JOIN sales_returns sr ON sr.id = srl.return_id
+        JOIN invoice_lines il ON il.id = srl.invoice_line_id
+        WHERE sr.workspace_id = $1 AND sr.return_date >= $2::date AND sr.return_date < $3::date
+        GROUP BY il.vat_treatment ORDER BY il.vat_treatment`, [request.session!.workspaceId, periodStart, periodEnd]),
+      pool!.query(`SELECT vbl.vat_treatment AS treatment, COUNT(*)::int AS line_count,
+        COALESCE(SUM(vbl.quantity * vbl.unit_price - vbl.discount_amount), 0)::text AS purchase_value,
+        COALESCE(SUM(vbl.tax_amount), 0)::text AS tax_amount,
+        COALESCE(SUM(vbl.recoverable_tax_amount), 0)::text AS recoverable_tax
+        FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id = vbl.bill_id
+        WHERE vb.workspace_id = $1 AND vb.status <> 'void' AND vb.approval_status = 'approved'
+          AND vb.bill_date >= $2::date AND vb.bill_date < $3::date
+        GROUP BY vbl.vat_treatment ORDER BY vbl.vat_treatment`, [request.session!.workspaceId, periodStart, periodEnd]),
+      pool!.query(`SELECT direction, COUNT(*)::int AS transaction_count, COALESCE(SUM(amount), 0)::text AS amount
+        FROM ledger_transactions WHERE workspace_id = $1 AND transaction_date >= $2::date AND transaction_date < $3::date
+        GROUP BY direction`, [request.session!.workspaceId, periodStart, periodEnd]),
+    ])
+    const sumColumn = (rows: Array<Record<string, unknown>>, key: string) => rows.reduce((total, row) => total + Number(row[key] ?? 0), 0)
+    const salesTax = sumColumn(sales.rows, 'tax_amount')
+    const returnedTax = sumColumn(returns.rows, 'tax_amount')
+    const recoverableInputTax = sumColumn(purchases.rows, 'recoverable_tax')
+    const outputSales = sumColumn(sales.rows, 'supply_value')
+    const returnedSales = sumColumn(returns.rows, 'supply_value')
+    const manualIncome = manualTransactions.rows.find((row: Record<string, unknown>) => row.direction === 'income')
+    const manualExpense = manualTransactions.rows.find((row: Record<string, unknown>) => row.direction === 'expense')
+    const unclassifiedSales = sales.rows.find((row: Record<string, unknown>) => row.treatment === 'unclassified')
+    const unclassifiedPurchases = purchases.rows.find((row: Record<string, unknown>) => row.treatment === 'unclassified')
+    const exemptInput = purchases.rows.filter((row: Record<string, unknown>) => row.treatment === 'A_EXEMPT').reduce((total: number, row: Record<string, unknown>) => total + Number(row.recoverable_tax ?? 0), 0)
+    const warnings = [
+      'Draft bookkeeping summary only. Reconcile it to KRA eTIMS, customs, withholding VAT, imports, credit notes, and the current official VAT3 return before filing.',
+      'Generic income and expense transactions have no VAT treatment fields and are excluded from the VAT totals; record VAT-bearing activity as invoices or approved vendor bills.',
+      'Only approved vendor bills and their manually entered recoverable tax are included. Confirm input VAT eligibility and apportionment with a qualified Kenyan tax professional.',
+      Number(unclassifiedSales?.line_count ?? 0) || Number(unclassifiedPurchases?.line_count ?? 0) ? 'Some invoice or supplier-bill lines are unclassified and should be reviewed before relying on this summary.' : '',
+      exemptInput > 0 ? 'Recoverable input tax is recorded against exempt purchases; review this before filing.' : '',
+    ].filter(Boolean)
+    response.json({
+      period: input.data.period,
+      periodStart,
+      periodEnd: new Date(new Date(`${periodEnd}T00:00:00.000Z`).getTime() - 86_400_000).toISOString().slice(0, 10),
+      sales: sales.rows,
+      salesReturns: returns.rows,
+      purchases: purchases.rows,
+      totals: {
+        outputSales: Number(outputSales.toFixed(2)),
+        returnedSales: Number(returnedSales.toFixed(2)),
+        netSales: Number((outputSales - returnedSales).toFixed(2)),
+        outputTax: Number(salesTax.toFixed(2)),
+        returnedOutputTax: Number(returnedTax.toFixed(2)),
+        netOutputTax: Number((salesTax - returnedTax).toFixed(2)),
+        recoverableInputTax: Number(recoverableInputTax.toFixed(2)),
+        netVatEstimate: Number((salesTax - returnedTax - recoverableInputTax).toFixed(2)),
+        unclassifiedSales: { lines: Number(unclassifiedSales?.line_count ?? 0), value: Number(unclassifiedSales?.supply_value ?? 0) },
+        unclassifiedPurchases: { lines: Number(unclassifiedPurchases?.line_count ?? 0), value: Number(unclassifiedPurchases?.purchase_value ?? 0) },
+        unclassifiedLedgerIncome: { transactions: Number(manualIncome?.transaction_count ?? 0), amount: Number(manualIncome?.amount ?? 0) },
+        unclassifiedLedgerExpenses: { transactions: Number(manualExpense?.transaction_count ?? 0), amount: Number(manualExpense?.amount ?? 0) },
+      },
+      warnings,
+      filingStatus: 'draft_only_not_filed',
+    })
+  } catch (error) { next(error) }
+})
+
 app.get('/v1/reports/aging', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   const input = z.object({ asOf: z.string().date().default(nairobiToday()) }).safeParse(request.query)
   if (!input.success) { response.status(400).json({ error: 'Use a valid YYYY-MM-DD as-of date.' }); return }
@@ -3358,6 +3441,7 @@ app.put('/v1/settings', requirePool, verifyOrigin, requireSession, requireWorksp
     monoEnabled: z.boolean().default(false),
     darajaEnabled: z.boolean().default(false),
     kraEtimsLiveEnabled: z.boolean().default(false),
+    kraEtimsAutoSubmitPos: z.boolean().default(false),
     statutoryFilingsEnabled: z.boolean().default(false),
     shifEnabled: z.boolean().default(false),
     nssfEnabled: z.boolean().default(false),
@@ -3858,8 +3942,12 @@ const commercialLineSchema = z.object({
   discountAmount: z.coerce.number().finite().min(0).max(999999999999).default(0),
   taxAmount: z.coerce.number().finite().min(0).max(999999999999).default(0),
   recoverableTaxAmount: z.coerce.number().finite().min(0).max(999999999999).default(0),
+  vatTreatment: z.enum(['B16', 'A_EXEMPT', 'C_ZERO', 'D_OUT_OF_SCOPE', 'E_NON_VATABLE', 'unclassified']).default('unclassified'),
 })
 type CommercialLine = z.infer<typeof commercialLineSchema>
+function kenyaVatRate(treatment: CommercialLine['vatTreatment']) {
+  return treatment === 'B16' ? 0.16 : 0
+}
 function calculateCommercialLines(lines: CommercialLine[]) {
   let subtotalCents = 0
   let taxCents = 0
@@ -4198,6 +4286,7 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
     customerEmail: z.string().trim().email().max(254).or(z.literal('')).default(''),
     locationId: z.string().uuid().optional(),
     idempotencyKey: z.string().uuid().optional(),
+    sourceChannel: z.enum(['manual', 'pos']).default('manual'),
     description: z.string().trim().min(1).max(240).optional(),
     amount: z.coerce.number().finite().positive().max(999999999999).optional(),
     lines: z.array(commercialLineSchema.omit({ recoverableTaxAmount: true })).min(1).max(100).optional(),
@@ -4206,9 +4295,28 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
     if (!value.lines && (!value.description || !value.amount)) context.addIssue({ code: 'custom', message: 'Provide invoice lines or a description and amount.' })
   }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a customer, invoice lines (or description and amount), and a valid due date.' }); return }
+  type InvoiceCommercialLine = Omit<CommercialLine, 'recoverableTaxAmount'>
+  let lines: InvoiceCommercialLine[] = input.data.lines ?? [{ description: input.data.description!, quantity: 1, unitPrice: input.data.amount!, discountAmount: 0, taxAmount: 0, vatTreatment: 'unclassified' }]
+  if (input.data.sourceChannel === 'pos') {
+    if (lines.some((line) => !line.itemId)) { response.status(400).json({ error: 'POS sales must reference saved inventory items or services so their saved VAT treatment can be applied.' }); return }
+    const itemIds = [...new Set(lines.map((line) => line.itemId!))]
+    const catalog = await pool!.query("SELECT id, data FROM workspace_records WHERE workspace_id = $1 AND id = ANY($2::uuid[]) AND record_type IN ('inventory', 'service')", [request.session!.workspaceId, itemIds])
+    const catalogById = new Map<string, Record<string, unknown>>(catalog.rows.map((row: { id: string; data: Record<string, unknown> }) => [String(row.id), row.data] as const))
+    if (catalogById.size !== itemIds.length) { response.status(409).json({ error: 'A POS item changed or was removed. Refresh the catalog and retry the sale.' }); return }
+    const mappedLines: InvoiceCommercialLine[] = []
+    for (const line of lines) {
+      const item = catalogById.get(line.itemId!)!
+      const treatment = String(item.vatTreatment ?? 'unclassified')
+      if (!['B16', 'A_EXEMPT', 'C_ZERO', 'D_OUT_OF_SCOPE', 'E_NON_VATABLE', 'unclassified'].includes(treatment)) { response.status(409).json({ error: `VAT treatment for ${String(item.name ?? line.description)} is invalid. Correct the item before checkout.` }); return }
+      if (line.vatTreatment !== treatment) { response.status(409).json({ error: `VAT treatment for ${String(item.name ?? line.description)} changed after this sale was opened. Refresh the catalog and retry.` }); return }
+      const netCents = Math.round((line.quantity * Math.round(line.unitPrice * 100) - Math.round(line.discountAmount * 100)))
+      const taxAmount = Math.round((netCents * kenyaVatRate(treatment as CommercialLine['vatTreatment']) + Number.EPSILON)) / 100
+      mappedLines.push({ ...line, taxAmount })
+    }
+    lines = mappedLines
+  }
   let financials: ReturnType<typeof calculateCommercialLines>
   try {
-    const lines = input.data.lines ?? [{ description: input.data.description!, quantity: 1, unitPrice: input.data.amount!, discountAmount: 0, taxAmount: 0, recoverableTaxAmount: 0 }]
     financials = calculateCommercialLines(lines.map((line) => ({ ...line, recoverableTaxAmount: 0 })))
   } catch (error) { response.status(400).json({ error: error instanceof Error ? error.message : 'Invoice line amounts are invalid.' }); return }
   if (financials.total <= 0) { response.status(400).json({ error: 'Invoice total must be greater than zero.' }); return }
@@ -4234,10 +4342,11 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
           response.status(409).json({ error: 'The earlier checkout is still being finalized. Retry it shortly.' })
           return
         }
-        const priorInvoice = await client.query('SELECT id, customer, customer_email, description, amount::text, due_date, status, created_at FROM invoices WHERE id = $1 AND workspace_id = $2', [prior.rows[0].invoice_id, request.session!.workspaceId])
+        const priorInvoice = await client.query('SELECT id, customer, customer_email, description, amount::text, due_date, status, created_at, sale_channel FROM invoices WHERE id = $1 AND workspace_id = $2', [prior.rows[0].invoice_id, request.session!.workspaceId])
         if (!priorInvoice.rowCount) throw new Error('A checkout retry key references an invoice that is no longer available.')
         await client.query('COMMIT')
-        response.status(200).json({ invoice: priorInvoice.rows[0], idempotentReplay: true })
+        const fiscalization = priorInvoice.rows[0].sale_channel === 'pos' ? await safelyAutoSubmitPosInvoiceToKra(request.session!.workspaceId, request.session!.userId, String(priorInvoice.rows[0].id)) : null
+        response.status(200).json({ invoice: priorInvoice.rows[0], idempotentReplay: true, ...(fiscalization ? { fiscalization } : {}) })
         return
       }
       await client.query('INSERT INTO invoice_idempotency_keys (workspace_id, idempotency_key, request_hash) VALUES ($1, $2, $3)', [request.session!.workspaceId, input.data.idempotencyKey, requestHash])
@@ -4245,12 +4354,16 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
     const id = randomUUID()
     const locationId = financials.lines.some((line) => line.itemId) || input.data.locationId ? await ensureInventoryLocation(client, request.session!.workspaceId, input.data.locationId) : null
     if (financials.lines.some((line) => line.itemId) && !locationId) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Active stock location not found.' }); return }
-    const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date, location_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, customer, customer_email, description, amount::text, due_date, status, created_at', [id, request.session!.workspaceId, input.data.customer, input.data.customerEmail, description, financials.total.toFixed(2), input.data.dueDate, locationId])
+    const result = await client.query('INSERT INTO invoices (id, workspace_id, customer, customer_email, description, amount, due_date, location_id, sale_channel) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, customer, customer_email, description, amount::text, due_date, status, created_at, sale_channel', [id, request.session!.workspaceId, input.data.customer, input.data.customerEmail, description, financials.total.toFixed(2), input.data.dueDate, locationId, input.data.sourceChannel])
     if (input.data.idempotencyKey) {
       await client.query('UPDATE invoice_idempotency_keys SET invoice_id = $1 WHERE workspace_id = $2 AND idempotency_key = $3', [id, request.session!.workspaceId, input.data.idempotencyKey])
     }
     let costOfGoodsSold = 0
     for (const [index, line] of financials.lines.entries()) {
+      let etimsItemCode: string | null = null
+      let etimsItemClassCode: string | null = null
+      let etimsPackageUnitCode: string | null = null
+      let etimsQuantityUnitCode: string | null = null
       if (line.itemId) {
         // A line may reference an inventory item (which deducts stock) or a service
         // (which is simply billed: services hold no stock and post no COGS).
@@ -4258,6 +4371,11 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
         const itemRow = item.rows[0] as { data: Record<string, unknown>; record_type: string } | undefined
         const itemData = itemRow?.data
         if (!itemData) { await client.query('ROLLBACK'); response.status(400).json({ error: 'A sales line references an item or service that is not in this business.' }); return }
+        if (input.data.sourceChannel === 'pos' && String(itemData.vatTreatment ?? 'unclassified') !== line.vatTreatment) { await client.query('ROLLBACK'); response.status(409).json({ error: `VAT treatment for ${String(itemData.name ?? line.description)} changed before checkout. Refresh the catalog and retry.` }); return }
+        etimsItemCode = String(itemData.etimsItemCode ?? '').trim() || null
+        etimsItemClassCode = String(itemData.etimsItemClassCode ?? '').trim() || null
+        etimsPackageUnitCode = String(itemData.etimsPackageUnitCode ?? '').trim() || null
+        etimsQuantityUnitCode = String(itemData.etimsQuantityUnitCode ?? '').trim() || null
         if (itemRow!.record_type === 'service') {
           // Services are not stock: fall through to the shared invoice_lines insert below
           // without touching quantities or cost of goods sold.
@@ -4276,7 +4394,7 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
         costOfGoodsSold += line.quantity * itemCost
         }
       }
-      await client.query('INSERT INTO invoice_lines (id, invoice_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [randomUUID(), id, index + 1, line.itemId ?? null, line.description, line.quantity.toFixed(3), line.unitPrice.toFixed(2), line.discountAmount, line.taxAmount, line.totalAmount])
+      await client.query('INSERT INTO invoice_lines (id, invoice_id, line_number, item_id, description, quantity, unit_price, discount_amount, tax_amount, total_amount, vat_treatment, etims_item_code, etims_item_class_code, etims_package_unit_code, etims_quantity_unit_code) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)', [randomUUID(), id, index + 1, line.itemId ?? null, line.description, line.quantity.toFixed(3), line.unitPrice.toFixed(2), line.discountAmount, line.taxAmount, line.totalAmount, line.vatTreatment, etimsItemCode, etimsItemClassCode, etimsPackageUnitCode, etimsQuantityUnitCode])
     }
     const journalLines: JournalLineInput[] = [{ accountCode: '1100', debit: financials.total, credit: 0 }]
     if (financials.subtotal > 0) journalLines.push({ accountCode: '4000', debit: 0, credit: financials.subtotal })
@@ -4284,7 +4402,8 @@ app.post('/v1/invoices', requirePool, verifyOrigin, requireSession, requireWorks
     if (costOfGoodsSold > 0) journalLines.push({ accountCode: '5100', debit: Number(costOfGoodsSold.toFixed(2)), credit: 0 }, { accountCode: '1200', debit: 0, credit: Number(costOfGoodsSold.toFixed(2)) })
     await insertJournal(client, { workspaceId: request.session!.workspaceId, userId: request.session!.userId, date: nairobiToday(), description: `Invoice: ${input.data.customer} — ${description}`, sourceType: 'invoice', sourceId: id, lines: journalLines })
     await client.query('COMMIT')
-    response.status(201).json({ invoice: result.rows[0] })
+    const fiscalization = input.data.sourceChannel === 'pos' ? await safelyAutoSubmitPosInvoiceToKra(request.session!.workspaceId, request.session!.userId, id) : null
+    response.status(201).json({ invoice: result.rows[0], ...(fiscalization ? { fiscalization } : {}) })
   } catch (error) { await client.query('ROLLBACK'); next(error) }
   finally { client.release() }
 })
@@ -4309,7 +4428,7 @@ app.post('/v1/estimates', requirePool, verifyOrigin, requireSession, requireWork
   if (!input.success) { response.status(400).json({ error: 'Enter a customer, estimate lines (or description and amount), and a valid expiry date.' }); return }
   let financials: ReturnType<typeof calculateCommercialLines>
   try {
-    const lines = input.data.lines ?? [{ description: input.data.description!, quantity: 1, unitPrice: input.data.amount!, discountAmount: 0, taxAmount: 0 }]
+    const lines = input.data.lines ?? [{ description: input.data.description!, quantity: 1, unitPrice: input.data.amount!, discountAmount: 0, taxAmount: 0, vatTreatment: 'unclassified' as const }]
     financials = calculateCommercialLines(lines.map((line) => ({ ...line, recoverableTaxAmount: 0 })))
   } catch (error) { response.status(400).json({ error: error instanceof Error ? error.message : 'Estimate line amounts are invalid.' }); return }
   if (financials.total <= 0) { response.status(400).json({ error: 'Estimate total must be greater than zero.' }); return }
@@ -4978,7 +5097,7 @@ app.post('/v1/bills', requirePool, verifyOrigin, requireSession, requireWorkspac
   if (!input.success || input.data.billDate > input.data.dueDate) { response.status(400).json({ error: 'Enter a supplier, description, positive amount, and valid bill/due dates.' }); return }
   let financials: ReturnType<typeof calculateCommercialLines>
   try {
-    const lines = input.data.lines ?? [{ description: input.data.description!, quantity: 1, unitPrice: input.data.amount!, discountAmount: 0, taxAmount: 0, recoverableTaxAmount: 0 }]
+    const lines = input.data.lines ?? [{ description: input.data.description!, quantity: 1, unitPrice: input.data.amount!, discountAmount: 0, taxAmount: 0, recoverableTaxAmount: 0, vatTreatment: 'unclassified' as const }]
     financials = calculateCommercialLines(lines)
   } catch (error) { response.status(400).json({ error: error instanceof Error ? error.message : 'Bill line amounts are invalid.' }); return }
   if (financials.total <= 0) { response.status(400).json({ error: 'Bill total must be greater than zero.' }); return }
@@ -4993,7 +5112,7 @@ app.post('/v1/bills', requirePool, verifyOrigin, requireSession, requireWorkspac
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $8 = 'approved' THEN $9::uuid ELSE NULL END, CASE WHEN $8 = 'approved' THEN now() ELSE NULL END)
       RETURNING id, supplier, description, amount::text, bill_date, due_date, status, approval_status`, [id, request.session!.workspaceId, input.data.supplier, description, financials.total.toFixed(2), input.data.billDate, input.data.dueDate, approvalStatus, request.session!.userId])
     for (const [index, line] of financials.lines.entries()) {
-      await client.query('INSERT INTO vendor_bill_lines (id, bill_id, line_number, description, quantity, unit_price, discount_amount, tax_amount, recoverable_tax_amount, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [randomUUID(), id, index + 1, line.description, line.quantity.toFixed(3), line.unitPrice.toFixed(2), line.discountAmount, line.taxAmount, line.recoverableTaxAmount, line.totalAmount])
+      await client.query('INSERT INTO vendor_bill_lines (id, bill_id, line_number, description, quantity, unit_price, discount_amount, tax_amount, recoverable_tax_amount, total_amount, vat_treatment) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)', [randomUUID(), id, index + 1, line.description, line.quantity.toFixed(3), line.unitPrice.toFixed(2), line.discountAmount, line.taxAmount, line.recoverableTaxAmount, line.totalAmount, line.vatTreatment])
     }
     if (approvalStatus === 'approved') {
       const expenseAmount = financials.total - financials.recoverableTax
@@ -5984,7 +6103,7 @@ const kraFiscalPayloadSchema = z.object({
   prchrAcptcYn: z.enum(['Y', 'N']),
   remark: z.string().max(400).nullable().optional(),
   receipt: z.object({ custTin: z.string().max(11).nullable().optional(), custMblNo: z.string().max(20).nullable().optional(), rcptPbctDt: z.string().regex(/^\d{14}$/), trdeNm: z.string().max(20).nullable().optional(), adrs: z.string().max(200).nullable().optional(), topMsg: z.string().max(20).nullable().optional(), btmMsg: z.string().max(20).nullable().optional(), prchrAcptcYn: z.enum(['Y', 'N']) }),
-  itemList: z.array(z.object({ itemSeq: z.coerce.number().int().positive(), itemClsCd: z.string().trim().max(10).nullable().optional(), itemCd: z.string().trim().min(1).max(20), itemNm: z.string().trim().min(1).max(200), bcd: z.string().max(20).nullable().optional(), pkgUnitCd: z.string().trim().min(1).max(5), pkg: z.coerce.number().finite().min(0), qtyUnitCd: z.string().trim().min(1).max(5), qty: z.coerce.number().finite().positive(), prc: z.coerce.number().finite().min(0), splyAmt: z.coerce.number().finite().min(0), dcRt: z.coerce.number().finite().min(0).default(0), dcAmt: z.coerce.number().finite().min(0).default(0), taxTyCd: z.enum(['A', 'B', 'C', 'D', 'E']), taxblAmt: z.coerce.number().finite().min(0), taxAmt: z.coerce.number().finite().min(0), totAmt: z.coerce.number().finite().min(0) })).min(1).max(1000),
+  itemList: z.array(z.object({ itemSeq: z.coerce.number().int().positive(), itemClsCd: z.string().trim().max(10).nullable().optional(), itemCd: z.string().trim().min(1).max(20), itemNm: z.string().trim().min(1).max(200), bcd: z.string().max(20).nullable().optional(), pkgUnitCd: z.string().trim().min(1).max(5), pkg: z.coerce.number().finite().min(0), qtyUnitCd: z.string().trim().min(1).max(5), qty: z.coerce.number().finite().positive(), prc: z.coerce.number().finite().min(0), splyAmt: z.coerce.number().finite().min(0), dcRt: z.coerce.number().finite().min(0).default(0), dcAmt: z.coerce.number().finite().min(0).default(0), taxTyCd: z.enum(['A', 'B', 'C', 'D']), taxblAmt: z.coerce.number().finite().min(0), taxAmt: z.coerce.number().finite().min(0), totAmt: z.coerce.number().finite().min(0) })).min(1).max(1000),
 }).superRefine((payload, context) => {
   const cents = (value: number) => Math.round((value + Number.EPSILON) * 100)
   const categories = ['A', 'B', 'C', 'D', 'E'] as const
@@ -5993,6 +6112,7 @@ const kraFiscalPayloadSchema = z.object({
   const totalAmount = payload.itemList.reduce((sum, item) => sum + cents(item.totAmt), 0)
   if (payload.totItemCnt !== payload.itemList.length) context.addIssue({ code: 'custom', path: ['totItemCnt'], message: 'Must equal the number of itemList entries.' })
   if (cents(payload.totTaxblAmt) !== totalTaxable || cents(payload.totTaxAmt) !== totalTax || cents(payload.totAmt) !== totalAmount) context.addIssue({ code: 'custom', path: ['totAmt'], message: 'Document totals must match the sums of its item lines.' })
+  if (cents(payload.taxblAmtE) !== 0 || cents(payload.taxRtE) !== 0 || cents(payload.taxAmtE) !== 0) context.addIssue({ code: 'custom', path: ['taxblAmtE'], message: 'The legacy KRA 8% tax type is not used; confirm current rates and mappings with KRA.' })
   for (const category of categories) {
     const categoryTaxable = payload.itemList.filter((item) => item.taxTyCd === category).reduce((sum, item) => sum + cents(item.taxblAmt), 0)
     const categoryTax = payload.itemList.filter((item) => item.taxTyCd === category).reduce((sum, item) => sum + cents(item.taxAmt), 0)
@@ -6014,6 +6134,180 @@ async function kraOsuRequest<T extends Record<string, unknown>>(path: string, pa
 function assertKraSuccess(result: Record<string, unknown>) {
   const code = String(result.resultCd ?? '')
   if (code !== '000') throw Object.assign(new Error(`KRA eTIMS rejected the request (${code || 'no result code'}): ${String(result.resultMsg ?? 'unknown KRA response').slice(0, 400)}`), { kraResult: result })
+}
+function kraLocalDateFields(value: Date) {
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(value)
+  const fields = Object.fromEntries(parts.map(({ type, value: part }) => [type, part]))
+  const date = `${fields.year}${fields.month}${fields.day}`
+  return { date, dateTime: `${date}${fields.hour}${fields.minute}${fields.second}` }
+}
+type AutoPosKraResult = { submissionStatus: string; notice: string; externalInvoiceNumber?: string; complianceDraftId?: string }
+async function safelyAutoSubmitPosInvoiceToKra(workspaceId: string, userId: string, invoiceId: string): Promise<AutoPosKraResult | null> {
+  try { return await autoSubmitPosInvoiceToKra(workspaceId, userId, invoiceId) }
+  catch (error) {
+    console.error('POS KRA fiscalization could not finish after the sale was saved:', error)
+    return { submissionStatus: 'attention_required', notice: 'POS sale was saved, but eTIMS did not return a confirmed outcome. Check Kenya compliance before any retry.' }
+  }
+}
+async function autoSubmitPosInvoiceToKra(workspaceId: string, userId: string, invoiceId: string): Promise<AutoPosKraResult | null> {
+  const [settingsResult, profileResult] = await Promise.all([
+    pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [workspaceId]),
+    pool!.query("SELECT milestone, details FROM integration_onboarding WHERE workspace_id = $1 AND integration_type = 'kra_etims'", [workspaceId]),
+  ])
+  const settings = { ...defaultWorkspaceSettings, ...(settingsResult.rows[0]?.preferences ?? {}) }
+  if (settings.kraEtimsAutoSubmitPos !== true) return null
+  if (!env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY) return { submissionStatus: 'not_submitted', notice: 'POS sale saved. KRA auto-submission needs the server credential-encryption key.' }
+  if (env.KRA_ETIMS_ENV === 'production' && (!kraEtimsLiveEnabled || settings.kraEtimsLiveEnabled !== true)) return { submissionStatus: 'not_submitted', notice: 'POS sale saved. Live KRA submission is disabled for this server or business.' }
+
+  const profileRow = profileResult.rows[0]
+  const details = (profileRow?.details ?? {}) as Record<string, unknown>
+  if (details.solution !== 'OSCU') return { submissionStatus: 'not_submitted', notice: 'POS auto-submission currently requires the OSCU solution. Configure an OSCU integration or use the existing manual process for VSCU.' }
+  if (!details.posSalesTyCd || !details.posRcptTyCd || !details.posSalesSttsCd) return { submissionStatus: 'not_submitted', notice: 'POS sale saved. Add the KRA sales, receipt, and sales-status codes before enabling automatic fiscalization.' }
+  if (env.KRA_ETIMS_ENV === 'production' && (profileRow?.milestone !== 'certified' || !details.solution || !details.sandboxReference || !details.certificationReference || !details.productionApprovalReference)) return { submissionStatus: 'not_submitted', notice: 'POS sale saved. Production fiscalization is blocked until KRA certification and approval references are recorded.' }
+
+  const invoiceResult = await pool!.query(`SELECT id, customer, amount::text, status, sale_channel, created_at
+    FROM invoices WHERE id = $1 AND workspace_id = $2`, [invoiceId, workspaceId])
+  const invoice = invoiceResult.rows[0]
+  if (!invoice || invoice.sale_channel !== 'pos' || invoice.status === 'void') return { submissionStatus: 'not_submitted', notice: 'POS sale saved, but its invoice is missing, void, or not a point-of-sale sale.' }
+  const priorResult = await pool!.query("SELECT id, workflow_status, provider_status, external_invoice_number FROM compliance_submission_drafts WHERE workspace_id = $1 AND integration_type = 'kra_etims' AND source_type = 'invoice' AND source_id = $2", [workspaceId, invoiceId])
+  const prior = priorResult.rows[0]
+  if (prior?.provider_status === 'accepted_by_kra') return { submissionStatus: 'accepted_by_kra', notice: 'KRA accepted the fiscal invoice.', externalInvoiceNumber: prior.external_invoice_number, complianceDraftId: String(prior.id) }
+  if (prior?.provider_status === 'accepted_in_sandbox') return { submissionStatus: 'accepted_in_sandbox', notice: 'KRA sandbox accepted this test. It is not a fiscal tax invoice.', externalInvoiceNumber: prior.external_invoice_number, complianceDraftId: String(prior.id) }
+  if (prior?.provider_status === 'submission_unknown' || prior?.provider_status === 'submitted_to_kra') return { submissionStatus: String(prior.provider_status), notice: 'KRA may have received this sale. Reconcile the reserved invoice number with KRA; it will not be retried automatically.', externalInvoiceNumber: prior.external_invoice_number }
+  if (prior?.provider_status === 'rejected_by_kra') return { submissionStatus: 'rejected_by_kra', notice: 'KRA rejected this sale. Review the provider response in Kenya compliance before retrying.' }
+
+  const deviceResult = await pool!.query('SELECT credentials_encrypted, initialized_at FROM kra_oscu_workspaces WHERE workspace_id = $1 AND environment = $2', [workspaceId, env.KRA_ETIMS_ENV])
+  if (!deviceResult.rowCount || !deviceResult.rows[0].initialized_at) return { submissionStatus: 'not_submitted', notice: `POS sale saved. Connect and initialize the approved KRA ${env.KRA_ETIMS_ENV} OSCU device before submission.` }
+  const credentials = decryptKraCredentials<KraOsuCredentials>(String(deviceResult.rows[0].credentials_encrypted))
+  if (!credentials.cmcKey) return { submissionStatus: 'not_submitted', notice: 'POS sale saved. The KRA device communication key is missing; reconnect the device before submission.' }
+
+  const lineResult = await pool!.query(`SELECT item_id, description, quantity::text, unit_price::text, discount_amount::text,
+    tax_amount::text, total_amount::text, vat_treatment, etims_item_code, etims_item_class_code,
+    etims_package_unit_code, etims_quantity_unit_code
+    FROM invoice_lines WHERE invoice_id = $1 ORDER BY line_number`, [invoiceId])
+  if (!lineResult.rowCount || lineResult.rows.some((line: Record<string, unknown>) => !line.item_id || line.vat_treatment === 'unclassified')) return { submissionStatus: 'not_submitted', notice: 'POS sale saved. Classify every line and map it to a saved inventory item or service before eTIMS can submit it.' }
+
+  const categories = ['A', 'B', 'C', 'D', 'E'] as const
+  const taxable: Record<typeof categories[number], number> = { A: 0, B: 0, C: 0, D: 0, E: 0 }
+  const tax: Record<typeof categories[number], number> = { A: 0, B: 0, C: 0, D: 0, E: 0 }
+  const taxTypeForTreatment: Record<string, typeof categories[number]> = { A_EXEMPT: 'A', B16: 'B', C_ZERO: 'C', D_OUT_OF_SCOPE: 'D', E_NON_VATABLE: 'D' }
+  const roundMoney = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100
+  const itemList: Array<Record<string, unknown>> = []
+  for (const [index, line] of lineResult.rows.entries()) {
+    const itemCd = String(line.etims_item_code ?? '').trim()
+    const itemClsCd = String(line.etims_item_class_code ?? '').trim()
+    const pkgUnitCd = String(line.etims_package_unit_code ?? '').trim()
+    const qtyUnitCd = String(line.etims_quantity_unit_code ?? '').trim()
+    const itemName = String(line.description ?? '').trim()
+    if (!itemCd || !itemClsCd || !pkgUnitCd || !qtyUnitCd) return { submissionStatus: 'not_submitted', notice: `POS sale saved. Complete the KRA item, classification, package-unit, and quantity-unit codes for ${itemName}.` }
+    const treatment = String(line.vat_treatment)
+    const taxType = taxTypeForTreatment[treatment]
+    if (!taxType) return { submissionStatus: 'not_submitted', notice: `POS sale saved. The VAT treatment for ${itemName} has no current KRA tax type mapping.` }
+    const quantity = Number(line.quantity)
+    const unitPrice = Number(line.unit_price)
+    const discountAmount = Number(line.discount_amount)
+    const supplyAmount = roundMoney(quantity * unitPrice - discountAmount)
+    const taxAmount = roundMoney(Number(line.tax_amount))
+    taxable[taxType] += supplyAmount
+    tax[taxType] += taxAmount
+    itemList.push({
+      itemSeq: index + 1,
+      itemClsCd,
+      itemCd,
+      itemNm: itemName.slice(0, 200),
+      bcd: null,
+      pkgUnitCd,
+      pkg: quantity,
+      qtyUnitCd,
+      qty: quantity,
+      prc: unitPrice,
+      splyAmt: supplyAmount,
+      dcRt: quantity * unitPrice > 0 ? roundMoney(discountAmount / (quantity * unitPrice) * 100) : 0,
+      dcAmt: discountAmount,
+      taxTyCd: taxType,
+      taxblAmt: supplyAmount,
+      taxAmt: taxAmount,
+      totAmt: roundMoney(supplyAmount + taxAmount),
+    })
+  }
+  for (const category of categories) {
+    taxable[category] = roundMoney(taxable[category])
+    tax[category] = roundMoney(tax[category])
+  }
+  const taxRates = { A: 0, B: 16, C: 0, D: 0, E: 0 }
+  const date = kraLocalDateFields(new Date(invoice.created_at))
+  const acceptance = details.posPurchaseAcceptance === 'Y' ? 'Y' : 'N'
+  const fiscalPayload = kraFiscalPayloadSchema.safeParse({
+    salesTyCd: String(details.posSalesTyCd),
+    rcptTyCd: String(details.posRcptTyCd),
+    salesSttsCd: String(details.posSalesSttsCd),
+    cfmDt: date.dateTime,
+    salesDt: date.date,
+    stockRlsDt: null,
+    custNm: String(invoice.customer).slice(0, 60),
+    pmtTyCd: String(details.posPmtTyCd ?? '').trim() || null,
+    taxblAmtA: taxable.A, taxblAmtB: taxable.B, taxblAmtC: taxable.C, taxblAmtD: taxable.D, taxblAmtE: taxable.E,
+    taxRtA: taxRates.A, taxRtB: taxRates.B, taxRtC: taxRates.C, taxRtD: taxRates.D, taxRtE: taxRates.E,
+    taxAmtA: tax.A, taxAmtB: tax.B, taxAmtC: tax.C, taxAmtD: tax.D, taxAmtE: tax.E,
+    totItemCnt: itemList.length,
+    totTaxblAmt: roundMoney(Object.values(taxable).reduce((sum, value) => sum + value, 0)),
+    totTaxAmt: roundMoney(Object.values(tax).reduce((sum, value) => sum + value, 0)),
+    totAmt: Number(invoice.amount),
+    prchrAcptcYn: acceptance,
+    remark: 'POS sale',
+    receipt: { rcptPbctDt: date.dateTime, prchrAcptcYn: acceptance },
+    itemList,
+  })
+  if (!fiscalPayload.success) return { submissionStatus: 'not_submitted', notice: `POS sale saved. eTIMS mapping needs review: ${fiscalPayload.error.issues.slice(0, 3).map((issue) => issue.message).join('; ')}` }
+
+  const draftPayload = { invoiceId, customer: invoice.customer, amount: invoice.amount, fiscalPayload: fiscalPayload.data, note: 'Auto-prepared from a mapped POS invoice; KRA response determines whether it is a fiscal invoice.' }
+  const draftResult = await pool!.query(`INSERT INTO compliance_submission_drafts
+    (workspace_id, integration_type, source_type, source_id, payload_version, draft_payload, workflow_status, provider_status, created_by)
+    VALUES ($1, 'kra_etims', 'invoice', $2, 'kashflow-pos-etims-v1', $3::jsonb, 'reviewed', 'blocked_no_certified_adapter', $4)
+    ON CONFLICT (workspace_id, integration_type, source_type, source_id) DO UPDATE SET
+      payload_version = EXCLUDED.payload_version, draft_payload = EXCLUDED.draft_payload, workflow_status = 'reviewed',
+      provider_status = 'blocked_no_certified_adapter', provider_result = NULL, external_invoice_number = NULL,
+      fiscal_receipt_signature = NULL, provider_submitted_at = NULL, updated_at = now()
+    WHERE compliance_submission_drafts.provider_status = 'blocked_no_certified_adapter'
+    RETURNING id`, [workspaceId, invoiceId, JSON.stringify(draftPayload), userId])
+  if (!draftResult.rowCount) return { submissionStatus: 'not_submitted', notice: 'POS sale saved. An existing KRA draft needs manual reconciliation before automatic submission.' }
+  const draftId = String(draftResult.rows[0].id)
+
+  const counterClient = await pool!.connect()
+  let invoiceNumber: number
+  try {
+    await counterClient.query('BEGIN')
+    await counterClient.query('INSERT INTO kra_oscu_invoice_counters (workspace_id, last_invoice_number) VALUES ($1, 0) ON CONFLICT (workspace_id) DO NOTHING', [workspaceId])
+    const counter = await counterClient.query('SELECT last_invoice_number FROM kra_oscu_invoice_counters WHERE workspace_id = $1 FOR UPDATE', [workspaceId])
+    invoiceNumber = Number(counter.rows[0].last_invoice_number) + 1
+    await counterClient.query('UPDATE kra_oscu_invoice_counters SET last_invoice_number = $1 WHERE workspace_id = $2', [invoiceNumber, workspaceId])
+    const reservation = await counterClient.query("UPDATE compliance_submission_drafts SET provider_status = 'submitted_to_kra', external_invoice_number = $1, provider_submitted_at = now(), updated_at = now() WHERE id = $2 AND workspace_id = $3 AND provider_status = 'blocked_no_certified_adapter' RETURNING id", [String(invoiceNumber), draftId, workspaceId])
+    if (!reservation.rowCount) { await counterClient.query('ROLLBACK'); return { submissionStatus: 'not_submitted', notice: 'POS sale saved. Another KRA request reserved this fiscal invoice; reconcile it before retrying.' } }
+    await counterClient.query('COMMIT')
+  } catch (error) { await counterClient.query('ROLLBACK'); throw error }
+  finally { counterClient.release() }
+
+  const requestPayload = { tin: credentials.taxpayerPin, bhfId: credentials.branchId, cmcKey: credentials.cmcKey, trdInvcNo: `KF-${invoiceId.replace(/-/g, '').slice(0, 40)}`, invcNo: invoiceNumber, orgInvcNo: 0, ...fiscalPayload.data }
+  try {
+    const providerResult = await kraOsuRequest<Record<string, unknown>>('/saveTrnsSalesOsdc', requestPayload)
+    const success = String(providerResult.resultCd ?? '') === '000'
+    const submissionStatus = success ? env.KRA_ETIMS_ENV === 'production' ? 'accepted_by_kra' : 'accepted_in_sandbox' : 'rejected_by_kra'
+    const data = providerResult.data && typeof providerResult.data === 'object' ? providerResult.data as Record<string, unknown> : null
+    await pool!.query(`UPDATE compliance_submission_drafts SET provider_status = $1, provider_result = $2::jsonb, fiscal_receipt_signature = $3,
+      workflow_status = CASE WHEN $4 THEN workflow_status ELSE 'draft' END,
+      external_invoice_number = CASE WHEN $4 THEN external_invoice_number ELSE NULL END,
+      provider_submitted_at = CASE WHEN $4 THEN provider_submitted_at ELSE NULL END, updated_at = now()
+      WHERE id = $5 AND workspace_id = $6`, [submissionStatus, JSON.stringify(providerResult), data ? String(data.rcptSign ?? '') : null, success, draftId, workspaceId])
+    return {
+      submissionStatus,
+      externalInvoiceNumber: String(invoiceNumber),
+      complianceDraftId: draftId,
+      notice: success ? env.KRA_ETIMS_ENV === 'production' ? 'KRA accepted the fiscal invoice. Verify the returned receipt/signature in KRA records.' : 'KRA sandbox accepted this test. It is not a fiscal tax invoice.' : `KRA rejected the fiscalization request: ${String(providerResult.resultMsg ?? 'review the KRA response in Kenya compliance').slice(0, 240)}`,
+    }
+  } catch (error) {
+    await pool!.query("UPDATE compliance_submission_drafts SET provider_status = 'submission_unknown', provider_result = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3", [JSON.stringify({ message: error instanceof Error ? error.message.slice(0, 500) : 'Network result unknown.' }), draftId, workspaceId])
+    return { submissionStatus: 'submission_unknown', externalInvoiceNumber: String(invoiceNumber), notice: 'KRA outcome is unknown. Do not retry automatically; reconcile by taxpayer PIN and reserved invoice number first.' }
+  }
 }
 app.get('/v1/integrations/etims/config', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
   try {
@@ -6086,7 +6380,7 @@ app.put('/v1/integrations/onboarding/:integrationType', requirePool, verifyOrigi
   if (input.data.milestone === 'certified' && type.data !== 'kra_etims') { response.status(400).json({ error: 'The certification milestone applies only to eTIMS; statutory routes and bank-feed approvals are tracked separately.' }); return }
   const safeDetails = { ...input.data.details }
   if (type.data === 'kra_etims') {
-    const allowed = ['solution', 'taxpayerPin', 'sandboxReference', 'certificationReference', 'productionApprovalReference']
+    const allowed = ['solution', 'taxpayerPin', 'sandboxReference', 'certificationReference', 'productionApprovalReference', 'posSalesTyCd', 'posRcptTyCd', 'posSalesSttsCd', 'posPmtTyCd', 'posPurchaseAcceptance']
     if (Object.keys(safeDetails).some((key) => !allowed.includes(key))) { response.status(400).json({ error: 'KRA profile accepts only route and non-secret certification references. Never submit passwords or private keys here.' }); return }
     delete safeDetails.taxpayerPin
     if (input.data.milestone === 'sandbox_testing' && (!input.data.details.solution || !input.data.details.sandboxReference)) { response.status(400).json({ error: 'Select OSCU/VSCU and record the KRA sandbox registration reference before marking sandbox testing.' }); return }
@@ -6183,6 +6477,7 @@ app.post('/v1/integrations/drafts/:draftId/submit', requirePool, verifyOrigin, r
     const draft = result.rows[0]
     if (!draft) { response.status(404).json({ error: 'Draft not found in this workspace.' }); return }
     if (draft.integration_type === 'kra_etims' && draft.provider_status === 'accepted_by_kra') { response.json({ submissionStatus: 'accepted_by_kra', result: draft.provider_result, externalInvoiceNumber: draft.external_invoice_number, duplicateRequest: true }); return }
+    if (draft.integration_type === 'kra_etims' && draft.provider_status === 'accepted_in_sandbox') { response.json({ submissionStatus: 'accepted_in_sandbox', result: draft.provider_result, externalInvoiceNumber: draft.external_invoice_number, duplicateRequest: true, notice: 'KRA sandbox accepted this test. It is not a fiscal tax invoice.' }); return }
     if (draft.integration_type === 'kra_etims' && ['submitted_to_kra', 'submission_unknown'].includes(String(draft.provider_status))) { response.status(409).json({ error: 'A prior KRA request may have reached KRA. Do not retry and create a duplicate fiscal invoice; reconcile this draft with KRA before any retry.', submissionStatus: draft.provider_status, externalInvoiceNumber: draft.external_invoice_number }); return }
     if (draft.workflow_status !== 'reviewed') { response.status(409).json({ error: 'Mark the draft internally reviewed before requesting an authority submission.' }); return }
     const integrationType = String(draft.integration_type)
@@ -6237,13 +6532,14 @@ app.post('/v1/integrations/drafts/:draftId/submit', requirePool, verifyOrigin, r
       try {
         const providerResult = await kraOsuRequest<Record<string, unknown>>('/saveTrnsSalesOsdc', requestPayload)
         const success = String(providerResult.resultCd ?? '') === '000'
+        const submissionStatus = success ? env.KRA_ETIMS_ENV === 'production' ? 'accepted_by_kra' : 'accepted_in_sandbox' : 'rejected_by_kra'
         const data = providerResult.data && typeof providerResult.data === 'object' ? providerResult.data : null
         await pool!.query(`UPDATE compliance_submission_drafts SET provider_status = $1, provider_result = $2::jsonb, fiscal_receipt_signature = $3,
           workflow_status = CASE WHEN $4 THEN workflow_status ELSE 'draft' END,
           external_invoice_number = CASE WHEN $4 THEN external_invoice_number ELSE NULL END,
           provider_submitted_at = CASE WHEN $4 THEN provider_submitted_at ELSE NULL END,
-          updated_at = now() WHERE id = $5 AND workspace_id = $6`, [success ? 'accepted_by_kra' : 'rejected_by_kra', JSON.stringify(providerResult), data && typeof data === 'object' ? String((data as Record<string, unknown>).rcptSign ?? '') : null, success, draft.id, request.session!.workspaceId])
-        response.status(success ? 200 : 502).json({ submissionStatus: success ? 'accepted_by_kra' : 'rejected_by_kra', externalInvoiceNumber: String(invoiceNumber), result: providerResult, environment: env.KRA_ETIMS_ENV, notice: success ? 'KRA OSCU accepted the fiscalization request. Verify the returned receipt/signature in KRA records.' : 'KRA rejected the fiscalization request; correct the provider response issues before creating a replacement request.' })
+          updated_at = now() WHERE id = $5 AND workspace_id = $6`, [submissionStatus, JSON.stringify(providerResult), data && typeof data === 'object' ? String((data as Record<string, unknown>).rcptSign ?? '') : null, success, draft.id, request.session!.workspaceId])
+        response.status(success ? 200 : 502).json({ submissionStatus, externalInvoiceNumber: String(invoiceNumber), result: providerResult, environment: env.KRA_ETIMS_ENV, notice: success ? env.KRA_ETIMS_ENV === 'production' ? 'KRA OSCU accepted the fiscalization request. Verify the returned receipt/signature in KRA records.' : 'KRA sandbox accepted this test. It is not a fiscal tax invoice.' : 'KRA rejected the fiscalization request; correct the provider response issues before creating a replacement request.' })
       } catch (error) {
         await pool!.query("UPDATE compliance_submission_drafts SET provider_status = 'submission_unknown', provider_result = $1::jsonb, updated_at = now() WHERE id = $2 AND workspace_id = $3", [JSON.stringify({ message: error instanceof Error ? error.message.slice(0, 500) : 'Network result unknown.' }), draft.id, request.session!.workspaceId])
         response.status(504).json({ error: 'KRA request outcome is unknown due to a network/provider error. Do not retry automatically; reconcile by taxpayer PIN and reserved invoice number first.', submissionStatus: 'submission_unknown', externalInvoiceNumber: String(invoiceNumber) })

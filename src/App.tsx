@@ -74,7 +74,7 @@ const descriptions: Record<string, string> = {
   'Point of sale': 'Serve quick retail transactions and cash/M-Pesa tills with the counter checkout.',
   Networking: 'Manage estimates, sales orders, invoices, and recurring transactions for this business.',
   Expenses: 'Record and review expenses entered in your workspace.',
-  Payroll: 'Manage encrypted employee records, prepare reviewed monthly payroll drafts, view payslips, post journals, and estimate Kenyan PAYE, NSSF, SHIF and Housing Levy. Track remittance references in one place.',
+  Payroll: 'Manage encrypted employee records, calculate Kenyan PAYE, NSSF, SHA/SHIF and Housing Levy estimates, prepare reviewed monthly payroll, and post approved payroll journals directly to the ledger.',
   Customers: 'Customer details are recorded as part of invoices.',
   Suppliers: 'Create, edit, and maintain workspace supplier contact records.',
   Inventory: 'Maintain item records, quantities, unit costs, and selling prices.',
@@ -139,10 +139,11 @@ type PayrollRun = { id: string; period: string; status: 'draft' | 'posted' | 'pa
 type Remittance = { id: string; remittance_type: string; amount: string; status: string; payment_reference?: string; payroll_run_id: string }
 type InvoiceRecord = { id: string; customer: string; customer_email?: string; description: string; amount: string; amount_paid?: string; amount_due?: string; due_date: string; status: string }
 type InvoiceMpesaPayment = { id: string; origin?: 'stk' | 'manual'; mpesa_reference?: string | null; status: string; amount: string; result_description?: string | null; mpesa_receipt_number?: string | null; created_at: string }
-type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number; kind: 'item' | 'service' }
+type PosCartLine = { itemId: string; description: string; quantity: number; unitPrice: number; onHand: number; kind: 'item' | 'service'; vatTreatment: string }
 // Every workspace export the API supports, in the order the Settings buttons list them.
 const EXPORT_TYPES = ['customers', 'suppliers', 'inventory', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit'] as const
-type PosReceipt = { invoiceId: string; businessName?: string; customer: string; customerEmail?: string; customerPhone?: string; amount: number; amountPaid: number; balanceDue: number; paymentMethod: string; status: string; createdAt: string; lines: PosCartLine[] }
+type PosFiscalization = { submissionStatus: string; notice: string; externalInvoiceNumber?: string; complianceDraftId?: string }
+type PosReceipt = { invoiceId: string; businessName?: string; customer: string; customerEmail?: string; customerPhone?: string; amount: number; amountPaid: number; balanceDue: number; paymentMethod: string; status: string; createdAt: string; lines: PosCartLine[]; fiscalization?: PosFiscalization }
 type PosCustomerSale = { id: string; description: string; amount: string; amount_paid: string; due_date: string; status: string; created_at: string }
 type PosCustomerHistory = { sales: PosCustomerSale[]; summary: { sale_count: number; lifetime_sales: string } }
 type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; paymentIdempotencyKey?: string; cashPaymentIdempotencyKey?: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[]; paymentMethod?: 'cash' | 'mpesa'; paymentPhone?: string; paymentSplits?: Array<PaymentSplit & { idempotencyKey: string }> }
@@ -155,17 +156,23 @@ type DraftLine = { itemId?: string; description: string; quantity: string; unitP
 // confirmed by a qualified adviser or the business's own tax records.
 const KENYA_VAT_RATES: Array<{ code: string; label: string; rate?: number; hint: string }> = [
   { code: 'B16', label: 'VAT standard rate', rate: 0.16, hint: 'Standard-rated supply at 16% VAT. Tax amount filled from the net line value.' },
-  { code: 'B08', label: 'VAT reduced rate (fuel/energy)', rate: 0.08, hint: 'Reduced-rate supply at 8% VAT where the law applies it.' },
   { code: 'A_EXEMPT', label: 'VAT exempt', rate: 0, hint: 'Exempt supply. No VAT is charged and no input VAT is claimable on related costs.' },
   { code: 'C_ZERO', label: 'Zero-rated', rate: 0, hint: 'Zero-rated supply (for example exports). VAT is 0% but the supply is still reportable.' },
   { code: 'D_OUT_OF_SCOPE', label: 'Outside the scope of VAT', rate: 0, hint: 'Not a taxable supply for VAT purposes.' },
-  { code: 'E_NON_VATABLE', label: 'Non-VATable / other', rate: 0, hint: 'Treatment does not fall under standard, reduced, exempt or zero-rated categories.' },
+  { code: 'E_NON_VATABLE', label: 'Non-VATable supply', rate: 0, hint: 'No VAT is charged; POS eTIMS maps this to KRA tax type D, never the legacy E/8% code.' },
 ]
 type PurchaseOrder = { id: string; supplier: string; status: string; order_date: string; expected_date?: string; lines: Array<{ id: string; item_id: string; item_name: string; quantity: string; received_quantity: string; unit_cost: string }> }
 type InventoryLocation = { id: string; name: string; code: string; is_default: boolean; active: boolean }
 type InventoryLocationStock = { location_id: string; item_id: string; quantity: string; location_name: string }
 type SalesOrder = { id: string; estimate_id: string; invoice_id?: string | null; status: 'confirmed' | 'fulfilled' | 'cancelled'; customer: string; description: string; amount: string }
 type RetailReport = { locations: InventoryLocation[]; stockLevels: Array<{ itemId: string; locationId: string; location: string; name: string; quantity: number; unit: string; unitCost: number; valuation: number; reorderPoint: number; needsReorder: boolean }>; reorderAlerts: Array<{ itemId: string; locationId: string; location: string; name: string; quantity: number; unit: string; reorderPoint: number }>; totalValuation: number; bestSellers: Array<{ itemId: string; name: string; quantitySold: number; revenue: number; cost: number; grossProfit: number }> }
+type VatLineGroup = { treatment: string; line_count: number; supply_value?: string; purchase_value?: string; tax_amount: string; recoverable_tax?: string }
+type VatDraftReport = {
+  period: string; periodStart: string; periodEnd: string
+  sales: VatLineGroup[]; salesReturns: VatLineGroup[]; purchases: VatLineGroup[]
+  totals: { outputSales: number; returnedSales: number; netSales: number; outputTax: number; returnedOutputTax: number; netOutputTax: number; recoverableInputTax: number; netVatEstimate: number; unclassifiedSales: { lines: number; value: number }; unclassifiedPurchases: { lines: number; value: number }; unclassifiedLedgerIncome: { transactions: number; amount: number }; unclassifiedLedgerExpenses: { transactions: number; amount: number } }
+  warnings: string[]; filingStatus: 'draft_only_not_filed'
+}
 type OnlineStoreConfig = { slug: string; title: string; description: string; enabled: boolean }
 type StoreOrder = { id: string; status: string; source: string; external_order_id?: string | null; customer_name: string; customer_email: string; customer_phone: string; total: string; invoice_id?: string | null; created_at: string }
 type WooConnection = { store_url: string; enabled: boolean; last_synced_at?: string | null; credentialsConfigured: boolean }
@@ -883,8 +890,20 @@ function DraftLineEditor({ lines, onChange, onAdd, onRemove, includeRecoverableT
   inventoryItems?: WorkspaceRecord[]
   descriptionLabel?: string
 }) {
+  const changeTaxableInput = (index: number, key: 'quantity' | 'unitPrice' | 'discountAmount', value: string) => {
+    const line = lines[index]
+    onChange(index, key, value)
+    if (!line?.vatTreatment) return
+    const rate = KENYA_VAT_RATES.find((entry) => entry.code === line.vatTreatment)?.rate
+    if (rate === undefined) return
+    const quantity = key === 'quantity' ? Number(value) : Number(line.quantity)
+    const unitPrice = key === 'unitPrice' ? Number(value) : Number(line.unitPrice)
+    const discount = key === 'discountAmount' ? Number(value || 0) : Number(line.discountAmount || 0)
+    const net = Math.max(0, quantity * unitPrice - discount)
+    onChange(index, 'taxAmount', (Math.round((net * rate + Number.EPSILON) * 100) / 100).toFixed(2))
+  }
   return <div className="draft-lines">
-    <p className="dialog-note">Enter any tax amounts confirmed by your qualified adviser. These are user-provided bookkeeping amounts, not tax calculations or fiscal invoices.</p>
+    <p className="dialog-note">Selecting a VAT treatment fills a bookkeeping estimate and recalculates it when the line changes. Confirm the treatment and tax amount with your tax records or adviser; these lines are not fiscal invoices.</p>
     {lines.map((line, index) => <fieldset className="draft-line" key={index}>
       <legend>Line {index + 1}</legend>
       {inventoryItems.length > 0 && <label className="field-label">Inventory item (optional; saved price shown)<select value={line.itemId ?? ''} onChange={(event) => {
@@ -892,17 +911,25 @@ function DraftLineEditor({ lines, onChange, onAdd, onRemove, includeRecoverableT
         const selectedItem = inventoryItems.find((item) => item.id === itemId)
         onChange(index, 'itemId', itemId)
         if (selectedItem) {
+          const treatment = String(selectedItem.data.vatTreatment ?? 'unclassified')
+          const selectedPrice = Number(selectedItem.data.price ?? 0)
           onChange(index, 'description', String(selectedItem.data.name ?? 'Inventory item'))
           onChange(index, 'unitPrice', String(selectedItem.data.price ?? ''))
+          onChange(index, 'vatTreatment', treatment)
+          const rate = KENYA_VAT_RATES.find((entry) => entry.code === treatment)?.rate
+          if (rate !== undefined) {
+            const net = Math.max(0, Number(line.quantity) * selectedPrice - Number(line.discountAmount || 0))
+            onChange(index, 'taxAmount', (Math.round((net * rate + Number.EPSILON) * 100) / 100).toFixed(2))
+          }
         }
       }}><option value="">No stock tracking</option>{inventoryItems.map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')} · {money(Number(item.data.price ?? 0))} · {Number(item.data.quantity ?? 0)} available</option>)}</select></label>}
       <label className="field-label">{descriptionLabel}<input required maxLength={240} value={line.description} onChange={(event) => onChange(index, 'description', event.target.value)} /></label>
       <div className="field-row">
-        <label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={line.quantity} onChange={(event) => onChange(index, 'quantity', event.target.value)} /></label>
-        <label className="field-label">Unit price (KSh)<input required min="0" step="0.01" type="number" value={line.unitPrice} onChange={(event) => onChange(index, 'unitPrice', event.target.value)} /></label>
+        <label className="field-label">Quantity<input required min="0.001" step="0.001" type="number" value={line.quantity} onChange={(event) => changeTaxableInput(index, 'quantity', event.target.value)} /></label>
+        <label className="field-label">Unit price (KSh)<input required min="0" step="0.01" type="number" value={line.unitPrice} onChange={(event) => changeTaxableInput(index, 'unitPrice', event.target.value)} /></label>
       </div>
       <div className="field-row">
-        <label className="field-label">Discount (KSh)<input min="0" step="0.01" type="number" value={line.discountAmount} onChange={(event) => onChange(index, 'discountAmount', event.target.value)} /></label>
+        <label className="field-label">Discount (KSh)<input min="0" step="0.01" type="number" value={line.discountAmount} onChange={(event) => changeTaxableInput(index, 'discountAmount', event.target.value)} /></label>
         <label className="field-label">VAT treatment (Kenya)<select value={line.vatTreatment ?? ''} onChange={(event) => {
           const treatment = event.target.value
           onChange(index, 'vatTreatment', treatment)
@@ -1169,6 +1196,8 @@ function App() {
   const [supplierPaymentInput, setSupplierPaymentInput] = useState({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' as 'none' | 'monthly' | 'quarterly' | 'annually' })
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
+  const [vatReportPeriod, setVatReportPeriod] = useState(today.slice(0, 7))
+  const [vatDraftReport, setVatDraftReport] = useState<VatDraftReport | null>(null)
   const [storeConfig, setStoreConfig] = useState<OnlineStoreConfig>({ slug: '', title: '', description: '', enabled: false })
   const [storeOrders, setStoreOrders] = useState<StoreOrder[]>([])
   const [wooConnection, setWooConnection] = useState<WooConnection | null>(null)
@@ -1292,6 +1321,7 @@ function App() {
     monoEnabled: false,
     darajaEnabled: false,
     kraEtimsLiveEnabled: false,
+    kraEtimsAutoSubmitPos: false,
     statutoryFilingsEnabled: false,
     shifEnabled: false,
     nssfEnabled: false,
@@ -1846,6 +1876,7 @@ function App() {
         request<AgingReport>(`/v1/reports/aging?asOf=${today}`).then(setAgingReport),
         request<{ accounts: AccountSummary[] }>('/v1/accounting/chart').then((result) => setAccounts(result.accounts)),
       ]).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load accounting reports.'))
+      if (canUse('accounting.write')) void request<VatDraftReport>(`/v1/reports/vat-draft?period=${vatReportPeriod}`).then(setVatDraftReport).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load the VAT draft summary.'))
       if (canUse('inventory.write')) void request<RetailReport>('/v1/reports/retail').then(setRetailReport).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load inventory reports.'))
     }
     if (page === 'Banking') {
@@ -1914,7 +1945,7 @@ function App() {
       )
       if (settingsLoads.length) void Promise.all(settingsLoads).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load the settings available to this role.'))
     }
-  }, [account, canOpenPage, canUse, dashboard?.workspaceName, page, offlineSyncRevision])
+  }, [account, canOpenPage, canUse, dashboard?.workspaceName, page, offlineSyncRevision, vatReportPeriod])
 
   async function saveStoreSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
@@ -2449,7 +2480,7 @@ function App() {
     } finally { setBusy(false) }
   }
 
-  function addPosItem(entry: { id: string; kind: 'item' | 'service'; name: string; price: number; onHand: number }) {
+  function addPosItem(entry: { id: string; kind: 'item' | 'service'; name: string; price: number; onHand: number; vatTreatment?: string }) {
     const existing = posCart.find((line) => line.itemId === entry.id)
     // Stock items are limited by on-hand quantity; services are unlimited lines.
     if (entry.kind === 'item' && (entry.onHand <= 0 || (existing && existing.quantity >= entry.onHand))) return
@@ -2458,12 +2489,21 @@ function App() {
     setPosCart((cart) => {
       const line = cart.find((item) => item.itemId === entry.id)
       if (line) return cart.map((item) => item.itemId === entry.id ? { ...item, quantity: item.quantity + 1 } : item)
-      return [...cart, { itemId: entry.id, description: entry.name, quantity: 1, unitPrice: entry.price, onHand: entry.onHand, kind: entry.kind }]
+      return [...cart, { itemId: entry.id, description: entry.name, quantity: 1, unitPrice: entry.price, onHand: entry.onHand, kind: entry.kind, vatTreatment: entry.vatTreatment ?? 'unclassified' }]
     })
   }
   // Counter line for a saved service; usable even when there is no matching catalog entry.
   function addServiceLine(service: WorkspaceRecord) {
-    addPosItem({ id: service.id, kind: 'service', name: String(service.data.name ?? 'Service'), price: Number(service.data.charge ?? 0), onHand: Number.POSITIVE_INFINITY })
+    addPosItem({ id: service.id, kind: 'service', name: String(service.data.name ?? 'Service'), price: Number(service.data.charge ?? 0), onHand: Number.POSITIVE_INFINITY, vatTreatment: String(service.data.vatTreatment ?? 'unclassified') })
+  }
+
+  function posLineTaxAmount(line: Pick<PosCartLine, 'quantity' | 'unitPrice' | 'vatTreatment'>) {
+    const rate = KENYA_VAT_RATES.find((entry) => entry.code === line.vatTreatment)?.rate ?? 0
+    return Math.round((line.quantity * line.unitPrice * rate + Number.EPSILON) * 100) / 100
+  }
+
+  function posLineTotal(line: PosCartLine) {
+    return Math.round((line.quantity * line.unitPrice + posLineTaxAmount(line) + Number.EPSILON) * 100) / 100
   }
 
   async function loadPosCustomerHistory(customerId: string) {
@@ -2555,6 +2595,7 @@ function App() {
       name: String(item.data.name ?? 'Inventory item'),
       price: Number(item.data.price ?? 0),
       onHand: Number(inventoryLocationStock.find((stock) => stock.location_id === posLocationId && stock.item_id === item.id)?.quantity ?? 0),
+      vatTreatment: String(item.data.vatTreatment ?? 'unclassified'),
     })
     setPosSearch('')
     notify(`${source}: ${String(item.data.name ?? 'Item')} added to the sale.`)
@@ -2836,7 +2877,7 @@ async function createCameraReader(): Promise<CameraReader> {
       customer,
       customerEmail: savedCustomer ? String(savedCustomer.data.email ?? '') : posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
       locationId: posLocationId,
-      amount: lines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0),
+      amount: lines.reduce((sum, line) => sum + posLineTotal(line), 0),
       lines,
       paymentMethod: posPaymentMethod,
       paymentPhone: posPaymentPhone.trim(),
@@ -2875,15 +2916,16 @@ async function createCameraReader(): Promise<CameraReader> {
     }
     setBusy(true); setError('')
     try {
-      const created = await request<{ invoice: { id: string } }>('/v1/invoices', {
+      const created = await request<{ invoice: { id: string }; fiscalization?: PosFiscalization }>('/v1/invoices', {
         method: 'POST',
         body: JSON.stringify({
           customer: draft.customer,
           customerEmail: draft.customerEmail,
           locationId: draft.locationId || undefined,
           idempotencyKey: draft.idempotencyKey,
+          sourceChannel: 'pos',
           dueDate: today,
-          lines: draft.lines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: 0 })),
+          lines: draft.lines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: posLineTaxAmount(line), vatTreatment: line.vatTreatment ?? 'unclassified' })),
         }),
       })
       const mpesaSplits = draft.paymentSplits?.filter((split) => split.method === 'mpesa') ?? []
@@ -2913,7 +2955,7 @@ async function createCameraReader(): Promise<CameraReader> {
       setOfflinePosDrafts((current) => current.filter((item) => item.id !== draft.id))
       const mpesaPending = mpesaTotal > 0
       const paymentMethod = draft.paymentSplits?.length ? [...new Set(draft.paymentSplits.map((split) => split.method))].join(' + ') : draft.paymentMethod ?? 'cash'
-      const receipt: PosReceipt = { invoiceId: created.invoice.id, businessName: dashboard?.workspaceName, customer: draft.customer, amount: draft.amount, amountPaid: cashAmount, balanceDue: Math.max(0, draft.amount - cashAmount), paymentMethod, status: mpesaPending ? `${cashAmount ? `Cash ${money(cashAmount)} recorded · ` : ''}M-Pesa prompt sent after reconnect · awaiting confirmation for ${money(mpesaTotal)}` : cashAmount >= draft.amount ? 'Paid · cash recorded after reconnect' : cashAmount > 0 ? `Cash ${money(cashAmount)} recorded after reconnect · remaining balance unpaid` : 'Created after reconnect · payment not recorded', createdAt: new Date().toISOString(), lines: draft.lines }
+      const receipt: PosReceipt = { invoiceId: created.invoice.id, businessName: dashboard?.workspaceName, customer: draft.customer, amount: draft.amount, amountPaid: cashAmount, balanceDue: Math.max(0, draft.amount - cashAmount), paymentMethod, status: mpesaPending ? `${cashAmount ? `Cash ${money(cashAmount)} recorded · ` : ''}M-Pesa prompt sent after reconnect · awaiting confirmation for ${money(mpesaTotal)}` : cashAmount >= draft.amount ? 'Paid · cash recorded after reconnect' : cashAmount > 0 ? `Cash ${money(cashAmount)} recorded after reconnect · remaining balance unpaid` : 'Created after reconnect · payment not recorded', createdAt: new Date().toISOString(), lines: draft.lines, fiscalization: created.fiscalization }
       setPosReceipt(receipt)
       notify(mpesaPending
         ? `Offline sale synced. Safaricom was asked to send a prompt for ${money(mpesaTotal)}; confirm payment before releasing goods.`
@@ -2955,7 +2997,7 @@ async function createCameraReader(): Promise<CameraReader> {
       ? String(savedCustomer.data.name ?? 'Saved customer')
       : posCustomerType === 'walk_in' ? 'Walk-in customer' : posCustomer.trim()
     const saleLines = posCart.map((line) => ({ ...line }))
-    const total = saleLines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
+    const total = saleLines.reduce((sum, line) => sum + posLineTotal(line), 0)
     // Optional split payment: several methods captured against one invoice.
     const splits = multiMethodEnabled ? (paymentSplits.pos ?? []).filter((split) => Number(split.amount) > 0) : []
     const splitsTotal = splits.reduce((sum, split) => sum + Number(split.amount), 0)
@@ -2986,22 +3028,23 @@ async function createCameraReader(): Promise<CameraReader> {
     setBusy(true)
     setError('')
     try {
-      const created = await request<{ invoice: { id: string } }>('/v1/invoices', {
+      const created = await request<{ invoice: { id: string }; fiscalization?: PosFiscalization }>('/v1/invoices', {
         method: 'POST',
         body: JSON.stringify({
           customer,
           customerEmail: savedCustomer ? String(savedCustomer.data.email ?? '') : posCustomerType === 'remote' ? posCustomerEmail.trim() : '',
           locationId: posLocationId || undefined,
           idempotencyKey: posIdempotencyKey,
+          sourceChannel: 'pos',
           dueDate: today,
-          lines: saleLines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: 0 })),
+          lines: saleLines.map((line) => ({ itemId: line.itemId, description: line.description, quantity: line.quantity, unitPrice: line.unitPrice, discountAmount: 0, taxAmount: posLineTaxAmount(line), vatTreatment: line.vatTreatment })),
         }),
         queueOffline: false,
       })
       setPosIdempotencyKey(crypto.randomUUID())
       const customerEmail = savedCustomer ? String(savedCustomer.data.email ?? '') : posCustomerType === 'remote' ? posCustomerEmail.trim() : ''
       const customerPhone = savedCustomer ? String(savedCustomer.data.phone ?? '') : posCustomerType === 'remote' ? posPaymentPhone.trim() : ''
-      const receipt: PosReceipt = { invoiceId: created.invoice.id, businessName: dashboard?.workspaceName, customer, customerEmail, customerPhone, amount: total, amountPaid: 0, balanceDue: total, paymentMethod: posPaymentMethod, status: 'Payment not yet recorded', createdAt: new Date().toISOString(), lines: saleLines }
+      const receipt: PosReceipt = { invoiceId: created.invoice.id, businessName: dashboard?.workspaceName, customer, customerEmail, customerPhone, amount: total, amountPaid: 0, balanceDue: total, paymentMethod: posPaymentMethod, status: 'Payment not yet recorded', createdAt: new Date().toISOString(), lines: saleLines, fiscalization: created.fiscalization }
       setPosReceipt(receipt)
       setPosCart([])
       setPosCustomer('')
@@ -3147,7 +3190,7 @@ async function createCameraReader(): Promise<CameraReader> {
         customerEmail,
         locationId: invoiceLocationId || undefined,
         dueDate: invoice.dueDate,
-        lines: invoiceLines.map((line) => ({ itemId: line.itemId || undefined, description: line.description, quantity: Number(line.quantity), unitPrice: Number(line.unitPrice), discountAmount: Number(line.discountAmount || 0), taxAmount: Number(line.taxAmount || 0) })),
+        lines: invoiceLines.map((line) => ({ itemId: line.itemId || undefined, description: line.description, quantity: Number(line.quantity), unitPrice: Number(line.unitPrice), discountAmount: Number(line.discountAmount || 0), taxAmount: Number(line.taxAmount || 0), vatTreatment: line.vatTreatment || 'unclassified' })),
       }) })
       setModal(null); setInvoice({ customer: '', customerEmail: '', description: '', amount: '', dueDate: '' }); setInvoiceCustomerMode('saved'); setInvoiceCustomerId(''); setInvoiceNewCustomer({ name: '', email: '', phone: '' })
       setInvoiceLocationId('')
@@ -3242,7 +3285,7 @@ async function createCameraReader(): Promise<CameraReader> {
         supplier: supplierName,
         billDate: billInput.billDate,
         dueDate: billInput.dueDate,
-        lines: billLines.map((line) => ({ description: line.description, quantity: Number(line.quantity), unitPrice: Number(line.unitPrice), discountAmount: Number(line.discountAmount || 0), taxAmount: Number(line.taxAmount || 0), recoverableTaxAmount: Number(line.recoverableTaxAmount || 0) })),
+        lines: billLines.map((line) => ({ description: line.description, quantity: Number(line.quantity), unitPrice: Number(line.unitPrice), discountAmount: Number(line.discountAmount || 0), taxAmount: Number(line.taxAmount || 0), recoverableTaxAmount: Number(line.recoverableTaxAmount || 0), vatTreatment: line.vatTreatment || 'unclassified' })),
       }) })
       setBillInput({ supplier: '', description: '', amount: '', billDate: today, dueDate: today }); setBillSupplierMode('saved'); setBillSupplierId(''); setBillNewSupplier({ name: '', email: '', phone: '' })
       setBillLines([{ description: '', quantity: '1', unitPrice: '', discountAmount: '0', taxAmount: '0', recoverableTaxAmount: '0' }])
@@ -4139,6 +4182,30 @@ async function createCameraReader(): Promise<CameraReader> {
     URL.revokeObjectURL(url)
   }
 
+  function downloadVatDraftReport() {
+    if (!vatDraftReport) return
+    const rows: Array<Array<string | number>> = [
+      ['KashFlow draft VAT summary', vatDraftReport.period],
+      ['Period start', vatDraftReport.periodStart], ['Period end', vatDraftReport.periodEnd],
+      ['Output sales', vatDraftReport.totals.outputSales], ['Sales returns', vatDraftReport.totals.returnedSales], ['Net sales', vatDraftReport.totals.netSales],
+      ['Output VAT', vatDraftReport.totals.outputTax], ['Returned output VAT', vatDraftReport.totals.returnedOutputTax], ['Net output VAT', vatDraftReport.totals.netOutputTax],
+      ['Recoverable input VAT entered', vatDraftReport.totals.recoverableInputTax], ['Net VAT estimate', vatDraftReport.totals.netVatEstimate],
+      [], ['Sales by treatment', 'Lines', 'Supply value', 'Tax'],
+      ...vatDraftReport.sales.map((line) => [line.treatment, line.line_count, line.supply_value ?? '0', line.tax_amount]),
+      [], ['Sales returns by treatment', 'Lines', 'Supply value', 'Tax'],
+      ...vatDraftReport.salesReturns.map((line) => [line.treatment, line.line_count, line.supply_value ?? '0', line.tax_amount]),
+      [], ['Approved purchases by treatment', 'Lines', 'Purchase value', 'Tax', 'Recoverable tax entered'],
+      ...vatDraftReport.purchases.map((line) => [line.treatment, line.line_count, line.purchase_value ?? '0', line.tax_amount, line.recoverable_tax ?? '0']),
+      [], ['Warnings'], ...vatDraftReport.warnings.map((warning) => [warning]),
+      ['Filing status', 'Draft only — not filed'],
+    ]
+    const escape = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`
+    const csv = `\uFEFF${rows.map((row) => row.map(escape).join(',')).join('\r\n')}`
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = `vat-${vatDraftReport.period}-draft.csv`; anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
   async function calculatePayroll(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError(''); setPayrollEstimate(null)
     try {
@@ -4531,6 +4598,7 @@ async function createCameraReader(): Promise<CameraReader> {
         monoEnabled: settings.monoEnabled,
         darajaEnabled: settings.darajaEnabled,
         kraEtimsLiveEnabled: settings.kraEtimsLiveEnabled,
+        kraEtimsAutoSubmitPos: settings.kraEtimsAutoSubmitPos,
         statutoryFilingsEnabled: settings.statutoryFilingsEnabled,
         shifEnabled: settings.shifEnabled,
         nssfEnabled: settings.nssfEnabled,
@@ -4891,6 +4959,7 @@ async function createCameraReader(): Promise<CameraReader> {
       barcode: String(item.data.barcode ?? ''),
       sku: String(item.data.sku ?? ''),
       price: Number(item.data.price ?? 0),
+      vatTreatment: String(item.data.vatTreatment ?? 'unclassified'),
       onHand: Number(inventoryLocationStock.find((stock) => stock.location_id === posLocationId && stock.item_id === item.id)?.quantity ?? 0),
       unitLabel: 'in stock',
     })),
@@ -4902,6 +4971,7 @@ async function createCameraReader(): Promise<CameraReader> {
       barcode: '',
       sku: '',
       price: Number(service.data.charge ?? 0),
+      vatTreatment: String(service.data.vatTreatment ?? 'unclassified'),
       // Services are never stock limited, so the counter always offers them.
       onHand: Number.POSITIVE_INFINITY,
       unitLabel: serviceBillingLabel(String(service.data.billingUnit ?? 'fixed')),
@@ -4915,7 +4985,7 @@ async function createCameraReader(): Promise<CameraReader> {
       return `${entry.name} ${entry.sku} ${entry.barcode} ${entry.reference}`.toLowerCase().includes(query)
     })
   }, [posCatalog, posSearch])
-  const posTotal = posCart.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0)
+  const posTotal = posCart.reduce((sum, line) => sum + posLineTotal(line), 0)
   const chart = useMemo(() => (dashboard?.cashflow ?? []).map((row) => ({
     date: new Date(`${row.date}T00:00:00`).toLocaleDateString('en-KE', { day: 'numeric', month: 'short' }),
     income: Number(row.income), expense: Number(row.expense),
@@ -5281,7 +5351,7 @@ async function createCameraReader(): Promise<CameraReader> {
             <form onSubmit={createPayrollRun}>
               <div className="field-row"><label className="field-label">Period<input required type="month" value={payrollPeriod} onChange={(event) => setPayrollPeriod(event.target.value)} /></label></div>
               <h3>Choose employees and add bonuses</h3>
-              <p className="dialog-note">Active employees are included by default. Remove someone by unchecking Include. Bonuses are added to gross pay before the saved tax estimate is calculated.</p>
+              <p className="dialog-note">Active employees are included by default. Bonuses are added to gross pay before PAYE, NSSF, SHA/SHIF and Affordable Housing Levy are calculated from the saved rules snapshot. Review the draft, then use Review & post to create its balanced ledger journal.</p>
               <div className="payroll-table-scroll"><table className="payroll-line-table"><thead><tr><th>Include</th><th>Employee</th><th>Bank account</th><th>Gross salary</th><th>Bonus (KSh)</th><th>Gross total</th></tr></thead><tbody>
                 {activePayrollEmployees.map((employee) => {
                   const included = payrollIncludedEmployeeIds.includes(employee.id)
@@ -5314,7 +5384,7 @@ async function createCameraReader(): Promise<CameraReader> {
                 </div>}
               </div>
             })}
-            {payslips.length > 0 && <div className="payroll-table-scroll"><h3>Employee payroll details · {payslips[0].period}</h3><table className="payroll-line-table payroll-payslip-table"><thead><tr><th>Employee / bank</th><th>Gross salary</th><th>Bonus</th><th>PAYE</th><th>NSSF</th><th>SHIF</th><th>AHL</th><th>Other deductions</th><th>Net pay</th></tr></thead><tbody>
+            {payslips.length > 0 && <div className="payroll-table-scroll"><h3>Employee payroll details · {payslips[0].period}</h3><table className="payroll-line-table payroll-payslip-table"><thead><tr><th>Employee / bank</th><th>Gross salary</th><th>Bonus</th><th>PAYE</th><th>NSSF</th><th>SHA / SHIF</th><th>AHL</th><th>Other deductions</th><th>Net pay</th></tr></thead><tbody>
               {payslips.map((slip) => {
                 const postTaxDeductions = slip.employee.deductions?.filter((item) => item.kind === 'post_tax').reduce((sum, item) => sum + Number(item.amount), 0) ?? 0
                 return <tr key={slip.id}>
@@ -5330,7 +5400,7 @@ async function createCameraReader(): Promise<CameraReader> {
           <article className="module-card"><h2>Ad-hoc payroll estimate (not saved)</h2><form onSubmit={calculatePayroll}>
             <div className="field-row"><label className="field-label">Gross monthly pay (KSh)<input required type="number" min="0" step="0.01" value={payrollInput.grossMonthlyPay} onChange={(event) => setPayrollInput({ ...payrollInput, grossMonthlyPay: event.target.value })} /></label><label className="field-label">Other allowable deductions<input type="number" min="0" step="0.01" value={payrollInput.otherTaxableDeductions} onChange={(event) => setPayrollInput({ ...payrollInput, otherTaxableDeductions: event.target.value })} /></label></div>
             <label className="field-label">Other tax reliefs<input type="number" min="0" step="0.01" value={payrollInput.otherTaxReliefs} onChange={(event) => setPayrollInput({ ...payrollInput, otherTaxReliefs: event.target.value })} /></label><button className="button button-secondary" disabled={busy}>Calculate one-person estimate</button>
-          </form>{payrollEstimate && <div className="invoice-summary"><strong>{payrollEstimate.ruleSet} · effective {payrollEstimate.effectiveFrom}</strong><p>PAYE {payrollMoney(payrollEstimate.payeEstimate)} · NSSF {payrollMoney(payrollEstimate.nssfEmployee)} · SHIF {payrollMoney(payrollEstimate.shifEmployee)} · AHL {payrollMoney(payrollEstimate.housingLevyEmployee)} · net {payrollMoney(payrollEstimate.netPayEstimate)}</p></div>}</article>
+          </form>{payrollEstimate && <div className="invoice-summary"><strong>{payrollEstimate.ruleSet} · effective {payrollEstimate.effectiveFrom}</strong><p>PAYE {payrollMoney(payrollEstimate.payeEstimate)} · NSSF {payrollMoney(payrollEstimate.nssfEmployee)} · SHA / SHIF {payrollMoney(payrollEstimate.shifEmployee)} · AHL {payrollMoney(payrollEstimate.housingLevyEmployee)} · net {payrollMoney(payrollEstimate.netPayEstimate)}</p></div>}</article>
           <div className="module-footnote"><ShieldCheck size={16} /> Employee and payslip fields are encrypted at rest with PAYROLL_DATA_ENCRYPTION_KEY and accessible only to workspace admins. The KE-2026-01 calculations remain unverified estimates; a qualified Kenyan payroll professional must review them before use. This is not statutory filing.</div>
         </section> : page === 'Accounting' ? <section className="module-page">
           <div className="eyebrow"><span className="live-dot" /> DOUBLE-ENTRY LEDGER · {dashboard?.workspaceName}</div><h1>Accounting</h1><p className="welcome-subtitle">Posted manual transactions, invoices, and payroll runs create balanced, immutable journal entries.</p>
@@ -5392,8 +5462,8 @@ async function createCameraReader(): Promise<CameraReader> {
           const fields: Record<string, Array<{ name: string; label: string; kind?: string }>> = {
             customers: [{ name: 'name', label: 'Customer name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
             suppliers: [{ name: 'name', label: 'Supplier name' }, { name: 'email', label: 'Email', kind: 'email' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address' }, { name: 'taxPin', label: 'KRA PIN (optional)' }, { name: 'notes', label: 'Notes' }],
-            inventory: [{ name: 'name', label: 'Item name' }, { name: 'sku', label: 'SKU' }, { name: 'barcode', label: 'Barcode (scanner input)' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
-            services: [{ name: 'name', label: 'Service name (e.g. Wifi installation)' }, { name: 'category', label: 'Category (e.g. Wifi, Security, Cleaning)' }, { name: 'charge', label: 'Customer charge (KSh)', kind: 'number' }, { name: 'description', label: 'What the service includes' }, { name: 'providerName', label: 'Service provider name' }, { name: 'providerContact', label: 'Provider contact person' }, { name: 'providerPhone', label: 'Provider phone' }, { name: 'providerEmail', label: 'Provider email', kind: 'email' }, { name: 'providerPin', label: 'Provider KRA PIN (optional)' }, { name: 'serviceLevel', label: 'Service level / SLA (e.g. 24hr response)' }, { name: 'duration', label: 'Typical duration (e.g. 3 hours, 1 month)' }, { name: 'notes', label: 'Notes' }],
+            inventory: [{ name: 'name', label: 'Item name' }, { name: 'sku', label: 'SKU' }, { name: 'barcode', label: 'Barcode (scanner input)' }, { name: 'quantity', label: 'Quantity', kind: 'number' }, { name: 'unit', label: 'Unit' }, { name: 'cost', label: 'Unit cost (KSh)', kind: 'number' }, { name: 'price', label: 'Selling price before VAT (KSh)', kind: 'number' }, { name: 'vatTreatment', label: 'Kenya VAT treatment', kind: 'vat' }, { name: 'etimsItemCode', label: 'KRA item code (from current code list)' }, { name: 'etimsItemClassCode', label: 'KRA item classification code' }, { name: 'etimsPackageUnitCode', label: 'KRA package unit code' }, { name: 'etimsQuantityUnitCode', label: 'KRA quantity unit code' }, { name: 'notes', label: 'Notes' }],
+            services: [{ name: 'name', label: 'Service name (e.g. Wifi installation)' }, { name: 'category', label: 'Category (e.g. Wifi, Security, Cleaning)' }, { name: 'charge', label: 'Customer charge before VAT (KSh)', kind: 'number' }, { name: 'vatTreatment', label: 'Kenya VAT treatment', kind: 'vat' }, { name: 'etimsItemCode', label: 'KRA item code (from current code list)' }, { name: 'etimsItemClassCode', label: 'KRA item classification code' }, { name: 'etimsPackageUnitCode', label: 'KRA package unit code' }, { name: 'etimsQuantityUnitCode', label: 'KRA quantity unit code' }, { name: 'description', label: 'What the service includes' }, { name: 'providerName', label: 'Service provider name' }, { name: 'providerContact', label: 'Provider contact person' }, { name: 'providerPhone', label: 'Provider phone' }, { name: 'providerEmail', label: 'Provider email', kind: 'email' }, { name: 'providerPin', label: 'Provider KRA PIN (optional)' }, { name: 'serviceLevel', label: 'Service level / SLA (e.g. 24hr response)' }, { name: 'duration', label: 'Typical duration (e.g. 3 hours, 1 month)' }, { name: 'notes', label: 'Notes' }],
             projects: [{ name: 'name', label: 'Project name' }, { name: 'customer', label: 'Customer' }, { name: 'status', label: 'Status', kind: 'status' }, { name: 'startDate', label: 'Start date', kind: 'date' }, { name: 'endDate', label: 'End date', kind: 'date' }, { name: 'budget', label: 'Budget (KSh)', kind: 'number' }, { name: 'notes', label: 'Notes' }],
           }
           const inventoryHealth = type === 'inventory' ? records.inventory.map((record) => {
@@ -5416,7 +5486,8 @@ async function createCameraReader(): Promise<CameraReader> {
           return <section className="module-page"><div className="eyebrow"><span className="live-dot" /> {page.toUpperCase()} · WORKSPACE DATABASE</div><h1>{page}</h1><p className="welcome-subtitle">{type === 'services' && !canManageServiceCatalog ? "Browse this business's saved services, manage customer subscriptions, and add services to a counter sale. Catalog and supplier details are maintained by inventory managers." : `Create and maintain records for ${dashboard?.workspaceName}. Data is private to this business.`}</p>
             {error && <p className="form-error" role="alert">{error}</p>}
             {(type !== 'services' || canManageServiceCatalog) && <>
-            <form className="module-card" onSubmit={(event) => void saveWorkspaceRecord(event, type)}><h2>{editingRecordId ? 'Edit' : 'Add'} {recordLabel}</h2><div className="record-form-grid">{fields[type].map((field) => <label className="field-label" key={field.name}>{field.label}{type === 'services' && field.name === 'category' ? <input required list="service-category-list" maxLength={80} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} placeholder="Wifi, Security, Shoe shining, Cleaning…" /> : field.kind === 'status' ? <select value={recordForm[field.name] ?? 'planned'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="planned">Planned</option><option value="active">Active</option><option value="on_hold">On hold</option><option value="completed">Completed</option></select> : <input required={field.name === 'name'} type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : field.kind ?? 'text'} min={field.kind === 'number' ? '0' : undefined} step={field.kind === 'number' ? '0.01' : undefined} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} />}</label>)}</div>
+            <form className="module-card" onSubmit={(event) => void saveWorkspaceRecord(event, type)}><h2>{editingRecordId ? 'Edit' : 'Add'} {recordLabel}</h2><div className="record-form-grid">{fields[type].map((field) => <label className="field-label" key={field.name}>{field.label}{type === 'services' && field.name === 'category' ? <input required list="service-category-list" maxLength={80} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} placeholder="Wifi, Security, Shoe shining, Cleaning…" /> : field.kind === 'vat' ? <select value={recordForm[field.name] ?? 'unclassified'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="unclassified">Not classified</option>{KENYA_VAT_RATES.map((entry) => <option key={entry.code} value={entry.code}>{entry.code} · {entry.label}</option>)}</select> : field.kind === 'status' ? <select value={recordForm[field.name] ?? 'planned'} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })}><option value="planned">Planned</option><option value="active">Active</option><option value="on_hold">On hold</option><option value="completed">Completed</option></select> : <input required={field.name === 'name'} type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : field.kind ?? 'text'} min={field.kind === 'number' ? '0' : undefined} step={field.kind === 'number' ? '0.01' : undefined} value={recordForm[field.name] ?? ''} onChange={(event) => setRecordForm({ ...recordForm, [field.name]: event.target.value })} />}</label>)}</div>
+              {(type === 'inventory' || type === 'services') && <p className="dialog-note">POS prices are entered before VAT. Select a reviewed VAT treatment to calculate sales tax. For automatic eTIMS submission, copy each item and unit code from the current KRA code lists; missing mappings stop submission and leave the sale as an internal invoice.</p>}
               {type === 'services' && <>
                 <datalist id="service-category-list"><option value="Wifi" /><option value="Security" /><option value="Shoe shining" /><option value="Cleaning" /><option value="Laundry" /><option value="Plumbing" /><option value="Electrical" /><option value="Catering" /><option value="Transport" /><option value="Consulting" /></datalist>
                 <label className="field-label">Billing unit<select value={recordForm.billingUnit ?? 'fixed'} onChange={(event) => setRecordForm({ ...recordForm, billingUnit: event.target.value })}>{SERVICE_BILLING_UNITS.map((unit) => <option key={unit.code} value={unit.code}>{unit.label}</option>)}</select></label>
@@ -5425,7 +5496,6 @@ async function createCameraReader(): Promise<CameraReader> {
                 <label className="field-label">Supplier<select value={recordForm.supplierId ?? ''} onChange={(event) => setRecordForm({ ...recordForm, supplierId: event.target.value })}><option value="">No saved supplier</option>{records.suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{String(supplier.data.name ?? 'Supplier')}</option>)}</select></label>
                 <label className="field-label checkbox-row"><input type="checkbox" checked={recordForm.supplierRecurring === 'true'} onChange={(event) => setRecordForm({ ...recordForm, supplierRecurring: String(event.target.checked) })} /> Supplier payment renews</label>
                 {recordForm.supplierRecurring === 'true' && <label className="field-label">Supplier renewal cycle<select value={recordForm.supplierBillingCycle ?? 'monthly'} onChange={(event) => setRecordForm({ ...recordForm, supplierBillingCycle: event.target.value })}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annually">Annually</option></select></label>}
-                <label className="field-label">VAT treatment note (Kenya, optional)<input maxLength={40} value={recordForm.taxTreatment ?? ''} onChange={(event) => setRecordForm({ ...recordForm, taxTreatment: event.target.value })} placeholder="e.g. B16 or exempt" /></label>
                 <p className="dialog-note">The customer charge is billed through subscriber records. Supplier cost is optional; saving it can also record a supplier payment and post it to expenses.</p>
               </>}
               {type === 'suppliers' && <fieldset className="module-card supplier-items-fieldset"><legend>Inventory items supplied (optional)</legend><p className="dialog-note">Link one or more items this supplier provides. These are reference links only; they do not change stock or purchase orders.</p>{supplierItemIds.map((itemId, index) => <div className="field-row" key={`supplier-item-${index}`}><label className="field-label">Inventory item<select aria-label={`Supplier inventory item ${index + 1}`} value={itemId} onChange={(event) => setSupplierItemIds((current) => current.map((value, row) => row === index ? event.target.value : value))}><option value="">Choose item (optional)</option>{records.inventory.filter((item) => !supplierItemIds.includes(item.id) || item.id === itemId).map((item) => <option key={item.id} value={item.id}>{String(item.data.name ?? 'Inventory item')}{item.data.sku ? ` · ${item.data.sku}` : ''}</option>)}</select></label>{supplierItemIds.length > 1 && <button type="button" className="button button-small" aria-label="Remove supplier item row" onClick={() => setSupplierItemIds((current) => current.filter((_, row) => row !== index))}>Remove</button>}</div>)}<button type="button" className="button button-secondary" onClick={() => setSupplierItemIds((current) => [...current, ''])}>Add another item</button></fieldset>}<div className="button-row"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : `${editingRecordId ? 'Update' : 'Save'} ${recordLabel}`}</button>{editingRecordId && <button type="button" className="button button-secondary" onClick={() => { setEditingRecordId(''); setRecordForm({}); setSupplierItemIds(['']) }}>Cancel edit</button>}</div></form>
@@ -5856,9 +5926,15 @@ async function createCameraReader(): Promise<CameraReader> {
                   <label className="field-label">KRA sandbox registration reference<input value={String(kraDetails.sandboxReference ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'sandboxReference', event.target.value)} placeholder="Reference from KRA sandbox" /></label>
                   <label className="field-label">KRA certification reference<input value={String(kraDetails.certificationReference ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'certificationReference', event.target.value)} placeholder="Certification reference" /></label>
                   <label className="field-label">Production approval reference<input value={String(kraDetails.productionApprovalReference ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'productionApprovalReference', event.target.value)} placeholder="Production approval reference" /></label>
+                  <label className="field-label">POS sales type code<input maxLength={5} value={String(kraDetails.posSalesTyCd ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'posSalesTyCd', event.target.value.trim())} placeholder="From the current KRA code list" /></label>
+                  <label className="field-label">POS receipt type code<input maxLength={5} value={String(kraDetails.posRcptTyCd ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'posRcptTyCd', event.target.value.trim())} placeholder="From the current KRA code list" /></label>
+                  <label className="field-label">POS sales status code<input maxLength={5} value={String(kraDetails.posSalesSttsCd ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'posSalesSttsCd', event.target.value.trim())} placeholder="From the current KRA code list" /></label>
+                  <label className="field-label">POS payment type code (optional)<input maxLength={5} value={String(kraDetails.posPmtTyCd ?? '')} onChange={(event) => setOnboardingDetail('kra_etims', 'posPmtTyCd', event.target.value.trim())} placeholder="From the current KRA code list" /></label>
+                  <label className="field-label">Buyer acceptance for POS receipt<select value={String(kraDetails.posPurchaseAcceptance ?? 'N')} onChange={(event) => setOnboardingDetail('kra_etims', 'posPurchaseAcceptance', event.target.value)}><option value="N">N · not recorded</option><option value="Y">Y · recorded</option></select></label>
                   <label className="field-label">Onboarding milestone<select value={kraProfile.milestone} onChange={(event) => setOnboarding((current) => ({ ...current, kra_etims: { ...kraProfile, milestone: event.target.value } }))}><option value="not_started">Not started</option><option value="application_in_progress">Application in progress</option><option value="sandbox_testing">Sandbox testing</option><option value="certification_review">Certification review</option><option value="certified">Certified (self-reported; not verified)</option></select><small>Set to Certified only after KRA has approved your production use.</small></label>
                   <label className="field-label">Progress note<textarea maxLength={1000} value={kraProfile.note} onChange={(event) => setOnboarding((current) => ({ ...current, kra_etims: { ...kraProfile, note: event.target.value } }))} placeholder="Track references or next steps; never enter passwords or API keys." /></label>
                 </div>
+                <p className="dialog-note">POS auto-submission also needs an item code, item classification, package unit, quantity unit, and VAT treatment on every item or service. Use the current KRA code-list response above; these values are not independently verified here.</p>
                 <div className="button-row"><button className="button button-secondary" disabled={busy} onClick={() => void updateOnboarding('kra_etims')}>Save approval references</button><a href="https://www.kra.go.ke/business/etims-electronic-tax-invoice-management-system/learn-about-etims/etims-system-to-system-integration" target="_blank" rel="noreferrer">Open KRA eTIMS integration guidance</a></div>
               </div>
             })()}
@@ -5871,7 +5947,7 @@ async function createCameraReader(): Promise<CameraReader> {
             {kraCodes && <details><summary>Latest response from KRA standard code lists</summary><pre className="kra-code-list">{JSON.stringify(kraCodes, null, 2)}</pre></details>}
           </article>
           <article className="module-card"><h2>Prepare eTIMS invoice drafts</h2><p>Creates a workspace draft. After taxpayer/device approval, initialization and exact KRA code/tax mapping, reviewed requests call the KRA OSCU sandbox or production endpoint selected by the API operator. Sandbox receipts are not fiscal invoices.</p>{invoicesList.filter((invoiceRow) => !complianceDrafts.some((draft) => draft.integration_type === 'kra_etims' && draft.source_id === invoiceRow.id)).map((invoiceRow) => <div className="transaction-row" key={invoiceRow.id}><span><strong>{invoiceRow.customer} · {invoiceRow.description}</strong><small>{money(invoiceRow.amount)} · {invoiceRow.status}</small></span><button className="button button-small" disabled={busy} onClick={() => void createComplianceDraft('kra_etims', invoiceRow.id)}>Create fiscalization draft</button></div>)}{!invoicesList.length && <div className="empty-state">Create an internal invoice first to prepare a draft snapshot.</div>}</article>
-          <article className="module-card"><h2>Integration preparation drafts ({complianceDrafts.length})</h2>{complianceDrafts.map((draft) => <div className="compliance-draft-row" key={draft.id}><div className="transaction-row"><span><strong>{draft.integration_type === 'kra_etims' ? 'eTIMS invoice draft' : 'Statutory filing preparation'} · {draft.workflow_status}</strong><small>{draft.payload_version} · Provider status: {draft.provider_status}{draft.external_invoice_number ? ` · KRA invoice ${draft.external_invoice_number}` : ''}</small></span><div className="button-row"><button className="button button-small" onClick={() => downloadComplianceDraft(draft)}>Download snapshot</button>{draft.workflow_status === 'reviewed' && <button className="button button-primary" disabled={busy || draft.provider_status === 'accepted_by_kra' || draft.provider_status === 'submitted_to_kra' || draft.provider_status === 'submission_unknown'} onClick={() => void submitComplianceDraft(draft.id)}>{draft.provider_status === 'accepted_by_kra' ? 'KRA accepted' : draft.provider_status === 'submission_unknown' ? 'Reconcile with KRA' : 'Submit to authority'}</button>}{draft.workflow_status !== 'cancelled' && <button className="button button-small" onClick={() => void updateComplianceDraft(draft.id, 'cancelled')}>Cancel draft</button>}</div></div>
+          <article className="module-card"><h2>Integration preparation drafts ({complianceDrafts.length})</h2>{complianceDrafts.map((draft) => <div className="compliance-draft-row" key={draft.id}><div className="transaction-row"><span><strong>{draft.integration_type === 'kra_etims' ? 'eTIMS invoice draft' : 'Statutory filing preparation'} · {draft.workflow_status}</strong><small>{draft.payload_version} · Provider status: {draft.provider_status.replaceAll('_', ' ')}{draft.external_invoice_number ? ` · KRA reference ${draft.external_invoice_number}` : ''}</small></span><div className="button-row"><button className="button button-small" onClick={() => downloadComplianceDraft(draft)}>Download snapshot</button>{draft.workflow_status === 'reviewed' && <button className="button button-primary" disabled={busy || draft.provider_status === 'accepted_by_kra' || draft.provider_status === 'accepted_in_sandbox' || draft.provider_status === 'submitted_to_kra' || draft.provider_status === 'submission_unknown'} onClick={() => void submitComplianceDraft(draft.id)}>{draft.provider_status === 'accepted_by_kra' ? 'KRA accepted' : draft.provider_status === 'accepted_in_sandbox' ? 'Sandbox accepted · not fiscal' : draft.provider_status === 'submission_unknown' ? 'Reconcile with KRA' : 'Submit to authority'}</button>}{draft.workflow_status !== 'cancelled' && <button className="button button-small" onClick={() => void updateComplianceDraft(draft.id, 'cancelled')}>Cancel draft</button>}</div></div>
             {draft.integration_type === 'kra_etims' && draft.workflow_status === 'draft' && <div className="kra-fiscal-editor"><h3>KRA OSCU fiscal payload</h3><p>Map the invoice using current KRA codes shown above and qualified tax review. This editor sends a draft to our validator first; no KRA call occurs until “Submit to authority”. Amount and tax groups must reconcile exactly.</p><label className="field-label">KRA sales JSON (OSCU)</label><textarea className="kra-json-editor" rows={18} spellCheck={false} value={kraPayloadEditors[draft.id] ?? JSON.stringify(draft.draft_payload.fiscalPayload ?? {}, null, 2)} onChange={(event) => setKraPayloadEditors((current) => ({ ...current, [draft.id]: event.target.value }))} /><div className="button-row"><button className="button button-secondary" disabled={busy || !kraEtimsConfig?.initialized} onClick={() => void saveKraFiscalPayload(draft.id)}>Validate & save payload</button><button className="button button-small" disabled={busy || !draft.draft_payload.fiscalPayload || !kraEtimsConfig?.initialized} onClick={() => void updateComplianceDraft(draft.id, 'reviewed')}>Mark reviewed</button></div></div>}
             {draft.integration_type === 'statutory_filing' && draft.workflow_status === 'draft' && <div className="statutory-review-editor">
               <h3>Qualified Kenyan payroll/tax review</h3>
@@ -5905,6 +5981,16 @@ async function createCameraReader(): Promise<CameraReader> {
           </Suspense>}
           {canUse('accounting.write') && <div className="module-card"><h2>At-a-glance</h2><div className="transaction-row"><span>Recorded income · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.income ?? 0)}</strong></div><div className="transaction-row"><span>Recorded expenses · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.expenses ?? 0)}</strong></div><div className="transaction-row"><span>Net movement · {overviewRangeNames[overviewRange]}</span><strong>{money(dashboard?.totals.net ?? 0)}</strong></div><div className="transaction-row"><span>Outstanding invoices</span><strong>{money(dashboard?.invoices.unpaid_amount ?? 0)}</strong></div><p>Sources: saved transactions and invoices, for the period chosen in the Overview toolbar. Confirmed payroll payments are included in cash-flow expenses; any unpaid net pay remains a payroll payable in the accounting ledger. Bank-feed rows are included only after review and posting.</p></div>
 }
+          {canUse('accounting.write') && <article className="module-card vat-draft-report">
+            <div className="panel-header"><div><h2>VAT return draft summary</h2><p>Build a period summary from classified invoices, sales returns, and approved supplier bills.</p></div><label className="field-label">Period<input type="month" value={vatReportPeriod} onChange={(event) => setVatReportPeriod(event.target.value)} /></label></div>
+            {vatDraftReport ? <>
+              <div className="metric-grid"><div className="metric-card"><span>Net sales</span><strong>{money(vatDraftReport.totals.netSales)}</strong></div><div className="metric-card"><span>Net output VAT</span><strong>{money(vatDraftReport.totals.netOutputTax)}</strong></div><div className="metric-card"><span>Recoverable input VAT entered</span><strong>{money(vatDraftReport.totals.recoverableInputTax)}</strong></div><div className="metric-card"><span>Net VAT estimate</span><strong>{money(vatDraftReport.totals.netVatEstimate)}</strong></div></div>
+              <h3>Sales by VAT treatment</h3>{vatDraftReport.sales.map((line) => <div className="transaction-row" key={`vat-sale-${line.treatment}`}><span><strong>{KENYA_VAT_RATES.find((entry) => entry.code === line.treatment)?.label ?? line.treatment}</strong><small>{line.line_count} invoice lines · {money(Number(line.supply_value ?? 0))} supply · VAT {money(Number(line.tax_amount))}</small></span></div>)}{vatDraftReport.salesReturns.map((line) => <div className="transaction-row" key={`vat-return-${line.treatment}`}><span><strong>Returns · {KENYA_VAT_RATES.find((entry) => entry.code === line.treatment)?.label ?? line.treatment}</strong><small>{line.line_count} returned lines · {money(Number(line.supply_value ?? 0))} value · VAT {money(Number(line.tax_amount))}</small></span></div>)}
+              <h3>Approved supplier bills</h3>{vatDraftReport.purchases.map((line) => <div className="transaction-row" key={`vat-purchase-${line.treatment}`}><span><strong>{KENYA_VAT_RATES.find((entry) => entry.code === line.treatment)?.label ?? line.treatment}</strong><small>{line.line_count} bill lines · {money(Number(line.purchase_value ?? 0))} purchase value · recoverable VAT entered {money(Number(line.recoverable_tax ?? 0))}</small></span></div>)}
+              <div className="button-row"><button className="button button-secondary" onClick={downloadVatDraftReport}>Download CSV draft</button><span className="dialog-note">{vatDraftReport.periodStart} to {vatDraftReport.periodEnd} · Draft only; not filed with KRA.</span></div>
+              <ul className="help-list">{vatDraftReport.warnings.map((warning, index) => <li key={`vat-warning-${index}`}>{warning}</li>)}</ul>
+            </> : <div className="empty-state">Loading VAT draft summary…</div>}
+          </article>}
           {canUse('inventory.write') && retailReport && <article className="module-card"><h2>Retail and inventory insights</h2><div className="transaction-row"><span>Inventory valuation at recorded unit cost</span><strong>{money(retailReport.totalValuation)}</strong></div><h3>Reorder alerts</h3>{retailReport.reorderAlerts.map((item) => <div className="transaction-row" key={`${item.itemId}-${item.locationId}`}><span><strong>{item.name} · {item.location}</strong><small>{item.quantity} {item.unit} on hand · alert at {item.reorderPoint}</small></span><span className="status-pill amber">Reorder</span></div>)}{!retailReport.reorderAlerts.length && <p>No items are at or below their configured reorder points.</p>}<h3>Best sellers</h3>{retailReport.bestSellers.map((item) => <div className="transaction-row" key={item.itemId}><span><strong>{item.name}</strong><small>{item.quantitySold.toLocaleString('en-KE')} sold · revenue {money(item.revenue)} · cost estimate {money(item.cost)}</small></span><strong>Gross profit est. {money(item.grossProfit)}</strong></div>)}{!retailReport.bestSellers.length && <div className="empty-state">Post product sales to see best sellers and gross profit estimates.</div>}<p className="dialog-note">Inventory value uses current average item cost; product margins are management estimates and do not replace reviewed accounting valuation.</p></article>}
           {canUse('accounting.write') && <article className="module-card"><h2>Cash-flow outlook</h2><p>Three-month estimate based on the average monthly posted ledger activity available over the last six months; not a cash guarantee.</p>{forecast.map((row) => <div className="transaction-row" key={row.period}><span><strong>{row.period}</strong><small>Historical-average estimate</small></span><span>Income {money(row.income)} · Expenses {money(row.expenses)}</span><strong>Net {money(row.income - row.expenses)}</strong></div>)}</article>
 }
@@ -5915,7 +6001,7 @@ async function createCameraReader(): Promise<CameraReader> {
         </section> : page === 'Point of sale' ? <section className="module-page pos-page">
           <div className="eyebrow"><span className="live-dot" /> POINT OF SALE · {dashboard?.workspaceName}</div>
           <h1>{t('Counter checkout')}</h1>
-          <p className="welcome-subtitle">Sell from saved inventory. Checkout creates an internal invoice, deducts stock, and records cash payments in your workspace.</p>
+          <p className="welcome-subtitle">Sell from saved inventory. Checkout creates an invoice, calculates the saved VAT treatment, deducts stock, and records cash payments in your workspace.</p>
           <p className={`pos-connectivity ${isOnline ? 'online' : 'offline'}`} role="status">{isOnline ? 'Online · inventory and prices are current when refreshed.' : 'Offline · using this business’s last cached catalog; stock may have changed. Sales save locally and are not posted until synced.'}</p>
           <p className="dialog-note">Offline drafts and the cached catalog are encrypted on this device and tied to your signed-in business account. They are not posted, paid, or deducted from stock until sync succeeds.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
@@ -5976,7 +6062,7 @@ async function createCameraReader(): Promise<CameraReader> {
                     {!posCustomerHistory.sales.length && <div className="empty-state">No previous sales found for this customer.</div>}
                   </div></>}</article>}
               <div className="pos-cart-lines">{posCart.map((line) => <div className="pos-cart-line" key={line.itemId}>
-                <div className="pos-line-main"><strong>{line.description}</strong><small>{money(line.unitPrice)} each · {line.kind === 'service' ? 'service' : `${line.onHand} available`}</small></div>
+                <div className="pos-line-main"><strong>{line.description}</strong><small>{money(line.unitPrice)} before VAT each · VAT {money(posLineTaxAmount({ ...line, quantity: 1 }))} each · {line.kind === 'service' ? 'service' : `${line.onHand} available`}</small></div>
                 <div className="pos-quantity"><button type="button" aria-label={`Remove one ${line.description}`} onClick={() => changePosQuantity(line.itemId, line.quantity - 1)}><Minus size={14} /></button><input key={`${line.itemId}-${line.quantity}`} aria-label={`Quantity for ${line.description}`} type="number" min="1" max={Number.isFinite(line.onHand) ? line.onHand : undefined} step="1" defaultValue={line.quantity} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur() } }} onBlur={(event) => {
                   const nextQuantity = Number(event.currentTarget.value)
                   if (!Number.isInteger(nextQuantity) || nextQuantity < 1) {
@@ -5985,10 +6071,10 @@ async function createCameraReader(): Promise<CameraReader> {
                   }
                   changePosQuantity(line.itemId, nextQuantity)
                 }} /><button type="button" aria-label={`Add one ${line.description}`} disabled={Number.isFinite(line.onHand) && line.quantity >= line.onHand} onClick={() => changePosQuantity(line.itemId, line.quantity + 1)}><Plus size={14} /></button></div>
-                <strong className="pos-line-total">{money(line.quantity * line.unitPrice)}</strong>
+                <strong className="pos-line-total">{money(posLineTotal(line))}</strong>
                 <button type="button" className="icon-button pos-remove" aria-label={`Remove ${line.description} from sale`} onClick={() => changePosQuantity(line.itemId, 0)}><Trash2 size={15} /></button>
               </div>)}{!posCart.length && <div className="pos-cart-empty"><ShoppingBag size={22} /><strong>Your sale is empty</strong><span>Select an item or service to add it to the cart.</span></div>}</div>
-              <div className="pos-total-row"><span>Total due</span><strong>{money(posTotal)}</strong></div>
+              <div className="pos-total-row"><span>Total due · VAT included where classified</span><strong>{money(posTotal)}</strong></div>
               <fieldset className="pos-payment-choice"><legend>Payment method</legend>
                 <button type="button" className={posPaymentMethod === 'cash' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'cash'} onClick={() => setPosPaymentMethod('cash')}><Banknote size={17} />Cash / manual</button>
                 <button type="button" className={posPaymentMethod === 'mpesa' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'mpesa'} disabled={!mpesaConfigured} title={mpesaConfigured ? 'Request an M-Pesa STK push' : 'Configure Daraja before requesting M-Pesa'} onClick={() => setPosPaymentMethod('mpesa')}><Smartphone size={17} />M-Pesa{!mpesaConfigured && <small>Setup needed</small>}</button>
@@ -6020,14 +6106,14 @@ async function createCameraReader(): Promise<CameraReader> {
                 {Boolean((paymentSplits.pos ?? []).filter((split) => split.method === 'mpesa').length) && !mpesaConfigured && <p className="form-error" role="alert">Daraja M-Pesa is not configured for this business, so M-Pesa splits cannot be requested. Remove them or ask a business administrator to add this business’s credentials on the Kenya compliance page.</p>}
               </div>}
               <button type="button" className="button button-primary pos-complete" disabled={busy || !posCart.length || posTotal <= 0 || (Boolean((paymentSplits.pos ?? []).length) && Math.abs((paymentSplits.pos ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0) - posTotal) >= 0.009)} onClick={() => void checkoutPos()}>{busy ? 'Processing sale…' : (paymentSplits.pos ?? []).length ? 'Complete sale with split payment' : posPaymentMethod === 'mpesa' ? 'Request M-Pesa payment' : 'Complete cash sale'}</button>
-              <p className="pos-disclaimer"><ShieldCheck size={14} />Internal invoice only—not a KRA/eTIMS fiscal receipt. M-Pesa requests require configured Daraja; verify payment before releasing goods.</p>
+              <p className="pos-disclaimer"><ShieldCheck size={14} />KRA eTIMS submission only runs when automatic POS submission is enabled and every item mapping and approved device is configured. Until KRA accepts, this remains an internal invoice. Verify payment before releasing goods.</p>
             </aside>
           </div>
-          {posReceipt && <div className="module-card pos-last-sale"><div><div className="eyebrow">LAST SALE · {posReceipt.invoiceId.slice(0, 8).toUpperCase()}</div><h2>{money(posReceipt.amount)}</h2><p>{posReceipt.customer} · {posReceipt.status}</p></div>
-            <div className="button-row"><button className="button button-secondary" onClick={() => printDocument('pos')}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod.toLowerCase().includes('cash') && posReceipt.amountPaid > 0 && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}<button className="button button-secondary" onClick={() => { setNetworkingTab('sales'); navigateTo('Networking') }}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
+          {posReceipt && <div className="module-card pos-last-sale"><div><div className="eyebrow">LAST SALE · {posReceipt.invoiceId.slice(0, 8).toUpperCase()}</div><h2>{money(posReceipt.amount)}</h2><p>{posReceipt.customer} · {posReceipt.status}</p>{posReceipt.fiscalization && <p className="dialog-note" role="status">eTIMS · {posReceipt.fiscalization.submissionStatus.replaceAll('_', ' ')}{posReceipt.fiscalization.externalInvoiceNumber ? ` · KRA reference ${posReceipt.fiscalization.externalInvoiceNumber}` : ''}. {posReceipt.fiscalization.notice}</p>}</div>
+            <div className="button-row"><button className="button button-secondary" onClick={() => printDocument('pos')}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod.toLowerCase().includes('cash') && posReceipt.amountPaid > 0 && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}{posReceipt.fiscalization?.submissionStatus === 'accepted_by_kra' && <button className="button button-primary" onClick={() => { setKraReceiptOpen(posReceipt.fiscalization?.complianceDraftId ?? ''); navigateTo('Kenya compliance') }}>View KRA fiscal receipt</button>}<button className="button button-secondary" onClick={() => { setNetworkingTab('sales'); navigateTo('Networking') }}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
             <details className="module-footnote"><summary>Receipt printer setup</summary><p>Use Print receipt to choose any printer installed on this computer, including a USB printer or network printer. Thermal print uses the optional local bridge and a compatible ESC/POS network printer on port 9100.</p><div className="field-row"><label className="field-label">Local bridge URL<input value={posBridgeAddress} onChange={(event) => changePosBridgeAddress(event.target.value)} placeholder="http://127.0.0.1:17371" /></label><button className="button button-small" disabled={posBridgeBusy} onClick={() => void testPosBridge()}>{posBridgeBusy ? 'Checking…' : t('Test connection')}</button></div>{posBridgeStatus && <p role="status">{t(posBridgeStatus)}</p>}<small>{t('Internal receipt only; not an eTIMS tax invoice.')} Cash drawer is enabled only after a cash payment is recorded.</small></details>
           </div>}
-          {posReceipt && <article className="pos-receipt-print"><header className="pos-receipt-brand"><strong>{posReceipt.businessName || dashboard?.workspaceName || 'Your business'}</strong><span>Powered by KashFlow</span></header><h2>{t('SALE RECEIPT')}</h2><div className="pos-receipt-meta"><span>Receipt <strong>{posReceipt.invoiceId.slice(0, 8).toUpperCase()}</strong></span><span>{new Date(posReceipt.createdAt).toLocaleString('en-KE', { dateStyle: 'medium', timeStyle: 'short' })}</span></div><p className="pos-receipt-customer">Customer: <strong>{posReceipt.customer}</strong></p><hr /><div className="pos-receipt-columns"><span>Item</span><span>Qty</span><span>Amount</span></div>{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.description}<small>{money(line.unitPrice)} each</small></span><span>{line.quantity}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line pos-receipt-total"><strong>Total</strong><strong>{money(posReceipt.amount)}</strong></div><div className="pos-receipt-payment"><span>Payment · {posReceipt.paymentMethod}</span><span>Paid {money(posReceipt.amountPaid)}</span>{posReceipt.balanceDue > 0 && <strong>Balance due {money(posReceipt.balanceDue)}</strong>}</div><footer>Thank you for your business.<small>Internal receipt · not an eTIMS tax invoice</small></footer></article>}
+          {posReceipt && <article className="pos-receipt-print"><header className="pos-receipt-brand"><strong>{posReceipt.businessName || dashboard?.workspaceName || 'Your business'}</strong><span>Powered by KashFlow</span></header><h2>{t('SALE RECEIPT')}</h2><div className="pos-receipt-meta"><span>Receipt <strong>{posReceipt.invoiceId.slice(0, 8).toUpperCase()}</strong></span><span>{new Date(posReceipt.createdAt).toLocaleString('en-KE', { dateStyle: 'medium', timeStyle: 'short' })}</span></div><p className="pos-receipt-customer">Customer: <strong>{posReceipt.customer}</strong></p><hr /><div className="pos-receipt-columns"><span>Item</span><span>Qty</span><span>Amount</span></div>{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.description}<small>{money(line.unitPrice)} each · VAT {money(posLineTaxAmount(line))}</small></span><span>{line.quantity}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><span>VAT total</span><span /><strong>{money(posReceipt.lines.reduce((sum, line) => sum + posLineTaxAmount(line), 0))}</strong></div><div className="pos-receipt-line pos-receipt-total"><strong>Total</strong><strong>{money(posReceipt.amount)}</strong></div><div className="pos-receipt-payment"><span>Payment · {posReceipt.paymentMethod}</span><span>Paid {money(posReceipt.amountPaid)}</span>{posReceipt.balanceDue > 0 && <strong>Balance due {money(posReceipt.balanceDue)}</strong>}</div><footer>Thank you for your business.<small>Internal receipt · not an eTIMS tax invoice</small></footer></article>}
         </section> : page === 'Networking' && networkingTab === 'sales' ? (
           <section className="module-page">
             <div className="eyebrow"><span className="live-dot" /> NETWORKING · {dashboard?.workspaceName}</div>
@@ -6178,7 +6264,8 @@ async function createCameraReader(): Promise<CameraReader> {
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.backupSchedule !== 'Manual only'} onChange={(event) => setSettings({ ...settings, backupSchedule: event.target.checked ? 'Daily automatic' : 'Manual only' })} /> Enable automatic backups and safety copies for this workspace</label></div>
             <p className="dialog-note">Save settings to apply this choice. Off-site copies also require the API operator to configure S3-compatible storage.</p>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.monoEnabled} onChange={(event) => setSettings({ ...settings, monoEnabled: event.target.checked })} /> Allow Mono bank-feed connections for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.darajaEnabled} onChange={(event) => setSettings({ ...settings, darajaEnabled: event.target.checked })} /> Allow Daraja / M-Pesa for this business</label></div>
-            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.kraEtimsLiveEnabled} onChange={(event) => setSettings({ ...settings, kraEtimsLiveEnabled: event.target.checked })} /> Permit live KRA eTIMS usage for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.statutoryFilingsEnabled} onChange={(event) => setSettings({ ...settings, statutoryFilingsEnabled: event.target.checked })} /> Permit statutory filing routes for this business</label></div>
+            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.kraEtimsLiveEnabled} onChange={(event) => setSettings({ ...settings, kraEtimsLiveEnabled: event.target.checked })} /> Permit live KRA eTIMS usage for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.kraEtimsAutoSubmitPos} onChange={(event) => setSettings({ ...settings, kraEtimsAutoSubmitPos: event.target.checked })} /> Automatically submit mapped POS sales to KRA eTIMS</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.statutoryFilingsEnabled} onChange={(event) => setSettings({ ...settings, statutoryFilingsEnabled: event.target.checked })} /> Permit statutory filing routes for this business</label></div>
+            <p className="dialog-note">POS auto-submission is off by default. Enable it only after KRA approval, device setup, current code mapping, and a reviewed VAT classification for every item. If KRA does not accept a sale, KashFlow keeps it as an internal invoice and shows the provider status.</p>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.shifEnabled} onChange={(event) => setSettings({ ...settings, shifEnabled: event.target.checked })} /> Enable SHIF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.nssfEnabled} onChange={(event) => setSettings({ ...settings, nssfEnabled: event.target.checked })} /> Enable NSSF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.ahlEnabled} onChange={(event) => setSettings({ ...settings, ahlEnabled: event.target.checked })} /> Enable AHL route</label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.multiMethodPayments} onChange={(event) => setSettings({ ...settings, multiMethodPayments: event.target.checked })} /> Allow customers to pay one invoice with more than one method (part cash, part M-Pesa)</label></div>
             <p className="dialog-note">Split payments only change how a payment is captured: each method is still recorded and verified on its own, and an M-Pesa request still needs a live connection. Total must match the invoice or sale.</p>
