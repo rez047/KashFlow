@@ -3257,7 +3257,7 @@ app.get('/v1/reports/aging', requirePool, requireSession, async (request: Authed
         ) r ON r.invoice_id = i.id
         WHERE i.workspace_id = $1 AND i.status <> 'void'
           AND i.amount - i.amount_paid - COALESCE(r.returned_amount, 0) + COALESCE(r.refunded_amount, 0) > 0
-        ORDER BY i.due_date`, [request.session!.workspaceId, input.data.asOf]),
+        ORDER BY i.due_date`, [request.session!.workspaceId]),
       pool!.query(`SELECT id, supplier AS counterparty, amount::text, amount_paid::text, due_date FROM vendor_bills
         WHERE workspace_id = $1 AND status <> 'void' AND amount > amount_paid ORDER BY due_date`, [request.session!.workspaceId]),
     ])
