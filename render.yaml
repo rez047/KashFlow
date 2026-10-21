@@ -16,6 +16,8 @@ services:
         generateValue: true
       - key: ONLINE_COMMERCE_ENCRYPTION_KEY
         generateValue: true
+      - key: INTASEND_WEBHOOK_CHALLENGE
+        sync: false
       - key: TWO_FACTOR_ENCRYPTION_KEY
         generateValue: true
       - key: FRONTEND_ORIGIN

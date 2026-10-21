@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { languages, useTranslation, type LanguageCode } from './i18n'
 import {
-  Activity, AlertCircle, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen,
+  Activity, AlertCircle, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen, CreditCard,
   BriefcaseBusiness, CalendarDays, Camera, Check, ChevronRight, CircleHelp,
   Eye, EyeOff, FileText, Filter, Gauge, Landmark, LayoutDashboard,
   LifeBuoy, LogOut, Mail, Menu, MessageCircle, Minus, Package, Phone, Plus, Printer, QrCode,
@@ -71,7 +71,7 @@ const SERVICE_BILLING_UNITS: Array<{ code: string; label: string }> = [
 const serviceBillingLabel = (code: string) => SERVICE_BILLING_UNITS.find((unit) => unit.code === code)?.label ?? 'Fixed charge'
 const descriptions: Record<string, string> = {
   Banking: 'Bank feeds are not configured. Manually entered records remain available in the workspace ledger.',
-  'Point of sale': 'Serve quick retail transactions and cash/M-Pesa tills with the counter checkout.',
+  'Point of sale': 'Serve quick retail transactions and collect cash, M-Pesa, or hosted card payments at checkout.',
   Networking: 'Manage estimates, sales orders, invoices, and recurring transactions for this business.',
   Expenses: 'Record and review expenses entered in your workspace.',
   Payroll: 'Manage encrypted employee records, calculate Kenyan PAYE, NSSF, SHA/SHIF and Housing Levy estimates, prepare reviewed monthly payroll, and post approved payroll journals directly to the ledger.',
@@ -124,7 +124,7 @@ type ServiceSubscription = {
 }
 type ServiceSupplierPayment = { id: string; amount: string; payment_date: string; billing_cycle: 'none' | 'monthly' | 'quarterly' | 'annually'; covered_until: string | null; expense_recorded: boolean }
 // Optional system-wide split-payment capture for an invoice or a counter sale.
-type PaymentSplit = { method: 'cash' | 'mpesa'; amount: string; phone: string; reference: string }
+type PaymentSplit = { method: 'cash' | 'mpesa' | 'card'; amount: string; phone: string; reference: string }
 type Account = { user: { id: string; email: string }; workspace: { id: string; name: string; permissions?: MemberPermission[] }; workspaces?: Array<{ id: string; name: string; role: string }> }
 type AccountDeletionPreview = { workspaces: Array<{ id: string; name: string; role: string; archivedAt: string | null; soleAdmin: boolean; otherMemberCount: number }> }
 type IntegrationReadiness = { integrations: Array<{ id: string; status: string }> }
@@ -143,7 +143,7 @@ type PosCartLine = { itemId: string; description: string; quantity: number; unit
 // Every workspace export the API supports, in the order the Settings buttons list them.
 const EXPORT_TYPES = ['customers', 'suppliers', 'inventory', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit'] as const
 type PosFiscalization = { submissionStatus: string; notice: string; externalInvoiceNumber?: string; complianceDraftId?: string }
-type PosReceipt = { invoiceId: string; businessName?: string; customer: string; customerEmail?: string; customerPhone?: string; amount: number; amountPaid: number; balanceDue: number; paymentMethod: string; status: string; createdAt: string; lines: PosCartLine[]; fiscalization?: PosFiscalization }
+type PosReceipt = { invoiceId: string; workspaceId?: string; businessName?: string; customer: string; customerEmail?: string; customerPhone?: string; amount: number; amountPaid: number; balanceDue: number; paymentMethod: string; status: string; createdAt: string; lines: PosCartLine[]; fiscalization?: PosFiscalization; cardIdempotencyKey?: string; cardPaymentId?: string; cardPaymentStatus?: string; cardCheckoutAmount?: number; mpesaPaymentIds?: string[]; mpesaPendingAmount?: number }
 type PosCustomerSale = { id: string; description: string; amount: string; amount_paid: string; due_date: string; status: string; created_at: string }
 type PosCustomerHistory = { sales: PosCustomerSale[]; summary: { sale_count: number; lifetime_sales: string } }
 type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; paymentIdempotencyKey?: string; cashPaymentIdempotencyKey?: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[]; paymentMethod?: 'cash' | 'mpesa'; paymentPhone?: string; paymentSplits?: Array<PaymentSplit & { idempotencyKey: string }> }
@@ -177,6 +177,7 @@ type OnlineStoreConfig = { slug: string; title: string; description: string; ena
 type StoreOrder = { id: string; status: string; source: string; external_order_id?: string | null; customer_name: string; customer_email: string; customer_phone: string; total: string; invoice_id?: string | null; created_at: string }
 type WooConnection = { store_url: string; enabled: boolean; last_synced_at?: string | null; credentialsConfigured: boolean }
 type DarajaConnection = { shortcode: string; callback_url: string; environment: 'sandbox' | 'production'; transaction_type: 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline'; initiator_name?: string | null; transactionStatusConfigured?: boolean; enabled: boolean; updated_at?: string | null; credentialsConfigured: boolean }
+type IntaSendConnection = { enabled: boolean; updated_at?: string | null; credentialsConfigured: boolean }
 type MemberPermission = 'operations.write' | 'sales.write' | 'inventory.write' | 'accounting.write' | 'banking.write' | 'payroll.manage' | 'integrations.manage' | 'workspace.manage' | 'team.manage' | 'store.manage'
 
 const PAGE_PERMISSION_REQUIREMENTS: Record<string, MemberPermission | MemberPermission[] | null> = {
@@ -400,7 +401,7 @@ async function warmOfflineWorkspace() {
     '/v1/accounting/chart', '/v1/accounting/trial-balance', '/v1/accounting/journals', '/v1/accounting/periods', '/v1/accounting/reconciliations', '/v1/accounting/audit-events',
     `/v1/accounting/reports/financial-statements?from=${yearStart}&to=${today}`,
     '/v1/payroll/employees', '/v1/payroll/runs', '/v1/payroll/remittances',
-    '/v1/integrations/readiness', '/v1/integrations/onboarding', '/v1/integrations/drafts', '/v1/integrations/etims/config', '/v1/integrations/daraja',
+    '/v1/integrations/readiness', '/v1/integrations/onboarding', '/v1/integrations/drafts', '/v1/integrations/etims/config', '/v1/integrations/daraja', '/v1/integrations/intasend',
     '/v1/banking/mono/config', '/v1/banking/accounts', '/v1/banking/transactions?status=needs_review',
     `/v1/reports/budgets?from=${month}-01&to=${today}`, '/v1/reports/cash-flow-forecast', `/v1/reports/aging?asOf=${today}`, '/v1/reports/retail',
     '/v1/store/settings', '/v1/store/orders', '/v1/integrations/woocommerce',
@@ -419,6 +420,14 @@ function requestInvoiceMpesaPayment(invoiceId: string, phone: string, amount?: n
     // M-Pesa portion rather than the whole outstanding invoice balance.
     body: JSON.stringify(amount === undefined ? { phone } : { phone, amount }),
     ...(idempotencyKey ? { headers: { 'Idempotency-Key': idempotencyKey } } : {}),
+  })
+}
+
+function requestInvoiceCardCheckout(invoiceId: string, amount: number, idempotencyKey: string) {
+  return request<{ payment: { id: string; status: string; amount: string; currency: string }; checkoutUrl: string }>(`/v1/invoices/${invoiceId}/payments/card`, {
+    method: 'POST',
+    body: JSON.stringify({ amount, idempotencyKey }),
+    headers: { 'Idempotency-Key': idempotencyKey },
   })
 }
 
@@ -1128,7 +1137,7 @@ function App() {
   const [posCustomerHistory, setPosCustomerHistory] = useState<PosCustomerHistory | null>(null)
   const [posCustomerHistoryLoading, setPosCustomerHistoryLoading] = useState(false)
   const [posCustomerHistoryForId, setPosCustomerHistoryForId] = useState('')
-  const [posPaymentMethod, setPosPaymentMethod] = useState<'cash' | 'mpesa'>('cash')
+  const [posPaymentMethod, setPosPaymentMethod] = useState<'cash' | 'mpesa' | 'card'>('cash')
   const [posPaymentPhone, setPosPaymentPhone] = useState('')
   const [posReceipt, setPosReceipt] = useState<PosReceipt | null>(null)
   const [posIdempotencyKey, setPosIdempotencyKey] = useState(() => crypto.randomUUID())
@@ -1206,6 +1215,10 @@ function App() {
   const [darajaConnection, setDarajaConnection] = useState<DarajaConnection | null>(null)
   const [darajaEncryptionReady, setDarajaEncryptionReady] = useState(false)
   const [darajaCredentials, setDarajaCredentials] = useState({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', initiatorName: '', transactionStatusSecurityCredential: '', callbackUrl: '', environment: 'sandbox' as 'sandbox' | 'production', transactionType: 'CustomerPayBillOnline' as 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline' })
+  const [intasendConnection, setIntaSendConnection] = useState<IntaSendConnection | null>(null)
+  const [intasendEncryptionReady, setIntaSendEncryptionReady] = useState(false)
+  const [intasendWebhookReady, setIntaSendWebhookReady] = useState(false)
+  const [intasendPublishableKey, setIntaSendPublishableKey] = useState('')
   const [teamMembers, setTeamMembers] = useState<WorkspaceMember[]>([])
   const [memberPermissionDrafts, setMemberPermissionDrafts] = useState<Record<string, MemberPermission[]>>({})
   const [memberRoleDrafts, setMemberRoleDrafts] = useState<Record<string, string>>({})
@@ -1320,6 +1333,7 @@ function App() {
     inventoryMediumStockThreshold: 10,
     monoEnabled: false,
     darajaEnabled: false,
+    intasendEnabled: false,
     kraEtimsLiveEnabled: false,
     kraEtimsAutoSubmitPos: false,
     statutoryFilingsEnabled: false,
@@ -1502,6 +1516,117 @@ function App() {
     const query = new URLSearchParams(period)
     setDashboard(await request<Dashboard>(`/v1/dashboard?${query}`))
   }, [overviewFrom, overviewRange, overviewTo])
+
+  useEffect(() => {
+    const paymentId = new URLSearchParams(window.location.search).get('card_payment')
+    if (!paymentId || !account || !navigator.onLine) return
+    let active = true
+    const receiptKey = `kashflow-card-checkout-${paymentId}`
+    let receipt: PosReceipt | null = null
+    try {
+      const saved = sessionStorage.getItem(receiptKey)
+      if (saved) {
+        const parsed = JSON.parse(saved) as PosReceipt
+        if (!parsed.workspaceId || parsed.workspaceId === account.workspace.id) receipt = parsed
+      }
+    } catch { /* Payment status is still verified if browser storage is unavailable. */ }
+    if (receipt) setPosReceipt(receipt)
+    if (receipt?.mpesaPaymentIds?.length && Number(receipt.mpesaPendingAmount) > 0) {
+      const updateReceiptAfterMpesa = async (paid: boolean) => {
+        try {
+          const listed = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+          const invoice = listed.invoices.find((item) => item.id === receipt!.invoiceId)
+          const amountPaid = Number(invoice?.amount_paid ?? receipt!.amountPaid)
+          const balanceDue = Math.max(0, receipt!.amount - amountPaid)
+          setInvoicesList(listed.invoices)
+          setPosReceipt({ ...receipt!, amountPaid, balanceDue, status: balanceDue <= 0 ? 'Paid · card and M-Pesa confirmed' : paid ? `M-Pesa confirmed · balance due ${money(balanceDue)}` : `M-Pesa not confirmed · balance due ${money(balanceDue)}` })
+          await refresh()
+        } catch { /* The invoice and verified payment stay saved on the API. */ }
+      }
+      watchMpesaPayment(receipt.invoiceId, Number(receipt.mpesaPendingAmount), `Point of sale · ${receipt.customer}`, () => { void updateReceiptAfterMpesa(true) }, () => { void updateReceiptAfterMpesa(false) }, receipt.mpesaPaymentIds)
+    }
+    const clearReturnUrl = () => {
+      const url = new URL(window.location.href)
+      url.searchParams.delete('card_payment')
+      window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+    }
+    const wait = () => new Promise<void>((resolve) => window.setTimeout(resolve, 3000))
+    const checkPayment = async () => {
+      for (let attempt = 0; attempt < 40 && active; attempt++) {
+        try {
+          const result = await request<{ payment: { id: string; invoice_id: string; status: string; amount: string; provider?: string | null; result_description?: string | null } }>(`/v1/payments/card/${paymentId}/status`)
+          if (!active) return
+          const payment = result.payment
+          const nextReceipt: PosReceipt = receipt ?? {
+            invoiceId: payment.invoice_id,
+            workspaceId: account.workspace.id,
+            businessName: dashboard?.workspaceName,
+            customer: 'Customer',
+            amount: Number(payment.amount),
+            amountPaid: 0,
+            balanceDue: Number(payment.amount),
+            paymentMethod: 'Card checkout',
+            status: 'Card payment is being confirmed',
+            createdAt: new Date().toISOString(),
+            lines: [],
+            cardPaymentId: paymentId,
+          }
+          nextReceipt.cardPaymentId = paymentId
+          nextReceipt.cardPaymentStatus = payment.status
+          if (payment.status === 'paid') {
+            if (payment.provider === 'M-PESA') nextReceipt.paymentMethod = nextReceipt.paymentMethod.replace(/\bcard\b/i, 'M-Pesa via IntaSend')
+            else if (payment.provider === 'PESALINK' || payment.provider === 'COOP_B2B') nextReceipt.paymentMethod = nextReceipt.paymentMethod.replace(/\bcard\b/i, 'bank transfer via IntaSend')
+            try {
+              const listed = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+              const invoice = listed.invoices.find((item) => item.id === payment.invoice_id)
+              if (invoice) {
+                nextReceipt.amountPaid = Number(invoice.amount_paid ?? payment.amount)
+                nextReceipt.balanceDue = Math.max(0, nextReceipt.amount - nextReceipt.amountPaid)
+              } else {
+                nextReceipt.amountPaid += Number(payment.amount)
+                nextReceipt.balanceDue = Math.max(0, nextReceipt.amount - nextReceipt.amountPaid)
+              }
+              setInvoicesList(listed.invoices)
+            } catch {
+              nextReceipt.amountPaid += Number(payment.amount)
+              nextReceipt.balanceDue = Math.max(0, nextReceipt.amount - nextReceipt.amountPaid)
+            }
+            nextReceipt.status = nextReceipt.balanceDue <= 0 ? 'Paid · card payment confirmed' : `Card payment confirmed · ${money(nextReceipt.amountPaid)} recorded; balance due ${money(nextReceipt.balanceDue)}`
+            setPosReceipt({ ...nextReceipt })
+            notify('IntaSend confirmed the card payment. Check the receipt status before releasing goods.')
+            try { sessionStorage.removeItem(receiptKey) } catch { /* Payment confirmation is stored on the server. */ }
+            clearReturnUrl()
+            await refresh().catch(() => undefined)
+            return
+          }
+          if (payment.status === 'failed' || payment.status === 'verification_required') {
+            nextReceipt.status = payment.status === 'failed'
+              ? 'Card payment failed · invoice remains unpaid'
+              : 'Card payment needs review · do not release goods'
+            setPosReceipt({ ...nextReceipt })
+            setError(payment.result_description || nextReceipt.status)
+            try { sessionStorage.removeItem(receiptKey) } catch { /* Payment status is stored on the server. */ }
+            clearReturnUrl()
+            return
+          }
+          nextReceipt.status = 'Card payment pending · awaiting provider confirmation'
+          setPosReceipt({ ...nextReceipt })
+        } catch {
+          // Provider confirmation can arrive after the browser redirect; retry briefly.
+        }
+        await wait()
+      }
+      if (!active) return
+      if (receipt) {
+        receipt.status = 'Card payment is still being confirmed · do not release goods until it shows paid'
+        setPosReceipt({ ...receipt })
+      }
+      notify('Card payment is still being confirmed. Check the invoice before releasing goods.')
+      clearReturnUrl()
+    }
+    void checkPayment()
+    return () => { active = false }
+  }, [account, dashboard?.workspaceName, refresh])
 
   async function reloadOfflineMutationQueue() {
     const workspaceId = account?.workspace.id
@@ -1899,6 +2024,9 @@ function App() {
           setDarajaConnection(result.connection); setDarajaEncryptionReady(result.encryptionReady)
           if (result.connection) setDarajaCredentials((current) => ({ ...current, shortcode: result.connection!.shortcode, callbackUrl: result.connection!.callback_url, initiatorName: result.connection!.initiator_name ?? '', environment: result.connection!.environment, transactionType: result.connection!.transaction_type }))
         }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load this business’s Daraja settings.'))
+        void request<{ connection: IntaSendConnection | null; encryptionReady: boolean; webhookReady: boolean }>('/v1/integrations/intasend').then((result) => {
+          setIntaSendConnection(result.connection); setIntaSendEncryptionReady(result.encryptionReady); setIntaSendWebhookReady(result.webhookReady)
+        }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load this business’s IntaSend settings.'))
       }
     }
     const recordType = ({ Customers: 'customers', Suppliers: 'suppliers', Inventory: 'inventory', Services: 'services', Projects: 'projects' } as Record<string, string>)[page]
@@ -1998,6 +2126,16 @@ function App() {
       setDarajaConnection(result.connection); setDarajaCredentials((current) => ({ ...current, consumerKey: '', consumerSecret: '', passkey: '', transactionStatusSecurityCredential: '' }))
       notify(`Daraja / M-Pesa credentials encrypted and saved for ${account?.workspace.name ?? 'this business'}.`)
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save Daraja credentials.') }
+    finally { setBusy(false) }
+  }
+
+  async function saveIntaSend(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      const result = await request<{ connection: IntaSendConnection; encryptionReady: boolean; webhookReady: boolean }>('/v1/integrations/intasend', { method: 'PUT', body: JSON.stringify({ publishableKey: intasendPublishableKey }) })
+      setIntaSendConnection(result.connection); setIntaSendEncryptionReady(result.encryptionReady); setIntaSendWebhookReady(result.webhookReady); setIntaSendPublishableKey('')
+      notify(`IntaSend card checkout credentials encrypted and saved for ${account?.workspace.name ?? 'this business'}.`)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save IntaSend credentials.') }
     finally { setBusy(false) }
   }
 
@@ -2879,7 +3017,7 @@ async function createCameraReader(): Promise<CameraReader> {
       locationId: posLocationId,
       amount: lines.reduce((sum, line) => sum + posLineTotal(line), 0),
       lines,
-      paymentMethod: posPaymentMethod,
+      paymentMethod: posPaymentMethod === 'mpesa' ? 'mpesa' : 'cash',
       paymentPhone: posPaymentPhone.trim(),
       paymentSplits: multiMethodEnabled ? (paymentSplits.pos ?? []).filter((split) => Number(split.amount) > 0).map((split) => ({ ...split, idempotencyKey: crypto.randomUUID() })) : undefined,
     }
@@ -2984,7 +3122,8 @@ async function createCameraReader(): Promise<CameraReader> {
       setError('Add available stock items to the cart before checkout.')
       return
     }
-    if (posPaymentMethod === 'mpesa' && !posPaymentPhone.trim() && !(multiMethodEnabled && (paymentSplits.pos ?? []).some((split) => split.method === 'mpesa' && Number(split.amount) > 0))) {
+    const hasActivePaymentSplits = multiMethodEnabled && (paymentSplits.pos ?? []).some((split) => Number(split.amount) > 0)
+    if (!hasActivePaymentSplits && posPaymentMethod === 'mpesa' && !posPaymentPhone.trim()) {
       setError('Enter the customer’s M-Pesa phone number before requesting payment.')
       return
     }
@@ -3001,6 +3140,9 @@ async function createCameraReader(): Promise<CameraReader> {
     // Optional split payment: several methods captured against one invoice.
     const splits = multiMethodEnabled ? (paymentSplits.pos ?? []).filter((split) => Number(split.amount) > 0) : []
     const splitsTotal = splits.reduce((sum, split) => sum + Number(split.amount), 0)
+    const cardSplits = splits.filter((split) => split.method === 'card')
+    const cardTotal = cardSplits.reduce((sum, split) => sum + Number(split.amount), 0)
+    const usesCard = splits.length ? cardTotal > 0 : posPaymentMethod === 'card'
     if (splits.length && Math.abs(splitsTotal - total) > 0.009) {
       setError(`Split payments total ${money(splitsTotal)} but the sale is ${money(total)}. Adjust the amounts so they match.`)
       return
@@ -3013,6 +3155,19 @@ async function createCameraReader(): Promise<CameraReader> {
       setError('Each M-Pesa split must be a whole-KSh amount. Adjust the split before checkout.')
       return
     }
+    if (cardSplits.some((split) => Math.abs(Number(split.amount) * 100 - Math.round(Number(split.amount) * 100)) > 0.000001)) {
+      setError('Each card split must use no more than two decimal places.')
+      return
+    }
+    if (usesCard && !cardPaymentsConfigured) {
+      setError('Hosted card checkout is not ready for this business. Ask an administrator to connect IntaSend and enable card payments in Settings.')
+      return
+    }
+    const hostedCardAmount = splits.length ? cardTotal : total
+    if (usesCard && Math.abs(hostedCardAmount * 100 - Math.round(hostedCardAmount * 100)) > 0.000001) {
+      setError('Card checkout amounts must use no more than two decimal places.')
+      return
+    }
     if (total <= 0) {
       setError('The sale total must be greater than zero. Check the item selling prices in Inventory.')
       return
@@ -3022,6 +3177,10 @@ async function createCameraReader(): Promise<CameraReader> {
       return
     }
     if (!navigator.onLine) {
+      if (usesCard) {
+        setError('Hosted card checkout needs an internet connection. Reconnect before saving this sale; card payments are not queued offline.')
+        return
+      }
       await queueOfflinePosSale()
       return
     }
@@ -3044,7 +3203,8 @@ async function createCameraReader(): Promise<CameraReader> {
       setPosIdempotencyKey(crypto.randomUUID())
       const customerEmail = savedCustomer ? String(savedCustomer.data.email ?? '') : posCustomerType === 'remote' ? posCustomerEmail.trim() : ''
       const customerPhone = savedCustomer ? String(savedCustomer.data.phone ?? '') : posCustomerType === 'remote' ? posPaymentPhone.trim() : ''
-      const receipt: PosReceipt = { invoiceId: created.invoice.id, businessName: dashboard?.workspaceName, customer, customerEmail, customerPhone, amount: total, amountPaid: 0, balanceDue: total, paymentMethod: posPaymentMethod, status: 'Payment not yet recorded', createdAt: new Date().toISOString(), lines: saleLines, fiscalization: created.fiscalization }
+      const cardIdempotencyKey = usesCard ? crypto.randomUUID() : undefined
+      const receipt: PosReceipt = { invoiceId: created.invoice.id, workspaceId: account?.workspace.id, businessName: dashboard?.workspaceName, customer, customerEmail, customerPhone, amount: total, amountPaid: 0, balanceDue: total, paymentMethod: splits.length ? [...new Set(splits.map((split) => split.method))].join(' + ') : posPaymentMethod, status: 'Payment not yet recorded', createdAt: new Date().toISOString(), lines: saleLines, fiscalization: created.fiscalization, cardIdempotencyKey, cardCheckoutAmount: cardTotal || (posPaymentMethod === 'card' ? total : undefined) }
       setPosReceipt(receipt)
       setPosCart([])
       setPosCustomer('')
@@ -3083,12 +3243,33 @@ async function createCameraReader(): Promise<CameraReader> {
             failures.push(`M-Pesa ${money(split.amount)}: ${reason instanceof Error ? reason.message : 'not requested'}`)
           }
         }
+        if (mpesaPrompted > 0) {
+          receipt.mpesaPaymentIds = mpesaPaymentIds
+          receipt.mpesaPendingAmount = mpesaPrompted
+        }
+        let cardPaymentId = ''
+        if (cardTotal > 0) {
+          try {
+            const result = await requestInvoiceCardCheckout(created.invoice.id, cardTotal, cardIdempotencyKey!)
+            cardPaymentId = result.payment.id
+            receipt.cardPaymentId = cardPaymentId
+            receipt.status = `Card checkout open · awaiting confirmation for ${money(cardTotal)}`
+            try { sessionStorage.setItem(`kashflow-card-checkout-${cardPaymentId}`, JSON.stringify(receipt)) } catch { /* The provider confirmation still posts to the invoice if browser storage is unavailable. */ }
+            setPosReceipt({ ...receipt })
+            setPaymentSplits((current) => ({ ...current, pos: [] }))
+            notify('Sale saved. Complete the card payment in IntaSend, then wait for KashFlow to confirm it before releasing goods.')
+            window.location.assign(result.checkoutUrl)
+            return
+          } catch (reason) {
+            failures.push(`Card checkout ${money(cardTotal)}: ${reason instanceof Error ? reason.message : 'not started'}`)
+          }
+        }
         receipt.balanceDue = Math.max(0, total - receipt.amountPaid)
         receipt.paymentMethod = [...new Set(splits.map((split) => split.method))].join(' + ')
         setPaymentSplits((current) => ({ ...current, pos: [] }))
-        receipt.status = failures.length ? `Partially recorded · ${failures.join(' · ')}` : mpesaSplits.length ? `M-Pesa request started · ${money(receipt.amountPaid)} collected in cash; confirm M-Pesa before releasing goods` : 'Paid · cash recorded'
+        receipt.status = failures.length ? `Partially recorded · ${failures.join(' · ')}` : mpesaSplits.length ? `M-Pesa request started · ${money(receipt.amountPaid)} collected in cash; confirm M-Pesa before releasing goods` : cardTotal > 0 ? 'Card checkout did not start · invoice remains unpaid' : 'Paid · cash recorded'
         if (failures.length) setError(`Sale saved as invoice ${created.invoice.id.slice(0, 8)}, but some split payments were not recorded: ${failures.join('; ')}`)
-        else notify('Sale completed. Stock and split payments recorded.')
+        else if (!mpesaSplits.length && cardTotal === 0) notify('Sale completed. Stock and cash split payments recorded.')
         // Wait for Daraja to confirm the M-Pesa portion so the user can see the sale is paid.
         if (mpesaPrompted > 0) watchMpesaPayment(created.invoice.id, mpesaPrompted, `Point of sale · ${customer}`, () => { receipt.status = 'Paid · M-Pesa confirmed'; setPosReceipt({ ...receipt }); void refreshAfterMpesaPaid(created.invoice.id) }, () => { receipt.status = `Unpaid · invoice ${created.invoice.id.slice(0, 8)} kept as not paid for the M-Pesa ${money(mpesaPrompted)}`; setPosReceipt({ ...receipt }) }, mpesaPaymentIds)
       } else if (posPaymentMethod === 'cash') {
@@ -3102,7 +3283,7 @@ async function createCameraReader(): Promise<CameraReader> {
           receipt.status = 'Unpaid · payment recording failed'
           setError(`Sale and stock were saved as invoice ${created.invoice.id.slice(0, 8)}, but cash payment was not recorded: ${reason instanceof Error ? reason.message : 'try recording the payment from Sales.'}`)
         }
-      } else {
+      } else if (posPaymentMethod === 'mpesa') {
         try {
           const result = await requestInvoiceMpesaPayment(created.invoice.id, posPaymentPhone.trim())
           receipt.status = 'M-Pesa request started · confirm payment status before releasing goods'
@@ -3112,6 +3293,20 @@ async function createCameraReader(): Promise<CameraReader> {
           const queued = reason instanceof OfflineQueuedError
           receipt.status = queued ? 'M-Pesa request queued · waiting for connection' : 'Unpaid · M-Pesa request did not start'
           setError(queued ? reason.message : `Sale and stock were saved as invoice ${created.invoice.id.slice(0, 8)}, but the M-Pesa request did not start: ${reason instanceof Error ? reason.message : 'check Daraja setup and try from Sales.'}`)
+        }
+      } else {
+        try {
+          const result = await requestInvoiceCardCheckout(created.invoice.id, total, cardIdempotencyKey!)
+          receipt.cardPaymentId = result.payment.id
+          receipt.status = 'Card checkout open · awaiting provider confirmation'
+          try { sessionStorage.setItem(`kashflow-card-checkout-${result.payment.id}`, JSON.stringify(receipt)) } catch { /* The provider confirmation still posts to the invoice if browser storage is unavailable. */ }
+          setPosReceipt({ ...receipt })
+          notify('Sale saved. Complete the card payment in IntaSend, then wait for KashFlow to confirm it before releasing goods.')
+          window.location.assign(result.checkoutUrl)
+          return
+        } catch (reason) {
+          receipt.status = 'Card checkout did not start · invoice remains unpaid'
+          setError(`Sale saved as invoice ${created.invoice.id.slice(0, 8)}, but card checkout did not start: ${reason instanceof Error ? reason.message : 'try again from Sales.'}`)
         }
       }
       setPosReceipt({ ...receipt })
@@ -3130,8 +3325,11 @@ async function createCameraReader(): Promise<CameraReader> {
       }
     } catch (reason) {
       if (reason instanceof TypeError) {
-        const saved = await queueOfflinePosSale()
-        if (saved) setError('The API could not be reached. The sale was saved as a local-only draft; its M-Pesa prompt, if selected, will be sent after reconnect. No payment or stock change is confirmed yet.')
+        if (usesCard) setError('The connection was lost while saving the card sale. Check Sales before retrying; card payment is recorded only after IntaSend confirms it.')
+        else {
+          const saved = await queueOfflinePosSale()
+          if (saved) setError('The API could not be reached. The sale was saved as a local-only draft; its M-Pesa prompt, if selected, will be sent after reconnect. No payment or stock change is confirmed yet.')
+        }
       } else setError(reason instanceof Error ? reason.message : 'Could not save the sale.')
     } finally {
       setBusy(false)
@@ -3156,6 +3354,41 @@ async function createCameraReader(): Promise<CameraReader> {
     } finally {
       setBusy(false)
     }
+  }
+
+  async function checkPosCardPayment() {
+    if (!posReceipt?.cardPaymentId) return
+    setBusy(true)
+    setError('')
+    try {
+      const result = await request<{ payment: { id: string; invoice_id: string; status: string; amount: string; provider?: string | null; result_description?: string | null } }>(`/v1/payments/card/${posReceipt.cardPaymentId}/status`)
+      const nextReceipt = { ...posReceipt, cardPaymentStatus: result.payment.status }
+      if (result.payment.status === 'paid') {
+        if (result.payment.provider === 'M-PESA') nextReceipt.paymentMethod = nextReceipt.paymentMethod.replace(/\bcard\b/i, 'M-Pesa via IntaSend')
+        else if (result.payment.provider === 'PESALINK' || result.payment.provider === 'COOP_B2B') nextReceipt.paymentMethod = nextReceipt.paymentMethod.replace(/\bcard\b/i, 'bank transfer via IntaSend')
+        const listed = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+        const invoice = listed.invoices.find((item) => item.id === result.payment.invoice_id)
+        nextReceipt.amountPaid = Number(invoice?.amount_paid ?? Math.min(nextReceipt.amount, nextReceipt.amountPaid + Number(result.payment.amount)))
+        nextReceipt.balanceDue = Math.max(0, nextReceipt.amount - nextReceipt.amountPaid)
+        nextReceipt.status = nextReceipt.balanceDue <= 0 ? 'Paid · card payment confirmed' : `Card payment confirmed · ${money(nextReceipt.amountPaid)} recorded; balance due ${money(nextReceipt.balanceDue)}`
+        setInvoicesList(listed.invoices)
+        try { sessionStorage.removeItem(`kashflow-card-checkout-${result.payment.id}`) } catch { /* Payment status is stored on the server. */ }
+        notify('IntaSend confirmed the payment. Check the receipt status before releasing goods.')
+        await refresh()
+      } else if (result.payment.status === 'failed') {
+        nextReceipt.status = 'Card payment failed · invoice remains unpaid'
+        setError(result.payment.result_description || nextReceipt.status)
+      } else if (result.payment.status === 'verification_required') {
+        nextReceipt.status = 'Card payment needs review · do not release goods'
+        setError(result.payment.result_description || nextReceipt.status)
+      } else {
+        nextReceipt.status = 'Card payment pending · awaiting provider confirmation'
+        notify('Card payment is still pending. Wait for confirmation before releasing goods.')
+      }
+      setPosReceipt(nextReceipt)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not check the IntaSend payment status.')
+    } finally { setBusy(false) }
   }
 
   async function saveInvoice(event: FormEvent<HTMLFormElement>) {
@@ -4597,6 +4830,7 @@ async function createCameraReader(): Promise<CameraReader> {
         inventoryMediumStockThreshold: Number(settings.inventoryMediumStockThreshold),
         monoEnabled: settings.monoEnabled,
         darajaEnabled: settings.darajaEnabled,
+        intasendEnabled: settings.intasendEnabled,
         kraEtimsLiveEnabled: settings.kraEtimsLiveEnabled,
         kraEtimsAutoSubmitPos: settings.kraEtimsAutoSubmitPos,
         statutoryFilingsEnabled: settings.statutoryFilingsEnabled,
@@ -4944,6 +5178,10 @@ async function createCameraReader(): Promise<CameraReader> {
     setDarajaConnection(null)
     setDarajaEncryptionReady(false)
     setDarajaCredentials({ consumerKey: '', consumerSecret: '', shortcode: '', passkey: '', initiatorName: '', transactionStatusSecurityCredential: '', callbackUrl: '', environment: 'sandbox', transactionType: 'CustomerPayBillOnline' })
+    setIntaSendConnection(null)
+    setIntaSendEncryptionReady(false)
+    setIntaSendWebhookReady(false)
+    setIntaSendPublishableKey('')
   }, [account?.workspace.id])
   const multiMethodEnabled = Boolean(settings.multiMethodPayments)
 
@@ -4992,6 +5230,8 @@ async function createCameraReader(): Promise<CameraReader> {
   })), [dashboard])
   const mpesaStatus = integrationReadiness?.integrations.find((item) => item.id === 'mpesa')?.status ?? 'daraja_credentials_and_callback_required'
   const mpesaConfigured = mpesaStatus.startsWith('configured_')
+  const cardPaymentStatus = integrationReadiness?.integrations.find((item) => item.id === 'card_payments')?.status ?? 'workspace_intasend_disabled'
+  const cardPaymentsConfigured = cardPaymentStatus === 'intasend_card_checkout_ready'
   const emailStatus = integrationReadiness?.integrations.find((item) => item.id === 'email')?.status ?? 'brevo_api_key_and_verified_sender_required'
   const emailConfigured = emailStatus === 'brevo_configured'
   const bankFeedStatus = integrationReadiness?.integrations.find((item) => item.id === 'bank_feeds')?.status ?? 'mono_business_approval_and_server_keys_required'
@@ -5834,7 +6074,7 @@ async function createCameraReader(): Promise<CameraReader> {
             </article>}
           </section>
         })() : page === 'Kenya compliance' ? <section className="module-page">
-          <div className="eyebrow"><span className="live-dot" /> KENYA COMPLIANCE · {dashboard?.workspaceName}</div><h1>Taxes and compliance</h1><p className="welcome-subtitle">Connect KRA eTIMS with one guided step, review bank feeds, prepare payroll taxes, and manage this business’s Daraja connection.</p>
+          <div className="eyebrow"><span className="live-dot" /> KENYA COMPLIANCE · {dashboard?.workspaceName}</div><h1>Taxes and compliance</h1><p className="welcome-subtitle">Connect KRA eTIMS, review bank feeds, prepare payroll taxes, and manage this business’s payment connections.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="metric-grid compliance-overview-grid">{[{ name: 'KRA eTIMS', description: 'Connect once below and fiscalise your invoices for KRA in a single guided step.', key: 'kra_etims' as const, blocker: kraEtimsConfig?.initialized ? 'Connected — ready to fiscalise' : 'Ready to connect in one step' }, { name: 'Bank feeds', description: 'Connect an eligible bank or import a statement. Review transactions before posting to your books.', key: 'bank_feeds' as const, blocker: monoConfigured ? 'Ready to connect' : 'Manual statement import available' }, { name: 'Payroll taxes', description: 'Prepare Kenyan payroll estimates for PAYE, NSSF, SHIF and Affordable Housing Levy alongside your monthly drafts.', key: 'statutory_filing' as const, blocker: 'Estimates ready in payroll' }].map((item) => {
             const value = onboarding[item.key] ?? { milestone: 'not_started', note: '', details: {} }
@@ -5868,6 +6108,23 @@ async function createCameraReader(): Promise<CameraReader> {
               <p className="dialog-note">To enable M-Pesa payment requests for this business, turn on “Allow Daraja / M-Pesa for this business” in Settings.</p>
               <button type="button" className="button button-secondary" onClick={() => navigateTo('Settings')}>Open workspace settings</button>
             </> : <p className="dialog-note">A business administrator can add or update this business’s encrypted Daraja credentials.</p>}
+          </section>
+
+          <section className="module-card" aria-labelledby="intasend-business-settings-heading">
+            <div className="panel-header"><div><h2 id="intasend-business-settings-heading">IntaSend · hosted card checkout</h2><p>Connect this business’s own IntaSend merchant account for browser-based card payments.</p></div><CreditCard size={20} /></div>
+            {canUse('integrations.manage') ? <>
+              <p>Customers enter payment details on IntaSend’s hosted page, where they can select a method enabled on your account. Ask card customers to select Card. KashFlow never receives or stores card numbers or CVV. The saved publishable key is encrypted and belongs only to this business.</p>
+              {intasendConnection && <p role="status">Publishable key saved for this business{intasendConnection.updated_at ? ` · updated ${new Date(intasendConnection.updated_at).toLocaleString()}` : ''} · webhook {intasendWebhookReady ? 'configured on the API' : 'challenge needed on the API'}</p>}
+              {!intasendEncryptionReady && <p className="form-error" role="alert">Secure credential storage is not configured on the API server. Set <code>ONLINE_COMMERCE_ENCRYPTION_KEY</code> before saving the key.</p>}
+              {!intasendWebhookReady && <p className="dialog-note">The API operator must set a random <code>INTASEND_WEBHOOK_CHALLENGE</code> (32+ characters). Configure that same challenge in the IntaSend dashboard.</p>}
+              <form className="record-form-grid" onSubmit={saveIntaSend}>
+                <label className="field-label">IntaSend publishable key<input required type="password" autoComplete="new-password" value={intasendPublishableKey} onChange={(event) => setIntaSendPublishableKey(event.target.value)} placeholder="ISPubKey_test_… or ISPubKey_live_…" /></label>
+                <div className="button-row"><button className="button button-primary" disabled={busy || !intasendEncryptionReady}>{busy ? 'Saving…' : 'Save encrypted key'}</button></div>
+              </form>
+              <p className="dialog-note">Set the webhook URL in the IntaSend dashboard to <code>{API_BASE}/v1/integrations/intasend/callback</code>. Keep its challenge the same as the API setting. Card fee handling follows your IntaSend dashboard settings; set the card tariff to Business pays. Test with a test key first; switch to a live key only after your merchant account is approved.</p>
+              <p className="dialog-note">After saving the key, a workspace administrator must enable IntaSend for this business in Settings.</p>
+              <button type="button" className="button button-secondary" onClick={() => navigateTo('Settings')}>Open workspace settings</button>
+            </> : <p className="dialog-note">A business administrator can connect or update this business’s IntaSend merchant account.</p>}
           </section>
 
           <article className="kra-wizard">
@@ -6078,12 +6335,13 @@ async function createCameraReader(): Promise<CameraReader> {
               <fieldset className="pos-payment-choice"><legend>Payment method</legend>
                 <button type="button" className={posPaymentMethod === 'cash' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'cash'} onClick={() => setPosPaymentMethod('cash')}><Banknote size={17} />Cash / manual</button>
                 <button type="button" className={posPaymentMethod === 'mpesa' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'mpesa'} disabled={!mpesaConfigured} title={mpesaConfigured ? 'Request an M-Pesa STK push' : 'Configure Daraja before requesting M-Pesa'} onClick={() => setPosPaymentMethod('mpesa')}><Smartphone size={17} />M-Pesa{!mpesaConfigured && <small>Setup needed</small>}</button>
+                <button type="button" className={posPaymentMethod === 'card' ? 'selected' : ''} aria-pressed={posPaymentMethod === 'card'} disabled={!cardPaymentsConfigured} title={cardPaymentsConfigured ? 'Open IntaSend hosted card checkout' : 'Connect IntaSend and enable card checkout in Settings'} onClick={() => setPosPaymentMethod('card')}><CreditCard size={17} />Card checkout{!cardPaymentsConfigured && <small>Setup needed</small>}</button>
               </fieldset>
               {posPaymentMethod === 'mpesa' && !((paymentSplits.pos ?? []).some((split) => split.method === 'mpesa' && Number(split.amount) > 0)) && <label className="field-label">Customer M-Pesa number<input type="tel" autoComplete="tel" placeholder="07XX XXX XXX" value={posPaymentPhone} onChange={(event) => setPosPaymentPhone(event.target.value)} /></label>}
               {multiMethodEnabled && <div className="payment-split-editor">
-                <div className="panel-header"><div><h3>Split payment (optional)</h3><p>Part cash, part M-Pesa, or any mix. Amounts must add up to the sale total of {money(posTotal)}.</p></div><button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, pos: [...(current.pos ?? []), { method: 'cash', amount: '', phone: '', reference: '' }] }))}><Plus size={14} /> Add method</button></div>
+                <div className="panel-header"><div><h3>Split payment (optional)</h3><p>Mix cash, M-Pesa, and card checkout. Amounts must add up to the sale total of {money(posTotal)}.</p></div><button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, pos: [...(current.pos ?? []), { method: 'cash', amount: '', phone: '', reference: '' }] }))}><Plus size={14} /> Add method</button></div>
                 {(paymentSplits.pos ?? []).map((split, index) => <div className="field-row payment-split-row" key={index}>
-                  <label className="field-label">Method<select value={split.method} onChange={(event) => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).map((item, row) => row === index ? { ...item, method: event.target.value as 'cash' | 'mpesa' } : item) }))}><option value="cash">Cash / manual</option><option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option></select></label>
+                  <label className="field-label">Method<select value={split.method} onChange={(event) => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).map((item, row) => row === index ? { ...item, method: event.target.value as PaymentSplit['method'] } : item) }))}><option value="cash">Cash / manual</option><option value="mpesa" disabled={!mpesaConfigured}>M-Pesa{!mpesaConfigured ? ' · setup needed' : ''}</option><option value="card" disabled={!cardPaymentsConfigured}>Card checkout{!cardPaymentsConfigured ? ' · setup needed' : ''}</option></select></label>
                   <label className="field-label">Amount (KSh)<input type="number" min="0" step="0.01" value={split.amount} onChange={(event) => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).map((item, row) => row === index ? { ...item, amount: event.target.value } : item) }))} /></label>
                   {split.method === 'mpesa' && <label className="field-label">M-Pesa phone<input type="tel" placeholder="07XX XXX XXX" value={split.phone} onChange={(event) => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).map((item, row) => row === index ? { ...item, phone: event.target.value } : item) }))} /></label>}
                   <button type="button" className="button button-small" onClick={() => setPaymentSplits((current) => ({ ...current, pos: (current.pos ?? []).filter((_, row) => row !== index) }))}>Remove</button>
@@ -6092,12 +6350,14 @@ async function createCameraReader(): Promise<CameraReader> {
                   const rows = (paymentSplits.pos ?? []).filter((split) => Number(split.amount) > 0)
                   const cashTotal = rows.filter((split) => split.method === 'cash').reduce((sum, split) => sum + Number(split.amount || 0), 0)
                   const mpesaTotal = rows.filter((split) => split.method === 'mpesa').reduce((sum, split) => sum + Number(split.amount || 0), 0)
-                  const splitTotal = cashTotal + mpesaTotal
+                  const cardTotal = rows.filter((split) => split.method === 'card').reduce((sum, split) => sum + Number(split.amount || 0), 0)
+                  const splitTotal = cashTotal + mpesaTotal + cardTotal
                   const remaining = posTotal - splitTotal
                   const balanced = Math.abs(remaining) < 0.009
                   return <div className={`split-summary${balanced ? ' is-balanced' : ' is-unbalanced'}`} role="status" aria-live="polite">
                     <span><small>Cash</small><strong>{money(cashTotal)}</strong></span>
                     <span><small>M-Pesa</small><strong>{money(mpesaTotal)}</strong></span>
+                    <span><small>Card</small><strong>{money(cardTotal)}</strong></span>
                     <span><small>Sale total</small><strong>{money(posTotal)}</strong></span>
                     <span><small>{remaining > 0 ? 'Still to allocate' : remaining < 0 ? 'Over the total' : 'Balanced'}</small><strong>{money(Math.abs(remaining))}</strong></span>
                   </div>
@@ -6105,12 +6365,12 @@ async function createCameraReader(): Promise<CameraReader> {
                 {Boolean((paymentSplits.pos ?? []).length) && Math.abs((paymentSplits.pos ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0) - posTotal) >= 0.009 && <p className="form-error" role="alert">The split amounts do not add up to {money(posTotal)}. Adjust them before completing the sale.</p>}
                 {Boolean((paymentSplits.pos ?? []).filter((split) => split.method === 'mpesa').length) && !mpesaConfigured && <p className="form-error" role="alert">Daraja M-Pesa is not configured for this business, so M-Pesa splits cannot be requested. Remove them or ask a business administrator to add this business’s credentials on the Kenya compliance page.</p>}
               </div>}
-              <button type="button" className="button button-primary pos-complete" disabled={busy || !posCart.length || posTotal <= 0 || (Boolean((paymentSplits.pos ?? []).length) && Math.abs((paymentSplits.pos ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0) - posTotal) >= 0.009)} onClick={() => void checkoutPos()}>{busy ? 'Processing sale…' : (paymentSplits.pos ?? []).length ? 'Complete sale with split payment' : posPaymentMethod === 'mpesa' ? 'Request M-Pesa payment' : 'Complete cash sale'}</button>
+              <button type="button" className="button button-primary pos-complete" disabled={busy || !posCart.length || posTotal <= 0 || (Boolean((paymentSplits.pos ?? []).length) && Math.abs((paymentSplits.pos ?? []).reduce((sum, split) => sum + Number(split.amount || 0), 0) - posTotal) >= 0.009)} onClick={() => void checkoutPos()}>{busy ? 'Processing sale…' : (paymentSplits.pos ?? []).length ? (paymentSplits.pos.some((split) => split.method === 'card') ? 'Continue to card checkout' : 'Complete sale with split payment') : posPaymentMethod === 'mpesa' ? 'Request M-Pesa payment' : posPaymentMethod === 'card' ? 'Open card checkout' : 'Complete cash sale'}</button>
               <p className="pos-disclaimer"><ShieldCheck size={14} />KRA eTIMS submission only runs when automatic POS submission is enabled and every item mapping and approved device is configured. Until KRA accepts, this remains an internal invoice. Verify payment before releasing goods.</p>
             </aside>
           </div>
           {posReceipt && <div className="module-card pos-last-sale"><div><div className="eyebrow">LAST SALE · {posReceipt.invoiceId.slice(0, 8).toUpperCase()}</div><h2>{money(posReceipt.amount)}</h2><p>{posReceipt.customer} · {posReceipt.status}</p>{posReceipt.fiscalization && <p className="dialog-note" role="status">eTIMS · {posReceipt.fiscalization.submissionStatus.replaceAll('_', ' ')}{posReceipt.fiscalization.externalInvoiceNumber ? ` · KRA reference ${posReceipt.fiscalization.externalInvoiceNumber}` : ''}. {posReceipt.fiscalization.notice}</p>}</div>
-            <div className="button-row"><button className="button button-secondary" onClick={() => printDocument('pos')}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod.toLowerCase().includes('cash') && posReceipt.amountPaid > 0 && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}{posReceipt.fiscalization?.submissionStatus === 'accepted_by_kra' && <button className="button button-primary" onClick={() => { setKraReceiptOpen(posReceipt.fiscalization?.complianceDraftId ?? ''); navigateTo('Kenya compliance') }}>View KRA fiscal receipt</button>}<button className="button button-secondary" onClick={() => { setNetworkingTab('sales'); navigateTo('Networking') }}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}</div>
+            <div className="button-row"><button className="button button-secondary" onClick={() => printDocument('pos')}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod.toLowerCase().includes('cash') && posReceipt.amountPaid > 0 && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}{posReceipt.fiscalization?.submissionStatus === 'accepted_by_kra' && <button className="button button-primary" onClick={() => { setKraReceiptOpen(posReceipt.fiscalization?.complianceDraftId ?? ''); navigateTo('Kenya compliance') }}>View KRA fiscal receipt</button>}<button className="button button-secondary" onClick={() => { setNetworkingTab('sales'); navigateTo('Networking') }}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}{posReceipt.cardPaymentId && !['paid', 'failed', 'verification_required'].includes(posReceipt.cardPaymentStatus ?? '') && <button className="button button-primary" disabled={busy} onClick={() => void checkPosCardPayment()}><CreditCard size={15} />Check card payment</button>}</div>
             <details className="module-footnote"><summary>Receipt printer setup</summary><p>Use Print receipt to choose any printer installed on this computer, including a USB printer or network printer. Thermal print uses the optional local bridge and a compatible ESC/POS network printer on port 9100.</p><div className="field-row"><label className="field-label">Local bridge URL<input value={posBridgeAddress} onChange={(event) => changePosBridgeAddress(event.target.value)} placeholder="http://127.0.0.1:17371" /></label><button className="button button-small" disabled={posBridgeBusy} onClick={() => void testPosBridge()}>{posBridgeBusy ? 'Checking…' : t('Test connection')}</button></div>{posBridgeStatus && <p role="status">{t(posBridgeStatus)}</p>}<small>{t('Internal receipt only; not an eTIMS tax invoice.')} Cash drawer is enabled only after a cash payment is recorded.</small></details>
           </div>}
           {posReceipt && <article className="pos-receipt-print"><header className="pos-receipt-brand"><strong>{posReceipt.businessName || dashboard?.workspaceName || 'Your business'}</strong><span>Powered by KashFlow</span></header><h2>{t('SALE RECEIPT')}</h2><div className="pos-receipt-meta"><span>Receipt <strong>{posReceipt.invoiceId.slice(0, 8).toUpperCase()}</strong></span><span>{new Date(posReceipt.createdAt).toLocaleString('en-KE', { dateStyle: 'medium', timeStyle: 'short' })}</span></div><p className="pos-receipt-customer">Customer: <strong>{posReceipt.customer}</strong></p><hr /><div className="pos-receipt-columns"><span>Item</span><span>Qty</span><span>Amount</span></div>{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.description}<small>{money(line.unitPrice)} each · VAT {money(posLineTaxAmount(line))}</small></span><span>{line.quantity}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><span>VAT total</span><span /><strong>{money(posReceipt.lines.reduce((sum, line) => sum + posLineTaxAmount(line), 0))}</strong></div><div className="pos-receipt-line pos-receipt-total"><strong>Total</strong><strong>{money(posReceipt.amount)}</strong></div><div className="pos-receipt-payment"><span>Payment · {posReceipt.paymentMethod}</span><span>Paid {money(posReceipt.amountPaid)}</span>{posReceipt.balanceDue > 0 && <strong>Balance due {money(posReceipt.balanceDue)}</strong>}</div><footer>Thank you for your business.<small>Internal receipt · not an eTIMS tax invoice</small></footer></article>}
@@ -6263,12 +6523,12 @@ async function createCameraReader(): Promise<CameraReader> {
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.emailAlerts} onChange={(event) => setSettings({ ...settings, emailAlerts: event.target.checked })} /> Email alert preference (delivery not configured)</label><p className="dialog-note">Workspace activity logging stays enabled for administrator accountability.</p></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.backupSchedule !== 'Manual only'} onChange={(event) => setSettings({ ...settings, backupSchedule: event.target.checked ? 'Daily automatic' : 'Manual only' })} /> Enable automatic backups and safety copies for this workspace</label></div>
             <p className="dialog-note">Save settings to apply this choice. Off-site copies also require the API operator to configure S3-compatible storage.</p>
-            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.monoEnabled} onChange={(event) => setSettings({ ...settings, monoEnabled: event.target.checked })} /> Allow Mono bank-feed connections for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.darajaEnabled} onChange={(event) => setSettings({ ...settings, darajaEnabled: event.target.checked })} /> Allow Daraja / M-Pesa for this business</label></div>
+            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.monoEnabled} onChange={(event) => setSettings({ ...settings, monoEnabled: event.target.checked })} /> Allow Mono bank-feed connections for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.darajaEnabled} onChange={(event) => setSettings({ ...settings, darajaEnabled: event.target.checked })} /> Allow Daraja / M-Pesa for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.intasendEnabled} onChange={(event) => setSettings({ ...settings, intasendEnabled: event.target.checked })} /> Allow IntaSend card checkout for this business</label></div>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.kraEtimsLiveEnabled} onChange={(event) => setSettings({ ...settings, kraEtimsLiveEnabled: event.target.checked })} /> Permit live KRA eTIMS usage for this business</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.kraEtimsAutoSubmitPos} onChange={(event) => setSettings({ ...settings, kraEtimsAutoSubmitPos: event.target.checked })} /> Automatically submit mapped POS sales to KRA eTIMS</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.statutoryFilingsEnabled} onChange={(event) => setSettings({ ...settings, statutoryFilingsEnabled: event.target.checked })} /> Permit statutory filing routes for this business</label></div>
             <p className="dialog-note">POS auto-submission is off by default. Enable it only after KRA approval, device setup, current code mapping, and a reviewed VAT classification for every item. If KRA does not accept a sale, KashFlow keeps it as an internal invoice and shows the provider status.</p>
             <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.shifEnabled} onChange={(event) => setSettings({ ...settings, shifEnabled: event.target.checked })} /> Enable SHIF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.nssfEnabled} onChange={(event) => setSettings({ ...settings, nssfEnabled: event.target.checked })} /> Enable NSSF route</label><label className="field-label checkbox-row"><input type="checkbox" checked={settings.ahlEnabled} onChange={(event) => setSettings({ ...settings, ahlEnabled: event.target.checked })} /> Enable AHL route</label></div>
-            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.multiMethodPayments} onChange={(event) => setSettings({ ...settings, multiMethodPayments: event.target.checked })} /> Allow customers to pay one invoice with more than one method (part cash, part M-Pesa)</label></div>
-            <p className="dialog-note">Split payments only change how a payment is captured: each method is still recorded and verified on its own, and an M-Pesa request still needs a live connection. Total must match the invoice or sale.</p>
+            <div className="field-row"><label className="field-label checkbox-row"><input type="checkbox" checked={settings.multiMethodPayments} onChange={(event) => setSettings({ ...settings, multiMethodPayments: event.target.checked })} /> Allow customers to pay one invoice with more than one method (cash, M-Pesa, or card)</label></div>
+            <p className="dialog-note">Split payments only change how a payment is captured. Cash is recorded by the workspace; M-Pesa and card are recorded only after provider confirmation. Total must match the invoice or sale.</p>
             {error && <p className="form-error" role="alert">{error}</p>}
             <div className="dialog-actions"><button className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save settings'}</button></div>
           </form>}

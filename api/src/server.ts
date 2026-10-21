@@ -32,6 +32,7 @@ const envSchema = z.object({
   KRA_ETIMS_LIVE_ENABLED: z.enum(['true', 'false']).default('false'),
   KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY: z.string().min(32).optional(),
   ONLINE_COMMERCE_ENCRYPTION_KEY: z.string().min(32).optional(),
+  INTASEND_WEBHOOK_CHALLENGE: z.string().min(32).optional(),
   BACKUP_OPERATOR_TOKEN: z.string().min(32).optional(),
   BACKUP_RESTORE_MAINTENANCE_MODE: z.enum(['true', 'false']).default('false'),
   BACKUP_S3_ENDPOINT: z.string().url().optional(),
@@ -66,6 +67,7 @@ type DarajaConfig = {
   transactionStatusSecurityCredential: string | null
   transactionType: 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline'
 }
+type IntaSendConfig = { publishableKey: string }
 const emailConfigured = Boolean(env.BREVO_API_KEY && (env.BREVO_SENDER_EMAIL || env.EMAIL_FROM))
 // Brevo (free tier) powers transactional email and SMS. WhatsApp needs an approved Brevo
 // WhatsApp sender, so it stays off until the operator supplies BREVO_WHATSAPP_NUMBER.
@@ -148,6 +150,7 @@ const defaultWorkspaceSettings = {
   inventoryMediumStockThreshold: 10,
   monoEnabled: false,
   darajaEnabled: false,
+  intasendEnabled: false,
   kraEtimsLiveEnabled: false,
   kraEtimsAutoSubmitPos: false,
   statutoryFilingsEnabled: false,
@@ -864,14 +867,14 @@ function requireInvoicePaymentAccess(request: AuthedRequest, response: express.R
   }
   next()
 }
-function requireWorkspaceProviderPreference(preference: 'monoEnabled' | 'darajaEnabled' | 'kraEtimsLiveEnabled', productionOnly = false) {
+function requireWorkspaceProviderPreference(preference: 'monoEnabled' | 'darajaEnabled' | 'intasendEnabled' | 'kraEtimsLiveEnabled', productionOnly = false) {
   return async (request: AuthedRequest, response: express.Response, next: express.NextFunction) => {
     if (productionOnly && env.KRA_ETIMS_ENV !== 'production') { next(); return }
     try {
       const result = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId])
       const preferences = result.rows[0]?.preferences ?? {}
       if (preferences[preference] !== true) {
-        response.status(403).json({ error: `This business has not enabled ${preference === 'monoEnabled' ? 'Mono bank feeds' : preference === 'darajaEnabled' ? 'Daraja / M-Pesa' : 'live KRA eTIMS'} in its workspace settings.` })
+        response.status(403).json({ error: `This business has not enabled ${preference === 'monoEnabled' ? 'Mono bank feeds' : preference === 'darajaEnabled' ? 'Daraja / M-Pesa' : preference === 'intasendEnabled' ? 'IntaSend card checkout' : 'live KRA eTIMS'} in its workspace settings.` })
         return
       }
       next()
@@ -980,6 +983,136 @@ async function resolveWorkspaceDarajaConfig(workspaceId: string): Promise<Daraja
   }
   return null
 }
+async function resolveWorkspaceIntaSendConfig(workspaceId: string): Promise<IntaSendConfig | null> {
+  const row = (await pool!.query('SELECT publishable_key_ciphertext FROM intasend_connections WHERE workspace_id = $1 AND enabled = true', [workspaceId])).rows[0]
+  return row ? { publishableKey: decryptCommerceSecret(String(row.publishable_key_ciphertext)) } : null
+}
+async function intasendRequest<T>(config: IntaSendConfig, path: string, body: Record<string, unknown>): Promise<T> {
+  const providerResponse = await fetch(`https://api.intasend.com/api/v1${path}`, {
+    method: 'POST',
+    headers: { 'X-IntaSend-Public-API-Key': config.publishableKey, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    redirect: 'error',
+    signal: AbortSignal.timeout(20_000),
+  })
+  const payload = await providerResponse.json().catch(() => null)
+  if (!providerResponse.ok) {
+    const detail = typeof payload?.detail === 'string' ? payload.detail.slice(0, 240)
+      : typeof payload?.message === 'string' ? payload.message.slice(0, 240)
+        : `HTTP ${providerResponse.status}`
+    throw new Error(`IntaSend request failed: ${detail}`)
+  }
+  return payload as T
+}
+type IntaSendCollectionEvent = {
+  invoice_id: string
+  api_ref: string
+  state: string
+  provider?: string
+  value?: string | number
+  charges?: string | number | null
+  net_amount?: string | number | null
+  currency?: string
+  provider_ref?: string | null
+  failed_reason?: string | null
+}
+function paymentCents(value: unknown) {
+  const amount = Number(value)
+  return Number.isFinite(amount) ? Math.round((amount + Number.EPSILON) * 100) : NaN
+}
+async function applyIntaSendCardEvent(event: IntaSendCollectionEvent) {
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query(`SELECT id, workspace_id, invoice_id, amount::text, currency, status, api_ref, provider_invoice_id
+      FROM intasend_card_payment_requests WHERE api_ref = $1 FOR UPDATE`, [event.api_ref])
+    const payment = found.rows[0]
+    if (!payment) { await client.query('COMMIT'); return }
+    if (payment.status === 'paid' || (payment.status === 'failed' && event.state !== 'COMPLETE')) { await client.query('COMMIT'); return }
+    const safeProviderResult = {
+      invoice_id: event.invoice_id,
+      api_ref: event.api_ref,
+      state: event.state,
+      provider: event.provider ?? null,
+      value: event.value ?? null,
+      charges: event.charges ?? null,
+      net_amount: event.net_amount ?? null,
+      currency: event.currency ?? null,
+      provider_ref: event.provider_ref ?? null,
+      failed_reason: event.failed_reason ?? null,
+    }
+    const setStatus = async (status: 'pending' | 'failed' | 'verification_required', message: string) => {
+      await client.query(`UPDATE intasend_card_payment_requests SET status = $1, provider_invoice_id = COALESCE(provider_invoice_id, $2),
+        provider_ref = COALESCE($3, provider_ref), provider = COALESCE($4, provider), result_description = $5,
+        provider_result = $6::jsonb, callback_received_at = now(), updated_at = now() WHERE id = $7`,
+      [status, event.invoice_id || null, event.provider_ref ?? null, event.provider ?? null, message.slice(0, 500), JSON.stringify(safeProviderResult), payment.id])
+    }
+    if (event.state !== 'COMPLETE') {
+      const terminalFailure = ['FAILED', 'CANCELED'].includes(event.state)
+      await setStatus(terminalFailure ? 'failed' : 'pending', event.failed_reason || `IntaSend payment is ${event.state.toLowerCase()}.`)
+      await client.query('COMMIT')
+      return
+    }
+    if (!event.provider || event.currency !== String(payment.currency)
+      || paymentCents(event.value) !== paymentCents(payment.amount)
+      || (payment.provider_invoice_id && String(payment.provider_invoice_id) !== event.invoice_id)) {
+      await setStatus('verification_required', 'IntaSend reported a completed payment, but its provider, invoice, amount, or currency did not match this request.')
+      await client.query('COMMIT')
+      return
+    }
+    const grossCents = paymentCents(payment.amount)
+    const chargeCents = event.charges !== null && event.charges !== undefined ? paymentCents(event.charges)
+      : event.net_amount !== null && event.net_amount !== undefined ? grossCents - paymentCents(event.net_amount) : 0
+    const netCents = event.net_amount !== null && event.net_amount !== undefined ? paymentCents(event.net_amount) : grossCents - chargeCents
+    if (!Number.isFinite(chargeCents) || !Number.isFinite(netCents) || chargeCents < 0 || netCents < 0 || chargeCents + netCents !== grossCents) {
+      await setStatus('verification_required', 'IntaSend reported a completed payment with invalid settlement amounts; no accounting entry was posted.')
+      await client.query('COMMIT')
+      return
+    }
+    const invoiceResult = await client.query(`SELECT id, customer, description, amount::text, amount_paid::text
+      FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [payment.invoice_id, payment.workspace_id])
+    const invoice = invoiceResult.rows[0]
+    if (!invoice) {
+      await setStatus('verification_required', 'The payment succeeded, but its invoice is no longer available in this business.')
+      await client.query('COMMIT')
+      return
+    }
+    const returns = await client.query('SELECT COALESCE(SUM(amount), 0)::text AS returned, COALESCE(SUM(refund_amount), 0)::text AS refunded FROM sales_returns WHERE invoice_id = $1', [invoice.id])
+    const dueCents = paymentCents(invoice.amount) - paymentCents(invoice.amount_paid) - paymentCents(returns.rows[0].returned) + paymentCents(returns.rows[0].refunded)
+    if (grossCents > dueCents) {
+      await setStatus('verification_required', 'The payment succeeded, but the invoice balance changed before confirmation. Reconcile the provider transaction before posting it.')
+      await client.query('COMMIT')
+      return
+    }
+    const paymentReference = String(event.provider_ref || event.invoice_id).slice(0, 180)
+    const provider = event.provider.toUpperCase()
+    const paymentMethod = ['CARD-PAYMENT', 'APPLE-PAY', 'GOOGLE-PAY'].includes(provider) ? 'card'
+      : provider === 'M-PESA' ? 'mpesa'
+        : ['PESALINK', 'COOP_B2B'].includes(provider) ? 'bank_transfer'
+          : `intasend_${provider.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`.slice(0, 40)
+    const paymentId = randomUUID()
+    const paymentDate = nairobiToday()
+    await client.query(`UPDATE invoices SET amount_paid = amount_paid + $1,
+      status = CASE WHEN amount_paid + $1 >= amount - $2 + $3 THEN 'paid' ELSE 'unpaid' END
+      WHERE id = $4 AND workspace_id = $5`, [payment.amount, returns.rows[0].returned, returns.rows[0].refunded, invoice.id, payment.workspace_id])
+    await client.query(`INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, payment_method, payment_reference)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)`, [paymentId, payment.workspace_id, invoice.id, payment.amount, paymentDate, paymentMethod, paymentReference])
+    const journalLines: JournalLineInput[] = []
+    if (netCents > 0) journalLines.push({ accountCode: '1000', debit: netCents / 100, credit: 0 })
+    if (chargeCents > 0) journalLines.push({ accountCode: '6000', debit: chargeCents / 100, credit: 0, description: 'IntaSend card processing fee' })
+    journalLines.push({ accountCode: '1100', debit: 0, credit: grossCents / 100 })
+    await insertJournal(client, { workspaceId: String(payment.workspace_id), userId: null, date: paymentDate, description: `IntaSend ${provider} payment ${paymentReference}`, sourceType: 'intasend_payment', sourceId: paymentId, lines: journalLines })
+    await client.query(`UPDATE intasend_card_payment_requests SET status = 'paid', provider_invoice_id = $1, provider_ref = $2,
+      provider = $3, provider_charges = $4, net_amount = $5, result_description = 'Payment confirmed by IntaSend.',
+      provider_result = $6::jsonb, callback_received_at = now(), updated_at = now() WHERE id = $7`,
+    [event.invoice_id, event.provider_ref ?? null, event.provider ?? null, chargeCents / 100, netCents / 100, JSON.stringify(safeProviderResult), payment.id])
+    await recordAudit(client, { workspaceId: String(payment.workspace_id), actorUserId: null, eventType: 'intasend.payment_confirmed', entityType: 'invoice', entityId: String(invoice.id), eventData: { paymentId, provider: event.provider, providerPaymentId: event.invoice_id, providerReference: paymentReference, amount: grossCents / 100, charges: chargeCents / 100, currency: payment.currency } })
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally { client.release() }
+}
 app.disable('x-powered-by')
 app.use(helmet())
 app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Kashflow-Client', 'Idempotency-Key'] }))
@@ -989,7 +1122,7 @@ app.use(rateLimit({
   limit: 240,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
-  skip: (request) => request.path === '/v1/integrations/mpesa/callback',
+  skip: (request) => request.path === '/v1/integrations/mpesa/callback' || request.path === '/v1/integrations/intasend/callback',
   handler: (_request, response) => response.status(429).json({ error: 'This service received too many requests from this network. Please wait a minute and try again.' }),
 }))
 app.use((request, response, next) => {
@@ -2539,6 +2672,31 @@ app.put('/v1/integrations/daraja', requirePool, verifyOrigin, requireSession, re
     response.json({ connection: { ...saved.rows[0], transactionStatusConfigured: Boolean(saved.rows[0].initiator_name && saved.rows[0].transaction_status_configured), credentialsConfigured: true } })
   } catch (error) { next(error) }
 })
+// Each workspace connects its own IntaSend merchant account for hosted card checkout.
+// The provider publishable key is encrypted at rest and never returned after save.
+app.get('/v1/integrations/intasend', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT enabled, updated_at FROM intasend_connections WHERE workspace_id = $1', [request.session!.workspaceId])
+    response.json({
+      connection: result.rows[0] ? { ...result.rows[0], credentialsConfigured: true } : null,
+      encryptionReady: Boolean(env.ONLINE_COMMERCE_ENCRYPTION_KEY),
+      webhookReady: Boolean(env.INTASEND_WEBHOOK_CHALLENGE),
+    })
+  } catch (error) { next(error) }
+})
+app.put('/v1/integrations/intasend', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({ publishableKey: z.string().trim().min(20).max(300).regex(/^ISPubKey_(test|live)_/, 'Use an IntaSend test or live publishable key.') }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: input.error.issues[0]?.message ?? 'Enter an IntaSend publishable key.' }); return }
+  if (!env.ONLINE_COMMERCE_ENCRYPTION_KEY) { response.status(503).json({ error: 'IntaSend credential storage is disabled. Configure ONLINE_COMMERCE_ENCRYPTION_KEY on the API service.' }); return }
+  try {
+    const saved = await pool!.query(`INSERT INTO intasend_connections (workspace_id, publishable_key_ciphertext)
+      VALUES ($1, $2)
+      ON CONFLICT (workspace_id) DO UPDATE SET publishable_key_ciphertext = EXCLUDED.publishable_key_ciphertext, enabled = true, updated_at = now()
+      RETURNING enabled, updated_at`, [request.session!.workspaceId, encryptCommerceSecret(input.data.publishableKey)])
+    await recordAudit(pool!, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'integrations.intasend_credentials_saved', entityType: 'workspace', entityId: request.session!.workspaceId, eventData: { keyMode: input.data.publishableKey.startsWith('ISPubKey_live_') ? 'live' : 'test' } })
+    response.json({ connection: { ...saved.rows[0], credentialsConfigured: true }, encryptionReady: true, webhookReady: Boolean(env.INTASEND_WEBHOOK_CHALLENGE) })
+  } catch (error) { next(error) }
+})
 app.post('/v1/integrations/woocommerce/products/sync', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   try {
     const connectionResult = await pool!.query('SELECT store_url, consumer_key_ciphertext, consumer_secret_ciphertext FROM woocommerce_connections WHERE workspace_id = $1 AND enabled = true', [request.session!.workspaceId])
@@ -3440,6 +3598,7 @@ app.put('/v1/settings', requirePool, verifyOrigin, requireSession, requireWorksp
     inventoryMediumStockThreshold: z.coerce.number().int().min(1).max(1_000_000),
     monoEnabled: z.boolean().default(false),
     darajaEnabled: z.boolean().default(false),
+    intasendEnabled: z.boolean().default(false),
     kraEtimsLiveEnabled: z.boolean().default(false),
     kraEtimsAutoSubmitPos: z.boolean().default(false),
     statutoryFilingsEnabled: z.boolean().default(false),
@@ -5824,14 +5983,16 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
       const invoiceResult = await client.query('SELECT id, amount, amount_paid, status FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.invoiceId, request.session!.workspaceId])
       if (!invoiceResult.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invoice not found in this business.' }); return }
       const outstanding = Number(invoiceResult.rows[0].amount) - Number(invoiceResult.rows[0].amount_paid)
+      const pendingCard = await client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM intasend_card_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 AND status IN ('initiating', 'pending', 'verification_required')", [request.params.invoiceId, request.session!.workspaceId])
+      const availableForMpesa = Math.round((outstanding - Number(pendingCard.rows[0].amount)) * 100) / 100
       // A paid invoice cannot be sent for M-Pesa. An outstanding balance of zero is also
       // rejected because there is nothing left to collect, even for a split payment.
-      if (invoiceResult.rows[0].status !== 'unpaid' || outstanding < 1) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only invoices with an outstanding balance can be sent for M-Pesa payment.' }); return }
-      if (input.data.amount !== undefined && input.data.amount > outstanding) {
+      if (invoiceResult.rows[0].status !== 'unpaid' || availableForMpesa < 1) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only the unreserved invoice balance can be sent for M-Pesa payment.' }); return }
+      if (input.data.amount !== undefined && input.data.amount > availableForMpesa) {
         await client.query('ROLLBACK')
-        response.status(400).json({ error: `The M-Pesa split amount (KSh ${input.data.amount}) is more than the outstanding balance (KSh ${outstanding}).` }); return
+        response.status(400).json({ error: `The M-Pesa split amount (KSh ${input.data.amount}) is more than the available balance (KSh ${availableForMpesa}).` }); return
       }
-      invoiceAmount = input.data.amount ?? outstanding
+      invoiceAmount = input.data.amount ?? availableForMpesa
       if (!Number.isSafeInteger(invoiceAmount) || invoiceAmount < 1) { await client.query('ROLLBACK'); response.status(400).json({ error: 'M-Pesa STK Push requires a whole-number KSh invoice amount.' }); return }
       const activeRequest = await client.query("SELECT 1 FROM mpesa_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 AND status IN ('initiating', 'pending', 'verification_required') LIMIT 1", [request.params.invoiceId, request.session!.workspaceId])
       if (activeRequest.rowCount) { await client.query('ROLLBACK'); response.status(409).json({ error: 'A payment request is already in progress for this invoice. Check its status before trying again.' }); return }
@@ -5869,6 +6030,160 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
       await pool!.query('UPDATE mpesa_payment_requests SET status = $1, result_description = $2 WHERE id = $3', ['failed', error instanceof Error ? error.message.slice(0, 500) : 'Daraja request failed.', paymentId])
       response.status(502).json({ error: error instanceof Error ? error.message : 'Daraja could not start the payment request.' })
     }
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/invoices/:invoiceId/payments/card', requirePool, verifyOrigin, requireSession, requireInvoicePaymentAccess, requireWorkspaceProviderPreference('intasendEnabled'), rateLimit({ windowMs: 15 * 60_000, limit: 20 }), async (request: AuthedRequest, response, next) => {
+  const input = z.object({ amount: z.coerce.number().finite().positive().max(999999999999).optional(), idempotencyKey: z.string().uuid() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a valid card amount and checkout idempotency key.' }); return }
+  if (input.data.amount !== undefined && Math.abs(input.data.amount * 100 - Math.round(input.data.amount * 100)) > 0.000001) { response.status(400).json({ error: 'Card checkout amounts must use no more than two decimal places.' }); return }
+  const config = await resolveWorkspaceIntaSendConfig(request.session!.workspaceId)
+  if (!config) { response.status(503).json({ error: 'Connect this business’s IntaSend publishable key on the Kenya compliance page before starting card checkout.' }); return }
+  if (!env.INTASEND_WEBHOOK_CHALLENGE) { response.status(503).json({ error: 'Card payments are unavailable until the API operator configures INTASEND_WEBHOOK_CHALLENGE and registers the webhook.' }); return }
+  try {
+    const existing = await pool!.query(`SELECT id, invoice_id, amount::text, currency, status, provider_invoice_id, checkout_url
+      FROM intasend_card_payment_requests WHERE workspace_id = $1 AND idempotency_key = $2`, [request.session!.workspaceId, input.data.idempotencyKey])
+    if (existing.rowCount) {
+      const payment = existing.rows[0]
+      if (String(payment.invoice_id) !== String(request.params.invoiceId)
+        || (input.data.amount !== undefined && paymentCents(payment.amount) !== paymentCents(input.data.amount))) {
+        response.status(409).json({ error: 'This idempotency key was already used for a different card checkout.' }); return
+      }
+      if (payment.status === 'pending' && payment.checkout_url) { response.status(202).json({ payment, checkoutUrl: payment.checkout_url, idempotentReplay: true }); return }
+      response.status(409).json({ error: payment.status === 'paid' ? 'This card checkout has already been paid.' : 'This card checkout was already started or needs reconciliation. Check its status before retrying.' }); return
+    }
+
+    const paymentId = randomUUID()
+    const apiRef = `kf:${request.session!.workspaceId}:${paymentId}`
+    const client = await pool!.connect()
+    let amount = 0
+    let currency = 'KES'
+    let invoice: Record<string, unknown> | undefined
+    try {
+      await client.query('BEGIN')
+      const found = await client.query(`SELECT id, workspace_id, customer, customer_email, description, amount::text, amount_paid::text, status
+        FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [request.params.invoiceId, request.session!.workspaceId])
+      invoice = found.rows[0] as Record<string, unknown> | undefined
+      if (!invoice) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invoice not found in this business.' }); return }
+      const returns = await client.query('SELECT COALESCE(SUM(amount), 0)::text AS returned, COALESCE(SUM(refund_amount), 0)::text AS refunded FROM sales_returns WHERE invoice_id = $1', [request.params.invoiceId])
+      const dueCents = paymentCents(invoice.amount) - paymentCents(invoice.amount_paid) - paymentCents(returns.rows[0].returned) + paymentCents(returns.rows[0].refunded)
+      const [pendingCard, pendingMpesa, preferenceResult] = await Promise.all([
+        client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM intasend_card_payment_requests WHERE workspace_id = $1 AND invoice_id = $2 AND status IN ('initiating', 'pending', 'verification_required')", [request.session!.workspaceId, request.params.invoiceId]),
+        client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM mpesa_payment_requests WHERE workspace_id = $1 AND invoice_id = $2 AND status IN ('initiating', 'pending', 'verification_required')", [request.session!.workspaceId, request.params.invoiceId]),
+        client.query("SELECT preferences->>'currency' AS currency FROM workspace_settings WHERE workspace_id = $1", [request.session!.workspaceId]),
+      ])
+      const availableCents = dueCents - paymentCents(pendingCard.rows[0].amount) - paymentCents(pendingMpesa.rows[0].amount)
+      if (invoice.status !== 'unpaid' || availableCents < 1) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This invoice has no unreserved balance available for card checkout.' }); return }
+      amount = input.data.amount === undefined ? availableCents / 100 : paymentCents(input.data.amount) / 100
+      if (!Number.isFinite(amount) || paymentCents(amount) < 10 || paymentCents(amount) > availableCents) {
+        await client.query('ROLLBACK')
+        if (paymentCents(amount) < 10) { response.status(400).json({ error: 'IntaSend hosted checkout requires a minimum payment of 0.10 in the workspace currency.' }); return }
+        response.status(409).json({ error: `Card amount exceeds the available invoice balance of KSh ${(availableCents / 100).toFixed(2)}.` }); return
+      }
+      currency = String(preferenceResult.rows[0]?.currency ?? 'KES').toUpperCase()
+      if (!['KES', 'USD', 'EUR', 'GBP'].includes(currency)) {
+        await client.query('ROLLBACK')
+        response.status(409).json({ error: `IntaSend checkout does not support the workspace currency ${currency}. Set this business currency to KES, USD, EUR, or GBP before accepting hosted payments.` }); return
+      }
+      await client.query(`INSERT INTO intasend_card_payment_requests (id, workspace_id, invoice_id, amount, currency, idempotency_key, api_ref, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, [paymentId, request.session!.workspaceId, request.params.invoiceId, amount.toFixed(2), currency, input.data.idempotencyKey, apiRef, request.session!.userId])
+      await client.query('COMMIT')
+    } catch (error) { await client.query('ROLLBACK'); throw error }
+    finally { client.release() }
+
+    const redirectUrl = new URL('/', env.FRONTEND_ORIGIN)
+    redirectUrl.searchParams.set('card_payment', paymentId)
+    try {
+      const checkout = await intasendRequest<{ id?: string; url?: string; amount?: number; currency?: string }>(config, '/checkout/', {
+        amount,
+        currency,
+        api_ref: apiRef,
+        unique_api_ref: true,
+        email: String(invoice.customer_email ?? '').trim() || undefined,
+        redirect_url: redirectUrl.toString(),
+        host: env.FRONTEND_ORIGIN,
+      })
+      const providerInvoiceId = String(checkout.id ?? '').trim()
+      const checkoutUrl = String(checkout.url ?? '').trim()
+      let parsedCheckoutUrl: URL | null = null
+      try { parsedCheckoutUrl = new URL(checkoutUrl) } catch { /* Return a safe provider error below. */ }
+      if (!providerInvoiceId || !parsedCheckoutUrl || parsedCheckoutUrl.protocol !== 'https:' || !(parsedCheckoutUrl.hostname === 'intasend.com' || parsedCheckoutUrl.hostname.endsWith('.intasend.com'))) {
+        await pool!.query("UPDATE intasend_card_payment_requests SET status = 'verification_required', result_description = $1, updated_at = now() WHERE id = $2 AND status = 'initiating'", ['IntaSend returned an invalid checkout reference or URL. Check the provider dashboard before retrying.', paymentId])
+        response.status(502).json({ error: 'IntaSend returned an invalid checkout response. Check the provider dashboard before retrying.' }); return
+      }
+      await pool!.query(`UPDATE intasend_card_payment_requests SET provider_invoice_id = $1, checkout_url = $2,
+        status = CASE WHEN status = 'initiating' THEN 'pending' ELSE status END, updated_at = now() WHERE id = $3`, [providerInvoiceId, parsedCheckoutUrl.toString(), paymentId])
+      await recordAudit(pool!, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'card.checkout_started', entityType: 'invoice', entityId: String(request.params.invoiceId), eventData: { paymentId, providerInvoiceId, amount, currency } })
+      response.status(202).json({ payment: { id: paymentId, status: 'pending', amount: amount.toFixed(2), currency }, checkoutUrl: parsedCheckoutUrl.toString() })
+    } catch (error) {
+      const uncertain = error instanceof TypeError || (error instanceof Error && error.name === 'TimeoutError')
+      await pool!.query(`UPDATE intasend_card_payment_requests SET status = $1, result_description = $2, updated_at = now()
+        WHERE id = $3 AND status = 'initiating'`, [uncertain ? 'verification_required' : 'failed', error instanceof Error ? error.message.slice(0, 500) : 'IntaSend request failed.', paymentId])
+      response.status(uncertain ? 504 : 502).json({ error: uncertain ? 'IntaSend’s response was not received. Check payment status before retrying.' : error instanceof Error ? error.message : 'IntaSend could not start the card checkout.' })
+    }
+  } catch (error) { next(error) }
+})
+
+app.get('/v1/payments/card/:paymentId/status', requirePool, requireSession, rateLimit({ windowMs: 60_000, limit: 30 }), async (request: AuthedRequest, response, next) => {
+  try {
+    const found = await pool!.query(`SELECT id, invoice_id, amount::text, currency, status, api_ref, provider_invoice_id, provider_ref, provider, result_description
+      FROM intasend_card_payment_requests WHERE id = $1 AND workspace_id = $2`, [request.params.paymentId, request.session!.workspaceId])
+    let payment = found.rows[0]
+    if (!payment) { response.status(404).json({ error: 'Card payment was not found in this business.' }); return }
+    if (['initiating', 'pending', 'verification_required'].includes(String(payment.status)) && payment.provider_invoice_id) {
+      const config = await resolveWorkspaceIntaSendConfig(request.session!.workspaceId)
+      if (config) {
+        try {
+          const current = await intasendRequest<{ invoice?: Record<string, unknown> }>(config, '/payment/status/', { invoice_id: String(payment.provider_invoice_id) })
+          const providerInvoice = current.invoice
+          if (providerInvoice) {
+            await applyIntaSendCardEvent({
+              invoice_id: String(providerInvoice.invoice_id ?? payment.provider_invoice_id),
+              api_ref: String(providerInvoice.api_ref ?? payment.api_ref),
+              state: String(providerInvoice.state ?? 'PENDING'),
+              provider: typeof providerInvoice.provider === 'string' ? providerInvoice.provider : undefined,
+              value: typeof providerInvoice.value === 'string' || typeof providerInvoice.value === 'number' ? providerInvoice.value : undefined,
+              charges: typeof providerInvoice.charges === 'string' || typeof providerInvoice.charges === 'number' ? providerInvoice.charges : null,
+              net_amount: typeof providerInvoice.net_amount === 'string' || typeof providerInvoice.net_amount === 'number' ? providerInvoice.net_amount : null,
+              currency: typeof providerInvoice.currency === 'string' ? providerInvoice.currency : undefined,
+              provider_ref: typeof providerInvoice.provider_ref === 'string' ? providerInvoice.provider_ref : null,
+              failed_reason: typeof providerInvoice.failed_reason === 'string' ? providerInvoice.failed_reason : null,
+            })
+          }
+        } catch (error) { console.error('IntaSend card status refresh failed:', error instanceof Error ? error.message : String(error)) }
+      }
+      const refreshed = await pool!.query(`SELECT id, invoice_id, amount::text, currency, status, api_ref, provider_invoice_id, provider_ref, provider, result_description
+        FROM intasend_card_payment_requests WHERE id = $1 AND workspace_id = $2`, [request.params.paymentId, request.session!.workspaceId])
+      payment = refreshed.rows[0]
+    }
+    response.json({ payment })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/integrations/intasend/callback', requirePool, rateLimit({ windowMs: 60_000, limit: 60 }), async (request, response, next) => {
+  const input = z.object({
+    invoice_id: z.string().trim().min(1).max(120),
+    api_ref: z.string().trim().min(1).max(140),
+    state: z.string().trim().min(1).max(30),
+    provider: z.string().trim().max(50).optional(),
+    value: z.union([z.string(), z.number()]).optional(),
+    charges: z.union([z.string(), z.number()]).nullable().optional(),
+    net_amount: z.union([z.string(), z.number()]).nullable().optional(),
+    currency: z.string().trim().max(5).optional(),
+    provider_ref: z.string().nullable().optional(),
+    failed_reason: z.string().nullable().optional(),
+    topic: z.string().optional(),
+    challenge: z.string().optional(),
+  }).passthrough().safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Invalid IntaSend callback.' }); return }
+  if (!env.INTASEND_WEBHOOK_CHALLENGE) { response.status(503).json({ error: 'IntaSend webhook challenge is not configured on the API.' }); return }
+  const suppliedChallenge = Buffer.from(input.data.challenge ?? '')
+  const expectedChallenge = Buffer.from(env.INTASEND_WEBHOOK_CHALLENGE)
+  if (suppliedChallenge.length !== expectedChallenge.length || !timingSafeEqual(suppliedChallenge, expectedChallenge)) { response.status(403).json({ error: 'IntaSend webhook challenge did not match.' }); return }
+  if (input.data.topic && input.data.topic !== 'collection_event') { response.json({ status: 'ignored' }); return }
+  try {
+    await applyIntaSendCardEvent(input.data)
+    response.json({ status: 'received' })
   } catch (error) { next(error) }
 })
 
@@ -6555,6 +6870,7 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
     const workspaceSettings = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId])
     const settings = { ...defaultWorkspaceSettings, ...(workspaceSettings.rows[0]?.preferences ?? {}) }
     const daraja = await resolveWorkspaceDarajaConfig(request.session!.workspaceId)
+    const intasend = await resolveWorkspaceIntaSendConfig(request.session!.workspaceId)
     const callbackIsSecure = daraja ? (daraja.environment !== 'production' || daraja.callbackUrl.startsWith('https://')) : false
     const mpesaReady = Boolean(settings.darajaEnabled && daraja && callbackIsSecure)
     const kraReady = Boolean(settings.kraEtimsLiveEnabled && env.KRA_ETIMS_CREDENTIALS_ENCRYPTION_KEY && kraEtimsLiveEnabled)
@@ -6562,6 +6878,7 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
     const integrations = [
       { id: 'kra_etims', status: kraReady ? 'oscu_production_switches_enabled_approval_and_device_still_required' : settings.kraEtimsLiveEnabled ? `oscu_${env.KRA_ETIMS_ENV}_live_disabled` : 'oscu_workspace_disabled' },
       { id: 'mpesa', status: mpesaReady ? `configured_${daraja!.environment}` : settings.darajaEnabled ? 'daraja_credentials_and_callback_required' : 'workspace_daraja_disabled' },
+      { id: 'card_payments', status: settings.intasendEnabled && intasend && env.INTASEND_WEBHOOK_CHALLENGE ? 'intasend_card_checkout_ready' : !settings.intasendEnabled ? 'workspace_intasend_disabled' : !intasend ? 'intasend_business_key_required' : 'intasend_webhook_challenge_required' },
       { id: 'bank_feeds', status: monoReady ? 'mono_configured_consent_required' : settings.monoEnabled ? 'mono_business_approval_and_server_keys_required' : 'workspace_mono_disabled' },
       { id: 'email', status: emailConfigured ? 'brevo_configured' : 'brevo_api_key_and_verified_sender_required' },
       { id: 'payroll', status: `encrypted_internal_runs_${env.PAYROLL_DATA_ENCRYPTION_KEY ? 'configured' : 'encryption_key_required'}_statutory_filing_not_implemented` },
@@ -6572,6 +6889,7 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
     const canManageIntegrations = permissions.has('integrations.manage')
     const visibleIntegrations = integrations.filter((integration) => canManageIntegrations
       || integration.id === 'mpesa' && permissions.has('sales.write')
+      || integration.id === 'card_payments' && permissions.has('sales.write')
       || integration.id === 'email' && permissions.has('sales.write')
       || integration.id === 'multi_method_payments' && (permissions.has('sales.write') || permissions.has('accounting.write'))
       || integration.id === 'bank_feeds' && permissions.has('banking.write'))
