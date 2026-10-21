@@ -68,6 +68,7 @@ type DarajaConfig = {
   transactionType: 'CustomerPayBillOnline' | 'CustomerBuyGoodsOnline'
 }
 type IntaSendConfig = { publishableKey: string }
+type PesapalSabiConfig = { consumerKey: string; consumerSecret: string; verificationApiKey: string }
 const emailConfigured = Boolean(env.BREVO_API_KEY && (env.BREVO_SENDER_EMAIL || env.EMAIL_FROM))
 // Brevo (free tier) powers transactional email and SMS. WhatsApp needs an approved Brevo
 // WhatsApp sender, so it stays off until the operator supplies BREVO_WHATSAPP_NUMBER.
@@ -151,6 +152,7 @@ const defaultWorkspaceSettings = {
   monoEnabled: false,
   darajaEnabled: false,
   intasendEnabled: false,
+  pesapalTerminalEnabled: false,
   kraEtimsLiveEnabled: false,
   kraEtimsAutoSubmitPos: false,
   statutoryFilingsEnabled: false,
@@ -867,14 +869,14 @@ function requireInvoicePaymentAccess(request: AuthedRequest, response: express.R
   }
   next()
 }
-function requireWorkspaceProviderPreference(preference: 'monoEnabled' | 'darajaEnabled' | 'intasendEnabled' | 'kraEtimsLiveEnabled', productionOnly = false) {
+function requireWorkspaceProviderPreference(preference: 'monoEnabled' | 'darajaEnabled' | 'intasendEnabled' | 'pesapalTerminalEnabled' | 'kraEtimsLiveEnabled', productionOnly = false) {
   return async (request: AuthedRequest, response: express.Response, next: express.NextFunction) => {
     if (productionOnly && env.KRA_ETIMS_ENV !== 'production') { next(); return }
     try {
       const result = await pool!.query('SELECT preferences FROM workspace_settings WHERE workspace_id = $1', [request.session!.workspaceId])
       const preferences = result.rows[0]?.preferences ?? {}
       if (preferences[preference] !== true) {
-        response.status(403).json({ error: `This business has not enabled ${preference === 'monoEnabled' ? 'Mono bank feeds' : preference === 'darajaEnabled' ? 'Daraja / M-Pesa' : preference === 'intasendEnabled' ? 'IntaSend card checkout' : 'live KRA eTIMS'} in its workspace settings.` })
+        response.status(403).json({ error: `This business has not enabled ${preference === 'monoEnabled' ? 'Mono bank feeds' : preference === 'darajaEnabled' ? 'Daraja / M-Pesa' : preference === 'intasendEnabled' ? 'IntaSend card checkout' : preference === 'pesapalTerminalEnabled' ? 'PesaPal Sabi card terminals' : 'live KRA eTIMS'} in its workspace settings.` })
         return
       }
       next()
@@ -986,6 +988,17 @@ async function resolveWorkspaceDarajaConfig(workspaceId: string): Promise<Daraja
 async function resolveWorkspaceIntaSendConfig(workspaceId: string): Promise<IntaSendConfig | null> {
   const row = (await pool!.query('SELECT publishable_key_ciphertext FROM intasend_connections WHERE workspace_id = $1 AND enabled = true', [workspaceId])).rows[0]
   return row ? { publishableKey: decryptCommerceSecret(String(row.publishable_key_ciphertext)) } : null
+}
+function credentialFingerprint(value: string) {
+  return createHash('sha256').update(value).digest('hex')
+}
+async function resolveWorkspacePesapalSabiConfig(workspaceId: string): Promise<PesapalSabiConfig | null> {
+  const row = (await pool!.query('SELECT consumer_key_ciphertext, consumer_secret_ciphertext, verification_api_key_ciphertext FROM pesapal_sabi_connections WHERE workspace_id = $1 AND enabled = true', [workspaceId])).rows[0]
+  return row ? {
+    consumerKey: decryptCommerceSecret(String(row.consumer_key_ciphertext)),
+    consumerSecret: decryptCommerceSecret(String(row.consumer_secret_ciphertext)),
+    verificationApiKey: decryptCommerceSecret(String(row.verification_api_key_ciphertext)),
+  } : null
 }
 async function intasendRequest<T>(config: IntaSendConfig, path: string, body: Record<string, unknown>): Promise<T> {
   const providerResponse = await fetch(`https://api.intasend.com/api/v1${path}`, {
@@ -1113,16 +1126,147 @@ async function applyIntaSendCardEvent(event: IntaSendCollectionEvent) {
     throw error
   } finally { client.release() }
 }
+type PesapalSabiNotification = {
+  id: string | number
+  amount: string | number
+  payment_option?: string
+  transaction_date?: string
+  currency: string
+  merchant_reference?: string
+  confirmation_code: string
+}
+type PesapalSabiVerification = {
+  amount?: string | number
+  status?: string | number
+  status_description?: string
+  posting_status?: string | number
+  posting_status_description?: string
+  transaction_date?: string
+  currency?: string
+  merchant_ref?: string
+  merchant_reference?: string
+  payment_option?: string
+  confirmation_code?: string
+}
+async function verifyPesapalSabiTransaction(apiKey: string, confirmationCode: string) {
+  const providerResponse = await fetch('https://ext.pesapal.com/api/transactions/verifytransaction', {
+    method: 'POST',
+    headers: { APIKey: apiKey, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirmation_code: confirmationCode }),
+    redirect: 'error',
+    signal: AbortSignal.timeout(20_000),
+  })
+  const payload = await providerResponse.json().catch(() => null)
+  if (!providerResponse.ok || !payload || typeof payload !== 'object') throw new Error(`PesaPal transaction verification failed: HTTP ${providerResponse.status}.`)
+  return payload as PesapalSabiVerification
+}
+async function applyPesapalSabiVerification(workspaceId: string, notification: PesapalSabiNotification, verification: PesapalSabiVerification) {
+  const safeProviderResult = {
+    transactionId: String(notification.id).slice(0, 100),
+    amount: verification.amount ?? null,
+    status: verification.status ?? null,
+    statusDescription: verification.status_description ?? null,
+    postingStatus: verification.posting_status ?? null,
+    postingStatusDescription: verification.posting_status_description ?? null,
+    transactionDate: verification.transaction_date ?? null,
+    currency: verification.currency ?? null,
+    merchantReference: verification.merchant_ref ?? verification.merchant_reference ?? null,
+    paymentOption: verification.payment_option ?? null,
+    confirmationCode: verification.confirmation_code ?? null,
+  }
+  const verifiedReference = String(verification.merchant_ref ?? verification.merchant_reference ?? '').trim()
+  const status = Number(verification.status)
+  const statusDescription = String(verification.status_description ?? '').trim().toLowerCase()
+  const postingStatusDescription = String(verification.posting_status_description ?? '').trim().toLowerCase()
+  const isCompleted = status === 1 && statusDescription === 'completed' && postingStatusDescription === 'success'
+  const isMobileMoney = /m\s?-?pesa|mobile\s?money/i.test(String(verification.payment_option ?? notification.payment_option ?? ''))
+  const amountMatches = paymentCents(verification.amount) === paymentCents(notification.amount)
+  const confirmationMatches = String(verification.confirmation_code ?? '').trim() === notification.confirmation_code
+  const currencyMatches = String(verification.currency ?? '').trim().toUpperCase() === notification.currency.toUpperCase()
+  const referenceMatches = verifiedReference === notification.merchant_reference
+
+  const client = await pool!.connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query(`SELECT id, workspace_id, invoice_id, amount::text, currency, reference, status
+      FROM pesapal_terminal_payment_requests WHERE workspace_id = $1 AND reference = $2 FOR UPDATE`, [workspaceId, notification.merchant_reference])
+    const payment = found.rows[0]
+    if (!payment || payment.status === 'paid') { await client.query('COMMIT'); return }
+    const setStatus = async (nextStatus: 'pending' | 'verification_required' | 'failed', message: string) => {
+      await client.query(`UPDATE pesapal_terminal_payment_requests SET status = $1, payment_option = COALESCE($2, payment_option),
+        result_description = $3, provider_result = $4::jsonb, callback_received_at = now(), updated_at = now()
+        WHERE id = $5`, [nextStatus, notification.payment_option ?? null, message.slice(0, 500), JSON.stringify(safeProviderResult), payment.id])
+    }
+    if (!isCompleted) {
+      const isPending = status === 0 || /pending|processing/i.test(statusDescription)
+      await setStatus(isPending ? 'pending' : 'verification_required', isPending ? 'PesaPal has not completed this transaction yet.' : 'PesaPal returned a status that needs manual reconciliation; no payment was posted.')
+      await client.query('COMMIT')
+      return
+    }
+    if (!amountMatches || !confirmationMatches || !currencyMatches || !referenceMatches || !['KES', 'USD'].includes(String(payment.currency).toUpperCase())
+      || String(payment.currency).toUpperCase() !== notification.currency.toUpperCase()
+      || paymentCents(verification.amount) !== paymentCents(payment.amount)
+      || !notification.confirmation_code || isMobileMoney) {
+      await setStatus('verification_required', 'The verified PesaPal status, reference, amount, currency, confirmation code, or payment type did not match this terminal request. No accounting entry was posted.')
+      await client.query('COMMIT')
+      return
+    }
+    const duplicate = await client.query('SELECT id FROM pesapal_terminal_payment_requests WHERE id <> $1 AND (provider_transaction_id = $2 OR confirmation_code = $3) LIMIT 1', [payment.id, String(notification.id), notification.confirmation_code])
+    if (duplicate.rowCount) {
+      await setStatus('verification_required', 'This PesaPal transaction or confirmation code is already linked to another payment request.')
+      await client.query('COMMIT')
+      return
+    }
+    const invoiceResult = await client.query(`SELECT id, amount::text, amount_paid::text
+      FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [payment.invoice_id, payment.workspace_id])
+    const invoice = invoiceResult.rows[0]
+    if (!invoice) {
+      await setStatus('verification_required', 'PesaPal confirmed the payment, but the invoice is no longer available in this business.')
+      await client.query('COMMIT')
+      return
+    }
+    const returns = await client.query('SELECT COALESCE(SUM(amount), 0)::text AS returned, COALESCE(SUM(refund_amount), 0)::text AS refunded FROM sales_returns WHERE invoice_id = $1', [invoice.id])
+    const grossCents = paymentCents(payment.amount)
+    const dueCents = paymentCents(invoice.amount) - paymentCents(invoice.amount_paid) - paymentCents(returns.rows[0].returned) + paymentCents(returns.rows[0].refunded)
+    if (grossCents > dueCents) {
+      await setStatus('verification_required', 'PesaPal confirmed the payment, but the invoice balance changed before confirmation. Reconcile this terminal charge before posting it.')
+      await client.query('COMMIT')
+      return
+    }
+    const paymentId = randomUUID()
+    const paymentDate = nairobiToday()
+    const reference = notification.confirmation_code.slice(0, 180)
+    await client.query(`UPDATE invoices SET amount_paid = amount_paid + $1,
+      status = CASE WHEN amount_paid + $1 >= amount - $2 + $3 THEN 'paid' ELSE 'unpaid' END
+      WHERE id = $4 AND workspace_id = $5`, [payment.amount, returns.rows[0].returned, returns.rows[0].refunded, invoice.id, payment.workspace_id])
+    await client.query(`INSERT INTO invoice_payments (id, workspace_id, invoice_id, amount, payment_date, payment_method, payment_reference)
+      VALUES ($1, $2, $3, $4, $5, 'card_terminal', $6)`, [paymentId, payment.workspace_id, invoice.id, payment.amount, paymentDate, reference])
+    await insertJournal(client, { workspaceId: String(payment.workspace_id), userId: null, date: paymentDate, description: `PesaPal card terminal payment ${reference}`, sourceType: 'pesapal_terminal_payment', sourceId: paymentId, lines: [
+      { accountCode: '1000', debit: grossCents / 100, credit: 0 },
+      { accountCode: '1100', debit: 0, credit: grossCents / 100 },
+    ] })
+    await client.query(`UPDATE pesapal_terminal_payment_requests SET status = 'paid', provider_transaction_id = $1,
+      confirmation_code = $2, payment_option = $3, result_description = 'Payment verified by PesaPal.',
+      provider_result = $4::jsonb, callback_received_at = now(), updated_at = now() WHERE id = $5`,
+    [String(notification.id), notification.confirmation_code, verification.payment_option ?? notification.payment_option ?? null, JSON.stringify(safeProviderResult), payment.id])
+    await recordAudit(client, { workspaceId: String(payment.workspace_id), actorUserId: null, eventType: 'pesapal_sabi.payment_confirmed', entityType: 'invoice', entityId: String(invoice.id), eventData: { paymentId, providerTransactionId: String(notification.id), reference: notification.merchant_reference, confirmationCode: reference, amount: grossCents / 100, currency: payment.currency, paymentOption: verification.payment_option ?? notification.payment_option ?? null } })
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally { client.release() }
+}
 app.disable('x-powered-by')
 app.use(helmet())
 app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin) ? origin : false), credentials: true, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Kashflow-Client', 'Idempotency-Key'] }))
 app.use(express.json({ limit: '8mb', type: 'application/json' }))
+app.use(express.urlencoded({ extended: false, limit: '16kb' }))
 app.use(rateLimit({
   windowMs: 60_000,
   limit: 240,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
-  skip: (request) => request.path === '/v1/integrations/mpesa/callback' || request.path === '/v1/integrations/intasend/callback',
+  skip: (request) => request.path === '/v1/integrations/mpesa/callback' || request.path === '/v1/integrations/intasend/callback' || request.path === '/v1/integrations/pesapal-sabi/notification',
   handler: (_request, response) => response.status(429).json({ error: 'This service received too many requests from this network. Please wait a minute and try again.' }),
 }))
 app.use((request, response, next) => {
@@ -2697,6 +2841,44 @@ app.put('/v1/integrations/intasend', requirePool, verifyOrigin, requireSession, 
     response.json({ connection: { ...saved.rows[0], credentialsConfigured: true }, encryptionReady: true, webhookReady: Boolean(env.INTASEND_WEBHOOK_CHALLENGE) })
   } catch (error) { next(error) }
 })
+// Each business connects its PesaPal Sabi wireless terminal credentials. PesaPal
+// pushes a completed transaction to the public notification URL; the server verifies
+// its confirmation code with PesaPal before posting it to the invoice and ledger.
+app.get('/v1/integrations/pesapal-sabi', requirePool, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query('SELECT enabled, updated_at FROM pesapal_sabi_connections WHERE workspace_id = $1', [request.session!.workspaceId])
+    response.json({
+      connection: result.rows[0] ? { ...result.rows[0], credentialsConfigured: true } : null,
+      encryptionReady: Boolean(env.ONLINE_COMMERCE_ENCRYPTION_KEY),
+    })
+  } catch (error) { next(error) }
+})
+app.put('/v1/integrations/pesapal-sabi', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
+  const input = z.object({
+    consumerKey: z.string().trim().min(1).max(300),
+    consumerSecret: z.string().trim().min(1).max(300),
+    verificationApiKey: z.string().trim().min(1).max(500),
+  }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter the PesaPal Sabi Consumer Key, Consumer Secret, and terminal verification API key.' }); return }
+  if (!env.ONLINE_COMMERCE_ENCRYPTION_KEY) { response.status(503).json({ error: 'Terminal credential storage is disabled. Configure ONLINE_COMMERCE_ENCRYPTION_KEY on the API service.' }); return }
+  try {
+    const saved = await pool!.query(`INSERT INTO pesapal_sabi_connections
+      (workspace_id, consumer_key_hash, consumer_secret_hash, consumer_key_ciphertext, consumer_secret_ciphertext, verification_api_key_ciphertext)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (workspace_id) DO UPDATE SET consumer_key_hash = EXCLUDED.consumer_key_hash,
+        consumer_secret_hash = EXCLUDED.consumer_secret_hash, consumer_key_ciphertext = EXCLUDED.consumer_key_ciphertext,
+        consumer_secret_ciphertext = EXCLUDED.consumer_secret_ciphertext,
+        verification_api_key_ciphertext = EXCLUDED.verification_api_key_ciphertext, enabled = true, updated_at = now()
+      RETURNING enabled, updated_at`, [request.session!.workspaceId,
+      credentialFingerprint(input.data.consumerKey), credentialFingerprint(input.data.consumerSecret),
+      encryptCommerceSecret(input.data.consumerKey), encryptCommerceSecret(input.data.consumerSecret), encryptCommerceSecret(input.data.verificationApiKey)])
+    await recordAudit(pool!, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'integrations.pesapal_sabi_credentials_saved', entityType: 'workspace', entityId: request.session!.workspaceId, eventData: {} })
+    response.json({ connection: { ...saved.rows[0], credentialsConfigured: true }, encryptionReady: true })
+  } catch (error) {
+    if ((error as { code?: string })?.code === '23505') { response.status(409).json({ error: 'These PesaPal webhook credentials are already connected to another business. Use unique merchant credentials for each business.' }); return }
+    next(error)
+  }
+})
 app.post('/v1/integrations/woocommerce/products/sync', requirePool, verifyOrigin, requireSession, requireWorkspaceAdmin, async (request: AuthedRequest, response, next) => {
   try {
     const connectionResult = await pool!.query('SELECT store_url, consumer_key_ciphertext, consumer_secret_ciphertext FROM woocommerce_connections WHERE workspace_id = $1 AND enabled = true', [request.session!.workspaceId])
@@ -3599,6 +3781,7 @@ app.put('/v1/settings', requirePool, verifyOrigin, requireSession, requireWorksp
     monoEnabled: z.boolean().default(false),
     darajaEnabled: z.boolean().default(false),
     intasendEnabled: z.boolean().default(false),
+    pesapalTerminalEnabled: z.boolean().default(false),
     kraEtimsLiveEnabled: z.boolean().default(false),
     kraEtimsAutoSubmitPos: z.boolean().default(false),
     statutoryFilingsEnabled: z.boolean().default(false),
@@ -5983,8 +6166,11 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
       const invoiceResult = await client.query('SELECT id, amount, amount_paid, status FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [request.params.invoiceId, request.session!.workspaceId])
       if (!invoiceResult.rowCount) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invoice not found in this business.' }); return }
       const outstanding = Number(invoiceResult.rows[0].amount) - Number(invoiceResult.rows[0].amount_paid)
-      const pendingCard = await client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM intasend_card_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 AND status IN ('initiating', 'pending', 'verification_required')", [request.params.invoiceId, request.session!.workspaceId])
-      const availableForMpesa = Math.round((outstanding - Number(pendingCard.rows[0].amount)) * 100) / 100
+      const [pendingCard, pendingTerminal] = await Promise.all([
+        client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM intasend_card_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 AND status IN ('initiating', 'pending', 'verification_required')", [request.params.invoiceId, request.session!.workspaceId]),
+        client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM pesapal_terminal_payment_requests WHERE invoice_id = $1 AND workspace_id = $2 AND status IN ('pending', 'verification_required')", [request.params.invoiceId, request.session!.workspaceId]),
+      ])
+      const availableForMpesa = Math.round((outstanding - Number(pendingCard.rows[0].amount) - Number(pendingTerminal.rows[0].amount)) * 100) / 100
       // A paid invoice cannot be sent for M-Pesa. An outstanding balance of zero is also
       // rejected because there is nothing left to collect, even for a split payment.
       if (invoiceResult.rows[0].status !== 'unpaid' || availableForMpesa < 1) { await client.query('ROLLBACK'); response.status(409).json({ error: 'Only the unreserved invoice balance can be sent for M-Pesa payment.' }); return }
@@ -6033,6 +6219,69 @@ app.post('/v1/invoices/:invoiceId/payments/mpesa', requirePool, verifyOrigin, re
   } catch (error) { next(error) }
 })
 
+app.post('/v1/invoices/:invoiceId/payments/card-terminal', requirePool, verifyOrigin, requireSession, requireInvoicePaymentAccess, requireWorkspaceProviderPreference('pesapalTerminalEnabled'), rateLimit({ windowMs: 15 * 60_000, limit: 20 }), async (request: AuthedRequest, response, next) => {
+  const input = z.object({ amount: z.coerce.number().finite().positive().max(999999999999).optional(), idempotencyKey: z.string().uuid() }).safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Enter a valid terminal payment amount and idempotency key.' }); return }
+  if (input.data.amount !== undefined && Math.abs(input.data.amount * 100 - Math.round(input.data.amount * 100)) > 0.000001) { response.status(400).json({ error: 'Terminal payment amounts must use no more than two decimal places.' }); return }
+  if (!env.ONLINE_COMMERCE_ENCRYPTION_KEY) { response.status(503).json({ error: 'Terminal credential storage is disabled. Configure ONLINE_COMMERCE_ENCRYPTION_KEY on the API service.' }); return }
+  const config = await resolveWorkspacePesapalSabiConfig(request.session!.workspaceId)
+  if (!config) { response.status(503).json({ error: 'Connect this business’s PesaPal Sabi credentials on the Kenya compliance page before requesting terminal payments.' }); return }
+  try {
+    const existing = await pool!.query(`SELECT id, invoice_id, amount::text, currency, status, reference
+      FROM pesapal_terminal_payment_requests WHERE workspace_id = $1 AND idempotency_key = $2`, [request.session!.workspaceId, input.data.idempotencyKey])
+    if (existing.rowCount) {
+      const payment = existing.rows[0]
+      if (String(payment.invoice_id) !== String(request.params.invoiceId)
+        || (input.data.amount !== undefined && paymentCents(payment.amount) !== paymentCents(input.data.amount))) {
+        response.status(409).json({ error: 'This idempotency key was already used for a different terminal payment.' }); return
+      }
+      if (payment.status === 'paid') { response.status(409).json({ error: 'This terminal payment has already been confirmed.' }); return }
+      response.status(202).json({ payment, idempotentReplay: true }); return
+    }
+
+    const paymentId = randomUUID()
+    const reference = `KF${randomBytes(5).toString('hex').toUpperCase()}`
+    const client = await pool!.connect()
+    let amount = 0
+    let currency = 'KES'
+    try {
+      await client.query('BEGIN')
+      const found = await client.query(`SELECT id, workspace_id, amount::text, amount_paid::text, status
+        FROM invoices WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [request.params.invoiceId, request.session!.workspaceId])
+      const invoice = found.rows[0]
+      if (!invoice) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invoice not found in this business.' }); return }
+      const [returns, pendingIntaSend, pendingMpesa, pendingTerminal, preferenceResult] = await Promise.all([
+        client.query('SELECT COALESCE(SUM(amount), 0)::text AS returned, COALESCE(SUM(refund_amount), 0)::text AS refunded FROM sales_returns WHERE invoice_id = $1', [invoice.id]),
+        client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM intasend_card_payment_requests WHERE workspace_id = $1 AND invoice_id = $2 AND status IN ('initiating', 'pending', 'verification_required')", [request.session!.workspaceId, invoice.id]),
+        client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM mpesa_payment_requests WHERE workspace_id = $1 AND invoice_id = $2 AND status IN ('initiating', 'pending', 'verification_required')", [request.session!.workspaceId, invoice.id]),
+        client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM pesapal_terminal_payment_requests WHERE workspace_id = $1 AND invoice_id = $2 AND status IN ('pending', 'verification_required')", [request.session!.workspaceId, invoice.id]),
+        client.query("SELECT preferences->>'currency' AS currency FROM workspace_settings WHERE workspace_id = $1", [request.session!.workspaceId]),
+      ])
+      currency = String(preferenceResult.rows[0]?.currency ?? 'KES').toUpperCase()
+      if (!['KES', 'USD'].includes(currency)) {
+        await client.query('ROLLBACK')
+        response.status(409).json({ error: `PesaPal Sabi card terminals support KES and USD in this integration. The workspace currency is ${currency}.` }); return
+      }
+      const dueCents = paymentCents(invoice.amount) - paymentCents(invoice.amount_paid) - paymentCents(returns.rows[0].returned) + paymentCents(returns.rows[0].refunded)
+      const reservedCents = paymentCents(pendingIntaSend.rows[0].amount) + paymentCents(pendingMpesa.rows[0].amount) + paymentCents(pendingTerminal.rows[0].amount)
+      const availableCents = dueCents - reservedCents
+      if (invoice.status !== 'unpaid' || availableCents < 1) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This invoice has no unreserved balance available for a terminal payment.' }); return }
+      amount = input.data.amount === undefined ? availableCents / 100 : paymentCents(input.data.amount) / 100
+      if (!Number.isFinite(amount) || paymentCents(amount) < 1 || paymentCents(amount) > availableCents) {
+        await client.query('ROLLBACK')
+        response.status(409).json({ error: `Terminal amount exceeds the available invoice balance of ${currency} ${(availableCents / 100).toFixed(2)}.` }); return
+      }
+      await client.query(`INSERT INTO pesapal_terminal_payment_requests
+        (id, workspace_id, invoice_id, amount, currency, reference, idempotency_key, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, [paymentId, request.session!.workspaceId, invoice.id, amount.toFixed(2), currency, reference, input.data.idempotencyKey, request.session!.userId])
+      await client.query('COMMIT')
+    } catch (error) { await client.query('ROLLBACK'); throw error }
+    finally { client.release() }
+    await recordAudit(pool!, { workspaceId: request.session!.workspaceId, actorUserId: request.session!.userId, eventType: 'card_terminal.payment_requested', entityType: 'invoice', entityId: String(request.params.invoiceId), eventData: { paymentId, reference, amount, currency } })
+    response.status(202).json({ payment: { id: paymentId, status: 'pending', amount: amount.toFixed(2), currency, reference } })
+  } catch (error) { next(error) }
+})
+
 app.post('/v1/invoices/:invoiceId/payments/card', requirePool, verifyOrigin, requireSession, requireInvoicePaymentAccess, requireWorkspaceProviderPreference('intasendEnabled'), rateLimit({ windowMs: 15 * 60_000, limit: 20 }), async (request: AuthedRequest, response, next) => {
   const input = z.object({ amount: z.coerce.number().finite().positive().max(999999999999).optional(), idempotencyKey: z.string().uuid() }).safeParse(request.body)
   if (!input.success) { response.status(400).json({ error: 'Enter a valid card amount and checkout idempotency key.' }); return }
@@ -6067,12 +6316,13 @@ app.post('/v1/invoices/:invoiceId/payments/card', requirePool, verifyOrigin, req
       if (!invoice) { await client.query('ROLLBACK'); response.status(404).json({ error: 'Invoice not found in this business.' }); return }
       const returns = await client.query('SELECT COALESCE(SUM(amount), 0)::text AS returned, COALESCE(SUM(refund_amount), 0)::text AS refunded FROM sales_returns WHERE invoice_id = $1', [request.params.invoiceId])
       const dueCents = paymentCents(invoice.amount) - paymentCents(invoice.amount_paid) - paymentCents(returns.rows[0].returned) + paymentCents(returns.rows[0].refunded)
-      const [pendingCard, pendingMpesa, preferenceResult] = await Promise.all([
+      const [pendingCard, pendingMpesa, pendingTerminal, preferenceResult] = await Promise.all([
         client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM intasend_card_payment_requests WHERE workspace_id = $1 AND invoice_id = $2 AND status IN ('initiating', 'pending', 'verification_required')", [request.session!.workspaceId, request.params.invoiceId]),
         client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM mpesa_payment_requests WHERE workspace_id = $1 AND invoice_id = $2 AND status IN ('initiating', 'pending', 'verification_required')", [request.session!.workspaceId, request.params.invoiceId]),
+        client.query("SELECT COALESCE(SUM(amount), 0)::text AS amount FROM pesapal_terminal_payment_requests WHERE workspace_id = $1 AND invoice_id = $2 AND status IN ('pending', 'verification_required')", [request.session!.workspaceId, request.params.invoiceId]),
         client.query("SELECT preferences->>'currency' AS currency FROM workspace_settings WHERE workspace_id = $1", [request.session!.workspaceId]),
       ])
-      const availableCents = dueCents - paymentCents(pendingCard.rows[0].amount) - paymentCents(pendingMpesa.rows[0].amount)
+      const availableCents = dueCents - paymentCents(pendingCard.rows[0].amount) - paymentCents(pendingMpesa.rows[0].amount) - paymentCents(pendingTerminal.rows[0].amount)
       if (invoice.status !== 'unpaid' || availableCents < 1) { await client.query('ROLLBACK'); response.status(409).json({ error: 'This invoice has no unreserved balance available for card checkout.' }); return }
       amount = input.data.amount === undefined ? availableCents / 100 : paymentCents(input.data.amount) / 100
       if (!Number.isFinite(amount) || paymentCents(amount) < 10 || paymentCents(amount) > availableCents) {
@@ -6185,6 +6435,56 @@ app.post('/v1/integrations/intasend/callback', requirePool, rateLimit({ windowMs
     await applyIntaSendCardEvent(input.data)
     response.json({ status: 'received' })
   } catch (error) { next(error) }
+})
+
+app.get('/v1/payments/card-terminal/:paymentId/status', requirePool, requireSession, requireInvoicePaymentAccess, rateLimit({ windowMs: 60_000, limit: 30 }), async (request: AuthedRequest, response, next) => {
+  try {
+    const result = await pool!.query(`SELECT id, invoice_id, amount::text, currency, status, reference,
+      provider_transaction_id, confirmation_code, payment_option, result_description
+      FROM pesapal_terminal_payment_requests WHERE id = $1 AND workspace_id = $2`, [request.params.paymentId, request.session!.workspaceId])
+    if (!result.rowCount) { response.status(404).json({ error: 'Card terminal payment was not found in this business.' }); return }
+    response.json({ payment: result.rows[0] })
+  } catch (error) { next(error) }
+})
+
+app.post('/v1/integrations/pesapal-sabi/notification', requirePool, rateLimit({ windowMs: 60_000, limit: 120 }), async (request, response) => {
+  const input = z.object({
+    id: z.union([z.string(), z.number()]),
+    amount: z.union([z.string(), z.number()]),
+    payment_option: z.string().trim().max(80).optional(),
+    transaction_date: z.string().max(80).optional(),
+    currency: z.string().trim().min(3).max(5),
+    merchant_reference: z.string().trim().max(120).optional(),
+    confirmation_code: z.string().trim().min(1).max(180),
+  }).passthrough().safeParse(request.body)
+  if (!input.success) { response.status(400).json({ error: 'Invalid PesaPal Sabi terminal notification.' }); return }
+  const consumerKey = request.get('Consumerkey')?.trim() ?? ''
+  const consumerSecret = request.get('Consumersecret')?.trim() ?? ''
+  if (!consumerKey || !consumerSecret) { response.status(401).json({ error: 'PesaPal merchant credentials are required.' }); return }
+  try {
+    const connection = await pool!.query(`SELECT workspace_id, verification_api_key_ciphertext
+      FROM pesapal_sabi_connections WHERE consumer_key_hash = $1 AND consumer_secret_hash = $2 AND enabled = true`,
+    [credentialFingerprint(consumerKey), credentialFingerprint(consumerSecret)])
+    if (!connection.rowCount) { response.status(403).json({ error: 'PesaPal merchant credentials did not match a connected business.' }); return }
+    const reference = input.data.merchant_reference
+    if (!reference) { response.json({ status: '200', message: 'Ok' }); return }
+    const pending = await pool!.query("SELECT id FROM pesapal_terminal_payment_requests WHERE workspace_id = $1 AND reference = $2 AND status IN ('pending', 'verification_required') LIMIT 1", [connection.rows[0].workspace_id, reference])
+    if (!pending.rowCount) { response.json({ status: '200', message: 'Ok' }); return }
+    const verificationApiKey = decryptCommerceSecret(String(connection.rows[0].verification_api_key_ciphertext))
+    const notification: PesapalSabiNotification = { ...input.data, merchant_reference: reference }
+    let verification: PesapalSabiVerification
+    try {
+      verification = await verifyPesapalSabiTransaction(verificationApiKey, notification.confirmation_code)
+    } catch (error) {
+      console.error('PesaPal Sabi verification request failed:', error instanceof Error ? error.message : String(error))
+      response.status(502).json({ error: 'PesaPal could not verify this terminal transaction yet. The terminal may retry the notification.' }); return
+    }
+    await applyPesapalSabiVerification(String(connection.rows[0].workspace_id), notification, verification)
+    response.json({ status: '200', message: 'Ok' })
+  } catch (error) {
+    console.error('PesaPal Sabi notification could not be processed:', error instanceof Error ? error.message : String(error))
+    response.status(500).json({ error: 'PesaPal terminal notification could not be processed.' })
+  }
 })
 
 app.get('/v1/invoices/:invoiceId/payments/mpesa', requirePool, requireSession, async (request: AuthedRequest, response, next) => {
@@ -6879,6 +7179,7 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
       { id: 'kra_etims', status: kraReady ? 'oscu_production_switches_enabled_approval_and_device_still_required' : settings.kraEtimsLiveEnabled ? `oscu_${env.KRA_ETIMS_ENV}_live_disabled` : 'oscu_workspace_disabled' },
       { id: 'mpesa', status: mpesaReady ? `configured_${daraja!.environment}` : settings.darajaEnabled ? 'daraja_credentials_and_callback_required' : 'workspace_daraja_disabled' },
       { id: 'card_payments', status: settings.intasendEnabled && intasend && env.INTASEND_WEBHOOK_CHALLENGE ? 'intasend_card_checkout_ready' : !settings.intasendEnabled ? 'workspace_intasend_disabled' : !intasend ? 'intasend_business_key_required' : 'intasend_webhook_challenge_required' },
+      { id: 'card_terminals', status: settings.pesapalTerminalEnabled && await resolveWorkspacePesapalSabiConfig(request.session!.workspaceId) ? 'pesapal_sabi_wireless_ready' : !settings.pesapalTerminalEnabled ? 'workspace_pesapal_terminal_disabled' : 'pesapal_sabi_credentials_required' },
       { id: 'bank_feeds', status: monoReady ? 'mono_configured_consent_required' : settings.monoEnabled ? 'mono_business_approval_and_server_keys_required' : 'workspace_mono_disabled' },
       { id: 'email', status: emailConfigured ? 'brevo_configured' : 'brevo_api_key_and_verified_sender_required' },
       { id: 'payroll', status: `encrypted_internal_runs_${env.PAYROLL_DATA_ENCRYPTION_KEY ? 'configured' : 'encryption_key_required'}_statutory_filing_not_implemented` },
@@ -6890,6 +7191,7 @@ app.get('/v1/integrations/readiness', requirePool, requireSession, async (reques
     const visibleIntegrations = integrations.filter((integration) => canManageIntegrations
       || integration.id === 'mpesa' && permissions.has('sales.write')
       || integration.id === 'card_payments' && permissions.has('sales.write')
+      || integration.id === 'card_terminals' && permissions.has('sales.write')
       || integration.id === 'email' && permissions.has('sales.write')
       || integration.id === 'multi_method_payments' && (permissions.has('sales.write') || permissions.has('accounting.write'))
       || integration.id === 'bank_feeds' && permissions.has('banking.write'))
