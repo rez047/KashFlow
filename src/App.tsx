@@ -730,7 +730,7 @@ function LandingPage({ onSignIn, onDemo, onForgot }: { onSignIn: () => void; onD
       <div className="section-head">
         <span className="section-eyebrow"><Download size={14} /> KASHFLOW BUSINESS APPS</span>
         <h2>Made for the way your team <em>works</em></h2>
-        <p>Get the complete KashFlow business suite in every app, including sales, accounting, payroll, reports, settings, and more. Encrypted offline inventory and stock-count tools stay ready on your device. Windows and macOS installers and the Android APK download directly from KashFlow without opening GitHub; iPhone and iPad install through Apple&apos;s own App Store or TestFlight.</p>
+        <p>Get the complete KashFlow business suite in every app, including sales, accounting, payroll, reports, settings, and more. Encrypted offline inventory and stock-count tools stay ready on your device ; iPhone and iPad install through Apple&apos;s own App Store or TestFlight.</p>
       </div>
       <div className="app-download-grid">
         {appPlatforms.map(({ platform, name, detail, label, icon: Icon, badge }) => {
