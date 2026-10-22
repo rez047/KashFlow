@@ -146,6 +146,7 @@ type PosCartLine = { itemId: string; description: string; quantity: number; unit
 const EXPORT_TYPES = ['customers', 'suppliers', 'inventory', 'projects', 'invoices', 'bills', 'transactions', 'journals', 'audit'] as const
 type PosFiscalization = { submissionStatus: string; notice: string; externalInvoiceNumber?: string; complianceDraftId?: string }
 type PosReceipt = { invoiceId: string; workspaceId?: string; businessName?: string; customer: string; customerEmail?: string; customerPhone?: string; amount: number; amountPaid: number; balanceDue: number; paymentMethod: string; status: string; createdAt: string; lines: PosCartLine[]; fiscalization?: PosFiscalization; cardIdempotencyKey?: string; cardPaymentId?: string; cardPaymentStatus?: string; cardCheckoutAmount?: number; terminalPaymentId?: string; terminalPaymentStatus?: string; terminalReference?: string; terminalAmount?: number; mpesaPaymentIds?: string[]; mpesaPendingAmount?: number }
+type TerminalPaymentWatch = { paymentId: string; invoiceId: string; amount: number; reference: string; label: string; phase: 'waiting' | 'paid' | 'unpaid' | 'failed' | 'review'; confirmationCode: string; message: string }
 type PosCustomerSale = { id: string; description: string; amount: string; amount_paid: string; due_date: string; status: string; created_at: string }
 type PosCustomerHistory = { sales: PosCustomerSale[]; summary: { sale_count: number; lifetime_sales: string } }
 type OfflinePosDraft = { id: string; workspaceId: string; createdAt: string; idempotencyKey: string; paymentIdempotencyKey?: string; cashPaymentIdempotencyKey?: string; customer: string; customerEmail: string; locationId: string; amount: number; lines: PosCartLine[]; paymentMethod?: 'cash' | 'mpesa'; paymentPhone?: string; paymentSplits?: Array<PaymentSplit & { idempotencyKey: string }> }
@@ -1147,6 +1148,11 @@ function App() {
   const mpesaPoll = useRef<ReturnType<typeof setInterval> | null>(null)
   const mpesaPollStarted = useRef(0)
   const mpesaWatchRef = useRef<{ invoiceId: string; amount: number; label: string; phase: 'waiting' | 'paid' | 'unpaid' | 'failed'; receipt: string; message: string; onPaid?: () => void; onUnpaid?: () => void; paymentIds?: string[] } | null>(null)
+  const terminalPoll = useRef<ReturnType<typeof setInterval> | null>(null)
+  const terminalPollStarted = useRef(0)
+  const terminalPollInFlight = useRef(false)
+  const terminalWatchRun = useRef(0)
+  const terminalWatchRef = useRef<TerminalPaymentWatch | null>(null)
   const [posCart, setPosCart] = useState<PosCartLine[]>([])
   const [posCustomer, setPosCustomer] = useState('')
   const [posCustomerType, setPosCustomerType] = useState<'walk_in' | 'remote'>('walk_in')
@@ -1223,6 +1229,7 @@ function App() {
   // recurring). While it is open it polls Daraja for the receipt, confirms the payment when it
   // arrives, and warns the user when no payment is received in time.
   const [mpesaWatch, setMpesaWatch] = useState<{ invoiceId: string; amount: number; label: string; phase: 'waiting' | 'paid' | 'unpaid' | 'failed'; receipt: string; message: string; onPaid?: () => void; onUnpaid?: () => void; paymentIds?: string[] } | null>(null)
+  const [terminalWatch, setTerminalWatch] = useState<TerminalPaymentWatch | null>(null)
   const [supplierPaymentInput, setSupplierPaymentInput] = useState({ serviceId: '', amount: '', paymentDate: today, billingCycle: 'none' as 'none' | 'monthly' | 'quarterly' | 'annually' })
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([])
   const [retailReport, setRetailReport] = useState<RetailReport | null>(null)
@@ -1486,6 +1493,7 @@ function App() {
     if (!account || canOpenPage(page)) return
     setModal(null)
     setMpesaWatch(null)
+    closeTerminalWatch()
     setSearchOpen(false)
     setSearchResults([])
     pageHistoryIndex.current = 0
@@ -1501,6 +1509,7 @@ function App() {
       auditRequestSequence.current += 1
       setModal(null)
       setMpesaWatch(null)
+      closeTerminalWatch()
       setIntegrationReadiness(null)
       setSearchOpen(false)
       setSearchResults([])
@@ -1781,6 +1790,7 @@ function App() {
   useEffect(() => {
     function handleSessionExpired(event: Event) {
       const message = (event as CustomEvent<string>).detail
+      closeTerminalWatch()
       setAccount(null)
       setDashboard(null)
       setShowSetupFlow(false)
@@ -2577,6 +2587,7 @@ function App() {
   async function logout() {
     try { await request('/v1/auth/logout', { method: 'POST' }) } catch { /* Discard an expired local session. */ }
     await clearOfflineResponseCache().catch(() => undefined)
+    closeTerminalWatch()
     setAccount(null); setDashboard(null); setPageHistory([]); setPage('Overview')
   }
 
@@ -2789,7 +2800,12 @@ function App() {
 
   // Keep the M-Pesa watcher ref in sync and stop polling when the overlay closes or the app unmounts.
   useEffect(() => { mpesaWatchRef.current = mpesaWatch }, [mpesaWatch])
-  useEffect(() => () => { if (mpesaPoll.current) clearInterval(mpesaPoll.current) }, [])
+  useEffect(() => { terminalWatchRef.current = terminalWatch }, [terminalWatch])
+  useEffect(() => () => {
+    if (mpesaPoll.current) clearInterval(mpesaPoll.current)
+    if (terminalPoll.current) clearInterval(terminalPoll.current)
+    terminalWatchRun.current += 1
+  }, [])
 
   // Manual Enter submit from the search / scan box.
   function scanPosBarcode(event: KeyboardEvent<HTMLInputElement>) {
@@ -3394,6 +3410,9 @@ async function createCameraReader(): Promise<CameraReader> {
         }
       }
       setPosReceipt({ ...receipt })
+      if (receipt.terminalPaymentId && receipt.terminalReference) {
+        watchCardTerminalPayment(receipt.terminalPaymentId, receipt.invoiceId, Number(receipt.terminalAmount ?? receipt.amount), receipt.terminalReference, `Point of sale · ${receipt.customer}`)
+      }
       try {
         const [inventory, listedInvoices] = await Promise.all([
           request<{ records: WorkspaceRecord[] }>('/v1/records/inventory'),
@@ -3472,35 +3491,6 @@ async function createCameraReader(): Promise<CameraReader> {
       setPosReceipt(nextReceipt)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not check the IntaSend payment status.')
-    } finally { setBusy(false) }
-  }
-
-  async function checkPosCardTerminalPayment() {
-    if (!posReceipt?.terminalPaymentId) return
-    setBusy(true)
-    setError('')
-    try {
-      const result = await request<{ payment: { id: string; invoice_id: string; status: string; amount: string; currency: string; reference: string; confirmation_code?: string | null; payment_option?: string | null; result_description?: string | null } }>(`/v1/payments/card-terminal/${posReceipt.terminalPaymentId}/status`)
-      const nextReceipt = { ...posReceipt, terminalPaymentStatus: result.payment.status, terminalReference: result.payment.reference }
-      if (result.payment.status === 'paid') {
-        const listed = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
-        const invoice = listed.invoices.find((item) => item.id === result.payment.invoice_id)
-        nextReceipt.amountPaid = Number(invoice?.amount_paid ?? Math.min(nextReceipt.amount, nextReceipt.amountPaid + Number(result.payment.amount)))
-        nextReceipt.balanceDue = Math.max(0, nextReceipt.amount - nextReceipt.amountPaid)
-        nextReceipt.status = nextReceipt.balanceDue <= 0 ? 'Paid · PesaPal card terminal confirmed' : `PesaPal terminal confirmed · ${money(nextReceipt.amountPaid)} recorded; balance due ${money(nextReceipt.balanceDue)}`
-        setInvoicesList(listed.invoices)
-        notify('PesaPal confirmed the terminal payment. Check the invoice and receipt before releasing goods.')
-        await refresh()
-      } else if (result.payment.status === 'verification_required' || result.payment.status === 'failed') {
-        nextReceipt.status = result.payment.status === 'failed' ? 'Terminal payment failed · invoice remains unpaid' : 'Terminal payment needs review · do not release goods'
-        setError(result.payment.result_description || nextReceipt.status)
-      } else {
-        nextReceipt.status = `Card terminal awaiting confirmation · reference ${result.payment.reference}`
-        notify('The terminal payment is still waiting for PesaPal confirmation. Check again before releasing goods.')
-      }
-      setPosReceipt(nextReceipt)
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not check the PesaPal terminal payment status.')
     } finally { setBusy(false) }
   }
 
@@ -4104,6 +4094,109 @@ async function createCameraReader(): Promise<CameraReader> {
 
   function stopMpesaWatch() {
     if (mpesaPoll.current) { clearInterval(mpesaPoll.current); mpesaPoll.current = null }
+  }
+
+  // Poll PesaPal's verified terminal status just like Daraja's M-Pesa watcher. A terminal
+  // sale stays unpaid until PesaPal's signed notification has been verified server-side.
+  function watchCardTerminalPayment(paymentId: string, invoiceId: string, amount: number, reference: string, label: string) {
+    if (terminalPoll.current) { clearInterval(terminalPoll.current); terminalPoll.current = null }
+    const run = ++terminalWatchRun.current
+    terminalPollStarted.current = Date.now()
+    const next: TerminalPaymentWatch = { paymentId, invoiceId, amount, reference, label, phase: 'waiting', confirmationCode: '', message: '' }
+    terminalWatchRef.current = next
+    setTerminalWatch(next)
+    terminalPoll.current = setInterval(() => { void checkCardTerminalWatch(run) }, 4000)
+    void checkCardTerminalWatch(run)
+  }
+
+  async function checkCardTerminalWatch(run: number) {
+    const watch = terminalWatchRef.current
+    if (run !== terminalWatchRun.current || !watch || watch.phase !== 'waiting' || terminalPollInFlight.current) return
+    terminalPollInFlight.current = true
+    try {
+      const result = await request<{ payment: { id: string; invoice_id: string; status: string; amount: string; reference: string; confirmation_code?: string | null; result_description?: string | null } }>(`/v1/payments/card-terminal/${watch.paymentId}/status`)
+      if (run !== terminalWatchRun.current) return
+      if (result.payment.status === 'paid') {
+        if (terminalPoll.current) { clearInterval(terminalPoll.current); terminalPoll.current = null }
+        const paidWatch = { ...watch, phase: 'paid' as const, reference: result.payment.reference, confirmationCode: result.payment.confirmation_code ?? '', message: '' }
+        terminalWatchRef.current = paidWatch
+        setTerminalWatch(paidWatch)
+        try {
+          const listed = await request<{ invoices: InvoiceRecord[] }>('/v1/invoices')
+          const invoice = listed.invoices.find((item) => item.id === result.payment.invoice_id)
+          setInvoicesList(listed.invoices)
+          setPosReceipt((current) => {
+            if (!current || current.terminalPaymentId !== result.payment.id) return current
+            const amountPaid = Number(invoice?.amount_paid ?? Math.min(current.amount, current.amountPaid + Number(result.payment.amount)))
+            const balanceDue = Math.max(0, current.amount - amountPaid)
+            return {
+              ...current,
+              terminalPaymentStatus: 'paid',
+              terminalReference: result.payment.reference,
+              amountPaid,
+              balanceDue,
+              status: balanceDue <= 0 ? 'Paid · PesaPal card terminal confirmed' : `PesaPal terminal confirmed · ${money(amountPaid)} recorded; balance due ${money(balanceDue)}`,
+            }
+          })
+          await refresh()
+        } catch { /* The verified payment remains recorded; the workspace view can refresh later. */ }
+        notify('PesaPal confirmed the terminal payment. Check the invoice and receipt before releasing goods.')
+        return
+      }
+      if (result.payment.status === 'failed' || result.payment.status === 'verification_required') {
+        if (terminalPoll.current) { clearInterval(terminalPoll.current); terminalPoll.current = null }
+        const needsReview = result.payment.status === 'verification_required'
+        const nextWatch: TerminalPaymentWatch = {
+          ...watch,
+          phase: needsReview ? 'review' : 'failed',
+          reference: result.payment.reference,
+          message: result.payment.result_description ?? (needsReview ? 'PesaPal needs to review this terminal payment.' : 'PesaPal reported that this terminal payment failed.'),
+        }
+        terminalWatchRef.current = nextWatch
+        setTerminalWatch(nextWatch)
+        setPosReceipt((current) => current?.terminalPaymentId === result.payment.id ? {
+          ...current,
+          terminalPaymentStatus: needsReview ? 'verification_required' : 'failed',
+          status: needsReview ? 'Terminal payment needs review · do not release goods' : 'Terminal payment failed · invoice remains unpaid',
+        } : current)
+        return
+      }
+      if (Date.now() - terminalPollStarted.current > 90000) {
+        if (terminalPoll.current) { clearInterval(terminalPoll.current); terminalPoll.current = null }
+        const nextWatch = { ...watch, phase: 'unpaid' as const, message: '' }
+        terminalWatchRef.current = nextWatch
+        setTerminalWatch(nextWatch)
+        setPosReceipt((current) => current?.terminalPaymentId === watch.paymentId ? {
+          ...current,
+          status: `Terminal payment not confirmed yet · reference ${watch.reference}`,
+        } : current)
+      }
+    } catch (reason) {
+      if (run === terminalWatchRun.current && Date.now() - terminalPollStarted.current > 90000) {
+        if (terminalPoll.current) { clearInterval(terminalPoll.current); terminalPoll.current = null }
+        const nextWatch = { ...watch, phase: 'unpaid' as const, message: reason instanceof Error ? reason.message : '' }
+        terminalWatchRef.current = nextWatch
+        setTerminalWatch(nextWatch)
+      }
+    } finally { terminalPollInFlight.current = false }
+  }
+
+  function closeTerminalWatch() {
+    if (terminalPoll.current) { clearInterval(terminalPoll.current); terminalPoll.current = null }
+    terminalWatchRun.current += 1
+    terminalWatchRef.current = null
+    setTerminalWatch(null)
+  }
+
+  function resumePosTerminalWatch() {
+    if (!posReceipt?.terminalPaymentId) return
+    watchCardTerminalPayment(
+      posReceipt.terminalPaymentId,
+      posReceipt.invoiceId,
+      Number(posReceipt.terminalAmount ?? posReceipt.amount),
+      posReceipt.terminalReference ?? '',
+      `Point of sale · ${posReceipt.customer}`,
+    )
   }
 
   function closeMpesaWatch() {
@@ -5556,6 +5649,41 @@ async function createCameraReader(): Promise<CameraReader> {
         </>}
       </div>
     </div>}
+    {terminalWatch && !mpesaWatch && canUse('sales.write') && <div className="mpesa-confirm-overlay" role="dialog" aria-modal="true" aria-live="assertive">
+      <div className={`mpesa-confirm-card is-${terminalWatch.phase}`}>
+        {terminalWatch.phase === 'waiting' ? <>
+          <div className="mpesa-spinner" aria-hidden="true" />
+          <h2>Waiting for card terminal payment</h2>
+          <p className="mpesa-confirm-amount">{money(terminalWatch.amount)}</p>
+          <p className="mpesa-confirm-subject">{terminalWatch.label}</p>
+          <p className="mpesa-confirm-receipt">Terminal reference <strong>{terminalWatch.reference}</strong></p>
+          <p className="mpesa-confirm-body">Enter this amount and reference on the PesaPal terminal. KashFlow is checking for PesaPal confirmation. Do not release the goods or service until the payment is confirmed.</p>
+          <p className="dialog-note">Checking payment status automatically…</p>
+          <div className="button-row"><button type="button" className="button button-small" onClick={closeTerminalWatch}>Stop waiting</button></div>
+        </> : terminalWatch.phase === 'paid' ? <>
+          <div className="mpesa-confirm-icon paid"><Check size={26} /></div>
+          <h2>Payment received</h2>
+          <p className="mpesa-confirm-amount">{money(terminalWatch.amount)}</p>
+          <p className="mpesa-confirm-subject">{terminalWatch.label}</p>
+          <p className="mpesa-confirm-receipt">Terminal reference <strong>{terminalWatch.reference}</strong></p>
+          {terminalWatch.confirmationCode && <p className="mpesa-confirm-receipt">PesaPal confirmation <strong>{terminalWatch.confirmationCode}</strong></p>}
+          <p className="mpesa-confirm-body">PesaPal verified this payment and it has been recorded against the sale.</p>
+          <div className="button-row"><button type="button" className="button button-primary" onClick={closeTerminalWatch}>Done</button></div>
+        </> : <>
+          <div className="mpesa-confirm-icon unpaid"><AlertCircle size={26} /></div>
+          <h2>{terminalWatch.phase === 'failed' ? 'Payment failed' : terminalWatch.phase === 'review' ? 'Payment needs review' : 'Payment not confirmed yet'}</h2>
+          <p className="mpesa-confirm-amount">{money(terminalWatch.amount)}</p>
+          <p className="mpesa-confirm-subject">{terminalWatch.label}</p>
+          <p className="mpesa-confirm-receipt">Terminal reference <strong>{terminalWatch.reference}</strong></p>
+          <p className="mpesa-confirm-body">{terminalWatch.phase === 'failed' ? terminalWatch.message || 'PesaPal reported that this terminal payment failed. The invoice remains unpaid.' : terminalWatch.phase === 'review' ? terminalWatch.message || 'PesaPal could not confirm this payment. No payment was recorded; keep the sale unpaid until it is resolved.' : 'No confirmed terminal payment has arrived yet, so the invoice remains unpaid. If the customer completed payment, check again and keep the goods until PesaPal confirms it.'}</p>
+          {terminalWatch.phase === 'unpaid' && <p className="dialog-note">The payment can still arrive later. Only PesaPal confirmation records it as paid.</p>}
+          <div className="button-row">
+            <button type="button" className="button button-primary" onClick={closeTerminalWatch}>Keep sale unpaid</button>
+            {(terminalWatch.phase === 'unpaid' || terminalWatch.phase === 'review') && <button type="button" className="button button-small" onClick={resumePosTerminalWatch}>Check again</button>}
+          </div>
+        </>}
+      </div>
+    </div>}
 
     <main className="main-area">
       <header className="topbar">
@@ -6512,7 +6640,7 @@ async function createCameraReader(): Promise<CameraReader> {
             </aside>
           </div>
           {posReceipt && <div className="module-card pos-last-sale"><div><div className="eyebrow">LAST SALE · {posReceipt.invoiceId.slice(0, 8).toUpperCase()}</div><h2>{money(posReceipt.amount)}</h2><p>{posReceipt.customer} · {posReceipt.status}</p>{posReceipt.terminalReference && <p className="dialog-note" role="status">PesaPal terminal reference · <strong>{posReceipt.terminalReference}</strong> · {money(posReceipt.terminalAmount ?? 0)}</p>}{posReceipt.fiscalization && <p className="dialog-note" role="status">eTIMS · {posReceipt.fiscalization.submissionStatus.replaceAll('_', ' ')}{posReceipt.fiscalization.externalInvoiceNumber ? ` · KRA reference ${posReceipt.fiscalization.externalInvoiceNumber}` : ''}. {posReceipt.fiscalization.notice}</p>}</div>
-            <div className="button-row"><button className="button button-secondary" onClick={() => printDocument('pos')}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod.toLowerCase().includes('cash') && posReceipt.amountPaid > 0 && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}{posReceipt.fiscalization?.submissionStatus === 'accepted_by_kra' && <button className="button button-primary" onClick={() => { setKraReceiptOpen(posReceipt.fiscalization?.complianceDraftId ?? ''); navigateTo('Kenya compliance') }}>View KRA fiscal receipt</button>}<button className="button button-secondary" onClick={() => { setNetworkingTab('sales'); navigateTo('Networking') }}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}{posReceipt.cardPaymentId && !['paid', 'failed', 'verification_required'].includes(posReceipt.cardPaymentStatus ?? '') && <button className="button button-primary" disabled={busy} onClick={() => void checkPosCardPayment()}><CreditCard size={15} />Check card payment</button>}{posReceipt.terminalPaymentId && posReceipt.terminalPaymentStatus !== 'paid' && <button className="button button-primary" disabled={busy} onClick={() => void checkPosCardTerminalPayment()}><CreditCard size={15} />Check terminal payment</button>}</div>
+            <div className="button-row"><button className="button button-secondary" onClick={() => printDocument('pos')}><Printer size={15} />{t('Print receipt')}</button><button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/receipt')}><Printer size={15} />{t('Thermal print')}</button>{posReceipt.paymentMethod.toLowerCase().includes('cash') && posReceipt.amountPaid > 0 && <button className="button button-secondary" disabled={posBridgeBusy} onClick={() => void sendPosHardwareCommand('/cash-drawer')}>{t('Open cash drawer')}</button>}{posReceipt.fiscalization?.submissionStatus === 'accepted_by_kra' && <button className="button button-primary" onClick={() => { setKraReceiptOpen(posReceipt.fiscalization?.complianceDraftId ?? ''); navigateTo('Kenya compliance') }}>View KRA fiscal receipt</button>}<button className="button button-secondary" onClick={() => { setNetworkingTab('sales'); navigateTo('Networking') }}>Open sales</button>{posReceipt.status.startsWith('Unpaid · payment recording failed') && <button className="button button-primary" disabled={busy} onClick={() => void retryPosCashPayment()}>Retry recording cash payment</button>}{posReceipt.cardPaymentId && !['paid', 'failed', 'verification_required'].includes(posReceipt.cardPaymentStatus ?? '') && <button className="button button-primary" disabled={busy} onClick={() => void checkPosCardPayment()}><CreditCard size={15} />Check card payment</button>}{posReceipt.terminalPaymentId && !['paid', 'failed'].includes(posReceipt.terminalPaymentStatus ?? '') && <button className="button button-primary" disabled={busy} onClick={resumePosTerminalWatch}><CreditCard size={15} />Check terminal payment</button>}</div>
             <details className="module-footnote"><summary>Receipt printer setup</summary><p>Use Print receipt to choose any printer installed on this computer, including a USB printer or network printer. Thermal print uses the optional local bridge and a compatible ESC/POS network printer on port 9100.</p><div className="field-row"><label className="field-label">Local bridge URL<input value={posBridgeAddress} onChange={(event) => changePosBridgeAddress(event.target.value)} placeholder="http://127.0.0.1:17371" /></label><button className="button button-small" disabled={posBridgeBusy} onClick={() => void testPosBridge()}>{posBridgeBusy ? 'Checking…' : t('Test connection')}</button></div>{posBridgeStatus && <p role="status">{t(posBridgeStatus)}</p>}<small>{t('Internal receipt only; not an eTIMS tax invoice.')} Cash drawer is enabled only after a cash payment is recorded.</small></details>
           </div>}
           {posReceipt && <article className="pos-receipt-print"><header className="pos-receipt-brand"><strong>{posReceipt.businessName || dashboard?.workspaceName || 'Your business'}</strong><span>Powered by KashFlow</span></header><h2>{t('SALE RECEIPT')}</h2><div className="pos-receipt-meta"><span>Receipt <strong>{posReceipt.invoiceId.slice(0, 8).toUpperCase()}</strong></span><span>{new Date(posReceipt.createdAt).toLocaleString('en-KE', { dateStyle: 'medium', timeStyle: 'short' })}</span></div><p className="pos-receipt-customer">Customer: <strong>{posReceipt.customer}</strong></p><hr /><div className="pos-receipt-columns"><span>Item</span><span>Qty</span><span>Amount</span></div>{posReceipt.lines.map((line) => <div className="pos-receipt-line" key={line.itemId}><span>{line.description}<small>{money(line.unitPrice)} each · VAT {money(posLineTaxAmount(line))}</small></span><span>{line.quantity}</span><strong>{money(line.quantity * line.unitPrice)}</strong></div>)}<hr /><div className="pos-receipt-line"><span>VAT total</span><span /><strong>{money(posReceipt.lines.reduce((sum, line) => sum + posLineTaxAmount(line), 0))}</strong></div><div className="pos-receipt-line pos-receipt-total"><strong>Total</strong><strong>{money(posReceipt.amount)}</strong></div><div className="pos-receipt-payment"><span>Payment · {posReceipt.paymentMethod}</span><span>Paid {money(posReceipt.amountPaid)}</span>{posReceipt.balanceDue > 0 && <strong>Balance due {money(posReceipt.balanceDue)}</strong>}</div><footer>Thank you for your business.<small>Internal receipt · not an eTIMS tax invoice</small></footer></article>}
