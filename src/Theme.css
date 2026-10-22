@@ -1,0 +1,285 @@
+:root[data-theme='dark'] .app-shell {
+  --app-bg: #101218;
+  --app-surface: #181b24;
+  --app-raised: #202430;
+  --app-control: #12151c;
+  --app-border: #303644;
+  --app-text: #e7eaf1;
+  --app-muted: #a7adbb;
+  color-scheme: dark;
+  color: var(--app-text);
+  background: var(--app-bg);
+}
+
+:root[data-theme='dark'] .app-shell .sidebar,
+:root[data-theme='dark'] .app-shell .topbar {
+  background: var(--app-surface);
+  border-color: var(--app-border);
+}
+
+:root[data-theme='dark'] .app-shell :is(
+  .metric-card-link,
+  .metric-card,
+  .panel,
+  .module-card,
+  .dialog,
+  .notification-popover,
+  .business-menu,
+  .company-switcher,
+  .period-select,
+  .table-tools button,
+  .button-secondary,
+  .button-small,
+  .statement-panel,
+  .attachment-item,
+  .invoice-preview-card,
+  .pos-item,
+  .pos-customer-summary > span,
+  .stock-health-card,
+  .global-search-results,
+  .global-search-result,
+  .search-more-results,
+  .service-detail,
+  .service-supplier-summary,
+  .service-subscribe-form,
+  .service-billing-form,
+  .role-group,
+  .user-card,
+  .stock-location-card,
+  .setup-more,
+  .compliance-advanced,
+  .help-result,
+  .help-guide-card,
+  .help-empty-state,
+  .help-workspace-highlights > div,
+  .offline-queue-list > div,
+  .mpesa-confirm-card,
+  .help-search-box,
+  .global-search-wrap .search-box
+) {
+  color: var(--app-text);
+  background-color: var(--app-surface);
+  border-color: var(--app-border);
+}
+
+:root[data-theme='dark'] .app-shell :is(
+  h1,
+  h2,
+  h3,
+  h4,
+  strong,
+  .brand-name,
+  .metric-value,
+  .task-copy strong,
+  .transaction-name strong,
+  .invoice-preview-grid strong,
+  .module-card summary
+) {
+  color: var(--app-text);
+}
+
+:root[data-theme='dark'] .app-shell :is(
+  p,
+  small,
+  label,
+  .breadcrumbs,
+  .eyebrow,
+  .nav-heading,
+  .company-copy small,
+  .metric-top,
+  .metric-foot,
+  .panel-header p,
+  .welcome-subtitle,
+  .transaction-date,
+  .transaction-name small,
+  .table-head,
+  .page-footer,
+  .field-label,
+  .profile-row,
+  .help-card p,
+  .module-card > p,
+  .invoice-preview-grid span,
+  .invoice-preview-card small
+) {
+  color: var(--app-muted);
+}
+
+:root[data-theme='dark'] .app-shell .nav-link {
+  color: var(--app-muted);
+}
+
+:root[data-theme='dark'] .app-shell .nav-link:hover {
+  color: var(--app-text);
+  background: #242835;
+}
+
+:root[data-theme='dark'] .app-shell .nav-link.active,
+:root[data-theme='dark'] .app-shell .business-menu-item.active {
+  color: #d1c8ff;
+  background: #2a2740;
+}
+
+:root[data-theme='dark'] .app-shell .company-switcher:hover,
+:root[data-theme='dark'] .app-shell .business-menu-item:hover:not(:disabled),
+:root[data-theme='dark'] .app-shell .button-secondary:hover,
+:root[data-theme='dark'] .app-shell .button-small:hover {
+  background: #272b38;
+}
+
+:root[data-theme='dark'] .app-shell .help-card {
+  background: #201e30;
+  border-color: #37334f;
+}
+
+:root[data-theme='dark'] .app-shell .help-icon {
+  color: #c9bcff;
+  background: #332d50;
+}
+
+:root[data-theme='dark'] .app-shell .profile-row,
+:root[data-theme='dark'] .app-shell .transaction-row,
+:root[data-theme='dark'] .app-shell .table-head,
+:root[data-theme='dark'] .app-shell .page-footer,
+:root[data-theme='dark'] .app-shell .invoice-preview-line,
+:root[data-theme='dark'] .app-shell .invoice-preview-total {
+  border-color: var(--app-border);
+}
+
+:root[data-theme='dark'] .app-shell :is(
+  input:not([type='checkbox']):not([type='radio']):not([type='range']),
+  select,
+  textarea
+) {
+  color: var(--app-text);
+  background-color: var(--app-control);
+  border-color: var(--app-border);
+}
+
+:root[data-theme='dark'] .app-shell :is(input, textarea)::placeholder {
+  color: #828a9a;
+}
+
+:root[data-theme='dark'] .app-shell :is(input, select, textarea):focus {
+  border-color: #8f7be4;
+}
+
+:root[data-theme='dark'] .app-shell code,
+:root[data-theme='dark'] .app-shell kbd {
+  color: #d8dce6;
+  background: #252a36;
+  border-color: #3a4050;
+}
+
+:root[data-theme='dark'] .app-shell .due-banner {
+  color: #e4c47f;
+  background: #2b261a;
+  border-color: #4c4128;
+}
+
+:root[data-theme='dark'] .app-shell .due-banner strong,
+:root[data-theme='dark'] .app-shell .due-banner span {
+  color: #dbc58f;
+}
+
+:root[data-theme='dark'] .app-shell .dialog-note {
+  color: #a8d8c6;
+  background: #1b2c28;
+}
+
+:root[data-theme='dark'] .app-shell .status-pill.green {
+  color: #91dfbd;
+  background: #18372d;
+}
+
+:root[data-theme='dark'] .app-shell .status-pill.blue {
+  color: #a8c5ff;
+  background: #202f4a;
+}
+
+:root[data-theme='dark'] .app-shell .status-pill.amber {
+  color: #e8c27a;
+  background: #3b301c;
+}
+
+:root[data-theme='dark'] .app-shell .transaction-status {
+  color: #91dfbd;
+}
+
+:root[data-theme='dark'] .app-shell .transaction-status.needs-review {
+  color: #e8c27a;
+}
+
+:root[data-theme='dark'] .app-shell .transaction-amount.amount-in {
+  color: #91dfbd;
+}
+
+:root[data-theme='dark'] .app-shell :is(.upload-zone, .bank-zone, .deduction-editor) {
+  color: #c9bcff;
+  background: #211e32;
+  border-color: #3c3659;
+}
+
+:root[data-theme='dark'] .app-shell .bank-zone {
+  color: #9bd9c2;
+  background: #1a2b27;
+  border-color: #315149;
+}
+
+:root[data-theme='dark'] .app-shell .attachment-pill,
+:root[data-theme='dark'] .app-shell .user-perm-chip {
+  color: #d1c8ff;
+  background: #2a2740;
+  border-color: #403a63;
+}
+
+:root[data-theme='dark'] .app-shell .theme-toggle-track {
+  display: flex;
+  align-items: center;
+  width: 30px;
+  height: 17px;
+  flex: 0 0 30px;
+  margin-left: auto;
+  padding: 2px;
+  border-radius: 999px;
+  background: #3a4050;
+  transition: background .16s ease;
+}
+
+.theme-toggle-track {
+  display: flex;
+  align-items: center;
+  width: 30px;
+  height: 17px;
+  flex: 0 0 30px;
+  margin-left: auto;
+  padding: 2px;
+  border-radius: 999px;
+  background: #dedfe7;
+  transition: background .16s ease;
+}
+
+.theme-toggle-track i {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px #18182735;
+  transition: transform .16s ease;
+}
+
+.theme-toggle-track.is-on {
+  background: #7058cf;
+}
+
+.theme-toggle-track.is-on i {
+  transform: translateX(13px);
+}
+
+@media print {
+  :root[data-theme='dark'] body.printing-invoice .invoice-preview-card,
+  :root[data-theme='dark'] body.printing-kra .kra-fiscal-receipt,
+  :root[data-theme='dark'] body.printing-pos .pos-receipt-print {
+    color: #111 !important;
+    background: #fff !important;
+  }
+}

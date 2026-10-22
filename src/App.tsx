@@ -4,13 +4,15 @@ import {
   Activity, AlertCircle, ArrowDownLeft, ArrowLeft, ArrowRight, ArrowUpRight, Banknote, Bell, BookOpen, CreditCard,
   BriefcaseBusiness, CalendarDays, Camera, Check, ChevronRight, CircleHelp,
   Eye, EyeOff, FileText, Filter, Gauge, Landmark, LayoutDashboard,
-  LifeBuoy, LogOut, Mail, Menu, MessageCircle, Minus, Package, Phone, Plus, Printer, QrCode,
+  LifeBuoy, LogOut, Mail, Menu, MessageCircle, Minus, Moon, Package, Phone, Plus, Printer, QrCode,
   ScanBarcode, Search, Settings2, ShieldCheck, ShoppingBag, Smartphone, Sparkles, Star, Trash2, Users, Volume2, Wallet, X, Laptop, MonitorDown, Download,
+  Sun,
 } from 'lucide-react'
 import { SupplierBillEmailSection } from './SupplierBillEmailSection'
 import { cacheApiResponse, canQueueOfflinePath, clearOfflineResponseCache, getActiveOfflineUser, getActiveOfflineWorkspace, listOfflineMutations, OfflineQueuedError, queueOfflineMutation, readCachedApiResponse, readOfflineLocalData, setActiveOfflineWorkspace, syncOfflineMutations, writeOfflineLocalData, type OfflineMutation } from './offlineSync'
 import './App.css'
 import './Sidebar.css'
+import './Theme.css'
 
 const OnlineStoreApp = lazy(() => import('./OnlineStore').then((module) => ({ default: module.OnlineStoreApp })))
 const OverviewCashflowChart = lazy(() => import('./FinanceCharts').then((module) => ({ default: module.OverviewCashflowChart })))
@@ -1048,10 +1050,19 @@ function App() {
   const [modal, setModal] = useState<Modal>(null)
   const [toast, setToast] = useState('')
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [darkMode, setDarkMode] = useState(() => {
+    try { return window.localStorage.getItem('kashflow-theme') === 'dark' }
+    catch { return false }
+  })
   const [businessMenuOpen, setBusinessMenuOpen] = useState(false)
   const [switchingBusiness, setSwitchingBusiness] = useState(false)
   const [statusOpen, setStatusOpen] = useState(false)
   const [account, setAccount] = useState<Account | null>(null)
+  useEffect(() => {
+    document.documentElement.dataset.theme = darkMode ? 'dark' : 'light'
+    try { window.localStorage.setItem('kashflow-theme', darkMode ? 'dark' : 'light') }
+    catch { /* The current theme still applies for this session. */ }
+  }, [darkMode])
   const effectivePermissions = useMemo<MemberPermission[]>(() => {
     if (!account) return []
     const role = account.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role
@@ -5501,6 +5512,9 @@ async function createCameraReader(): Promise<CameraReader> {
           <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { teamPermissionsScrollPending.current = false; navigateTo('Settings'); setSidebarOpen(false) }}><Settings2 size={18} /> {t('Settings')}</button>
           {canUse('team.manage') && <button className={`nav-link bottom-link ${page === 'Settings' ? 'active' : ''}`} onClick={() => { setSidebarOpen(false); if (page === 'Settings') document.getElementById('team-permissions')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); else { teamPermissionsScrollPending.current = true; navigateTo('Settings') } }}><Users size={18} /> Team &amp; Permissions</button>}
           <button className={`nav-link bottom-link ${page === 'Help' ? 'active' : ''}`} onClick={() => { navigateTo('Help'); setSidebarOpen(false) }}><LifeBuoy size={18} /> {t('Help & support')}</button>
+          <button type="button" className="nav-link bottom-link theme-toggle" aria-label={t('Dark mode')} aria-pressed={darkMode} onClick={() => setDarkMode((current) => !current)}>
+            {darkMode ? <Sun size={18} /> : <Moon size={18} />}<span>{t('Dark mode')}</span><span className={`theme-toggle-track ${darkMode ? 'is-on' : ''}`} aria-hidden="true"><i /></span>
+          </button>
         </div>
         <div className="profile-row"><div className="profile-avatar">{account.user.email.slice(0, 1).toUpperCase()}</div>
           <div className="profile-copy"><strong>{account.user.email}</strong><small>{account.workspaces?.find((workspace) => workspace.id === account.workspace.id)?.role ?? 'Workspace member'}</small></div>
