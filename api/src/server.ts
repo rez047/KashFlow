@@ -603,7 +603,8 @@ function requirePool(_request: express.Request, response: express.Response, next
 }
 async function requireSession(request: AuthedRequest, response: express.Response, next: express.NextFunction) {
   const bearer = request.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]
-  request.session = readSession(cookies(request.headers.cookie)[cookieName] ?? bearer) ?? undefined
+  const sessionCookieToken = cookies(request.headers.cookie)[cookieName]
+  request.session = readSession(sessionCookieToken ?? bearer) ?? undefined
   if (!request.session) { response.status(401).json({ error: 'Authentication is required to access this workspace.' }); return }
   try {
     const membership = await pool!.query(`SELECT wm.role, wm.permissions, u.session_version, w.archived_at
@@ -658,6 +659,20 @@ async function requireSession(request: AuthedRequest, response: express.Response
         response.status(403).json({ error: `Your workspace role does not have the ${missingPermission} permission.` })
         return
       }
+    }
+    // Browser sessions have a sliding 12-hour inactivity window. In particular, starting a
+    // hosted checkout refreshes the cookie before the customer leaves KashFlow to pay; provider
+    // callbacks can record the payment while the browser is away. Native clients use their
+    // separate bearer-token lifetime, and these routes explicitly rotate or clear the cookie.
+    const sessionManagedByRoute = [
+      '/v1/auth/change-password',
+      '/v1/auth/account',
+      '/v1/workspaces',
+      '/v1/workspaces/:workspaceId/activate',
+    ].includes(routePath)
+    if (sessionCookieToken && !isNativeClient(request) && !sessionManagedByRoute) {
+      request.session = { ...request.session!, expiresAt: Date.now() + sessionTtlSeconds * 1000 }
+      setSessionCookie(response, request.session)
     }
     const activityContext: RequestAuditContext = { request, eventRecorded: false }
     const shouldRecordActivity = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)
